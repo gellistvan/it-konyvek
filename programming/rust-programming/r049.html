@@ -1,0 +1,909 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>22.1 Teljesítmény: mérés, profilozás, allokáció,
+release-beállítások – Rust programozás C++-fejlesztőknek – a nulláról a
+mesterszintig</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz6">VI. RÉSZ – Haladó Rust: unsafe, FFI, makrók, típusrendszer, teljesítmény</a> › <a href="index.html#rch21">22 Teljesítmény</a></p>
+<div class="links"><a class="prev" rel="prev" href="r048.html">← 21.2 API-tervezés Rustban: irányelvek és ergonómia</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="r050.html">23.1 no_std, embedded-hal és Embassy: Rust mikrovezérlőn →</a></div>
+</nav>
+<h2 data-number="22.1" id="r049"><span
+class="header-section-number">22.1</span> Teljesítmény: mérés,
+profilozás, allokáció, release-beállítások</h2>
+<h3 data-number="22.1.1" id="motiváció"><span
+class="header-section-number">22.1.1</span> Motiváció</h3>
+<p>A C++-fejlesztő ösztönösen tudja, hogy a teljesítményoptimalizálás
+nem hit kérdése: előbb mérünk, aztán profilozunk, és csak utána nyúlunk
+a kódhoz. A Rust ugyanezt a mérnöki fegyelmet kínálja, de a nyelv
+adottságai – a borrow checker, a generikusok monomorfizálása, az
+iterátorok és a release-profil – más optimalizálási utakat nyitnak, mint
+a C++. Ebben az alfejezetben a <code>rkv</code> projektet vesszük elő,
+és a méréstől a kézzelfogható gyorsításig vezetjük végig a folyamatot.
+Kiindulópontunk a <a href="r032.html">Property-alapú tesztelés és
+benchmark</a> alfejezetben létrehozott criterion benchmark. A fejezet
+mérőszáma az <strong>allokációszám</strong>: ezzel azonosítjuk a forró
+pontot, megszüntetjük a felesleges másolatokat, és a release-profil
+finomhangolásával további nyereséget érünk el. A CPU-profil (perf,
+flamegraph) bemutatása kitekintés marad; a laborok nem futtatnak
+perf-et, és nem ígérnek checksum-benchmarkot.</p>
+<h3 data-number="22.1.2" id="fogalmak-és-szabályok"><span
+class="header-section-number">22.1.2</span> Fogalmak és szabályok</h3>
+<p><strong>Definíció.</strong> A <strong>profilozás</strong> (profiling)
+a program futás közbeni megfigyelése annak érdekében, hogy megtudjuk,
+mely függvények, kódsorok vagy erőforrás-műveletek fogyasztják a legtöbb
+időt. A <strong>forró pont</strong> (hot spot) a profilban kiemelkedő, a
+futási idő jelentős részét kitevő kódrész. A <strong>flamegraph</strong>
+a profilozás vizualizációja, amely a hívási láncokat színes sávokkal, a
+szélességet pedig időaránnyal ábrázolja.</p>
+<p><strong>Definíció.</strong> Az <strong>allokáció</strong>
+(allocation) futás közbeni memóriafoglalás a kupacon, például
+<code>Vec::push</code> kapacitásbővítés, <code>String</code> növekedés,
+<code>clone</code>, vagy <code>Box</code> létrehozása. Egy allokáció
+költsége (az allokátor hívása, a cache-hatás, a későbbi felszabadítás)
+gyakran nagyobb, mint néhány aritmetikai utasításé, ezért az allokációk
+számának csökkentése sokszor többet hoz, mint az utasításszámé. Hogy
+mennyit, az az adott programtól függ: ezt mérni kell, nem kitalálni.</p>
+<p><strong>Szabály.</strong> A mérés-vezérelt optimalizálás ciklusa: (1)
+fogalmazz meg egy hipotézist, (2) mérj egy determinisztikus
+benchmarkkal, (3) profilozz, (4) végezd el a módosítást, (5) mérd újra
+ugyanazzal a benchmarkkal, (6) ha a javulás elhanyagolható, lépj tovább.
+Soha ne optimalizálj mérés nélkül, és soha ne fogadd el a javulást
+visszamérés nélkül.</p>
+<p><strong>Szabály.</strong> Az indexelés (<code>v[i]</code>) a nyelv
+szemantikája szerint ellenőrzött: ha <code>i &gt;= v.len()</code>, a
+program pánikol (nem a memóriához fér hozzá). A <code>get(i)</code>
+ugyanezt <code>Option</code>-nel fejezi ki: <code>None</code> jelzi a
+határon kívüli indexet, panic nélkül. Ez <em>szemantika</em>, nem
+kötelező futási költség: az optimalizáló gyakran <strong>bizonyítani
+tudja</strong>, hogy az index érvényes (például egy
+<code>0..v.len()</code> ciklusban), és ilyenkor az ellenőrzést
+eltávolítja. Az iterátor (<code>for x in &amp;v</code>) nem indexel, így
+a kérdés fel sem merül. Az ellenőrzés megmaradása vagy eltűnése konkrét
+kódon és fordítási beállításon múlik, ezért egy költségállítást mindig
+ugyanazzal a toolchainnel és profillal kell igazolni.</p>
+<p><strong>Szabály.</strong> A generikus függvények és típusok
+<strong>monomorfizálódnak</strong>: minden konkrét típusparaméterre a
+fordító külön kódot generál. Ez lehetővé teszi az inline-t és a statikus
+diszpécs miatti devirtualizálást, de növeli a bináris méretét. A
+<code>#[inline]</code> attribútum a fordítót a függvény beillesztésére
+kéri; a <code>lto</code> és a <code>codegen-units</code> ezt a
+lehetőséget erősíti.</p>
+<h3 data-number="22.1.3" id="c-és-rust-összevetés"><span
+class="header-section-number">22.1.3</span> C++ és Rust összevetés</h3>
+<p>C++-ban a Google Benchmark és a <code>std::chrono</code> a mérés, a
+<code>perf</code> és a <code>gprof</code> a profilozás eszköze. Rustban
+a criterion ugyanazt a szerepet tölti be, mint a Google Benchmark:
+statisztikai elemzéssel, konfidenciaintervallummal és
+<code>black_box</code>-szal véd a kihagyástól. A profilozáshoz Linuxon
+ugyanaz a <code>perf</code> működik, a <code>cargo flamegraph</code>
+pedig a perf-et és a flamegraph generálást csomagolja egy parancsba;
+ezek a fejezetben <strong>kitekintésként</strong> szerepelnek, a laborok
+mérőszáma az allokációszám.</p>
+<p>A legfontosabb nyelvi különbség a C++-hoz képest a
+<strong>noalias</strong> információnál jelenik meg. A Rust
+<code>&amp;mut</code> referencia szavatolja, hogy nincs más élő alias
+ugyanarra a memóriára. Ez a fordító számára olyan optimalizálási
+lehetőséget ad, amit C++-ban a <code>restrict</code> kulcsszóval (ami
+nem szabványos, bár a GCC és a Clang támogatja) csak körülményesen
+érhetünk el. A Rust minden <code>&amp;mut</code> paraméternél
+automatikusan érvényesíti a noalias-t, így a vektorizálás, a
+cache-optimalizálás és a konstansok előrehozása agresszívebb lehet.</p>
+<p>A C++ <code>std::vector::operator[]</code> nem végez határellenőrzést
+(a határon kívüli index definiálatlan viselkedés), míg a Rust
+<code>v[i]</code> igen (pánik). C++-ban az ellenőrzött hozzáférés az
+<code>at()</code> (kivétel), Rustban a <code>get()</code>
+(<code>Option</code>) vagy az indexelés (pánik). A Rust tehát alapból a
+biztonságosabb szemantikát adja, és az optimalizáló dolga, hogy ahol
+tudja, a költséget eltüntesse; ahol nem tudja, ott az ellenőrzés
+megmarad.</p>
+<h3 data-number="22.1.4"
+id="kidolgozott-példa-határellenőrzés-a-gépi-kódban"><span
+class="header-section-number">22.1.4</span> Kidolgozott példa:
+határellenőrzés a gépi kódban</h3>
+<p>Vizsgáljunk meg négy függvényt. Az első kettő ugyanazt számolja (egy
+szelet bájtjainak XOR-ját) indexeléssel, illetve iterátorral; a harmadik
+és a negyedik külső indexeket használ, amelyekről a fordító semmit sem
+tud. (Ez csak a határellenőrzés bemutatása, <strong>nem</strong> az rkv
+ellenőrzőösszege; azt az <a href="r036.html">Adatpárhuzamosság
+rayonnal</a> alfejezet kétszintű hash-e adja.)</p>
+<p><em>Kódblokk</em> — fájl: <code>src/lib.rs</code> (önálló
+<code>cargo new --lib bc</code> projekt) · művelet: teljes csere ·
+ellenőrzés: <code>cargo test</code></p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>inline<span class="at">(</span>never<span class="at">)]</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">fn</span> xor_fold_indexed(data<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>]) <span class="op">-&gt;</span> <span class="dt">u8</span> <span class="op">{</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> result <span class="op">=</span> <span class="dv">0u8</span><span class="op">;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> i <span class="kw">in</span> <span class="dv">0</span><span class="op">..</span>data<span class="op">.</span>len() <span class="op">{</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>        result <span class="op">^=</span> data[i]<span class="op">;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    result</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>inline<span class="at">(</span>never<span class="at">)]</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">fn</span> xor_fold(data<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>]) <span class="op">-&gt;</span> <span class="dt">u8</span> <span class="op">{</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    data<span class="op">.</span>iter()<span class="op">.</span>fold(<span class="dv">0u8</span><span class="op">,</span> <span class="op">|</span>acc<span class="op">,</span> <span class="op">&amp;</span>b<span class="op">|</span> acc <span class="op">^</span> b)</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="co">/// Az index kívülről jön: a fordító nem bizonyíthatja, hogy érvényes.</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>inline<span class="at">(</span>never<span class="at">)]</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">fn</span> xor_picked(data<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>]<span class="op">,</span> idx<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">usize</span>]) <span class="op">-&gt;</span> <span class="dt">u8</span> <span class="op">{</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> result <span class="op">=</span> <span class="dv">0u8</span><span class="op">;</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">&amp;</span>i <span class="kw">in</span> idx <span class="op">{</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>        result <span class="op">^=</span> data[i]<span class="op">;</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>    result</span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>inline<span class="at">(</span>never<span class="at">)]</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">fn</span> xor_picked_get(data<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>]<span class="op">,</span> idx<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">usize</span>]) <span class="op">-&gt;</span> <span class="dt">Option</span><span class="op">&lt;</span><span class="dt">u8</span><span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> result <span class="op">=</span> <span class="dv">0u8</span><span class="op">;</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">&amp;</span>i <span class="kw">in</span> idx <span class="op">{</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a>        result <span class="op">^=</span> <span class="op">*</span>data<span class="op">.</span>get(i)<span class="op">?;</span></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Some</span>(result)</span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>cfg<span class="at">(</span>test<span class="at">)]</span></span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a><span class="kw">mod</span> tests <span class="op">{</span></span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a>    <span class="kw">use</span> <span class="kw">super</span><span class="pp">::</span><span class="op">*;</span></span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a>    <span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> same_value() <span class="op">{</span></span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> v<span class="op">:</span> <span class="dt">Vec</span><span class="op">&lt;</span><span class="dt">u8</span><span class="op">&gt;</span> <span class="op">=</span> (<span class="dv">0</span><span class="op">..=</span><span class="dv">255</span>)<span class="op">.</span>collect()<span class="op">;</span></span>
+<span id="cb1-40"><a href="#cb1-40" aria-hidden="true" tabindex="-1"></a>        <span class="pp">assert_eq!</span>(xor_fold_indexed(<span class="op">&amp;</span>v)<span class="op">,</span> xor_fold(<span class="op">&amp;</span>v))<span class="op">;</span></span>
+<span id="cb1-41"><a href="#cb1-41" aria-hidden="true" tabindex="-1"></a>        <span class="pp">assert_eq!</span>(xor_picked(<span class="op">&amp;</span>v<span class="op">,</span> <span class="op">&amp;</span>[<span class="dv">1</span><span class="op">,</span> <span class="dv">2</span><span class="op">,</span> <span class="dv">3</span>])<span class="op">,</span> xor_picked_get(<span class="op">&amp;</span>v<span class="op">,</span> <span class="op">&amp;</span>[<span class="dv">1</span><span class="op">,</span> <span class="dv">2</span><span class="op">,</span> <span class="dv">3</span>])<span class="op">.</span>unwrap())<span class="op">;</span></span>
+<span id="cb1-42"><a href="#cb1-42" aria-hidden="true" tabindex="-1"></a>        <span class="pp">assert_eq!</span>(xor_picked_get(<span class="op">&amp;</span>v<span class="op">,</span> <span class="op">&amp;</span>[<span class="dv">999</span>])<span class="op">,</span> <span class="cn">None</span>)<span class="op">;</span></span>
+<span id="cb1-43"><a href="#cb1-43" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-44"><a href="#cb1-44" aria-hidden="true" tabindex="-1"></a>    <span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb1-45"><a href="#cb1-45" aria-hidden="true" tabindex="-1"></a>    <span class="at">#[</span>should_panic<span class="at">]</span></span>
+<span id="cb1-46"><a href="#cb1-46" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> index_panics() <span class="op">{</span></span>
+<span id="cb1-47"><a href="#cb1-47" aria-hidden="true" tabindex="-1"></a>        xor_picked(<span class="op">&amp;</span>[<span class="dv">1</span><span class="op">,</span> <span class="dv">2</span>]<span class="op">,</span> <span class="op">&amp;</span>[<span class="dv">5</span>])<span class="op">;</span></span>
+<span id="cb1-48"><a href="#cb1-48" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-49"><a href="#cb1-49" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A C++-ban az indexelés ellenőrzés nélküli; a Rust
+<code>xor_fold_indexed</code> forráskódja ugyanezt írja, csak a
+szemantika ellenőrzött. A két fogalom különválasztása a kulcs:
+<strong>mit ír elő a nyelv</strong> és <strong>mit tartalmaz az
+optimalizált gépi kód</strong>.</p>
+<p>Ellenőrzés ugyanazzal a toolchainnel (Rust 1.99.1,
+<code>x86_64</code>, <code>--release</code>): az optimalizált assemblyt
+<code>cargo rustc --release --lib -- --emit asm</code> állítja elő, és a
+függvényenként megszámoljuk az utasításokat és a
+<code>panic_bounds_check</code> hívásokat:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Függvény</th>
+<th>Utasítás</th>
+<th><code>panic_bounds_check</code> hívás</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>xor_fold_indexed</code> (<code>0..data.len()</code> ciklus,
+<code>data[i]</code>)</td>
+<td>67</td>
+<td>0</td>
+</tr>
+<tr>
+<td><code>xor_fold</code> (iterátor)</td>
+<td>67</td>
+<td>0</td>
+</tr>
+<tr>
+<td><code>xor_picked</code> (külső indexek, <code>data[i]</code>)</td>
+<td>19</td>
+<td>1</td>
+</tr>
+<tr>
+<td><code>xor_picked_get</code> (külső indexek,
+<code>get(i)?</code>)</td>
+<td>21</td>
+<td>0 (az <code>Option</code> ág kezeli)</td>
+</tr>
+</tbody>
+</table>
+<p>Az első két függvény gépi kódja ugyanannyi utasítás, és egyik sem hív
+határellenőrző rutint: az optimalizáló a <code>0..data.len()</code>
+ciklusban bizonyította az index érvényességét, és eltávolította az
+ellenőrzést. (A <code>cargo test</code> ellenőrzi, hogy a két változat
+ugyanazt az értéket adja.) A <code>xor_picked</code>-ben viszont az
+index kívülről jön, ezért az ellenőrzés megmarad, és egy érvénytelen
+index pánikot okoz (<code>index_panics</code> teszt); a
+<code>xor_picked_get</code> ugyanezt <code>Option</code>-nel kezeli.
+Tanulság: <em>ne állítsuk, hogy az indexelés futási többlet</em>, de azt
+se, hogy mindig ingyenes. Debug módban (<code>opt-level = 0</code>) az
+ellenőrzések megmaradnak.</p>
+<h3 data-number="22.1.5"
+id="labor-az-rkv-filestore-optimalizálása-mérés-alapján"><span
+class="header-section-number">22.1.5</span> Labor: az rkv
+<code>FileStore</code> optimalizálása mérés alapján</h3>
+<p><strong>Munkakönyvtár:</strong> <code>~/rust-labor/rkv/</code></p>
+<p>A labor az <strong>előző alfejezetekben elkészült, ellenőrzött
+rkv-kódon</strong> dolgozik (a <code>rkv-core</code> a
+<code>Store</code>/<code>FileStore</code> típusokkal). Az optimalizálás
+célpontját nem találgatjuk: allokációszámlálóval mérjük meg, hol foglal
+a kód feleslegesen. A fejezet a <em>profilozás</em> alatt itt ezt az
+allokációszámlálós mérést érti; a CPU-profil (perf, flamegraph)
+kitekintés, nem része a labornak. A <code>FileStore::set</code>
+jelenlegi változata:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">fn</span> set(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> key<span class="op">:</span> <span class="dt">String</span><span class="op">,</span> value<span class="op">:</span> <span class="dt">Vec</span><span class="op">&lt;</span><span class="dt">u8</span><span class="op">&gt;</span>) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> entry <span class="op">=</span> <span class="pp">LogEntry::</span>Set <span class="op">{</span> key<span class="op">:</span> key<span class="op">.</span>clone()<span class="op">,</span> value<span class="op">:</span> value<span class="op">.</span>clone() <span class="op">};</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">self</span><span class="op">.</span>append_entry(<span class="op">&amp;</span>entry)<span class="op">?;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">self</span><span class="op">.</span>data<span class="op">.</span>insert(key<span class="op">,</span> value)<span class="op">;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(())</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A naplórekord <em>tulajdonolt</em> <code>LogEntry</code>, ezért a
+kulcsot és az értéket le kell másolni, hogy a másolatot serde kiírja, az
+eredetiek pedig a térképbe kerüljenek. A <code>save_snapshot</code>
+pedig a teljes térképet másolja le egy <code>Snapshot</code>-ba, csak
+azért, hogy kiírja. Mindkettő olyan allokáció, amelyet a nyelv nem
+kényszerít ki.</p>
+<h4 data-number="22.1.5.1"
+id="lépés-allokációszámláló-alapállapot"><span
+class="header-section-number">22.1.5.1</span> 1. lépés:
+allokációszámláló (alapállapot)</h4>
+<p>A számláló egy globális allokátor-burkoló. Az allokációszám kevésbé
+zajos, mint az időmérés, de <strong>nem univerzálisan
+gépfüggetlen</strong>: a standard könyvtár és a <code>HashMap</code>
+belső növekedési stratégiája, valamint a fordító verziója befolyásolja.
+A fejezet számait ezért egy rögzített környezet (Rust 1.99.1, Linux
+x86-64, a könyv <code>Cargo.lock</code>-ja) eredményeként kell olvasni.
+A stabil követelmény a felesleges másolatok megszűnése, nem az, hogy
+minden gépen pontosan ugyanaz a szám jöjjön ki; a saját mérésnél az
+előtte/utána különbséget és a működés változatlanságát kell
+ellenőrizni.</p>
+<p><em>Kódblokk</em> — fájl:
+<code>rkv-core/examples/alloc_count.rs</code> · művelet: új fájl ·
+ellenőrzés:
+<code>cargo run --release -p rkv-core --example alloc_count</code></p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">//! Allokációszámláló: hány kupacfoglalást végez 1000 `FileStore::set`, illetve egy snapshot-mentés.</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::alloc::</span><span class="op">{</span><span class="bu">GlobalAlloc</span><span class="op">,</span> Layout<span class="op">,</span> System<span class="op">};</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::atomic::</span><span class="op">{</span>AtomicUsize<span class="op">,</span> <span class="pp">Ordering::</span>Relaxed<span class="op">};</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">rkv_core::</span>FileStore<span class="op">;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Counting<span class="op">;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="kw">static</span> ALLOCS<span class="op">:</span> AtomicUsize <span class="op">=</span> <span class="pp">AtomicUsize::</span>new(<span class="dv">0</span>)<span class="op">;</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="kw">static</span> BYTES<span class="op">:</span> AtomicUsize <span class="op">=</span> <span class="pp">AtomicUsize::</span>new(<span class="dv">0</span>)<span class="op">;</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="kw">unsafe</span> <span class="kw">impl</span> <span class="bu">GlobalAlloc</span> <span class="cf">for</span> Counting <span class="op">{</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">unsafe</span> <span class="kw">fn</span> alloc(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> layout<span class="op">:</span> Layout) <span class="op">-&gt;</span> <span class="op">*</span><span class="kw">mut</span> <span class="dt">u8</span> <span class="op">{</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>        ALLOCS<span class="op">.</span>fetch_add(<span class="dv">1</span><span class="op">,</span> Relaxed)<span class="op">;</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>        BYTES<span class="op">.</span>fetch_add(layout<span class="op">.</span>size()<span class="op">,</span> Relaxed)<span class="op">;</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span> System<span class="op">.</span>alloc(layout) <span class="op">}</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>    <span class="kw">unsafe</span> <span class="kw">fn</span> dealloc(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> ptr<span class="op">:</span> <span class="op">*</span><span class="kw">mut</span> <span class="dt">u8</span><span class="op">,</span> layout<span class="op">:</span> Layout) <span class="op">{</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span> System<span class="op">.</span>dealloc(ptr<span class="op">,</span> layout) <span class="op">}</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>    <span class="kw">unsafe</span> <span class="kw">fn</span> realloc(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> ptr<span class="op">:</span> <span class="op">*</span><span class="kw">mut</span> <span class="dt">u8</span><span class="op">,</span> layout<span class="op">:</span> Layout<span class="op">,</span> new_size<span class="op">:</span> <span class="dt">usize</span>) <span class="op">-&gt;</span> <span class="op">*</span><span class="kw">mut</span> <span class="dt">u8</span> <span class="op">{</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>        ALLOCS<span class="op">.</span>fetch_add(<span class="dv">1</span><span class="op">,</span> Relaxed)<span class="op">;</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>        BYTES<span class="op">.</span>fetch_add(new_size<span class="op">,</span> Relaxed)<span class="op">;</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span> System<span class="op">.</span>realloc(ptr<span class="op">,</span> layout<span class="op">,</span> new_size) <span class="op">}</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>global_allocator<span class="at">]</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a><span class="kw">static</span> GLOBAL<span class="op">:</span> Counting <span class="op">=</span> Counting<span class="op">;</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> measure<span class="op">&lt;</span>T<span class="op">&gt;</span>(label<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span><span class="op">,</span> f<span class="op">:</span> <span class="kw">impl</span> <span class="bu">FnOnce</span>() <span class="op">-&gt;</span> T) <span class="op">-&gt;</span> T <span class="op">{</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> (a0<span class="op">,</span> b0) <span class="op">=</span> (ALLOCS<span class="op">.</span>load(Relaxed)<span class="op">,</span> BYTES<span class="op">.</span>load(Relaxed))<span class="op">;</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> out <span class="op">=</span> f()<span class="op">;</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(</span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;{label}: {} allokáció, {} bájt&quot;</span><span class="op">,</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>        ALLOCS<span class="op">.</span>load(Relaxed) <span class="op">-</span> a0<span class="op">,</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a>        BYTES<span class="op">.</span>load(Relaxed) <span class="op">-</span> b0</span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a>    )<span class="op">;</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>    out</span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> dir <span class="op">=</span> <span class="pp">std::env::</span>temp_dir()<span class="op">.</span>join(<span class="pp">format!</span>(<span class="st">&quot;rkv-alloc-{}&quot;</span><span class="op">,</span> <span class="pp">std::process::</span>id()))<span class="op">;</span></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a>    <span class="pp">std::fs::</span>create_dir_all(<span class="op">&amp;</span>dir)<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> store <span class="op">=</span> <span class="pp">FileStore::</span>open(dir<span class="op">.</span>join(<span class="st">&quot;state.json&quot;</span>)<span class="op">,</span> dir<span class="op">.</span>join(<span class="st">&quot;append.log&quot;</span>))<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Az előkészítést (kulcsok, értékek) a mérésen kívül végezzük.</span></span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> items<span class="op">:</span> <span class="dt">Vec</span><span class="op">&lt;</span>(<span class="dt">String</span><span class="op">,</span> <span class="dt">Vec</span><span class="op">&lt;</span><span class="dt">u8</span><span class="op">&gt;</span>)<span class="op">&gt;</span> <span class="op">=</span></span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a>        (<span class="dv">0</span><span class="op">..</span><span class="dv">1000</span>)<span class="op">.</span>map(<span class="op">|</span>i<span class="op">|</span> (<span class="pp">format!</span>(<span class="st">&quot;kulcs-{i:04}&quot;</span>)<span class="op">,</span> <span class="pp">vec!</span>[i <span class="kw">as</span> <span class="dt">u8</span><span class="op">;</span> <span class="dv">64</span>]))<span class="op">.</span>collect()<span class="op">;</span></span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A riportban szereplő kulcshossz ellenőrzése: &quot;kulcs-&quot; (6 bájt) + 4 jegy = 10 bájt.</span></span>
+<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a>    <span class="pp">assert!</span>(items<span class="op">.</span>iter()<span class="op">.</span>all(<span class="op">|</span>(k<span class="op">,</span> _)<span class="op">|</span> k<span class="op">.</span>len() <span class="op">==</span> <span class="dv">10</span>))<span class="op">;</span></span>
+<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a>    measure(<span class="st">&quot;1000 x FileStore::set&quot;</span><span class="op">,</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb3-51"><a href="#cb3-51" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> (key<span class="op">,</span> value) <span class="kw">in</span> items <span class="op">{</span></span>
+<span id="cb3-52"><a href="#cb3-52" aria-hidden="true" tabindex="-1"></a>            store<span class="op">.</span>set(key<span class="op">,</span> value)<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb3-53"><a href="#cb3-53" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-54"><a href="#cb3-54" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb3-55"><a href="#cb3-55" aria-hidden="true" tabindex="-1"></a>    measure(<span class="st">&quot;FileStore::save_snapshot (1000 elem)&quot;</span><span class="op">,</span> <span class="op">||</span> store<span class="op">.</span>save_snapshot()<span class="op">.</span>unwrap())<span class="op">;</span></span>
+<span id="cb3-56"><a href="#cb3-56" aria-hidden="true" tabindex="-1"></a>    drop(store)<span class="op">;</span></span>
+<span id="cb3-57"><a href="#cb3-57" aria-hidden="true" tabindex="-1"></a>    <span class="pp">std::fs::</span>remove_dir_all(<span class="op">&amp;</span>dir)<span class="op">.</span>ok()<span class="op">;</span></span>
+<span id="cb3-58"><a href="#cb3-58" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Alapállapot (ellenőrzött futás, 1000 elem, 10 bájtos kulcs, 64 bájtos
+érték):</p>
+<pre class="text"><code>1000 x FileStore::set: 4610 allokáció, 965868 bájt
+FileStore::save_snapshot (1000 elem): 2003 allokáció, 182596 bájt</code></pre>
+<h4 data-number="22.1.5.2"
+id="lépés-kölcsönzött-naplórekord-és-snapshot"><span
+class="header-section-number">22.1.5.2</span> 2. lépés: kölcsönzött
+naplórekord és snapshot</h4>
+<p>A serde képes kölcsönzött adatot szerializálni. A
+<code>LogEntryRef</code> és a <code>SnapshotRef</code> ugyanazt a JSON-t
+írja, mint a tulajdonolt <code>LogEntry</code>, illetve
+<code>Snapshot</code>, ezért a napló- és snapshot-formátum (és a
+visszaolvasás) <strong>nem változik</strong>.</p>
+<p><em>Kódblokk</em> — fájl:
+<code>rkv-core/src/store/file_store.rs</code> · művelet: két új típus a
+<code>LogEntry</code> mellé; a <code>set</code>, <code>delete</code>,
+<code>append_entry</code> és a <code>save_snapshot</code> egy-egy
+sorának cseréje · ellenőrzés: <code>cargo test -p rkv-core</code></p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">/// Kölcsönzött naplórekord: ugyanazt a JSON-t írja, mint a `LogEntry`, de nem másol.</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>derive<span class="at">(</span>Serialize<span class="at">)]</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">enum</span> LogEntryRef<span class="op">&lt;</span><span class="ot">&#39;a</span><span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    Set <span class="op">{</span> key<span class="op">:</span> <span class="op">&amp;</span><span class="ot">&#39;a</span> <span class="dt">str</span><span class="op">,</span> value<span class="op">:</span> <span class="op">&amp;</span><span class="ot">&#39;a</span> [<span class="dt">u8</span>] <span class="op">},</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    Delete <span class="op">{</span> key<span class="op">:</span> <span class="op">&amp;</span><span class="ot">&#39;a</span> <span class="dt">str</span> <span class="op">},</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="co">/// Kölcsönzött snapshot: a `Snapshot` JSON-alakja, a térkép másolása nélkül.</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>derive<span class="at">(</span>Serialize<span class="at">)]</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> SnapshotRef<span class="op">&lt;</span><span class="ot">&#39;a</span><span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    data<span class="op">:</span> <span class="op">&amp;</span><span class="ot">&#39;a</span> HashMap<span class="op">&lt;</span><span class="dt">String</span><span class="op">,</span> <span class="dt">Vec</span><span class="op">&lt;</span><span class="dt">u8</span><span class="op">&gt;&gt;,</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">fn</span> set(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> key<span class="op">:</span> <span class="dt">String</span><span class="op">,</span> value<span class="op">:</span> <span class="dt">Vec</span><span class="op">&lt;</span><span class="dt">u8</span><span class="op">&gt;</span>) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>    <span class="kw">self</span><span class="op">.</span>append_entry(<span class="op">&amp;</span><span class="pp">LogEntryRef::</span>Set <span class="op">{</span> key<span class="op">:</span> <span class="op">&amp;</span>key<span class="op">,</span> value<span class="op">:</span> <span class="op">&amp;</span>value <span class="op">}</span>)<span class="op">?;</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Csak a tartós naplórekord után módosul a memóriabeli állapot.</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>    <span class="kw">self</span><span class="op">.</span>data<span class="op">.</span>insert(key<span class="op">,</span> value)<span class="op">;</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(())</span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a><span class="co">// a delete-ben:   self.append_entry(&amp;LogEntryRef::Delete { key })?;</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a><span class="co">// az append_entry aláírása:   fn append_entry(&amp;mut self, entry: &amp;LogEntryRef&lt;&#39;_&gt;) -&gt; Result&lt;()&gt;</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a><span class="co">// a save_snapshot-ban:        serde_json::to_writer(&amp;mut writer, &amp;SnapshotRef { data: &amp;self.data })?;</span></span></code></pre></div>
+<p>A commit-szerződés (teljes rekord kiírása, flush,
+<code>sync_data</code>, csak utána a memória módosítása) érintetlen. Két
+új teszt védi a formátumot: a kölcsönzött és a tulajdonolt rekord
+<strong>bájtra azonos</strong> JSON-t ad, és a szóközös kulcs, a
+sortörést tartalmazó kulcs, valamint minden bájtérték
+(<code>0..=255</code>) veszteség nélkül visszaolvasható a naplóból és a
+snapshotból.</p>
+<p><em>Kódblokk</em> — fájl:
+<code>rkv-core/src/store/file_store.rs</code> · művelet: két teszt a
+<code>tests</code> modul végére · ellenőrzés:
+<code>cargo test -p rkv-core</code></p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> borrowed_records_serialize_like_owned_ones() <span class="op">{</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> owned <span class="op">=</span> <span class="pp">LogEntry::</span>Set <span class="op">{</span> key<span class="op">:</span> <span class="st">&quot;a b&quot;</span><span class="op">.</span>into()<span class="op">,</span> value<span class="op">:</span> <span class="pp">vec!</span>[<span class="dv">0</span><span class="op">,</span> <span class="dv">255</span><span class="op">,</span> <span class="dv">10</span>] <span class="op">};</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> borrowed <span class="op">=</span> <span class="pp">LogEntryRef::</span>Set <span class="op">{</span> key<span class="op">:</span> <span class="st">&quot;a b&quot;</span><span class="op">,</span> value<span class="op">:</span> <span class="op">&amp;</span>[<span class="dv">0</span><span class="op">,</span> <span class="dv">255</span><span class="op">,</span> <span class="dv">10</span>] <span class="op">};</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    <span class="pp">assert_eq!</span>(<span class="pp">serde_json::</span>to_vec(<span class="op">&amp;</span>owned)<span class="op">.</span>unwrap()<span class="op">,</span> <span class="pp">serde_json::</span>to_vec(<span class="op">&amp;</span>borrowed)<span class="op">.</span>unwrap())<span class="op">;</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> owned <span class="op">=</span> <span class="pp">LogEntry::</span>Delete <span class="op">{</span> key<span class="op">:</span> <span class="st">&quot;k&quot;</span><span class="op">.</span>into() <span class="op">};</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> borrowed <span class="op">=</span> <span class="pp">LogEntryRef::</span>Delete <span class="op">{</span> key<span class="op">:</span> <span class="st">&quot;k&quot;</span> <span class="op">};</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>    <span class="pp">assert_eq!</span>(<span class="pp">serde_json::</span>to_vec(<span class="op">&amp;</span>owned)<span class="op">.</span>unwrap()<span class="op">,</span> <span class="pp">serde_json::</span>to_vec(<span class="op">&amp;</span>borrowed)<span class="op">.</span>unwrap())<span class="op">;</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> awkward_keys_and_values_survive_log_and_snapshot() <span class="op">{</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> (snap<span class="op">,</span> log) <span class="op">=</span> fresh_dir(<span class="st">&quot;awkward&quot;</span>)<span class="op">;</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> all_bytes<span class="op">:</span> <span class="dt">Vec</span><span class="op">&lt;</span><span class="dt">u8</span><span class="op">&gt;</span> <span class="op">=</span> (<span class="dv">0</span><span class="op">..=</span><span class="dv">255</span>)<span class="op">.</span>collect()<span class="op">;</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> <span class="kw">mut</span> store <span class="op">=</span> <span class="pp">FileStore::</span>open(<span class="op">&amp;</span>snap<span class="op">,</span> <span class="op">&amp;</span>log)<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>        store<span class="op">.</span>set(<span class="st">&quot;kulcs szóközzel&quot;</span><span class="op">.</span>into()<span class="op">,</span> all_bytes<span class="op">.</span>clone())<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>        store<span class="op">.</span>set(<span class="st">&quot;sor</span><span class="sc">\n</span><span class="st">törés&quot;</span><span class="op">.</span>into()<span class="op">,</span> <span class="st">b&quot;</span><span class="sc">\n\r\0</span><span class="st">&quot;</span><span class="op">.</span>to_vec())<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>        store<span class="op">.</span>save_snapshot()<span class="op">.</span>unwrap()<span class="op">;</span> <span class="co">// snapshot: a kölcsönzött SnapshotRef írja</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>        store<span class="op">.</span>set(<span class="st">&quot;a napló&quot;</span><span class="op">.</span>into()<span class="op">,</span> <span class="pp">vec!</span>[])<span class="op">.</span>unwrap()<span class="op">;</span> <span class="co">// napló: a kölcsönzött LogEntryRef írja</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> store <span class="op">=</span> <span class="pp">FileStore::</span>open(<span class="op">&amp;</span>snap<span class="op">,</span> <span class="op">&amp;</span>log)<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>    <span class="pp">assert_eq!</span>(get(<span class="op">&amp;</span>store<span class="op">,</span> <span class="st">&quot;kulcs szóközzel&quot;</span>)<span class="op">,</span> <span class="cn">Some</span>(all_bytes))<span class="op">;</span></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a>    <span class="pp">assert_eq!</span>(get(<span class="op">&amp;</span>store<span class="op">,</span> <span class="st">&quot;sor</span><span class="sc">\n</span><span class="st">törés&quot;</span>)<span class="op">,</span> <span class="cn">Some</span>(<span class="st">b&quot;</span><span class="sc">\n\r\0</span><span class="st">&quot;</span><span class="op">.</span>to_vec()))<span class="op">;</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a>    <span class="pp">assert_eq!</span>(get(<span class="op">&amp;</span>store<span class="op">,</span> <span class="st">&quot;a napló&quot;</span>)<span class="op">,</span> <span class="cn">Some</span>(<span class="pp">vec!</span>[]))<span class="op">;</span></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h4 data-number="22.1.5.3" id="lépés-az-eredmény-mérése"><span
+class="header-section-number">22.1.5.3</span> 3. lépés: az eredmény
+mérése</h4>
+<p>Ugyanaz a számláló az átírt kódon:</p>
+<pre class="text"><code>1000 x FileStore::set: 2610 allokáció, 891868 bájt
+FileStore::save_snapshot (1000 elem): 2 allokáció, 8228 bájt</code></pre>
+<p>A diff <strong>pontosan</strong> a megnevezett allokációkat szüntette
+meg: a <code>set</code> hívásonként kettőt (a kulcs és az érték
+másolatát: 4610 − 2610 = 2000 = 2 × 1000), a <code>save_snapshot</code>
+pedig a teljes térkép másolatát (2003 → 2). A maradék 2,6 allokáció
+<code>set</code>-enként a serde kimeneti pufferének
+(<code>to_vec</code>) növekedése és a térkép bővülése; az előbbit a 3.
+feladat szünteti meg. Az időnyereség ennél kisebb: a <code>set</code>
+ideje a <code>sync_data</code>-n (lemezszinkron) múlik, nem a másoláson,
+ezért itt az allokációszám a jó mérőszám, az idő nem.</p>
+<p>Az alábbi ábra a labor három állapotának allokációit rétegenként
+bontja: melyik javítás melyik forrást tüntette el.</p>
+<figure id="fig-r049-allokaciok">
+<div class="fig-interactive"><iframe src="figures/html/r049-allokaciok.html" title="A set allokációi 4610-ről 2610-re, majd 10-re, a snapshoté 2003-ról 2-re csökkennek." loading="lazy" style="width:100%;border:0;height:720px"></iframe><noscript><img src="figures/img/r049-allokaciok.png" style="width:95.0%"
+alt="A set allokációi 4610-ről 2610-re, majd 10-re, a snapshoté 2003-ról 2-re csökkennek." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/r049-allokaciok.png" style="width:95.0%"
+alt="A set allokációi 4610-ről 2610-re, majd 10-re, a snapshoté 2003-ról 2-re csökkennek." /></details></div>
+<figcaption>Allokációk száma 1000 set és egy snapshot alatt, a javítások
+előtt és után (gépfüggő mért érték; a rétegek bontása
+számított)</figcaption>
+</figure>
+<h4 data-number="22.1.5.4"
+id="lépés-a-set-benchmark-pontos-leírása"><span
+class="header-section-number">22.1.5.4</span> 4. lépés: a
+<code>set</code> benchmark pontos leírása</h4>
+<p>A criterion-benchmark mindig egy konkrét műveletet mér. A
+<code>set</code> két különböző esete két külön névvel szerepel, a nevek
+leírják, mit mérnek:</p>
+<p><em>Kódblokk</em> — fájl: <code>rkv-core/benches/benchmark.rs</code>
+· művelet: a <code>bench_set</code> cseréje · ellenőrzés:
+<code>cargo bench -p rkv-core --bench benchmark</code></p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">/// Mért művelet: egyetlen `Storage::set` hívás. Két külön eset, két külön névvel.</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> bench_set(c<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> Criterion) <span class="op">{</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. Új kulcs egy üres tárolóban. Előkészítés (nem mért): friss tároló, tulajdonolt kulcs és érték.</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A tároló eldobása (Drop) a mért függvény visszatérési értékén keresztül kívül esik a mérésen.</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    c<span class="op">.</span>bench_function(<span class="st">&quot;MemStore::set (új kulcs, üres tároló)&quot;</span><span class="op">,</span> <span class="op">|</span>b<span class="op">|</span> <span class="op">{</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>        b<span class="op">.</span>iter_batched(</span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>            <span class="op">||</span> (<span class="pp">MemStore::</span>new()<span class="op">,</span> <span class="st">&quot;key&quot;</span><span class="op">.</span>to_string()<span class="op">,</span> <span class="st">b&quot;value&quot;</span><span class="op">.</span>to_vec())<span class="op">,</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>            <span class="op">|</span>(<span class="kw">mut</span> store<span class="op">,</span> key<span class="op">,</span> value)<span class="op">|</span> <span class="op">{</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>                <span class="pp">Storage::</span>set(<span class="op">&amp;</span><span class="kw">mut</span> store<span class="op">,</span> black_box(key)<span class="op">,</span> black_box(value))<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>                store</span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>            <span class="op">},</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>            <span class="pp">BatchSize::</span>SmallInput<span class="op">,</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>        )<span class="op">;</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. Meglévő kulcs cseréje egy 1000 elemű tárolóban. Az előkészítés (nem mért) feltölti a</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>    <span class="co">// tárolót; a mért hívás a &quot;kulcs-0500&quot; értékét cseréli, tehát nincs új csomópont és kulcs.</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>    c<span class="op">.</span>bench_function(<span class="st">&quot;MemStore::set (csere, 1000 elemű tároló)&quot;</span><span class="op">,</span> <span class="op">|</span>b<span class="op">|</span> <span class="op">{</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>        b<span class="op">.</span>iter_batched(</span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>            <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>                <span class="kw">let</span> <span class="kw">mut</span> store <span class="op">=</span> <span class="pp">MemStore::</span>new()<span class="op">;</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a>                <span class="cf">for</span> i <span class="kw">in</span> <span class="dv">0</span><span class="op">..</span><span class="dv">1000</span> <span class="op">{</span></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>                    <span class="pp">Storage::</span>set(<span class="op">&amp;</span><span class="kw">mut</span> store<span class="op">,</span> <span class="pp">format!</span>(<span class="st">&quot;kulcs-{i:04}&quot;</span>)<span class="op">,</span> <span class="pp">vec!</span>[<span class="dv">0u8</span><span class="op">;</span> <span class="dv">16</span>])<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a>                (store<span class="op">,</span> <span class="st">&quot;kulcs-0500&quot;</span><span class="op">.</span>to_string()<span class="op">,</span> <span class="st">b&quot;value&quot;</span><span class="op">.</span>to_vec())</span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a>            <span class="op">},</span></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a>            <span class="op">|</span>(<span class="kw">mut</span> store<span class="op">,</span> key<span class="op">,</span> value)<span class="op">|</span> <span class="op">{</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a>                <span class="pp">Storage::</span>set(<span class="op">&amp;</span><span class="kw">mut</span> store<span class="op">,</span> black_box(key)<span class="op">,</span> black_box(value))<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a>                store</span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a>            <span class="op">},</span></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a>            <span class="pp">BatchSize::</span>LargeInput<span class="op">,</span></span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a>        )<span class="op">;</span></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Rekonstruálható leírás: a mért művelet egyetlen
+<code>Storage::set</code> hívás; az inputméret az első esetben 0 meglévő
+elem, a másodikban 1000; az első eset <strong>új</strong> kulcsot szúr
+be, a második egy <strong>meglévő</strong> kulcsot cserél; a tároló
+összeállítása az <code>iter_batched</code> előkészítő lépésében történik
+(nem mért), a tároló eldobása pedig a mért függvény visszatérési értékén
+keresztül kívül esik a mérésen. Egy ellenőrzött futás eredménye
+(gépfüggő, egyetlen futás): <code>[26,6 ns 26,9 ns 27,2 ns]</code> az új
+kulcsra; a cserére a lenti profiltáblázat alapsora (74,7 ns) érvényes.
+Az egymás utáni futások között ±10% eltérés is előfordul.</p>
+<h4 data-number="22.1.5.5"
+id="lépés-release-profil-egyszerre-egy-változtatás"><span
+class="header-section-number">22.1.5.5</span> 5. lépés: release-profil,
+egyszerre egy változtatás</h4>
+<p>A profil beállításai kölcsönhatásban vannak, ezért <strong>egyszerre
+egy</strong> változtatást mérünk az alapértelmezett <code>release</code>
+ellen. A profilt kizárólag a workspace gyökerében lévő
+<code>Cargo.toml</code> veszi figyelembe (a tagcrate-ek
+<code>[profile]</code> szakaszát a Cargo figyelmen kívül hagyja). A
+mérés környezeti változókkal történik, hogy a <code>Cargo.toml</code> ne
+módosuljon:
+<code>CARGO_PROFILE_RELEASE_LTO=thin cargo build --release -p rkv-cli</code>,
+és
+<code>CARGO_PROFILE_RELEASE_LTO=thin cargo bench -p rkv-core --bench benchmark -- csere</code>.
+A két metrika külön van: a bináris mérete (<code>rkv-cli</code>) és a
+<code>MemStore::set (csere, 1000 elemű tároló)</code> ideje.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Változtatás (egyedül, az alaphoz képest)</th>
+<th><code>rkv-cli</code> mérete</th>
+<th><code>set (csere)</code> ideje</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>alap <code>release</code></td>
+<td>1 234 680 bájt</td>
+<td>74,7 ns</td>
+</tr>
+<tr>
+<td><code>codegen-units = 1</code></td>
+<td>1 032 984 bájt</td>
+<td>69,8 ns</td>
+</tr>
+<tr>
+<td><code>lto = "thin"</code></td>
+<td>1 163 608 bájt</td>
+<td>73,8 ns</td>
+</tr>
+<tr>
+<td><code>lto = "fat"</code></td>
+<td>937 928 bájt</td>
+<td>74,2 ns</td>
+</tr>
+<tr>
+<td><code>panic = "abort"</code></td>
+<td>1 049 600 bájt</td>
+<td>(nem értelmezhető, lásd lent)</td>
+</tr>
+<tr>
+<td><code>lto = "fat"</code> + <code>codegen-units = 1</code></td>
+<td>874 184 bájt</td>
+<td>81,5 ns</td>
+</tr>
+</tbody>
+</table>
+<p>Egyetlen futás, egy gép: az időkülönbségek (±10%) a zaj tartományában
+vannak, a méretcsökkenés viszont egyértelmű (<code>lto = "fat"</code> +
+<code>codegen-units = 1</code>: −29%). A tanulság: a profilbeállítás itt
+a <em>bináris méretét</em> és a linkelés minőségét javítja, ezt a
+mikrobenchmark nem látja. A <code>[profile.release]</code>-be ezért azt
+vesszük fel, amit a mérés indokol:</p>
+<p><em>Kódblokk</em> — fájl: <code>Cargo.toml</code> (workspace gyökér)
+· művelet: új szakasz a fájl végére · ellenőrzés:
+<code>cargo build --release -p rkv-cli</code> → kisebb bináris</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode toml"><code class="sourceCode toml"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[profile.release]</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="dt">lto</span> <span class="op">=</span> <span class="st">&quot;fat&quot;</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="dt">codegen-units</span> <span class="op">=</span> <span class="dv">1</span></span></code></pre></div>
+<p><strong>A <code>panic = "abort"</code> külön kérdés</strong>, nem
+teljesítménybeállítás. A cargo a teszt- és benchmark-célpontokat mindig
+unwinding-gel fordítja, ezért a Criterion-idő nem mutathatja a hatását,
+és a <code>cargo test --release -p rkv-ffi</code> zöld marad
+<code>panic = "abort"</code> mellett is: a tesztek nem a termék
+viselkedését igazolják. A termék viselkedése megváltozik: az
+<code>rkv-ffi</code> a Rust-pánikot <code>catch_unwind</code>-del fogja
+el és <code>RKV_PANIC</code> státuszkóddá alakítja, a szerver a
+kliensfeladat pánikját a taskra korlátozza. Abort módban mindkettő
+megszűnik. Önálló bizonyíték (egy <code>catch_unwind</code>-es program):
+<code>panic = "unwind"</code> mellett a kimenet
+<code>elkapva: true</code>, <code>panic = "abort"</code> mellett a
+folyamat megszakad, és a sor ki sem íródik. Ezért az rkv workspace-ben a
+<code>panic = "abort"</code> <strong>nincs</strong> a profilban; ha a
+CLI-hez kis binárisra van szükség, azt külön csomagolt,
+<code>catch_unwind</code>-et nem használó célpontnál lehet
+megfontolni.</p>
+<p><strong>Ellenőrzési pont.</strong> Az <code>alloc_count</code> példa
+a 3. lépés számait adja (<code>4610 → 2610</code>, illetve
+<code>2003 → 2</code> allokáció), a <code>cargo test -p rkv-core</code>
+zöld (a két formátumvédő teszttel együtt), a
+<code>cargo bench -p rkv-core --bench benchmark</code> a két külön nevű
+<code>set</code> esetet futtatja, a profiltáblázat minden sorához
+tartozik parancs és profil, és a <code>panic = "abort"</code> nem kerül
+a <code>[profile.release]</code>-be.</p>
+<p><strong>Továbbvitt eredmény.</strong> A kölcsönzött
+<code>LogEntryRef</code>/<code>SnapshotRef</code>, az allokációszámláló,
+a két <code>set</code> benchmark és a <code>[profile.release]</code>
+(<code>lto = "fat"</code>, <code>codegen-units = 1</code>, <strong>abort
+nélkül</strong>) a <a href="r051.html">Záróprojekt: az rkv teljes
+rendszerként</a> alfejezetben a teljes rendszer összeállításakor
+érvényesül.</p>
+<h3 data-number="22.1.6" id="tipikus-hibák-és-átállási-csapdák"><span
+class="header-section-number">22.1.6</span> Tipikus hibák és átállási
+csapdák</h3>
+<ol type="1">
+<li><p><strong>Klónozás a borrow checker „legyőzésére”.</strong> Amikor
+a kölcsönzési szabályok miatt nem férünk hozzá egy értékhez, a gyors
+munka kedvéért <code>clone</code>-t hívunk. Ez elrejti az allokációt, és
+a forró ponton teljesítményromlást okozhat. A megoldás: vizsgáljuk meg,
+hogy a <code>clone</code> valóban szükséges-e, vagy áthelyezhetjük a
+tulajdonlást, átadhatunk <code>&amp;str</code>-et <code>String</code>
+helyett, vagy használhatunk <code>Cow</code>-t. A laborban a
+<code>FileStore</code> tulajdonolt <code>LogEntry</code>-je volt ilyen:
+kölcsönzött rekorddal a másolat felesleges.</p></li>
+<li><p><strong>A hibakezelés módját a sebességből választani.</strong>
+Az <code>unwrap</code>/<code>expect</code>, a <code>?</code> és a
+<code>match</code> közül a <em>szerződés</em> dönt: <code>unwrap</code>
+ott, ahol a hiba programozói hiba (invariánssértés), <code>Result</code>
+és <code>?</code> ott, ahol a hívó kezelheti. A teljesítménykülönbség a
+legtöbb kódban elhanyagolható, és nem általánosítható: a <code>?</code>
+használata önmagában nem gyorsít. Ha a hot path hibakezelése számít,
+azonos feladatot megoldó két konkrét változatot kell lemérni, nem
+általános szabályt alkalmazni.</p></li>
+<li><p><strong><code>Rc&lt;RefCell&lt;T&gt;&gt;</code> és
+<code>Arc&lt;Mutex&lt;T&gt;&gt;</code> összekeverése.</strong> Négy
+különböző költség van. Az <code>Rc</code> referenciaszámlálása
+<em>nem</em> atomi (olcsó, de <code>!Send</code>); az <code>Arc</code>-é
+atomi. A <code>RefCell</code> futásidejű kölcsönzés-ellenőrzése
+<em>nem</em> atomi, egy számláló vizsgálata és módosítása; a
+<code>Mutex</code> zárolása atomi művelet, szálak közötti kizárással.
+Egyszálú megosztásra <code>Rc&lt;RefCell&lt;T&gt;&gt;</code> elegendő,
+szálak között <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> vagy
+<code>Arc&lt;RwLock&lt;T&gt;&gt;</code> kell; a forró ponton viszont
+gyakran el lehet kerülni a megosztást tulajdonjog-átadással vagy
+<code>&amp;mut</code>-tal.</p></li>
+<li><p><strong>Generikus monomorfizálás kiteregetése.</strong> A
+túlzottan generikus kód minden típusra külön példányt hoz létre, ami a
+bináris méretét és a fordítási időt növeli. Ha a típusparaméterek csak
+kevés konkrét típussal fordulnak elő, érdemes megfontolni a
+trait-objektumot (<code>Box&lt;dyn Storage&gt;</code>) a forró ponton
+kívül, ahol a dinamikus diszpécs költsége elhanyagolható. C++-ban
+ugyanez a sablon-kiteregetés problémája, de a Rustban a trait-objektumok
+expliciten jelzik a dinamikus diszpécs szándékát.</p></li>
+<li><p><strong>Több profilbeállítás egyszerre, mérés nélkül.</strong> Ha
+az <code>lto</code>, a <code>codegen-units</code> és a
+<code>panic</code> egyszerre változik, nem tudjuk, melyik tett jót vagy
+rosszat. Egyszerre egyet mérjünk, és külön a bináris méretét az
+idejétől.</p></li>
+</ol>
+<h3 data-number="22.1.7" id="feladatok"><span
+class="header-section-number">22.1.7</span> Feladatok</h3>
+<p><strong>1. Feladat (fogalmi).</strong> Miért nem elegendő a debug
+módú <code>cargo run</code> a teljesítmény mérésére? Magyarázd el, miért
+használunk release módot, <code>black_box</code>-ot és
+konfidenciaintervallumot a criterionban. Miért jobb mérőszám az
+allokációk száma, mint az idő, ha a művelet lemezszinkronra vár?</p>
+<p><strong>2. Feladat (C++ → Rust átírás).</strong> Adott a következő
+C++ függvény, amely egy <code>std::vector&lt;std::string&gt;</code>
+elemeit fűzi össze szóközökkel elválasztva:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>string join<span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="bu">std::</span>string<span class="op">&gt;&amp;</span> words<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>string result<span class="op">;</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">size_t</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> words<span class="op">.</span>size<span class="op">();</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>i <span class="op">&gt;</span> <span class="dv">0</span><span class="op">)</span> result <span class="op">+=</span> <span class="st">&quot; &quot;</span><span class="op">;</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>        result <span class="op">+=</span> words<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> result<span class="op">;</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Írd át a függvényt idiomatikus Rustra, <code>&amp;[String]</code>
+paraméterrel, iterátorokkal, és legalább <code>with_capacity</code>
+használatával, hogy csökkentsd az allokációk számát. A kód ne klónozza a
+szavakat.</p>
+<p><strong>3. Feladat (implementáció az rkv-ban).</strong> A labor a
+<code>FileStore::set</code> és a <code>save_snapshot</code> másolatait
+szüntette meg. Keress a <code>FileStore</code>-ban egy további,
+szükségtelen allokációt az allokációszámláló segítségével (tipp: a
+naplóbejegyzés <code>serde_json::to_vec</code> +
+<code>push(b'\n')</code> párosa), és szüntesd meg úgy, hogy a
+naplóformátum bájtra azonos maradjon. Mutasd meg az előtte/utána
+számokat, és védd tesztel, hogy minden engedélyezett bájtérték, szóközös
+kulcs és sortörés veszteség nélkül visszaolvasható.</p>
+<p><strong>4. Feladat (tervezési döntés).</strong> A
+<code>Storage</code> trait jelenleg
+<code>fn set(&amp;mut self, key: String, value: Vec&lt;u8&gt;) -&gt; Result&lt;()&gt;</code>.
+Tételezd fel, hogy a hálózati szerver forró hívási láncában a
+<code>set</code> a legtöbbször kis kulcsokkal és értékekkel dolgozik.
+Válaszd ki, hogy a <code>key</code> paramétert <code>String</code>-ről
+<code>&amp;str</code>-re vagy <code>impl Into&lt;String&gt;</code>-re
+változtatod-e. Két konkrét hívóhelyen (a hívó <code>String</code>-et
+birtokol / a hívó csak <code>&amp;str</code>-t lát) számold össze az
+allokációkat, és különítsd el az új kulcs beszúrását a meglévő
+frissítésétől. Hogyan érinti ez a <code>FileStore</code>
+implementációt?</p>
+<h3 data-number="22.1.8" id="megoldások"><span
+class="header-section-number">22.1.8</span> Megoldások</h3>
+<p><strong>1. Megoldás.</strong> A debug módban a fordító nem végez
+optimalizálást (<code>opt-level = 0</code>), a határellenőrzések
+megmaradnak, és a generált kód lassabb. A release mód
+(<code>opt-level = 3</code>) a fordítói optimalizálások teljes
+eszköztárát bekapcsolja, így a mért adatok a valós használatot tükrözik.
+A <code>black_box</code> arra szolgál, hogy a fordító ne hajtsa ki a
+konstans kifejezéseket, ne inline-olja el a teljes hívást, és ne vegye
+észre, hogy az eredmény nem használt. A konfidenciaintervallum a mérési
+zaj miatt fontos: a criterion újra és újra lefuttatja a benchmarkot, és
+statisztikai elemzéssel ad megbízható tartományt az átlag körül. Ha a
+művelet <code>fsync</code>-re vár, az idő a lemez sebességét méri; az
+allokációszám determinisztikus, ezért a kód változását zajmentesen
+mutatja.</p>
+<p><strong>2. Megoldás.</strong></p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> join(words<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">String</span>]) <span class="op">-&gt;</span> <span class="dt">String</span> <span class="op">{</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A kapacitás bájtokban számít (nem karakterekben): a szavak bájthosszának összege</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// plusz az elválasztók száma. Az összeg túlcsordulását ellenőrizzük.</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> total <span class="op">=</span> words<span class="op">.</span>len()<span class="op">.</span>saturating_sub(<span class="dv">1</span>)<span class="op">;</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> w <span class="kw">in</span> words <span class="op">{</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>        total <span class="op">=</span> total<span class="op">.</span>checked_add(w<span class="op">.</span>len())<span class="op">.</span>expect(<span class="st">&quot;capacity overflow&quot;</span>)<span class="op">;</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> result <span class="op">=</span> <span class="dt">String</span><span class="pp">::</span>with_capacity(total)<span class="op">;</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> (i<span class="op">,</span> word) <span class="kw">in</span> words<span class="op">.</span>iter()<span class="op">.</span>enumerate() <span class="op">{</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> i <span class="op">&gt;</span> <span class="dv">0</span> <span class="op">{</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>            result<span class="op">.</span>push(<span class="ch">&#39; &#39;</span>)<span class="op">;</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a>        result<span class="op">.</span>push_str(word)<span class="op">;</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a>    result</span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A reallokációmentesség <strong>csak</strong> azért igaz, mert az
+előre lefoglalt kapacitás (<code>total</code>) pontosan elég: a
+<code>push</code> és a <code>push_str</code> egyszer sem lépi túl. Egy
+becsült kapacitásnál (például átlagos szóhosszal) lehetnek reallokációk.
+Az üres lista <code>total = 0</code>-t ad (a <code>saturating_sub</code>
+megakadályozza az <code>0 - 1</code> alulcsordulást), az eredmény üres
+<code>String</code>. A hossz bájtban értendő: az <code>"árvíz"</code> 7
+bájt, a <code>"😀"</code> 4 bájt, ezért <code>chars().count()</code>-tal
+számolt kapacitás kevés lenne. A túlcsordulásra a
+<code>checked_add</code> panicol (<code>capacity overflow</code>), ahogy
+a standard könyvtár is teszi, valódi szavakból álló szeleten ez
+gyakorlatilag nem fordulhat elő.</p>
+<p>A szabványos megoldás ugyanezt kész eszközzel adja:
+<code>words.join(" ")</code>, ami szintén előre kiszámolja a méretet,
+ezért a saját <code>join</code> ritkán indokolt. Futtatva (release,
+számláló-allokátorral, 1000 szó): a saját <code>join</code> 1 allokáció,
+a <code>words.join(" ")</code> 1 allokáció, az
+<code>String::new()</code>-ból induló naiv változat 13 (a kapacitás
+duplázódik); az eredmény bájtra azonos, üres, egyelemű és többbájtos
+(<code>árvíz</code>, <code>tűrő</code>, <code>😀</code>) bemeneten
+is.</p>
+<p><strong>3. Megoldás.</strong> A <code>save_snapshot</code> másolata a
+labor 2. lépésében már megszűnt. A maradék allokációt (2610 / 1000
+<code>set</code>) az <code>append_entry</code> okozza: minden híváskor
+új <code>Vec&lt;u8&gt;</code>-et készít
+(<code>serde_json::to_vec</code>), majd egy <code>\n</code>-nel tovább
+növeli. Megoldás: a rekordot közvetlenül a <code>BufWriter</code>-be
+írjuk, ugyanazzal a sorvéggel, a commit-szerződés (flush +
+<code>sync_data</code>, hiba esetén a tároló „megmérgezése”) érintetlen
+marad:</p>
+<p><em>Kódblokk</em> — fájl:
+<code>rkv-core/src/store/file_store.rs</code> · művelet: az
+<code>append_entry</code> rekordkiírásának cseréje · ellenőrzés:
+<code>cargo test -p rkv-core</code> és az allokációszámláló</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> append_entry(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> entry<span class="op">:</span> <span class="op">&amp;</span>LogEntryRef<span class="op">&lt;</span><span class="ot">&#39;_</span><span class="op">&gt;</span>) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">self</span><span class="op">.</span>ensure_healthy()<span class="op">?;</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> res <span class="op">=</span> <span class="pp">serde_json::</span>to_writer(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">.</span>log_writer<span class="op">,</span> entry)</span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>map_err(<span class="pp">io::</span><span class="bu">Error</span><span class="pp">::</span>from)</span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>and_then(<span class="op">|</span>()<span class="op">|</span> <span class="kw">self</span><span class="op">.</span>log_writer<span class="op">.</span>write_all(<span class="st">b&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>))</span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>and_then(<span class="op">|</span>()<span class="op">|</span> <span class="kw">self</span><span class="op">.</span>log_writer<span class="op">.</span>flush())</span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>and_then(<span class="op">|</span>()<span class="op">|</span> <span class="kw">self</span><span class="op">.</span>log_writer<span class="op">.</span>get_ref()<span class="op">.</span>sync_data())<span class="op">;</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="kw">let</span> <span class="cn">Err</span>(e) <span class="op">=</span> res <span class="op">{</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a>        <span class="co">// A pufferben vagy a fájlban félkész rekord maradhatott:</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a>        <span class="co">// vakon nem folytatjuk a naplózást.</span></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a>        <span class="kw">self</span><span class="op">.</span>poisoned <span class="op">=</span> <span class="cn">true</span><span class="op">;</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="cn">Err</span>(e<span class="op">.</span>into())<span class="op">;</span></span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(())</span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Az eredmény (ellenőrzött futás, a fejezet rögzített környezetében:
+Rust 1.99.1, Linux x86-64):
+<code>1000 x FileStore::set: 10 allokáció, 200668 bájt</code> (korábban
+2610 és 891868 bájt); a maradék a térkép növekedése. A hordozható
+követelmény nem az abszolút érték, hanem a felesleges másolatok eltűnése
+és a bájtra azonos formátum; a számok gépenként és toolchainenként
+eltérhetnek. A formátum nem változik, mert ugyanazt a JSON-t írjuk
+ugyanazzal a sorvéggel; a labor
+<code>borrowed_records_serialize_like_owned_ones</code> és
+<code>awkward_keys_and_values_survive_log_and_snapshot</code> tesztjei
+ezt védik, és a teljes <code>rkv-core</code> tesztkészlet változtatás
+nélkül zöld. Egy mellékhatás: a szerializációs hiba is „megmérgezi” a
+tárolót, mert a rekord egy része már a pufferben lehet; a
+<code>LogEntryRef</code> típusokra ez nem fordulhat elő. Nem szabad
+másik, „szebb” formátumot (például <code>from_utf8_lossy</code>-val
+szövegesített értéket) bevezetni: az nem alakítja vissza a nem UTF-8
+bájtokat, így adatot veszítene.</p>
+<p><strong>4. Megoldás.</strong> A döntés a hívók adatformáján és a
+tárolóművelet jellegén múlik, nem általános szabály. Lemérve (release,
+számláló-allokátor, előre méretezett
+<code>HashMap&lt;String, Vec&lt;u8&gt;&gt;</code>, üres értékkel):</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Hívóhely</th>
+<th><code>key: String</code></th>
+<th><code>key: &amp;str</code> (<code>get_mut</code>, különben
+<code>to_owned</code>)</th>
+<th><code>impl Into&lt;String&gt;</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>(a) a hívó már birtokol <code>String</code>-et, új kulcs</td>
+<td>0 allokáció (átmozgatjuk)</td>
+<td>1</td>
+<td>0</td>
+</tr>
+<tr>
+<td>(b) a hívó csak <code>&amp;str</code>-t lát,
+<strong>meglévő</strong> kulcs frissítése</td>
+<td>1 (a kulcs másolata, amit a <code>insert</code> eldob)</td>
+<td>0</td>
+<td>1</td>
+</tr>
+<tr>
+<td>(c) a hívó csak <code>&amp;str</code>-t lát, <strong>új</strong>
+kulcs</td>
+<td>1</td>
+<td>1</td>
+<td>1</td>
+</tr>
+</tbody>
+</table>
+<p>Az <code>owned</code> paraméter tehát akkor jó, ha a tipikus hívó már
+<code>String</code>-et épített (például a parancssor szétszedése után),
+mert a tulajdonjog átadása másolatmentes, és a
+<code>FileStore::set</code> a kulcsot kölcsönzi a naplóhoz
+(<code>LogEntryRef</code>), majd a térképbe mozgatja. Ha viszont a hívó
+csak <code>&amp;str</code>-t lát (egy sorpuffer része), és a szerver
+gyakran <strong>frissít</strong> meglévő kulcsot, akkor a
+<code>&amp;str</code>-es szignatúra spórol, mert a
+<code>get_mut</code>-tal megtalált kulcshoz nem kell
+<code>String</code>. A <code>&amp;str</code> esetén a hívónak
+<strong>nem kötelező</strong> <code>String</code>-et készítenie: a
+tároló készíti el, de csak új kulcsnál. Az
+<code>impl Into&lt;String&gt;</code> ergonomikus középút (a hívó
+<code>&amp;str</code>-t és <code>String</code>-et is átadhat), de
+generikus, ezért trait-objektumon (<code>dyn Storage</code>) át nem
+hívható, így a <code>Storage</code> trait szintjén nem alkalmazható;
+konkrét típus (<code>FileStore</code>) kényelmi metódusán igen. Az
+rkv-ban a <code>String</code> marad, mert a szerver a parancs
+szétszedésekor úgyis birtokolt kulcsot készít, a mérés pedig az (a)
+esetet mutatja tipikusnak; ha a profil sok frissítést és
+<code>&amp;str</code> hívót mutatna, érdemes lenne újragondolni. A
+<code>FileStore</code> esetén is ugyanez a helyzet: a naplórekordhoz a
+kulcsot kölcsönözzük (<code>LogEntryRef</code>), utána pedig a térképbe
+mozgatjuk, másolat nélkül.</p>
+<h3 data-number="22.1.9" id="rövid-összefoglaló"><span
+class="header-section-number">22.1.9</span> Rövid összefoglaló</h3>
+<p>A mérés-vezérelt optimalizálás a hipotézis, a mérés, a profilozás, a
+módosítás és az újramérés ciklusára épül. A határellenőrzés a nyelv
+szemantikája, nem garantált futási költség: a labor gépi kódja szerint a
+<code>0..len</code> ciklus indexelése és az iterátor ugyanazt a (67
+utasításos, ellenőrzés nélküli) kódot adja, külső index esetén viszont
+az ellenőrzés megmarad. A laborban az allokációszámláló megmutatta, hogy
+a <code>FileStore::set</code> hívásonként két, a
+<code>save_snapshot</code> a teljes térképnyi felesleges másolatot
+készített; kölcsönzött <code>LogEntryRef</code>/<code>SnapshotRef</code>
+típusokkal, a naplóformátum megváltoztatása nélkül ezek megszűntek (a
+fejezet rögzített környezetében <code>4610 → 2610</code>, illetve
+<code>2003 → 2</code> allokáció; a 3. feladat megoldása a
+<code>set</code>-et tovább csökkenti 10-re). A <code>set</code>
+benchmark két, külön nevű esetet mér (új kulcs üres tárolóban; csere
+1000 elemű tárolóban). A release-profilnál egyszerre egy beállítást
+mértünk: az <code>lto = "fat"</code> és a <code>codegen-units = 1</code>
+a bináris méretét 29%-kal csökkentette, a <code>panic = "abort"</code>
+viszont nem teljesítmény-, hanem viselkedésváltozás, és az
+<code>rkv-ffi</code> <code>catch_unwind</code>-je miatt nem kerül a
+profilba. <strong>Továbbvitt eredmény.</strong> A kölcsönzött
+naplórekord és snapshot, az allokációszámláló, a benchmarkok és a
+<code>[profile.release]</code> a <a href="r051.html">Záróprojekt: az rkv
+teljes rendszerként</a> alfejezet alapja.</p>
+<h3 data-number="22.1.10" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">22.1.10</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li>Ellenőrizve (Rust 1.99.1, <code>x86_64</code> Linux, egyetlen gép):
+a <code>xor_*</code> függvények assembly-elemzése
+(<code>--emit asm</code>), az allokációszámlálós futások, a két
+<code>set</code> benchmark, a profilmátrix (méret és idő), a
+<code>catch_unwind</code> viselkedése <code>panic = "abort"</code> és
+<code>"unwind"</code> mellett, valamint a <code>rkv-core</code> tesztjei
+és a <code>clippy -D warnings</code>.</li>
+<li>A mért időértékek gépfüggők és egyetlen futásból származnak; a
+±10%-os eltérések zajnak tekintendők. A méretek (bájt) ugyanezen a
+toolchainen reprodukálhatók.</li>
+<li>A <code>cargo flamegraph</code> és a <code>perf</code> ebben a
+fejezetben nem lett futtatva; a pontos parancssori kapcsolók
+verziófüggők. A flamegraph a következő lépés lehet, ha az allokációszám
+nem magyarázza meg az időt.</li>
+<li>A <code>criterion</code> főverzióját a <code>Cargo.toml</code>, a
+pontos alverziót a <code>Cargo.lock</code> rögzíti.</li>
+</ul>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="r048.html">← 21.2 API-tervezés Rustban: irányelvek és ergonómia</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="r050.html">23.1 no_std, embedded-hal és Embassy: Rust mikrovezérlőn →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

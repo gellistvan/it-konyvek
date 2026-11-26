@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Az nvcc fordítási lánca és a fatbin betöltése</title>
+<style>
+:root{--fg:#111;--bg:#fff;--muted:#666;--hl:#1f4e79;--hl2:#c55a11;--cell:#fff;--cellhl:#d9d9d9;--line:#000;--code:#f3f3f3}
+@media (prefers-color-scheme:dark){:root{--fg:#eee;--bg:#1b1b1b;--muted:#aaa;--hl:#8fb8e8;--hl2:#f0a060;--cell:#262626;--cellhl:#4a4a4a;--line:#ddd;--code:#2a2a2a}}
+*{box-sizing:border-box}
+body{margin:0;padding:10px;font:14px/1.45 system-ui,sans-serif;color:var(--fg);background:var(--bg)}
+.ctl{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:6px}
+button{font:inherit;padding:3px 10px;cursor:pointer}
+input[type=range]{flex:1;min-width:120px}
+#status{margin:4px 0 6px;min-height:2.9em}
+/* A pszeudokód a rajz ALATT, teljes szélességben (hosszú sorok ne görgessenek oldalra) */
+.wrap{display:flex;flex-direction:column;gap:10px;align-items:stretch}
+svg{width:100%;height:auto;display:block}
+pre#code{width:100%;margin:0;padding:6px 8px;background:var(--code);font:12.5px/1.5 ui-monospace,monospace;white-space:pre;overflow-x:auto}
+pre#code span{display:block;padding:0 4px}
+pre#code span.on{outline:2px solid var(--hl);font-weight:bold}
+svg text:not([fill]){fill:var(--fg);}
+svg text{font-family:system-ui,sans-serif}
+.small{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="ctl" role="group" aria-label="Lejátszás vezérlői">
+  <button id="first" title="Első lépés">⏮</button>
+  <button id="prev" title="Előző lépés">◀ Lépés</button>
+  <button id="play" title="Lejátszás / szünet">▶ Lejátszás</button>
+  <button id="next" title="Következő lépés">Lépés ▶</button>
+  <input id="pos" type="range" min="0" max="0" value="0" aria-label="Lépés kiválasztása">
+  <span id="cnt" class="small"></span>
+</div>
+<div class="ctl"><label>Fordítási kapcsoló <select id="flag"><option value="-arch=sm_80" selected>-arch=sm_80</option><option value="-gencode arch=compute_80,code=sm_80">-gencode arch=compute_80,code=sm_80</option><option value="-gencode arch=compute_80,code=compute_80">-gencode arch=compute_80,code=compute_80</option><option value="-arch=sm_86">-arch=sm_86</option></select></label> <label>Cél-GPU <select id="cc"><option value="7.5">CC 7.5</option><option value="8.0" selected>CC 8.0</option><option value="8.6">CC 8.6</option><option value="8.9">CC 8.9</option><option value="9.0">CC 9.0</option></select></label><svg width="0" height="0" style="position:absolute"><defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs></svg></div>
+<div id="status" aria-live="polite"></div>
+<div class="wrap">
+  <svg id="v" viewBox="0 0 560 300" role="img" aria-label="Folyamatábra: forrás szétválasztása host- és device-ágra, PTX és SASS, fatbin, linkelés; a választott kapcsoló és CC szerinti betöltési eredmény"></svg>
+  <pre id="code" aria-label="Pszeudokód"></pre>
+</div>
+<p class="small">Betöltési szabály (4.3.2): sm_XY SASS natív, ha a GPU major CC-je X és minor CC-je legalább Y; különben a compute_XY PTX JIT-fordul, ha XY nem nagyobb a GPU CC-jénél; egyébként cudaErrorNoKernelImageForDevice. A ptxas-adat NVRTC 13.0-val, sm_80-ra ellenőrizve; a toolkit-verziótól függ.</p>
+<script>
+// ---- Adat: lépések (a Python-szkript számolja ki és illeszti be, a könyv példájával egyezően) ----
+// Minden lépés: {msg: "állapotsor szövege", line: kiemelt pszeudokódsor indexe vagy -1, ...saját mezők}
+let STEPS = [{"msg": "Válassz fordítási kapcsolót és cél-GPU-t; a ▶ a lánc négy lépését mutatja.", "step": 0, "line": -1}, {"msg": "1. Előfeldolgozás és szétválasztás: a preprocessor és a CUDA frontend kettéválasztja a host C++ kódot és a device kódot (__global__, __device__).", "step": 1, "line": 0}, {"msg": "2. Device kód fordítása: PTX (virtuális ISA, compute_80), majd a ptxas natív SASS-t (sm_80) készít; itt rögzül a regiszterhasználat (Used 12 registers, 380 B cmem[0]; NVRTC 13.0, a toolkit-verziótól függ).", "step": 2, "line": 1}, {"msg": "3. Fatbin összeállítás: a SASS és (a kapcsolótól függően) a PTX a fatbinbe kerül; a betöltéskor a driver ebből választ.", "step": 3, "line": 2}, {"msg": "4. Host kód fordítása és linkelés: a host C++ kódot a g++ fordítja, a fatbin beágyazódik a host-objektumba, a linkelés a libcudart-tal adja a futtathatót.", "step": 4, "line": 3}];
+const CODE = ["1. előfeldolgozás és szétválasztás (preprocessor + CUDA frontend)", "2. device kód: PTX → ptxas → SASS", "3. fatbin összeállítás (SASS + opcionálisan PTX)", "4. host kód: g++, beágyazás, link libcudart"];          // pszeudokód sorai (üres lista: a panel elrejtve)
+
+// ---- Rajzolás: ezt a függvényt kell az ábrához igazítani ----
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, text){const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);if(text!==undefined)e.textContent=text;svg.appendChild(e);return e;}
+const svg = document.getElementById("v");
+function css(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim();}
+function render(s){
+  // Példa: tömb cellákként, s.a = értékek, s.hl = kiemelt indexek
+  svg.innerHTML = "";
+  const a = s.a || [], w = 48, x0 = (560 - a.length * w) / 2, y0 = 110;
+  a.forEach((v, i) => {
+    const on = (s.hl || []).includes(i);
+    el("rect", {x: x0 + i * w, y: y0, width: w, height: w, fill: on ? css("--cellhl") : css("--cell"), stroke: css("--line"), "stroke-width": on ? 3 : 1.2});
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w / 2 + 6, "text-anchor": "middle", "font-size": 18}, String(v));
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w + 18, "text-anchor": "middle", "font-size": 12, fill: css("--muted")}, String(i));
+  });
+}
+
+const NODES = {"src": [0.0, 3.9, 2.5, 1.2, "vectorAdd.cu", "both", 1], "fe": [2.85, 3.8, 2.8, 1.4, "preprocessor +\nCUDA frontend", "both", 1], "host": [5.9, 5.5, 2.3, 1.2, "host C++", "host", 4], "gxx": [8.6, 5.5, 2.1, 1.2, "g++ → .o", "host", 4], "ptx": [5.9, 2.2, 2.3, 1.2, "PTX\ncompute_80", "dev", 2], "sass": [8.6, 2.2, 2.1, 1.2, "ptxas →\nSASS sm_80", "dev", 2], "fat": [11.1, 1.3, 3.7, 2.8, "fatbin", "dev", 3], "link": [11.1, 5.2, 3.7, 1.7, "beágyazás +\nlink libcudart\n→ vectorAdd", "host", 4]}, EDGES = [["src", "fe", "-"], ["fe", "host", "-"], ["fe", "ptx", "--"], ["host", "gxx", "-"], ["ptx", "sass", "--"], ["sass", "fat", "--"], ["gxx", "link", "-"], ["fat", "link", "--"]], FLAGS = {"-arch=sm_80": [["80"], ["80"]], "-gencode arch=compute_80,code=sm_80": [["80"], []], "-gencode arch=compute_80,code=compute_80": [[], ["80"]], "-arch=sm_86": [["86"], ["86"]]}, TABLE = {"-arch=sm_80": {"7.5": ["error", "nincs illeszkedő kép: cudaErrorNoKernelImageForDevice"], "8.0": ["native", "SASS sm_80 natív"], "8.6": ["native", "SASS sm_80 natív (azonos major, nagyobb minor)"], "8.9": ["native", "SASS sm_80 natív (azonos major, nagyobb minor)"], "9.0": ["jit", "PTX compute_80 JIT-fordítása CC 9.0-ra a betöltéskor"]}, "-gencode arch=compute_80,code=sm_80": {"7.5": ["error", "nincs illeszkedő kép: cudaErrorNoKernelImageForDevice"], "8.0": ["native", "SASS sm_80 natív"], "8.6": ["native", "SASS sm_80 natív (azonos major, nagyobb minor)"], "8.9": ["native", "SASS sm_80 natív (azonos major, nagyobb minor)"], "9.0": ["error", "nincs illeszkedő kép: cudaErrorNoKernelImageForDevice"]}, "-gencode arch=compute_80,code=compute_80": {"7.5": ["error", "nincs illeszkedő kép: cudaErrorNoKernelImageForDevice"], "8.0": ["jit", "PTX compute_80 JIT-fordítása CC 8.0-ra a betöltéskor"], "8.6": ["jit", "PTX compute_80 JIT-fordítása CC 8.6-ra a betöltéskor"], "8.9": ["jit", "PTX compute_80 JIT-fordítása CC 8.9-ra a betöltéskor"], "9.0": ["jit", "PTX compute_80 JIT-fordítása CC 9.0-ra a betöltéskor"]}, "-arch=sm_86": {"7.5": ["error", "nincs illeszkedő kép: cudaErrorNoKernelImageForDevice"], "8.0": ["error", "nincs illeszkedő kép: cudaErrorNoKernelImageForDevice"], "8.6": ["native", "SASS sm_86 natív"], "8.9": ["native", "SASS sm_86 natív (azonos major, nagyobb minor)"], "9.0": ["jit", "PTX compute_86 JIT-fordítása CC 9.0-ra a betöltéskor"]}}, PTXAS = "Used 12 registers, 380 B cmem[0]";
+function render(s){
+  svg.setAttribute("viewBox", "0 0 640 330");
+  svg.innerHTML = "";
+  const f = document.getElementById("flag").value, cc = document.getElementById("cc").value;
+  const S = 42, X = x => 14 + x * S, Y = y => 300 - y * S;
+  const sass = FLAGS[f][0], ptx = FLAGS[f][1];
+  EDGES.forEach(e => {
+    const a = NODES[e[0]], b = NODES[e[1]];
+    let x1 = X(a[0] + a[2]), y1 = Y(a[1] + a[3] / 2), x2 = X(b[0]), y2 = Y(b[1] + b[3] / 2);
+    if (e[0] === "fat") { x1 = X(a[0] + a[2] / 2); y1 = Y(a[1] + a[3]); x2 = X(b[0] + b[2] / 2) + 3; y2 = Y(b[1]) + 3; }
+    const on = s.step && (b[6] === s.step);
+    el("line", {x1: x1, y1: y1, x2: x2 - 3, y2: y2, stroke: on ? css("--hl") : css("--line"), "stroke-width": on ? 2.5 : 1.3, "stroke-dasharray": e[2] === "--" ? "6 4" : "none", "marker-end": "url(#ar)"});
+  });
+  Object.keys(NODES).forEach(k => {
+    const n = NODES[k], on = s.step && n[6] === s.step;
+    const isDev = n[5] === "dev";
+    el("rect", {x: X(n[0]), y: Y(n[1] + n[3]), width: n[2] * S, height: n[3] * S, rx: 6, fill: n[5] === "both" ? css("--cellhl") : css("--cell"), stroke: on ? css("--hl") : css("--line"), "stroke-width": on ? 3.5 : 1.3, "stroke-dasharray": isDev ? "6 4" : "none"});
+    if (k === "fat") {
+      el("text", {x: X(n[0] + n[2] / 2), y: Y(n[1] + n[3]) + 14, "text-anchor": "middle", "font-size": 12, "font-weight": "bold"}, "fatbin");
+      const parts = [["SASS sm_" + (sass[0] || "–"), sass.length > 0], ["PTX compute_" + (ptx[0] || "–"), ptx.length > 0]];
+      parts.forEach((p, i) => {
+        const bx = X(n[0] + 0.15), by = Y(n[1] + 1.95 - i * 1.0), bw = (n[2] - 0.3) * S;
+        el("rect", {x: bx, y: by, width: bw, height: 0.8 * S, fill: p[1] ? css("--cellhl") : "none", stroke: css("--line"), "stroke-dasharray": p[1] ? "none" : "2 3"});
+        el("text", {x: bx + bw / 2, y: by + 22, "text-anchor": "middle", "font-size": 12}, p[1] ? p[0] : (i ? "nincs PTX" : "nincs SASS"));
+      });
+      return;
+    }
+    let lab = n[4];
+    if (k === "ptx") lab = ptx.length ? "PTX\ncompute_" + ptx[0] : (sass.length ? "PTX compute_80\n(csak köztes,\nnem kerül be)" : "PTX");
+    if (k === "sass") lab = sass.length ? "ptxas →\nSASS sm_" + sass[0] : "ptxas: nincs\nSASS";
+    lab.split("\n").forEach((t, i, arr) => el("text", {x: X(n[0] + n[2] / 2), y: Y(n[1] + n[3] / 2) + 5 + (i - (arr.length - 1) / 2) * 14, "text-anchor": "middle", "font-size": 12}, t));
+  });
+  el("text", {x: X(5.9), y: Y(2.2) + 18, "font-size": 11, fill: css("--muted")}, "12 reg., 380 B cmem[0] (sm_80, NVRTC)");
+  el("text", {x: X(5.9), y: Y(6.85), "font-size": 11, fill: css("--muted")}, "host ág (folytonos)");
+  el("text", {x: X(0), y: Y(2.2) + 18, "font-size": 11, fill: css("--muted")}, "device ág (szaggatott)");
+  const r = TABLE[f][cc];
+  const col = r[0] === "native" ? css("--hl") : r[0] === "jit" ? css("--hl2") : css("--hl2");
+  el("rect", {x: 14, y: 270, width: 612, height: 54, rx: 6, fill: "none", stroke: col, "stroke-width": 2.5, "stroke-dasharray": r[0] === "error" ? "6 3" : "none"});
+  el("text", {x: 26, y: 291, "font-size": 13}, "CC " + cc + ", " + f);
+  el("text", {x: 26, y: 313, "font-size": 13.5, "font-weight": "bold"}, "→ " + r[1]);
+}
+
+document.getElementById("flag").addEventListener("change", () => show(k));
+document.getElementById("cc").addEventListener("change", () => show(k));
+
+
+// ---- Vezérlés (általában nem kell módosítani) ----
+let k = 0, timer = null;
+const pos = document.getElementById("pos"), status = document.getElementById("status");
+const codeEl = document.getElementById("code");
+if (!CODE.length) codeEl.style.display = "none";
+else codeEl.innerHTML = CODE.map((l, i) => `<span id="L${i}">${l.replace(/&/g,"&amp;").replace(/</g,"&lt;")}</span>`).join("");
+pos.max = STEPS.length - 1;
+// Új lépéssor betöltése (pl. saját bemenetből számolva): setSteps(lista)
+function setSteps(list){ stop(); STEPS = list; pos.max = STEPS.length - 1; show(0); }
+function show(i){
+  k = Math.max(0, Math.min(STEPS.length - 1, i));
+  const s = STEPS[k];
+  pos.value = k;
+  document.getElementById("cnt").textContent = `${k + 1}/${STEPS.length}`;
+  status.textContent = s.msg || "";
+  codeEl.querySelectorAll("span").forEach(x => x.classList.remove("on"));
+  if (s.line !== undefined && s.line >= 0) { const L = document.getElementById("L" + s.line); if (L) L.classList.add("on"); }
+  render(s);
+}
+function stop(){ if (timer) { clearInterval(timer); timer = null; } document.getElementById("play").textContent = "▶ Lejátszás"; }
+document.getElementById("first").onclick = () => { stop(); show(0); };
+document.getElementById("prev").onclick = () => { stop(); show(k - 1); };
+document.getElementById("next").onclick = () => { stop(); show(k + 1); };
+document.getElementById("play").onclick = () => {
+  if (timer) { stop(); return; }
+  if (k >= STEPS.length - 1) show(0);
+  document.getElementById("play").textContent = "⏸ Szünet";
+  timer = setInterval(() => { if (k >= STEPS.length - 1) stop(); else show(k + 1); }, 1600);
+};
+pos.oninput = () => { stop(); show(+pos.value); };
+document.addEventListener("keydown", e => { if (e.key === "ArrowRight") { stop(); show(k + 1); } if (e.key === "ArrowLeft") { stop(); show(k - 1); } });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => show(k));
+show(0);
+</script>
+<script>(function(){function s(){var b=document.body;parent.postMessage({figResize:Math.ceil(b.getBoundingClientRect().height)},"*")}addEventListener("load",s);addEventListener("resize",s);if(window.ResizeObserver)new ResizeObserver(s).observe(document.body);s()})()</script></body>
+</html>

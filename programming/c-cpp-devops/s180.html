@@ -1,0 +1,927 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>35.5 Aszinkron I/O adapter és coroutine-labor – C és modern C++
+rendszerszemléletben DevOps szakembereknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. rész: Modern C++</a> › <a href="index.html#ch35">35 Coroutine-ok és aszinkron erőforrás-életciklus</a></p>
+<div class="links"><a class="prev" rel="prev" href="s179.html">← 35.4 Generator és streaming feldolgozás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="s181.html">36.1 Névtorzítás, layout és C++ runtime ABI →</a></div>
+</nav>
+<h2 data-number="35.5" id="s180"><span
+class="header-section-number">35.5</span> Aszinkron I/O adapter és
+coroutine-labor</h2>
+<p>A coroutine nyelvi mechanizmus, nem I/O-runtime: a
+<code>co_await</code> felfüggeszti a coroutine-t, de a folytatásról, az
+eseményekről és az erőforrások élettartamáról a program gondoskodik. Ez
+a labor egy kis <code>poll</code>-alapú eseményloophoz készít read/write
+awaitable-t, hogy látható legyen a teljes szerződés: ki birtokolja a
+buffert, meddig él az operation, hogyan lehet cancelálni, és hogyan
+biztosítható a pontosan egyszeri completion. A <code>co_await</code>
+önmagában nem indít szálat és nem végez hálózati I/O-t; a scheduler, az
+I/O és a cancellation policy külön implementációs szerződés. A rész a <a
+href="s179.html">generátorok</a> felfüggesztési mintájára, a <a
+href="s061.html">poll/epoll eseményállapotgépre</a> és a <a
+href="s170.html">jthread cancellation</a> fogalmaira épül, de azokat nem
+ismétli meg.</p>
+<h3 data-number="35.5.1" id="az-adapter-mint-szerződés"><span
+class="header-section-number">35.5.1</span> Az adapter mint
+szerződés</h3>
+<p>Az aszinkron I/O adapter feladata, hogy egy operációs rendszerbeli
+eseményt coroutine-felfüggesztéssé és folytatássá alakítson. Ehhez négy
+fogalmat kell pontosan rögzíteni.</p>
+<p><strong>Operation (művelet):</strong> egy regisztrált I/O-kérés,
+amelyhez fájlleíró, várt esemény, completion-művelet és buffer tartozik.
+Az operation addig él, amíg a completion vagy a cancellation le nem
+zárja.</p>
+<p><strong>Awaitable:</strong> a <code>co_await</code> operandusa. Három
+tagfüggvénye van: <code>await_ready()</code> eldöntheti, hogy nincs
+szükség felfüggesztésre; <code>await_suspend(handle)</code> regisztrálja
+a műveletet és felfüggeszti a coroutine-t; <code>await_resume()</code>
+átadja az eredményt. Az awaitable élettartama a teljes
+<code>co_await</code> kifejezés, beleértve a felfüggesztést is.</p>
+<p><strong>Completion:</strong> az operation eredményének átadása a
+coroutine-nak. Pontosan egyszer történhet meg. Utána az operation nem
+hivatkozható, a hozzá tartozó awaitable pedig hamarosan megsemmisül.</p>
+<p><strong>Cancellation:</strong> az operation eredmény nélküli
+lezárása. A coroutine vagy hibát kap az <code>await_resume()</code>-ban,
+vagy a coroutine frame megsemmisül, és az awaitable destruktora
+deregisztrálja a műveletet.</p>
+<p>A szerződés feltételei a következők. Az awaitable élettartamának
+fednie kell a felfüggesztést; ha a coroutine frame megsemmisül
+felfüggesztett állapotban, az awaitable destruktorának el kell
+távolítania az operationt az eseménylooptól. A buffer tulajdonosa a hívó
+marad; az adapter nem másol, csak pointert tárol, ezért a buffer
+élettartama legalább a completionig tart. A terminális események —
+completion, cancel, timeout — közül pontosan egy nyerhet. A versenyt az
+eseményloop szálán, az operation eltávolításával kell eldönteni: amelyik
+ág előbb eltávolítja az operationt, az nyer, a másik ág már nem
+hivatkozhat rá. Végül a shutdown alatt új operation nem regisztrálható,
+a meglévőket pedig drainelni vagy cancelálni kell; az outstanding
+operation számlálója ezt teszi ellenőrizhetővé.</p>
+<p>A callback, az explicit állapotgép és a coroutine ugyanazt a
+folyamatot írja le, de más szerződéssel. A callbacknél az állapot egy
+structban él, és a struct élettartama a cancellation határa. Az explicit
+állapotgépnél az állapot egy enum és egy struct, a vezérlést switch
+adja. A coroutine-nál az állapot a coroutine frame-ben van, a vezérlés
+lineáris, a cancellation a frame és az awaitable élettartamához kötött.
+A coroutine frame allokálhat, és a
+<code>promise_type::operator new</code> testreszabható, de a coroutine
+nem feltétlenül gyorsabb a callbacknél.</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Szempont</th>
+<th>Callback</th>
+<th>Explicit állapotgép</th>
+<th>Coroutine</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Állapot helye</td>
+<td>struct</td>
+<td>enum + struct</td>
+<td>coroutine frame</td>
+</tr>
+<tr>
+<td>Vezérlés</td>
+<td>visszahívási lánc</td>
+<td>switch</td>
+<td>lineáris kód</td>
+</tr>
+<tr>
+<td>Cancel</td>
+<td>a struct élettartama</td>
+<td>state flag</td>
+<td>frame + awaitable</td>
+</tr>
+<tr>
+<td>Allokáció</td>
+<td>stack vagy heap</td>
+<td>stack vagy heap</td>
+<td>frame, testreszabható</td>
+</tr>
+<tr>
+<td>Debug</td>
+<td>callback-lánc</td>
+<td>állapotváltozó</td>
+<td>frame és handle</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="35.5.2"
+id="az-oktatási-eseményloop-és-az-awaitable"><span
+class="header-section-number">35.5.2</span> Az oktatási eseményloop és
+az awaitable</h3>
+<p>A <code>Loop</code> <code>poll</code>-t használ, és <code>Op</code>
+rekordokat tart nyilván. Az <code>Op</code> tartalmazza a fájlleírót, a
+várt eseményt, a felfüggesztett coroutine handle-jét, a
+completion-függvényt és az awaitable-re mutató <code>owner</code>
+pointert. Az awaitable az <code>Op</code>-ot saját tagjaként tárolja,
+tehát az <code>Op</code> a coroutine frame-ben él. A <code>Loop</code>
+csak pointert tárol rá, nem birtokolja. Ez teszi lehetővé, hogy a
+completion után az awaitable destruktora <code>remove</code>-olja
+magát.</p>
+<p>A <code>run()</code> ciklus minden iterációban <code>pollfd</code>
+tömböt épít és <code>poll</code>-ol. Esemény esetén először a completion
+fut, amely a <code>read</code>/<code>write</code> rendszerhívást végzi;
+a döntést ennek eredménye hozza, nem önmagában a
+<code>poll</code>-esemény. Átmeneti hibánál (<code>EAGAIN</code>,
+<code>EINTR</code>) a completion hamisat ad, és a művelet regisztrálva
+marad a következő körre; egyébként a <code>Loop</code> eltávolítja a
+műveletet, és felébreszti a coroutine-t. Az eredményt és a végleges
+hibát az awaitable <code>result</code> és <code>error</code> tagja
+hordozza.</p>
+<p>Az alábbi példa egyetlen fájlban, oktatási célra készült. Nem éles
+runtime: egy szálon fut, és a <code>Loop</code> nem szálbiztos. A
+<strong>descriptorprofil</strong> rögzített: az adapter csak
+<code>O_NONBLOCK</code> módú pipe- vagy socket-fd-vel használható, mert
+csak így garantált, hogy egy <code>poll</code> utáni
+<code>read</code>/<code>write</code> nem blokkolja az egész loopot, és
+egy lassú kimenet (<code>EAGAIN</code>) nem állítja meg a többi
+műveletet. Az awaitable az fd-t kölcsönzi; a tulajdonos a hívó
+<code>unique_fd</code>-je (<a href="s103.html">RAII wrapper file
+descriptorhoz és lockhoz (21.2)</a>). A <code>Loop</code> háromállapotú:
+nyitott (fogad), leálló (új regisztrációt elutasít, a függőket
+<code>ECANCELED</code>-del lemondja) és leállt. A laborban a fordítás és
+futtatás a tanuló feladata; a kód a megadott profillal
+ellenőrizendő.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// echo_coro.cpp</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co">// Descriptorprofil: az adapter csak O_NONBLOCK módú pipe/socket fd-vel</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co">// használható. Az awaitable az fd-t kölcsönzi, nem birtokolja.</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;algorithm&gt;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cerrno&gt;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;chrono&gt;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;coroutine&gt;</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstddef&gt;</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdint&gt;</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;csignal&gt;</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstring&gt;</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;exception&gt;</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;poll.h&gt;</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdexcept&gt;</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;unistd.h&gt;</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;utility&gt;</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a><span class="co">// A [RAII wrapper file descriptorhoz] rész unique_fd-je, rövidítve.</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> unique_fd <span class="op">{</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>  unique_fd<span class="op">()</span> <span class="kw">noexcept</span> <span class="op">=</span> <span class="cf">default</span><span class="op">;</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>  <span class="kw">explicit</span> unique_fd<span class="op">(</span><span class="dt">int</span> fd<span class="op">)</span> <span class="kw">noexcept</span> <span class="op">:</span> <span class="va">fd_</span><span class="op">(</span>fd<span class="op">)</span> <span class="op">{}</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a>  unique_fd<span class="op">(</span><span class="at">const</span> unique_fd<span class="op">&amp;)</span> <span class="op">=</span> <span class="kw">delete</span><span class="op">;</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>  unique_fd<span class="op">&amp;</span> <span class="kw">operator</span><span class="op">=(</span><span class="at">const</span> unique_fd<span class="op">&amp;)</span> <span class="op">=</span> <span class="kw">delete</span><span class="op">;</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>  unique_fd<span class="op">(</span>unique_fd<span class="op">&amp;&amp;</span> o<span class="op">)</span> <span class="kw">noexcept</span> <span class="op">:</span> <span class="va">fd_</span><span class="op">(</span><span class="bu">std::</span>exchange<span class="op">(</span>o<span class="op">.</span><span class="va">fd_</span><span class="op">,</span> <span class="op">-</span><span class="dv">1</span><span class="op">))</span> <span class="op">{}</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a>  <span class="op">~</span>unique_fd<span class="op">()</span> <span class="op">{</span> reset<span class="op">();</span> <span class="op">}</span></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>  <span class="op">[[</span><span class="at">nodiscard</span><span class="op">]]</span> <span class="dt">int</span> get<span class="op">()</span> <span class="at">const</span> <span class="kw">noexcept</span> <span class="op">{</span> <span class="cf">return</span> <span class="va">fd_</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a>  <span class="dt">void</span> reset<span class="op">(</span><span class="dt">int</span> fd <span class="op">=</span> <span class="op">-</span><span class="dv">1</span><span class="op">)</span> <span class="kw">noexcept</span> <span class="op">{</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fd <span class="op">==</span> <span class="va">fd_</span><span class="op">)</span> <span class="cf">return</span><span class="op">;</span>          <span class="co">// önmagára reset: nincs teendő</span></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span><span class="va">fd_</span> <span class="op">&gt;=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">(</span><span class="dt">void</span><span class="op">)::</span>close<span class="op">(</span><span class="va">fd_</span><span class="op">);</span></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a>    <span class="va">fd_</span> <span class="op">=</span> fd<span class="op">;</span></span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> <span class="va">fd_</span> <span class="op">=</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-40"><a href="#cb1-40" aria-hidden="true" tabindex="-1"></a><span class="pp">#ifdef INJECT_TRANSIENT</span></span>
+<span id="cb1-41"><a href="#cb1-41" aria-hidden="true" tabindex="-1"></a><span class="co">// Tesztbuild: az első két read és az első két write EAGAIN, majd EINTR hibát ad.</span></span>
+<span id="cb1-42"><a href="#cb1-42" aria-hidden="true" tabindex="-1"></a><span class="at">static</span> <span class="dt">int</span> injected <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-43"><a href="#cb1-43" aria-hidden="true" tabindex="-1"></a><span class="at">static</span> <span class="dt">ssize_t</span> sys_read<span class="op">(</span><span class="dt">int</span> fd<span class="op">,</span> <span class="dt">void</span><span class="op">*</span> b<span class="op">,</span> <span class="bu">std::</span>size_t n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-44"><a href="#cb1-44" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span>injected <span class="op">&lt;</span> <span class="dv">2</span><span class="op">)</span> <span class="op">{</span> errno <span class="op">=</span> injected<span class="op">++</span> <span class="op">?</span> EINTR <span class="op">:</span> EAGAIN<span class="op">;</span> <span class="cf">return</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb1-45"><a href="#cb1-45" aria-hidden="true" tabindex="-1"></a>  <span class="cf">return</span> <span class="op">::</span>read<span class="op">(</span>fd<span class="op">,</span> b<span class="op">,</span> n<span class="op">);</span></span>
+<span id="cb1-46"><a href="#cb1-46" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-47"><a href="#cb1-47" aria-hidden="true" tabindex="-1"></a><span class="at">static</span> <span class="dt">int</span> injected_w <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-48"><a href="#cb1-48" aria-hidden="true" tabindex="-1"></a><span class="at">static</span> <span class="dt">ssize_t</span> sys_write<span class="op">(</span><span class="dt">int</span> fd<span class="op">,</span> <span class="at">const</span> <span class="dt">void</span><span class="op">*</span> b<span class="op">,</span> <span class="bu">std::</span>size_t n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-49"><a href="#cb1-49" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span>injected_w <span class="op">&lt;</span> <span class="dv">2</span><span class="op">)</span> <span class="op">{</span> errno <span class="op">=</span> injected_w<span class="op">++</span> <span class="op">?</span> EINTR <span class="op">:</span> EAGAIN<span class="op">;</span> <span class="cf">return</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb1-50"><a href="#cb1-50" aria-hidden="true" tabindex="-1"></a>  <span class="cf">return</span> <span class="op">::</span>write<span class="op">(</span>fd<span class="op">,</span> b<span class="op">,</span> n<span class="op">);</span></span>
+<span id="cb1-51"><a href="#cb1-51" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-52"><a href="#cb1-52" aria-hidden="true" tabindex="-1"></a><span class="pp">#else</span></span>
+<span id="cb1-53"><a href="#cb1-53" aria-hidden="true" tabindex="-1"></a><span class="at">static</span> <span class="dt">ssize_t</span> sys_read<span class="op">(</span><span class="dt">int</span> fd<span class="op">,</span> <span class="dt">void</span><span class="op">*</span> b<span class="op">,</span> <span class="bu">std::</span>size_t n<span class="op">)</span> <span class="op">{</span> <span class="cf">return</span> <span class="op">::</span>read<span class="op">(</span>fd<span class="op">,</span> b<span class="op">,</span> n<span class="op">);</span> <span class="op">}</span></span>
+<span id="cb1-54"><a href="#cb1-54" aria-hidden="true" tabindex="-1"></a><span class="at">static</span> <span class="dt">ssize_t</span> sys_write<span class="op">(</span><span class="dt">int</span> fd<span class="op">,</span> <span class="at">const</span> <span class="dt">void</span><span class="op">*</span> b<span class="op">,</span> <span class="bu">std::</span>size_t n<span class="op">)</span> <span class="op">{</span> <span class="cf">return</span> <span class="op">::</span>write<span class="op">(</span>fd<span class="op">,</span> b<span class="op">,</span> n<span class="op">);</span> <span class="op">}</span></span>
+<span id="cb1-55"><a href="#cb1-55" aria-hidden="true" tabindex="-1"></a><span class="pp">#endif</span></span>
+<span id="cb1-56"><a href="#cb1-56" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-57"><a href="#cb1-57" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Op <span class="op">{</span></span>
+<span id="cb1-58"><a href="#cb1-58" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>uint64_t id <span class="op">=</span> <span class="dv">0</span><span class="op">;</span>        <span class="co">// a Loop adja; a pillanatkép ezt tárolja</span></span>
+<span id="cb1-59"><a href="#cb1-59" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> fd <span class="op">=</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-60"><a href="#cb1-60" aria-hidden="true" tabindex="-1"></a>  <span class="dt">short</span> events <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-61"><a href="#cb1-61" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>coroutine_handle<span class="op">&lt;&gt;</span> waiter<span class="op">{};</span></span>
+<span id="cb1-62"><a href="#cb1-62" aria-hidden="true" tabindex="-1"></a>  <span class="co">// A rendszerhívást végzi; hamis, ha átmeneti hiba miatt újra kell próbálni.</span></span>
+<span id="cb1-63"><a href="#cb1-63" aria-hidden="true" tabindex="-1"></a>  <span class="dt">bool</span> <span class="op">(*</span>complete<span class="op">)(</span>Op<span class="op">*)</span> <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb1-64"><a href="#cb1-64" aria-hidden="true" tabindex="-1"></a>  <span class="dt">void</span><span class="op">*</span> owner <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb1-65"><a href="#cb1-65" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>chrono::steady_clock::time_point deadline<span class="op">{};</span>   <span class="co">// lejárat (ha has_deadline)</span></span>
+<span id="cb1-66"><a href="#cb1-66" aria-hidden="true" tabindex="-1"></a>  <span class="dt">bool</span> has_deadline <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb1-67"><a href="#cb1-67" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> cancel_error <span class="op">=</span> <span class="dv">0</span><span class="op">;</span>        <span class="co">// ECANCELED, ha a Loop lemondta a műveletet</span></span>
+<span id="cb1-68"><a href="#cb1-68" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb1-69"><a href="#cb1-69" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-70"><a href="#cb1-70" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> Loop <span class="op">{</span></span>
+<span id="cb1-71"><a href="#cb1-71" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb1-72"><a href="#cb1-72" aria-hidden="true" tabindex="-1"></a>  <span class="co">// Nyitott: fogad műveletet. Leálló: nem fogad újat, a függőket lemondja.</span></span>
+<span id="cb1-73"><a href="#cb1-73" aria-hidden="true" tabindex="-1"></a>  <span class="co">// Leállt: a run() visszatért, nincs függő művelet.</span></span>
+<span id="cb1-74"><a href="#cb1-74" aria-hidden="true" tabindex="-1"></a>  <span class="kw">enum</span> <span class="kw">class</span> State <span class="op">{</span> open<span class="op">,</span> stopping<span class="op">,</span> stopped <span class="op">};</span></span>
+<span id="cb1-75"><a href="#cb1-75" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-76"><a href="#cb1-76" aria-hidden="true" tabindex="-1"></a>  <span class="co">// Hamis, ha a Loop már nem fogad műveletet: ilyenkor a hívó nem függeszt fel.</span></span>
+<span id="cb1-77"><a href="#cb1-77" aria-hidden="true" tabindex="-1"></a>  <span class="op">[[</span><span class="at">nodiscard</span><span class="op">]]</span> <span class="dt">bool</span> add<span class="op">(</span>Op<span class="op">*</span> op<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-78"><a href="#cb1-78" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span><span class="va">state_</span> <span class="op">!=</span> State<span class="op">::</span>open<span class="op">)</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb1-79"><a href="#cb1-79" aria-hidden="true" tabindex="-1"></a>    op<span class="op">-&gt;</span>id <span class="op">=</span> <span class="va">next_id_</span><span class="op">++;</span></span>
+<span id="cb1-80"><a href="#cb1-80" aria-hidden="true" tabindex="-1"></a>    <span class="va">ops_</span><span class="op">.</span>push_back<span class="op">(</span>op<span class="op">);</span></span>
+<span id="cb1-81"><a href="#cb1-81" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb1-82"><a href="#cb1-82" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-83"><a href="#cb1-83" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-84"><a href="#cb1-84" aria-hidden="true" tabindex="-1"></a>  <span class="co">// Csak a még regisztrált műveletet adja vissza. A megszűnt awaitable</span></span>
+<span id="cb1-85"><a href="#cb1-85" aria-hidden="true" tabindex="-1"></a>  <span class="co">// destruktora remove-olja az Op-ot, így annak azonosítója nem található.</span></span>
+<span id="cb1-86"><a href="#cb1-86" aria-hidden="true" tabindex="-1"></a>  Op<span class="op">*</span> lookup<span class="op">(</span><span class="bu">std::</span>uint64_t id<span class="op">)</span> <span class="at">const</span> <span class="op">{</span></span>
+<span id="cb1-87"><a href="#cb1-87" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="kw">auto</span><span class="op">*</span> op <span class="op">:</span> <span class="va">ops_</span><span class="op">)</span></span>
+<span id="cb1-88"><a href="#cb1-88" aria-hidden="true" tabindex="-1"></a>      <span class="cf">if</span> <span class="op">(</span>op<span class="op">-&gt;</span>id <span class="op">==</span> id<span class="op">)</span> <span class="cf">return</span> op<span class="op">;</span></span>
+<span id="cb1-89"><a href="#cb1-89" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb1-90"><a href="#cb1-90" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-91"><a href="#cb1-91" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-92"><a href="#cb1-92" aria-hidden="true" tabindex="-1"></a>  <span class="dt">void</span> remove<span class="op">(</span>Op<span class="op">*</span> op<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-93"><a href="#cb1-93" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> it <span class="op">=</span> <span class="bu">std::</span>find<span class="op">(</span><span class="va">ops_</span><span class="op">.</span>begin<span class="op">(),</span> <span class="va">ops_</span><span class="op">.</span>end<span class="op">(),</span> op<span class="op">);</span></span>
+<span id="cb1-94"><a href="#cb1-94" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>it <span class="op">!=</span> <span class="va">ops_</span><span class="op">.</span>end<span class="op">())</span> <span class="va">ops_</span><span class="op">.</span>erase<span class="op">(</span>it<span class="op">);</span></span>
+<span id="cb1-95"><a href="#cb1-95" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-96"><a href="#cb1-96" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-97"><a href="#cb1-97" aria-hidden="true" tabindex="-1"></a>  <span class="co">// Egyetlen függő művelet lemondása. Az nyer, aki előbb remove-ol: ha az Op már nincs</span></span>
+<span id="cb1-98"><a href="#cb1-98" aria-hidden="true" tabindex="-1"></a>  <span class="co">// regisztrálva (közben befejeződött vagy megszűnt), nincs teendő (false).</span></span>
+<span id="cb1-99"><a href="#cb1-99" aria-hidden="true" tabindex="-1"></a>  <span class="dt">bool</span> cancel<span class="op">(</span><span class="bu">std::</span>uint64_t id<span class="op">,</span> <span class="dt">int</span> error <span class="op">=</span> ECANCELED<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-100"><a href="#cb1-100" aria-hidden="true" tabindex="-1"></a>    Op<span class="op">*</span> op <span class="op">=</span> lookup<span class="op">(</span>id<span class="op">);</span></span>
+<span id="cb1-101"><a href="#cb1-101" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>op <span class="op">==</span> <span class="kw">nullptr</span><span class="op">)</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb1-102"><a href="#cb1-102" aria-hidden="true" tabindex="-1"></a>    remove<span class="op">(</span>op<span class="op">);</span></span>
+<span id="cb1-103"><a href="#cb1-103" aria-hidden="true" tabindex="-1"></a>    op<span class="op">-&gt;</span>cancel_error <span class="op">=</span> error<span class="op">;</span></span>
+<span id="cb1-104"><a href="#cb1-104" aria-hidden="true" tabindex="-1"></a>    op<span class="op">-&gt;</span>waiter<span class="op">.</span>resume<span class="op">();</span></span>
+<span id="cb1-105"><a href="#cb1-105" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb1-106"><a href="#cb1-106" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-107"><a href="#cb1-107" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-108"><a href="#cb1-108" aria-hidden="true" tabindex="-1"></a>  <span class="co">// Lejárt műveletek lezárása ETIMEDOUT-tal. Az azonosítókat előre gyűjtjük, mert a</span></span>
+<span id="cb1-109"><a href="#cb1-109" aria-hidden="true" tabindex="-1"></a>  <span class="co">// resume módosíthatja az ops_ vektort.</span></span>
+<span id="cb1-110"><a href="#cb1-110" aria-hidden="true" tabindex="-1"></a>  <span class="dt">void</span> expire<span class="op">(</span><span class="bu">std::</span>chrono::steady_clock::time_point now<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-111"><a href="#cb1-111" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="bu">std::</span>uint64_t<span class="op">&gt;</span> due<span class="op">;</span></span>
+<span id="cb1-112"><a href="#cb1-112" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="kw">auto</span><span class="op">*</span> op <span class="op">:</span> <span class="va">ops_</span><span class="op">)</span></span>
+<span id="cb1-113"><a href="#cb1-113" aria-hidden="true" tabindex="-1"></a>      <span class="cf">if</span> <span class="op">(</span>op<span class="op">-&gt;</span>has_deadline <span class="op">&amp;&amp;</span> op<span class="op">-&gt;</span>deadline <span class="op">&lt;=</span> now<span class="op">)</span> due<span class="op">.</span>push_back<span class="op">(</span>op<span class="op">-&gt;</span>id<span class="op">);</span></span>
+<span id="cb1-114"><a href="#cb1-114" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="kw">auto</span> id <span class="op">:</span> due<span class="op">)</span> <span class="op">(</span><span class="dt">void</span><span class="op">)</span>cancel<span class="op">(</span>id<span class="op">,</span> ETIMEDOUT<span class="op">);</span></span>
+<span id="cb1-115"><a href="#cb1-115" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-116"><a href="#cb1-116" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-117"><a href="#cb1-117" aria-hidden="true" tabindex="-1"></a>  <span class="dt">void</span> stop<span class="op">()</span> <span class="kw">noexcept</span> <span class="op">{</span></span>
+<span id="cb1-118"><a href="#cb1-118" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span><span class="va">state_</span> <span class="op">==</span> State<span class="op">::</span>open<span class="op">)</span> <span class="va">state_</span> <span class="op">=</span> State<span class="op">::</span>stopping<span class="op">;</span></span>
+<span id="cb1-119"><a href="#cb1-119" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-120"><a href="#cb1-120" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-121"><a href="#cb1-121" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>size_t outstanding<span class="op">()</span> <span class="at">const</span> <span class="kw">noexcept</span> <span class="op">{</span> <span class="cf">return</span> <span class="va">ops_</span><span class="op">.</span>size<span class="op">();</span> <span class="op">}</span></span>
+<span id="cb1-122"><a href="#cb1-122" aria-hidden="true" tabindex="-1"></a>  State state<span class="op">()</span> <span class="at">const</span> <span class="kw">noexcept</span> <span class="op">{</span> <span class="cf">return</span> <span class="va">state_</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb1-123"><a href="#cb1-123" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-124"><a href="#cb1-124" aria-hidden="true" tabindex="-1"></a>  <span class="dt">void</span> run<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-125"><a href="#cb1-125" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(!</span><span class="va">ops_</span><span class="op">.</span>empty<span class="op">())</span> <span class="op">{</span></span>
+<span id="cb1-126"><a href="#cb1-126" aria-hidden="true" tabindex="-1"></a>      <span class="cf">if</span> <span class="op">(</span><span class="va">state_</span> <span class="op">==</span> State<span class="op">::</span>stopping<span class="op">)</span> <span class="op">{</span> cancel_all<span class="op">();</span> <span class="cf">continue</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb1-127"><a href="#cb1-127" aria-hidden="true" tabindex="-1"></a>      <span class="bu">std::</span>vector<span class="op">&lt;</span>pollfd<span class="op">&gt;</span> pfds<span class="op">;</span></span>
+<span id="cb1-128"><a href="#cb1-128" aria-hidden="true" tabindex="-1"></a>      <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="bu">std::</span>uint64_t<span class="op">&gt;</span> ids<span class="op">;</span>   <span class="co">// nem pointer: az Op közben megszűnhet</span></span>
+<span id="cb1-129"><a href="#cb1-129" aria-hidden="true" tabindex="-1"></a>      pfds<span class="op">.</span>reserve<span class="op">(</span><span class="va">ops_</span><span class="op">.</span>size<span class="op">());</span></span>
+<span id="cb1-130"><a href="#cb1-130" aria-hidden="true" tabindex="-1"></a>      ids<span class="op">.</span>reserve<span class="op">(</span><span class="va">ops_</span><span class="op">.</span>size<span class="op">());</span></span>
+<span id="cb1-131"><a href="#cb1-131" aria-hidden="true" tabindex="-1"></a>      <span class="cf">for</span> <span class="op">(</span><span class="kw">auto</span><span class="op">*</span> op <span class="op">:</span> <span class="va">ops_</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-132"><a href="#cb1-132" aria-hidden="true" tabindex="-1"></a>        pfds<span class="op">.</span>push_back<span class="op">(</span>pollfd<span class="op">{</span>op<span class="op">-&gt;</span>fd<span class="op">,</span> op<span class="op">-&gt;</span>events<span class="op">,</span> <span class="dv">0</span><span class="op">});</span></span>
+<span id="cb1-133"><a href="#cb1-133" aria-hidden="true" tabindex="-1"></a>        ids<span class="op">.</span>push_back<span class="op">(</span>op<span class="op">-&gt;</span>id<span class="op">);</span></span>
+<span id="cb1-134"><a href="#cb1-134" aria-hidden="true" tabindex="-1"></a>      <span class="op">}</span></span>
+<span id="cb1-135"><a href="#cb1-135" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-136"><a href="#cb1-136" aria-hidden="true" tabindex="-1"></a>      <span class="co">// A poll időkorlátja a legközelebbi lejáratig csökken (legfeljebb 10 ms).</span></span>
+<span id="cb1-137"><a href="#cb1-137" aria-hidden="true" tabindex="-1"></a>      <span class="dt">int</span> wait_ms <span class="op">=</span> <span class="dv">10</span><span class="op">;</span></span>
+<span id="cb1-138"><a href="#cb1-138" aria-hidden="true" tabindex="-1"></a>      <span class="at">const</span> <span class="kw">auto</span> now0 <span class="op">=</span> <span class="bu">std::</span>chrono::steady_clock::now<span class="op">();</span></span>
+<span id="cb1-139"><a href="#cb1-139" aria-hidden="true" tabindex="-1"></a>      <span class="cf">for</span> <span class="op">(</span><span class="kw">auto</span><span class="op">*</span> op <span class="op">:</span> <span class="va">ops_</span><span class="op">)</span></span>
+<span id="cb1-140"><a href="#cb1-140" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>op<span class="op">-&gt;</span>has_deadline<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-141"><a href="#cb1-141" aria-hidden="true" tabindex="-1"></a>          <span class="kw">auto</span> left <span class="op">=</span> <span class="bu">std::</span>chrono::duration_cast<span class="op">&lt;</span><span class="bu">std::</span>chrono::milliseconds<span class="op">&gt;(</span>op<span class="op">-&gt;</span>deadline <span class="op">-</span> now0<span class="op">).</span>count<span class="op">();</span></span>
+<span id="cb1-142"><a href="#cb1-142" aria-hidden="true" tabindex="-1"></a>          wait_ms <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;(</span><span class="bu">std::</span>max<span class="op">&lt;</span><span class="dt">long</span> <span class="dt">long</span><span class="op">&gt;(</span><span class="dv">0</span><span class="op">,</span> <span class="bu">std::</span>min<span class="op">&lt;</span><span class="dt">long</span> <span class="dt">long</span><span class="op">&gt;(</span>wait_ms<span class="op">,</span> left<span class="op">)));</span></span>
+<span id="cb1-143"><a href="#cb1-143" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb1-144"><a href="#cb1-144" aria-hidden="true" tabindex="-1"></a>      <span class="dt">int</span> n <span class="op">=</span> <span class="op">::</span>poll<span class="op">(</span>pfds<span class="op">.</span>data<span class="op">(),</span> pfds<span class="op">.</span>size<span class="op">(),</span> wait_ms<span class="op">);</span></span>
+<span id="cb1-145"><a href="#cb1-145" aria-hidden="true" tabindex="-1"></a>      <span class="cf">if</span> <span class="op">(</span>n <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-146"><a href="#cb1-146" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>errno <span class="op">==</span> EINTR<span class="op">)</span> <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb1-147"><a href="#cb1-147" aria-hidden="true" tabindex="-1"></a>        <span class="cf">throw</span> <span class="bu">std::</span>runtime_error<span class="op">(</span><span class="st">&quot;poll failed&quot;</span><span class="op">);</span></span>
+<span id="cb1-148"><a href="#cb1-148" aria-hidden="true" tabindex="-1"></a>      <span class="op">}</span></span>
+<span id="cb1-149"><a href="#cb1-149" aria-hidden="true" tabindex="-1"></a>      expire<span class="op">(</span><span class="bu">std::</span>chrono::steady_clock::now<span class="op">());</span>   <span class="co">// előbb a lejáratok: az Op eltűnik, a poll ág nem találja</span></span>
+<span id="cb1-150"><a href="#cb1-150" aria-hidden="true" tabindex="-1"></a>      <span class="cf">for</span> <span class="op">(</span><span class="bu">std::</span>size_t i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> pfds<span class="op">.</span>size<span class="op">();</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-151"><a href="#cb1-151" aria-hidden="true" tabindex="-1"></a>        <span class="co">// A stop() a kész kötegen belül is érvényes: a még nem feldolgozott eseményeket nem</span></span>
+<span id="cb1-152"><a href="#cb1-152" aria-hidden="true" tabindex="-1"></a>        <span class="co">// teljesítjük, a következő iteráció cancel_all()-ja ECANCELED-del zárja le őket.</span></span>
+<span id="cb1-153"><a href="#cb1-153" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span><span class="va">state_</span> <span class="op">==</span> State<span class="op">::</span>stopping<span class="op">)</span> <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb1-154"><a href="#cb1-154" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>pfds<span class="op">[</span>i<span class="op">].</span>revents <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb1-155"><a href="#cb1-155" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Egy korábbi resume ugyanebben a kötegben megszüntethette ezt a</span></span>
+<span id="cb1-156"><a href="#cb1-156" aria-hidden="true" tabindex="-1"></a>        <span class="co">// műveletet; ekkor nincs completion és nincs resume.</span></span>
+<span id="cb1-157"><a href="#cb1-157" aria-hidden="true" tabindex="-1"></a>        Op<span class="op">*</span> op <span class="op">=</span> lookup<span class="op">(</span>ids<span class="op">[</span>i<span class="op">]);</span></span>
+<span id="cb1-158"><a href="#cb1-158" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>op <span class="op">==</span> <span class="kw">nullptr</span><span class="op">)</span> <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb1-159"><a href="#cb1-159" aria-hidden="true" tabindex="-1"></a>        <span class="co">// A rendszerhívás eredménye dönt, nem a poll-esemény: átmeneti</span></span>
+<span id="cb1-160"><a href="#cb1-160" aria-hidden="true" tabindex="-1"></a>        <span class="co">// hibánál (EAGAIN, EINTR) a művelet regisztrálva marad.</span></span>
+<span id="cb1-161"><a href="#cb1-161" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(!</span>op<span class="op">-&gt;</span>complete<span class="op">(</span>op<span class="op">))</span> <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb1-162"><a href="#cb1-162" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Előbb eltávolítjuk, csak utána folytatjuk a coroutine-t.</span></span>
+<span id="cb1-163"><a href="#cb1-163" aria-hidden="true" tabindex="-1"></a>        remove<span class="op">(</span>op<span class="op">);</span></span>
+<span id="cb1-164"><a href="#cb1-164" aria-hidden="true" tabindex="-1"></a>        op<span class="op">-&gt;</span>waiter<span class="op">.</span>resume<span class="op">();</span></span>
+<span id="cb1-165"><a href="#cb1-165" aria-hidden="true" tabindex="-1"></a>      <span class="op">}</span></span>
+<span id="cb1-166"><a href="#cb1-166" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-167"><a href="#cb1-167" aria-hidden="true" tabindex="-1"></a>    <span class="va">state_</span> <span class="op">=</span> State<span class="op">::</span>stopped<span class="op">;</span></span>
+<span id="cb1-168"><a href="#cb1-168" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-169"><a href="#cb1-169" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-170"><a href="#cb1-170" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb1-171"><a href="#cb1-171" aria-hidden="true" tabindex="-1"></a>  <span class="co">// Minden függő műveletet ECANCELED-del zár le: remove, majd resume.</span></span>
+<span id="cb1-172"><a href="#cb1-172" aria-hidden="true" tabindex="-1"></a>  <span class="dt">void</span> cancel_all<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-173"><a href="#cb1-173" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(!</span><span class="va">ops_</span><span class="op">.</span>empty<span class="op">())</span> <span class="op">{</span></span>
+<span id="cb1-174"><a href="#cb1-174" aria-hidden="true" tabindex="-1"></a>      Op<span class="op">*</span> op <span class="op">=</span> <span class="va">ops_</span><span class="op">.</span>front<span class="op">();</span></span>
+<span id="cb1-175"><a href="#cb1-175" aria-hidden="true" tabindex="-1"></a>      remove<span class="op">(</span>op<span class="op">);</span></span>
+<span id="cb1-176"><a href="#cb1-176" aria-hidden="true" tabindex="-1"></a>      op<span class="op">-&gt;</span>cancel_error <span class="op">=</span> ECANCELED<span class="op">;</span></span>
+<span id="cb1-177"><a href="#cb1-177" aria-hidden="true" tabindex="-1"></a>      op<span class="op">-&gt;</span>waiter<span class="op">.</span>resume<span class="op">();</span></span>
+<span id="cb1-178"><a href="#cb1-178" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-179"><a href="#cb1-179" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-180"><a href="#cb1-180" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-181"><a href="#cb1-181" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>vector<span class="op">&lt;</span>Op<span class="op">*&gt;</span> <span class="va">ops_</span><span class="op">;</span></span>
+<span id="cb1-182"><a href="#cb1-182" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>uint64_t <span class="va">next_id_</span> <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-183"><a href="#cb1-183" aria-hidden="true" tabindex="-1"></a>  State <span class="va">state_</span> <span class="op">=</span> State<span class="op">::</span>open<span class="op">;</span></span>
+<span id="cb1-184"><a href="#cb1-184" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb1-185"><a href="#cb1-185" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-186"><a href="#cb1-186" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> ReadAwaitable <span class="op">{</span></span>
+<span id="cb1-187"><a href="#cb1-187" aria-hidden="true" tabindex="-1"></a>  Loop<span class="op">&amp;</span> loop<span class="op">;</span></span>
+<span id="cb1-188"><a href="#cb1-188" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> fd<span class="op">;</span>                      <span class="co">// kölcsönzött, nem birtokolt</span></span>
+<span id="cb1-189"><a href="#cb1-189" aria-hidden="true" tabindex="-1"></a>  <span class="dt">void</span><span class="op">*</span> buf<span class="op">;</span></span>
+<span id="cb1-190"><a href="#cb1-190" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>size_t len<span class="op">;</span></span>
+<span id="cb1-191"><a href="#cb1-191" aria-hidden="true" tabindex="-1"></a>  <span class="dt">ssize_t</span> result <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-192"><a href="#cb1-192" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> error <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-193"><a href="#cb1-193" aria-hidden="true" tabindex="-1"></a>  Op op<span class="op">;</span></span>
+<span id="cb1-194"><a href="#cb1-194" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-195"><a href="#cb1-195" aria-hidden="true" tabindex="-1"></a>  ReadAwaitable<span class="op">(</span>Loop<span class="op">&amp;</span> l<span class="op">,</span> <span class="dt">int</span> f<span class="op">,</span> <span class="dt">void</span><span class="op">*</span> b<span class="op">,</span> <span class="bu">std::</span>size_t n<span class="op">)</span></span>
+<span id="cb1-196"><a href="#cb1-196" aria-hidden="true" tabindex="-1"></a>      <span class="op">:</span> loop<span class="op">(</span>l<span class="op">),</span> fd<span class="op">(</span>f<span class="op">),</span> buf<span class="op">(</span>b<span class="op">),</span> len<span class="op">(</span>n<span class="op">)</span> <span class="op">{}</span></span>
+<span id="cb1-197"><a href="#cb1-197" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-198"><a href="#cb1-198" aria-hidden="true" tabindex="-1"></a>  <span class="op">~</span>ReadAwaitable<span class="op">()</span> <span class="op">{</span> loop<span class="op">.</span>remove<span class="op">(&amp;</span>op<span class="op">);</span> <span class="op">}</span></span>
+<span id="cb1-199"><a href="#cb1-199" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-200"><a href="#cb1-200" aria-hidden="true" tabindex="-1"></a>  <span class="dt">bool</span> await_ready<span class="op">()</span> <span class="at">const</span> <span class="kw">noexcept</span> <span class="op">{</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb1-201"><a href="#cb1-201" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-202"><a href="#cb1-202" aria-hidden="true" tabindex="-1"></a>  <span class="dt">bool</span> await_suspend<span class="op">(</span><span class="bu">std::</span>coroutine_handle<span class="op">&lt;&gt;</span> h<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-203"><a href="#cb1-203" aria-hidden="true" tabindex="-1"></a>    op<span class="op">.</span>fd <span class="op">=</span> fd<span class="op">;</span></span>
+<span id="cb1-204"><a href="#cb1-204" aria-hidden="true" tabindex="-1"></a>    op<span class="op">.</span>events <span class="op">=</span> POLLIN<span class="op">;</span></span>
+<span id="cb1-205"><a href="#cb1-205" aria-hidden="true" tabindex="-1"></a>    op<span class="op">.</span>waiter <span class="op">=</span> h<span class="op">;</span></span>
+<span id="cb1-206"><a href="#cb1-206" aria-hidden="true" tabindex="-1"></a>    op<span class="op">.</span>complete <span class="op">=</span> <span class="op">&amp;</span>on_complete<span class="op">;</span></span>
+<span id="cb1-207"><a href="#cb1-207" aria-hidden="true" tabindex="-1"></a>    op<span class="op">.</span>owner <span class="op">=</span> <span class="kw">this</span><span class="op">;</span></span>
+<span id="cb1-208"><a href="#cb1-208" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>loop<span class="op">.</span>add<span class="op">(&amp;</span>op<span class="op">))</span> <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span>    <span class="co">// felfüggesztés</span></span>
+<span id="cb1-209"><a href="#cb1-209" aria-hidden="true" tabindex="-1"></a>    error <span class="op">=</span> ECANCELED<span class="op">;</span>                 <span class="co">// a Loop már nem fogad: azonnal folytat</span></span>
+<span id="cb1-210"><a href="#cb1-210" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb1-211"><a href="#cb1-211" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-212"><a href="#cb1-212" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-213"><a href="#cb1-213" aria-hidden="true" tabindex="-1"></a>  <span class="dt">ssize_t</span> await_resume<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-214"><a href="#cb1-214" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>op<span class="op">.</span>cancel_error<span class="op">)</span> error <span class="op">=</span> op<span class="op">.</span>cancel_error<span class="op">;</span></span>
+<span id="cb1-215"><a href="#cb1-215" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>error<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-216"><a href="#cb1-216" aria-hidden="true" tabindex="-1"></a>      errno <span class="op">=</span> error<span class="op">;</span></span>
+<span id="cb1-217"><a href="#cb1-217" aria-hidden="true" tabindex="-1"></a>      <span class="cf">return</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-218"><a href="#cb1-218" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-219"><a href="#cb1-219" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> result<span class="op">;</span></span>
+<span id="cb1-220"><a href="#cb1-220" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-221"><a href="#cb1-221" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-222"><a href="#cb1-222" aria-hidden="true" tabindex="-1"></a>  <span class="at">static</span> <span class="dt">bool</span> on_complete<span class="op">(</span>Op<span class="op">*</span> o<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-223"><a href="#cb1-223" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span><span class="op">*</span> self <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span>ReadAwaitable<span class="op">*&gt;(</span>o<span class="op">-&gt;</span>owner<span class="op">);</span></span>
+<span id="cb1-224"><a href="#cb1-224" aria-hidden="true" tabindex="-1"></a>    self<span class="op">-&gt;</span>result <span class="op">=</span> sys_read<span class="op">(</span>o<span class="op">-&gt;</span>fd<span class="op">,</span> self<span class="op">-&gt;</span>buf<span class="op">,</span> self<span class="op">-&gt;</span>len<span class="op">);</span></span>
+<span id="cb1-225"><a href="#cb1-225" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>self<span class="op">-&gt;</span>result <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-226"><a href="#cb1-226" aria-hidden="true" tabindex="-1"></a>      <span class="cf">if</span> <span class="op">(</span>errno <span class="op">==</span> EAGAIN <span class="op">||</span> errno <span class="op">==</span> EWOULDBLOCK <span class="op">||</span> errno <span class="op">==</span> EINTR<span class="op">)</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb1-227"><a href="#cb1-227" aria-hidden="true" tabindex="-1"></a>      self<span class="op">-&gt;</span>error <span class="op">=</span> errno<span class="op">;</span></span>
+<span id="cb1-228"><a href="#cb1-228" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-229"><a href="#cb1-229" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb1-230"><a href="#cb1-230" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-231"><a href="#cb1-231" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb1-232"><a href="#cb1-232" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-233"><a href="#cb1-233" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> WriteAwaitable <span class="op">{</span></span>
+<span id="cb1-234"><a href="#cb1-234" aria-hidden="true" tabindex="-1"></a>  Loop<span class="op">&amp;</span> loop<span class="op">;</span></span>
+<span id="cb1-235"><a href="#cb1-235" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> fd<span class="op">;</span>                      <span class="co">// kölcsönzött, nem birtokolt</span></span>
+<span id="cb1-236"><a href="#cb1-236" aria-hidden="true" tabindex="-1"></a>  <span class="at">const</span> <span class="dt">void</span><span class="op">*</span> buf<span class="op">;</span></span>
+<span id="cb1-237"><a href="#cb1-237" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>size_t len<span class="op">;</span></span>
+<span id="cb1-238"><a href="#cb1-238" aria-hidden="true" tabindex="-1"></a>  <span class="dt">ssize_t</span> result <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-239"><a href="#cb1-239" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> error <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-240"><a href="#cb1-240" aria-hidden="true" tabindex="-1"></a>  Op op<span class="op">;</span></span>
+<span id="cb1-241"><a href="#cb1-241" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-242"><a href="#cb1-242" aria-hidden="true" tabindex="-1"></a>  WriteAwaitable<span class="op">(</span>Loop<span class="op">&amp;</span> l<span class="op">,</span> <span class="dt">int</span> f<span class="op">,</span> <span class="at">const</span> <span class="dt">void</span><span class="op">*</span> b<span class="op">,</span> <span class="bu">std::</span>size_t n<span class="op">)</span></span>
+<span id="cb1-243"><a href="#cb1-243" aria-hidden="true" tabindex="-1"></a>      <span class="op">:</span> loop<span class="op">(</span>l<span class="op">),</span> fd<span class="op">(</span>f<span class="op">),</span> buf<span class="op">(</span>b<span class="op">),</span> len<span class="op">(</span>n<span class="op">)</span> <span class="op">{}</span></span>
+<span id="cb1-244"><a href="#cb1-244" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-245"><a href="#cb1-245" aria-hidden="true" tabindex="-1"></a>  <span class="op">~</span>WriteAwaitable<span class="op">()</span> <span class="op">{</span> loop<span class="op">.</span>remove<span class="op">(&amp;</span>op<span class="op">);</span> <span class="op">}</span></span>
+<span id="cb1-246"><a href="#cb1-246" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-247"><a href="#cb1-247" aria-hidden="true" tabindex="-1"></a>  <span class="dt">bool</span> await_ready<span class="op">()</span> <span class="at">const</span> <span class="kw">noexcept</span> <span class="op">{</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb1-248"><a href="#cb1-248" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-249"><a href="#cb1-249" aria-hidden="true" tabindex="-1"></a>  <span class="dt">bool</span> await_suspend<span class="op">(</span><span class="bu">std::</span>coroutine_handle<span class="op">&lt;&gt;</span> h<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-250"><a href="#cb1-250" aria-hidden="true" tabindex="-1"></a>    op<span class="op">.</span>fd <span class="op">=</span> fd<span class="op">;</span></span>
+<span id="cb1-251"><a href="#cb1-251" aria-hidden="true" tabindex="-1"></a>    op<span class="op">.</span>events <span class="op">=</span> POLLOUT<span class="op">;</span></span>
+<span id="cb1-252"><a href="#cb1-252" aria-hidden="true" tabindex="-1"></a>    op<span class="op">.</span>waiter <span class="op">=</span> h<span class="op">;</span></span>
+<span id="cb1-253"><a href="#cb1-253" aria-hidden="true" tabindex="-1"></a>    op<span class="op">.</span>complete <span class="op">=</span> <span class="op">&amp;</span>on_complete<span class="op">;</span></span>
+<span id="cb1-254"><a href="#cb1-254" aria-hidden="true" tabindex="-1"></a>    op<span class="op">.</span>owner <span class="op">=</span> <span class="kw">this</span><span class="op">;</span></span>
+<span id="cb1-255"><a href="#cb1-255" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>loop<span class="op">.</span>add<span class="op">(&amp;</span>op<span class="op">))</span> <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb1-256"><a href="#cb1-256" aria-hidden="true" tabindex="-1"></a>    error <span class="op">=</span> ECANCELED<span class="op">;</span></span>
+<span id="cb1-257"><a href="#cb1-257" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb1-258"><a href="#cb1-258" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-259"><a href="#cb1-259" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-260"><a href="#cb1-260" aria-hidden="true" tabindex="-1"></a>  <span class="dt">ssize_t</span> await_resume<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-261"><a href="#cb1-261" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>op<span class="op">.</span>cancel_error<span class="op">)</span> error <span class="op">=</span> op<span class="op">.</span>cancel_error<span class="op">;</span></span>
+<span id="cb1-262"><a href="#cb1-262" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>error<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-263"><a href="#cb1-263" aria-hidden="true" tabindex="-1"></a>      errno <span class="op">=</span> error<span class="op">;</span></span>
+<span id="cb1-264"><a href="#cb1-264" aria-hidden="true" tabindex="-1"></a>      <span class="cf">return</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-265"><a href="#cb1-265" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-266"><a href="#cb1-266" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> result<span class="op">;</span></span>
+<span id="cb1-267"><a href="#cb1-267" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-268"><a href="#cb1-268" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-269"><a href="#cb1-269" aria-hidden="true" tabindex="-1"></a>  <span class="at">static</span> <span class="dt">bool</span> on_complete<span class="op">(</span>Op<span class="op">*</span> o<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-270"><a href="#cb1-270" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span><span class="op">*</span> self <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span>WriteAwaitable<span class="op">*&gt;(</span>o<span class="op">-&gt;</span>owner<span class="op">);</span></span>
+<span id="cb1-271"><a href="#cb1-271" aria-hidden="true" tabindex="-1"></a>    self<span class="op">-&gt;</span>result <span class="op">=</span> sys_write<span class="op">(</span>o<span class="op">-&gt;</span>fd<span class="op">,</span> self<span class="op">-&gt;</span>buf<span class="op">,</span> self<span class="op">-&gt;</span>len<span class="op">);</span></span>
+<span id="cb1-272"><a href="#cb1-272" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>self<span class="op">-&gt;</span>result <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-273"><a href="#cb1-273" aria-hidden="true" tabindex="-1"></a>      <span class="cf">if</span> <span class="op">(</span>errno <span class="op">==</span> EAGAIN <span class="op">||</span> errno <span class="op">==</span> EWOULDBLOCK <span class="op">||</span> errno <span class="op">==</span> EINTR<span class="op">)</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb1-274"><a href="#cb1-274" aria-hidden="true" tabindex="-1"></a>      self<span class="op">-&gt;</span>error <span class="op">=</span> errno<span class="op">;</span></span>
+<span id="cb1-275"><a href="#cb1-275" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-276"><a href="#cb1-276" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb1-277"><a href="#cb1-277" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-278"><a href="#cb1-278" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb1-279"><a href="#cb1-279" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-280"><a href="#cb1-280" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Task <span class="op">{</span></span>
+<span id="cb1-281"><a href="#cb1-281" aria-hidden="true" tabindex="-1"></a>  <span class="kw">struct</span> <span class="dt">promise_type</span> <span class="op">{</span></span>
+<span id="cb1-282"><a href="#cb1-282" aria-hidden="true" tabindex="-1"></a>    Task get_return_object<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-283"><a href="#cb1-283" aria-hidden="true" tabindex="-1"></a>      <span class="cf">return</span> Task<span class="op">{</span><span class="bu">std::</span>coroutine_handle<span class="op">&lt;</span><span class="dt">promise_type</span><span class="op">&gt;::</span>from_promise<span class="op">(*</span><span class="kw">this</span><span class="op">)};</span></span>
+<span id="cb1-284"><a href="#cb1-284" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-285"><a href="#cb1-285" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>suspend_always initial_suspend<span class="op">()</span> <span class="kw">noexcept</span> <span class="op">{</span> <span class="cf">return</span> <span class="op">{};</span> <span class="op">}</span></span>
+<span id="cb1-286"><a href="#cb1-286" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>suspend_always final_suspend<span class="op">()</span> <span class="kw">noexcept</span> <span class="op">{</span> <span class="cf">return</span> <span class="op">{};</span> <span class="op">}</span></span>
+<span id="cb1-287"><a href="#cb1-287" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> return_value<span class="op">(</span><span class="dt">int</span> err<span class="op">)</span> <span class="kw">noexcept</span> <span class="op">{</span> error <span class="op">=</span> err<span class="op">;</span> <span class="op">}</span></span>
+<span id="cb1-288"><a href="#cb1-288" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> unhandled_exception<span class="op">()</span> <span class="kw">noexcept</span> <span class="op">{</span> exception <span class="op">=</span> <span class="bu">std::</span>current_exception<span class="op">();</span> <span class="op">}</span></span>
+<span id="cb1-289"><a href="#cb1-289" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-290"><a href="#cb1-290" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> error <span class="op">=</span> <span class="dv">0</span><span class="op">;</span>                    <span class="co">// 0: siker, egyébként errno</span></span>
+<span id="cb1-291"><a href="#cb1-291" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>exception_ptr exception<span class="op">;</span>     <span class="co">// a coroutine-ból kiszökő kivétel</span></span>
+<span id="cb1-292"><a href="#cb1-292" aria-hidden="true" tabindex="-1"></a>  <span class="op">};</span></span>
+<span id="cb1-293"><a href="#cb1-293" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-294"><a href="#cb1-294" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>coroutine_handle<span class="op">&lt;</span><span class="dt">promise_type</span><span class="op">&gt;</span> h<span class="op">{};</span></span>
+<span id="cb1-295"><a href="#cb1-295" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-296"><a href="#cb1-296" aria-hidden="true" tabindex="-1"></a>  <span class="kw">explicit</span> Task<span class="op">(</span><span class="bu">std::</span>coroutine_handle<span class="op">&lt;</span><span class="dt">promise_type</span><span class="op">&gt;</span> handle<span class="op">)</span> <span class="op">:</span> h<span class="op">(</span>handle<span class="op">)</span> <span class="op">{}</span></span>
+<span id="cb1-297"><a href="#cb1-297" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-298"><a href="#cb1-298" aria-hidden="true" tabindex="-1"></a>  Task<span class="op">(</span>Task<span class="op">&amp;&amp;</span> other<span class="op">)</span> <span class="kw">noexcept</span> <span class="op">:</span> h<span class="op">(</span>other<span class="op">.</span>h<span class="op">)</span> <span class="op">{</span> other<span class="op">.</span>h <span class="op">=</span> <span class="op">{};</span> <span class="op">}</span></span>
+<span id="cb1-299"><a href="#cb1-299" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-300"><a href="#cb1-300" aria-hidden="true" tabindex="-1"></a>  Task<span class="op">&amp;</span> <span class="kw">operator</span><span class="op">=(</span>Task<span class="op">&amp;&amp;</span> other<span class="op">)</span> <span class="kw">noexcept</span> <span class="op">{</span></span>
+<span id="cb1-301"><a href="#cb1-301" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span><span class="kw">this</span> <span class="op">!=</span> <span class="op">&amp;</span>other<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-302"><a href="#cb1-302" aria-hidden="true" tabindex="-1"></a>      <span class="cf">if</span> <span class="op">(</span>h<span class="op">)</span> h<span class="op">.</span>destroy<span class="op">();</span></span>
+<span id="cb1-303"><a href="#cb1-303" aria-hidden="true" tabindex="-1"></a>      h <span class="op">=</span> other<span class="op">.</span>h<span class="op">;</span></span>
+<span id="cb1-304"><a href="#cb1-304" aria-hidden="true" tabindex="-1"></a>      other<span class="op">.</span>h <span class="op">=</span> <span class="op">{};</span></span>
+<span id="cb1-305"><a href="#cb1-305" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-306"><a href="#cb1-306" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">*</span><span class="kw">this</span><span class="op">;</span></span>
+<span id="cb1-307"><a href="#cb1-307" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-308"><a href="#cb1-308" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-309"><a href="#cb1-309" aria-hidden="true" tabindex="-1"></a>  Task<span class="op">(</span><span class="at">const</span> Task<span class="op">&amp;)</span> <span class="op">=</span> <span class="kw">delete</span><span class="op">;</span></span>
+<span id="cb1-310"><a href="#cb1-310" aria-hidden="true" tabindex="-1"></a>  Task<span class="op">&amp;</span> <span class="kw">operator</span><span class="op">=(</span><span class="at">const</span> Task<span class="op">&amp;)</span> <span class="op">=</span> <span class="kw">delete</span><span class="op">;</span></span>
+<span id="cb1-311"><a href="#cb1-311" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-312"><a href="#cb1-312" aria-hidden="true" tabindex="-1"></a>  <span class="op">~</span>Task<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-313"><a href="#cb1-313" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>h<span class="op">)</span> h<span class="op">.</span>destroy<span class="op">();</span></span>
+<span id="cb1-314"><a href="#cb1-314" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-315"><a href="#cb1-315" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-316"><a href="#cb1-316" aria-hidden="true" tabindex="-1"></a>  <span class="dt">void</span> resume<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-317"><a href="#cb1-317" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>h <span class="op">&amp;&amp;</span> <span class="op">!</span>h<span class="op">.</span>done<span class="op">())</span> h<span class="op">.</span>resume<span class="op">();</span></span>
+<span id="cb1-318"><a href="#cb1-318" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-319"><a href="#cb1-319" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-320"><a href="#cb1-320" aria-hidden="true" tabindex="-1"></a>  <span class="dt">bool</span> done<span class="op">()</span> <span class="at">const</span> <span class="kw">noexcept</span> <span class="op">{</span> <span class="cf">return</span> <span class="op">!</span>h <span class="op">||</span> h<span class="op">.</span>done<span class="op">();</span> <span class="op">}</span></span>
+<span id="cb1-321"><a href="#cb1-321" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-322"><a href="#cb1-322" aria-hidden="true" tabindex="-1"></a>  <span class="co">// Csak befejezett coroutine-ra hívható; kivételt továbbdob.</span></span>
+<span id="cb1-323"><a href="#cb1-323" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> result<span class="op">()</span> <span class="at">const</span> <span class="op">{</span></span>
+<span id="cb1-324"><a href="#cb1-324" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>h<span class="op">.</span>promise<span class="op">().</span>exception<span class="op">)</span> <span class="bu">std::</span>rethrow_exception<span class="op">(</span>h<span class="op">.</span>promise<span class="op">().</span>exception<span class="op">);</span></span>
+<span id="cb1-325"><a href="#cb1-325" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> h<span class="op">.</span>promise<span class="op">().</span>error<span class="op">;</span></span>
+<span id="cb1-326"><a href="#cb1-326" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-327"><a href="#cb1-327" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb1-328"><a href="#cb1-328" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-329"><a href="#cb1-329" aria-hidden="true" tabindex="-1"></a><span class="co">// Eredmény: 0, ha a bemenet EOF-ig átment; különben a végleges hiba errno-ja</span></span>
+<span id="cb1-330"><a href="#cb1-330" aria-hidden="true" tabindex="-1"></a><span class="co">// (ECANCELED, ha a Loop leállítása mondta le). Az átmeneti hibákat az adapter</span></span>
+<span id="cb1-331"><a href="#cb1-331" aria-hidden="true" tabindex="-1"></a><span class="co">// kezeli, ide nem jutnak el.</span></span>
+<span id="cb1-332"><a href="#cb1-332" aria-hidden="true" tabindex="-1"></a>Task echo<span class="op">(</span>Loop<span class="op">&amp;</span> loop<span class="op">,</span> <span class="dt">int</span> in_fd<span class="op">,</span> <span class="dt">int</span> out_fd<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-333"><a href="#cb1-333" aria-hidden="true" tabindex="-1"></a>  <span class="dt">char</span> buf<span class="op">[</span><span class="dv">4096</span><span class="op">];</span></span>
+<span id="cb1-334"><a href="#cb1-334" aria-hidden="true" tabindex="-1"></a>  <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb1-335"><a href="#cb1-335" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ssize_t</span> n <span class="op">=</span> <span class="cf">co_await</span> ReadAwaitable<span class="op">{</span>loop<span class="op">,</span> in_fd<span class="op">,</span> buf<span class="op">,</span> <span class="kw">sizeof</span> buf<span class="op">};</span></span>
+<span id="cb1-336"><a href="#cb1-336" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>n <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">co_return</span> <span class="dv">0</span><span class="op">;</span>                              <span class="co">// EOF: siker</span></span>
+<span id="cb1-337"><a href="#cb1-337" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>n <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">co_return</span> errno<span class="op">;</span>                           <span class="co">// végleges hiba</span></span>
+<span id="cb1-338"><a href="#cb1-338" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-339"><a href="#cb1-339" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t off <span class="op">=</span> <span class="dv">0</span><span class="op">;</span>                                  <span class="co">// n &gt; 0: a konverzió értéktartó</span></span>
+<span id="cb1-340"><a href="#cb1-340" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>off <span class="op">&lt;</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="bu">std::</span>size_t<span class="op">&gt;(</span>n<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb1-341"><a href="#cb1-341" aria-hidden="true" tabindex="-1"></a>      <span class="dt">ssize_t</span> w <span class="op">=</span> <span class="cf">co_await</span> WriteAwaitable<span class="op">{</span></span>
+<span id="cb1-342"><a href="#cb1-342" aria-hidden="true" tabindex="-1"></a>          loop<span class="op">,</span> out_fd<span class="op">,</span> buf <span class="op">+</span> off<span class="op">,</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="bu">std::</span>size_t<span class="op">&gt;(</span>n<span class="op">)</span> <span class="op">-</span> off<span class="op">};</span></span>
+<span id="cb1-343"><a href="#cb1-343" aria-hidden="true" tabindex="-1"></a>      <span class="cf">if</span> <span class="op">(</span>w <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">co_return</span> EIO<span class="op">;</span>                          <span class="co">// pozitív hátralevő hossz, nulla előrehaladás: végleges hiba</span></span>
+<span id="cb1-344"><a href="#cb1-344" aria-hidden="true" tabindex="-1"></a>      <span class="cf">if</span> <span class="op">(</span>w <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">co_return</span> errno<span class="op">;</span></span>
+<span id="cb1-345"><a href="#cb1-345" aria-hidden="true" tabindex="-1"></a>      off <span class="op">+=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="bu">std::</span>size_t<span class="op">&gt;(</span>w<span class="op">);</span></span>
+<span id="cb1-346"><a href="#cb1-346" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-347"><a href="#cb1-347" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-348"><a href="#cb1-348" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-349"><a href="#cb1-349" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-350"><a href="#cb1-350" aria-hidden="true" tabindex="-1"></a><span class="at">static</span> <span class="dt">bool</span> set_nonblock<span class="op">(</span><span class="dt">int</span> fd<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-351"><a href="#cb1-351" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> fl <span class="op">=</span> <span class="op">::</span>fcntl<span class="op">(</span>fd<span class="op">,</span> F_GETFL<span class="op">);</span></span>
+<span id="cb1-352"><a href="#cb1-352" aria-hidden="true" tabindex="-1"></a>  <span class="cf">return</span> fl <span class="op">&gt;=</span> <span class="dv">0</span> <span class="op">&amp;&amp;</span> <span class="op">::</span>fcntl<span class="op">(</span>fd<span class="op">,</span> F_SETFL<span class="op">,</span> fl <span class="op">|</span> O_NONBLOCK<span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-353"><a href="#cb1-353" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-354"><a href="#cb1-354" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-355"><a href="#cb1-355" aria-hidden="true" tabindex="-1"></a><span class="co">// Egy echo-futás saját pipe-pal; a kimenet egy kölcsönzött, már nem</span></span>
+<span id="cb1-356"><a href="#cb1-356" aria-hidden="true" tabindex="-1"></a><span class="co">// blokkoló fd. Minden pipe-vég a unique_fd-k révén pontosan egyszer záródik,</span></span>
+<span id="cb1-357"><a href="#cb1-357" aria-hidden="true" tabindex="-1"></a><span class="co">// a korai returnokon is.</span></span>
+<span id="cb1-358"><a href="#cb1-358" aria-hidden="true" tabindex="-1"></a><span class="op">[[</span><span class="at">maybe_unused</span><span class="op">]]</span> <span class="at">static</span> <span class="dt">int</span> run_echo<span class="op">(</span><span class="dt">int</span> out_fd<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-359"><a href="#cb1-359" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> fds<span class="op">[</span><span class="dv">2</span><span class="op">];</span></span>
+<span id="cb1-360"><a href="#cb1-360" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(::</span>pipe<span class="op">(</span>fds<span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-361"><a href="#cb1-361" aria-hidden="true" tabindex="-1"></a>  unique_fd rd<span class="op">{</span>fds<span class="op">[</span><span class="dv">0</span><span class="op">]},</span> wr<span class="op">{</span>fds<span class="op">[</span><span class="dv">1</span><span class="op">]};</span></span>
+<span id="cb1-362"><a href="#cb1-362" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(!</span>set_nonblock<span class="op">(</span>rd<span class="op">.</span>get<span class="op">()))</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-363"><a href="#cb1-363" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-364"><a href="#cb1-364" aria-hidden="true" tabindex="-1"></a>  Loop loop<span class="op">;</span></span>
+<span id="cb1-365"><a href="#cb1-365" aria-hidden="true" tabindex="-1"></a>  Task task <span class="op">=</span> echo<span class="op">(</span>loop<span class="op">,</span> rd<span class="op">.</span>get<span class="op">(),</span> out_fd<span class="op">);</span></span>
+<span id="cb1-366"><a href="#cb1-366" aria-hidden="true" tabindex="-1"></a>  task<span class="op">.</span>resume<span class="op">();</span></span>
+<span id="cb1-367"><a href="#cb1-367" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-368"><a href="#cb1-368" aria-hidden="true" tabindex="-1"></a>  <span class="at">const</span> <span class="dt">char</span> msg<span class="op">[]</span> <span class="op">=</span> <span class="st">&quot;hello from coroutine</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb1-369"><a href="#cb1-369" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(::</span>write<span class="op">(</span>wr<span class="op">.</span>get<span class="op">(),</span> msg<span class="op">,</span> <span class="kw">sizeof</span> msg <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-370"><a href="#cb1-370" aria-hidden="true" tabindex="-1"></a>  wr<span class="op">.</span>reset<span class="op">();</span>                                <span class="co">// EOF jelzése az olvasónak</span></span>
+<span id="cb1-371"><a href="#cb1-371" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-372"><a href="#cb1-372" aria-hidden="true" tabindex="-1"></a>  loop<span class="op">.</span>run<span class="op">();</span></span>
+<span id="cb1-373"><a href="#cb1-373" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(!</span>task<span class="op">.</span>done<span class="op">())</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-374"><a href="#cb1-374" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span><span class="dt">int</span> err <span class="op">=</span> task<span class="op">.</span>result<span class="op">();</span> err <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-375"><a href="#cb1-375" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;echo: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> <span class="bu">std::</span>strerror<span class="op">(</span>err<span class="op">));</span></span>
+<span id="cb1-376"><a href="#cb1-376" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-377"><a href="#cb1-377" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-378"><a href="#cb1-378" aria-hidden="true" tabindex="-1"></a>  <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-379"><a href="#cb1-379" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-380"><a href="#cb1-380" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-381"><a href="#cb1-381" aria-hidden="true" tabindex="-1"></a><span class="pp">#if !defined(LOOP_CANCEL_TEST) &amp;&amp; !defined(LOOP_STOP_TEST)</span></span>
+<span id="cb1-382"><a href="#cb1-382" aria-hidden="true" tabindex="-1"></a><span class="co">// A stdout O_NONBLOCK módját RAII őr állítja vissza minden kilépési úton (kivétel esetén is).</span></span>
+<span id="cb1-383"><a href="#cb1-383" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> FlagRestore <span class="op">{</span></span>
+<span id="cb1-384"><a href="#cb1-384" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> old<span class="op">;</span></span>
+<span id="cb1-385"><a href="#cb1-385" aria-hidden="true" tabindex="-1"></a>  <span class="op">~</span>FlagRestore<span class="op">()</span> <span class="op">{</span> <span class="op">(</span><span class="dt">void</span><span class="op">)::</span>fcntl<span class="op">(</span>STDOUT_FILENO<span class="op">,</span> F_SETFL<span class="op">,</span> old<span class="op">);</span> <span class="op">}</span></span>
+<span id="cb1-386"><a href="#cb1-386" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb1-387"><a href="#cb1-387" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-388"><a href="#cb1-388" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-389"><a href="#cb1-389" aria-hidden="true" tabindex="-1"></a>  <span class="co">// SIGPIPE-policy: a példa write()-ot használ; bezárt olvasójú pipe-nál az alapértelmezett</span></span>
+<span id="cb1-390"><a href="#cb1-390" aria-hidden="true" tabindex="-1"></a>  <span class="co">// SIGPIPE a folyamatot megszüntetné, mielőtt a Task hibát adhatna. Ezért a folyamat</span></span>
+<span id="cb1-391"><a href="#cb1-391" aria-hidden="true" tabindex="-1"></a>  <span class="co">// elején ignoráljuk: a write() ekkor EPIPE-pal tér vissza, amely a végleges hibacsatornán</span></span>
+<span id="cb1-392"><a href="#cb1-392" aria-hidden="true" tabindex="-1"></a>  <span class="co">// (Task::result) jelenik meg. Socketnél alternatíva az MSG_NOSIGNAL a send()-en.</span></span>
+<span id="cb1-393"><a href="#cb1-393" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>signal<span class="op">(</span>SIGPIPE<span class="op">,</span> SIG_IGN<span class="op">);</span></span>
+<span id="cb1-394"><a href="#cb1-394" aria-hidden="true" tabindex="-1"></a>  <span class="co">// A stdout fájlleírását a szülővel osztjuk meg: a nem blokkoló módot csak</span></span>
+<span id="cb1-395"><a href="#cb1-395" aria-hidden="true" tabindex="-1"></a>  <span class="co">// a futás idejére állítjuk be, utána visszaállítjuk.</span></span>
+<span id="cb1-396"><a href="#cb1-396" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> old <span class="op">=</span> <span class="op">::</span>fcntl<span class="op">(</span>STDOUT_FILENO<span class="op">,</span> F_GETFL<span class="op">);</span></span>
+<span id="cb1-397"><a href="#cb1-397" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span>old <span class="op">&lt;</span> <span class="dv">0</span> <span class="op">||</span> <span class="op">!</span>set_nonblock<span class="op">(</span>STDOUT_FILENO<span class="op">))</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-398"><a href="#cb1-398" aria-hidden="true" tabindex="-1"></a>  FlagRestore restore<span class="op">{</span>old<span class="op">};</span></span>
+<span id="cb1-399"><a href="#cb1-399" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> rc <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-400"><a href="#cb1-400" aria-hidden="true" tabindex="-1"></a>  <span class="cf">try</span> <span class="op">{</span></span>
+<span id="cb1-401"><a href="#cb1-401" aria-hidden="true" tabindex="-1"></a>    rc <span class="op">=</span> run_echo<span class="op">(</span>STDOUT_FILENO<span class="op">);</span></span>
+<span id="cb1-402"><a href="#cb1-402" aria-hidden="true" tabindex="-1"></a><span class="pp">#ifdef FD_LEAK_TEST</span></span>
+<span id="cb1-403"><a href="#cb1-403" aria-hidden="true" tabindex="-1"></a>  <span class="kw">auto</span> count_fds <span class="op">=</span> <span class="op">[]</span> <span class="op">{</span> <span class="dt">int</span> c <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> fd <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> fd <span class="op">&lt;</span> <span class="dv">1024</span><span class="op">;</span> <span class="op">++</span>fd<span class="op">)</span> <span class="cf">if</span> <span class="op">(::</span>fcntl<span class="op">(</span>fd<span class="op">,</span> F_GETFD<span class="op">)</span> <span class="op">&gt;=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">++</span>c<span class="op">;</span> <span class="cf">return</span> c<span class="op">;</span> <span class="op">};</span></span>
+<span id="cb1-404"><a href="#cb1-404" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> before <span class="op">=</span> count_fds<span class="op">();</span></span>
+<span id="cb1-405"><a href="#cb1-405" aria-hidden="true" tabindex="-1"></a>  <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">100</span> <span class="op">&amp;&amp;</span> rc <span class="op">==</span> <span class="dv">0</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> rc <span class="op">=</span> run_echo<span class="op">(</span>STDOUT_FILENO<span class="op">);</span></span>
+<span id="cb1-406"><a href="#cb1-406" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;fd before=</span><span class="sc">%d</span><span class="st"> after=</span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> before<span class="op">,</span> count_fds<span class="op">());</span></span>
+<span id="cb1-407"><a href="#cb1-407" aria-hidden="true" tabindex="-1"></a><span class="pp">#endif</span></span>
+<span id="cb1-408"><a href="#cb1-408" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span> <span class="cf">catch</span> <span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>exception<span class="op">&amp;</span> e<span class="op">)</span> <span class="op">{</span>          <span class="co">// Task::result / Loop::run kivétele: dokumentált kilépési kód</span></span>
+<span id="cb1-409"><a href="#cb1-409" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;echo: kivétel: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> e<span class="op">.</span>what<span class="op">());</span></span>
+<span id="cb1-410"><a href="#cb1-410" aria-hidden="true" tabindex="-1"></a>    rc <span class="op">=</span> <span class="dv">3</span><span class="op">;</span></span>
+<span id="cb1-411"><a href="#cb1-411" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span> <span class="cf">catch</span> <span class="op">(...)</span> <span class="op">{</span></span>
+<span id="cb1-412"><a href="#cb1-412" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;echo: ismeretlen kivétel</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb1-413"><a href="#cb1-413" aria-hidden="true" tabindex="-1"></a>    rc <span class="op">=</span> <span class="dv">3</span><span class="op">;</span></span>
+<span id="cb1-414"><a href="#cb1-414" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb1-415"><a href="#cb1-415" aria-hidden="true" tabindex="-1"></a>  <span class="cf">return</span> rc<span class="op">;</span>                                   <span class="co">// a FlagRestore destruktora visszaállítja a módot</span></span>
+<span id="cb1-416"><a href="#cb1-416" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-417"><a href="#cb1-417" aria-hidden="true" tabindex="-1"></a><span class="pp">#elif defined(LOOP_STOP_TEST)</span></span>
+<span id="cb1-418"><a href="#cb1-418" aria-hidden="true" tabindex="-1"></a><span class="co">// Leállítás függő olvasással: a függő művelet ECANCELED-et kap, a run()</span></span>
+<span id="cb1-419"><a href="#cb1-419" aria-hidden="true" tabindex="-1"></a><span class="co">// véges időben visszatér, és a stop után új regisztráció elutasított.</span></span>
+<span id="cb1-420"><a href="#cb1-420" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-421"><a href="#cb1-421" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> fds<span class="op">[</span><span class="dv">2</span><span class="op">];</span></span>
+<span id="cb1-422"><a href="#cb1-422" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(::</span>pipe<span class="op">(</span>fds<span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-423"><a href="#cb1-423" aria-hidden="true" tabindex="-1"></a>  unique_fd rd<span class="op">{</span>fds<span class="op">[</span><span class="dv">0</span><span class="op">]},</span> wr<span class="op">{</span>fds<span class="op">[</span><span class="dv">1</span><span class="op">]};</span></span>
+<span id="cb1-424"><a href="#cb1-424" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(!</span>set_nonblock<span class="op">(</span>rd<span class="op">.</span>get<span class="op">()))</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-425"><a href="#cb1-425" aria-hidden="true" tabindex="-1"></a>  Loop loop<span class="op">;</span></span>
+<span id="cb1-426"><a href="#cb1-426" aria-hidden="true" tabindex="-1"></a>  Task pending <span class="op">=</span> echo<span class="op">(</span>loop<span class="op">,</span> rd<span class="op">.</span>get<span class="op">(),</span> STDOUT_FILENO<span class="op">);</span></span>
+<span id="cb1-427"><a href="#cb1-427" aria-hidden="true" tabindex="-1"></a>  pending<span class="op">.</span>resume<span class="op">();</span>                          <span class="co">// olvasásra vár, adat nem jön</span></span>
+<span id="cb1-428"><a href="#cb1-428" aria-hidden="true" tabindex="-1"></a>  loop<span class="op">.</span>stop<span class="op">();</span></span>
+<span id="cb1-429"><a href="#cb1-429" aria-hidden="true" tabindex="-1"></a>  loop<span class="op">.</span>run<span class="op">();</span>                                <span class="co">// lemondja, majd visszatér</span></span>
+<span id="cb1-430"><a href="#cb1-430" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> e1 <span class="op">=</span> pending<span class="op">.</span>done<span class="op">()</span> <span class="op">?</span> pending<span class="op">.</span>result<span class="op">()</span> <span class="op">:</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-431"><a href="#cb1-431" aria-hidden="true" tabindex="-1"></a>  Task late <span class="op">=</span> echo<span class="op">(</span>loop<span class="op">,</span> rd<span class="op">.</span>get<span class="op">(),</span> STDOUT_FILENO<span class="op">);</span></span>
+<span id="cb1-432"><a href="#cb1-432" aria-hidden="true" tabindex="-1"></a>  late<span class="op">.</span>resume<span class="op">();</span>                             <span class="co">// a stop után: azonnal elutasítva</span></span>
+<span id="cb1-433"><a href="#cb1-433" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> e2 <span class="op">=</span> late<span class="op">.</span>done<span class="op">()</span> <span class="op">?</span> late<span class="op">.</span>result<span class="op">()</span> <span class="op">:</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-434"><a href="#cb1-434" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;pending=</span><span class="sc">%s</span><span class="st"> late=</span><span class="sc">%s</span><span class="st"> outstanding=</span><span class="sc">%zu\n</span><span class="st">&quot;</span><span class="op">,</span> <span class="bu">std::</span>strerror<span class="op">(</span>e1<span class="op">),</span></span>
+<span id="cb1-435"><a href="#cb1-435" aria-hidden="true" tabindex="-1"></a>              <span class="bu">std::</span>strerror<span class="op">(</span>e2<span class="op">),</span> loop<span class="op">.</span>outstanding<span class="op">());</span></span>
+<span id="cb1-436"><a href="#cb1-436" aria-hidden="true" tabindex="-1"></a>  <span class="cf">return</span> <span class="op">(</span>e1 <span class="op">==</span> ECANCELED <span class="op">&amp;&amp;</span> e2 <span class="op">==</span> ECANCELED <span class="op">&amp;&amp;</span> loop<span class="op">.</span>outstanding<span class="op">()</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">?</span> <span class="dv">0</span> <span class="op">:</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-437"><a href="#cb1-437" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-438"><a href="#cb1-438" aria-hidden="true" tabindex="-1"></a><span class="pp">#else</span></span>
+<span id="cb1-439"><a href="#cb1-439" aria-hidden="true" tabindex="-1"></a><span class="co">// Két egyszerre kész művelet: az első folytatása megszünteti a másodikat.</span></span>
+<span id="cb1-440"><a href="#cb1-440" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;optional&gt;</span></span>
+<span id="cb1-441"><a href="#cb1-441" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>optional<span class="op">&lt;</span>Task<span class="op">&gt;</span> victim<span class="op">;</span></span>
+<span id="cb1-442"><a href="#cb1-442" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> completions <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-443"><a href="#cb1-443" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-444"><a href="#cb1-444" aria-hidden="true" tabindex="-1"></a>Task reader<span class="op">(</span>Loop<span class="op">&amp;</span> loop<span class="op">,</span> <span class="dt">int</span> fd<span class="op">,</span> <span class="dt">bool</span> kill_victim<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-445"><a href="#cb1-445" aria-hidden="true" tabindex="-1"></a>  <span class="dt">char</span> c<span class="op">;</span></span>
+<span id="cb1-446"><a href="#cb1-446" aria-hidden="true" tabindex="-1"></a>  <span class="dt">ssize_t</span> n <span class="op">=</span> <span class="cf">co_await</span> ReadAwaitable<span class="op">{</span>loop<span class="op">,</span> fd<span class="op">,</span> <span class="op">&amp;</span>c<span class="op">,</span> <span class="dv">1</span><span class="op">};</span></span>
+<span id="cb1-447"><a href="#cb1-447" aria-hidden="true" tabindex="-1"></a>  <span class="op">++</span>completions<span class="op">;</span></span>
+<span id="cb1-448"><a href="#cb1-448" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;reader fd=</span><span class="sc">%d</span><span class="st"> n=</span><span class="sc">%zd\n</span><span class="st">&quot;</span><span class="op">,</span> fd<span class="op">,</span> n<span class="op">);</span></span>
+<span id="cb1-449"><a href="#cb1-449" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(</span>kill_victim<span class="op">)</span> victim<span class="op">.</span>reset<span class="op">();</span></span>
+<span id="cb1-450"><a href="#cb1-450" aria-hidden="true" tabindex="-1"></a>  <span class="cf">co_return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-451"><a href="#cb1-451" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-452"><a href="#cb1-452" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-453"><a href="#cb1-453" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-454"><a href="#cb1-454" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> a<span class="op">[</span><span class="dv">2</span><span class="op">],</span> b<span class="op">[</span><span class="dv">2</span><span class="op">];</span></span>
+<span id="cb1-455"><a href="#cb1-455" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(::</span>pipe<span class="op">(</span>a<span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-456"><a href="#cb1-456" aria-hidden="true" tabindex="-1"></a>  unique_fd ar<span class="op">{</span>a<span class="op">[</span><span class="dv">0</span><span class="op">]},</span> aw<span class="op">{</span>a<span class="op">[</span><span class="dv">1</span><span class="op">]};</span></span>
+<span id="cb1-457"><a href="#cb1-457" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(::</span>pipe<span class="op">(</span>b<span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-458"><a href="#cb1-458" aria-hidden="true" tabindex="-1"></a>  unique_fd br<span class="op">{</span>b<span class="op">[</span><span class="dv">0</span><span class="op">]},</span> bw<span class="op">{</span>b<span class="op">[</span><span class="dv">1</span><span class="op">]};</span></span>
+<span id="cb1-459"><a href="#cb1-459" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(!</span>set_nonblock<span class="op">(</span>ar<span class="op">.</span>get<span class="op">())</span> <span class="op">||</span> <span class="op">!</span>set_nonblock<span class="op">(</span>br<span class="op">.</span>get<span class="op">()))</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-460"><a href="#cb1-460" aria-hidden="true" tabindex="-1"></a>  Loop loop<span class="op">;</span></span>
+<span id="cb1-461"><a href="#cb1-461" aria-hidden="true" tabindex="-1"></a>  Task first <span class="op">=</span> reader<span class="op">(</span>loop<span class="op">,</span> ar<span class="op">.</span>get<span class="op">(),</span> <span class="kw">true</span><span class="op">);</span></span>
+<span id="cb1-462"><a href="#cb1-462" aria-hidden="true" tabindex="-1"></a>  victim<span class="op">.</span>emplace<span class="op">(</span>reader<span class="op">(</span>loop<span class="op">,</span> br<span class="op">.</span>get<span class="op">(),</span> <span class="kw">false</span><span class="op">));</span></span>
+<span id="cb1-463"><a href="#cb1-463" aria-hidden="true" tabindex="-1"></a>  first<span class="op">.</span>resume<span class="op">();</span></span>
+<span id="cb1-464"><a href="#cb1-464" aria-hidden="true" tabindex="-1"></a>  victim<span class="op">-&gt;</span>resume<span class="op">();</span></span>
+<span id="cb1-465"><a href="#cb1-465" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(::</span>write<span class="op">(</span>aw<span class="op">.</span>get<span class="op">(),</span> <span class="st">&quot;x&quot;</span><span class="op">,</span> <span class="dv">1</span><span class="op">)</span> <span class="op">!=</span> <span class="dv">1</span> <span class="op">||</span> <span class="op">::</span>write<span class="op">(</span>bw<span class="op">.</span>get<span class="op">(),</span> <span class="st">&quot;y&quot;</span><span class="op">,</span> <span class="dv">1</span><span class="op">)</span> <span class="op">!=</span> <span class="dv">1</span><span class="op">)</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-466"><a href="#cb1-466" aria-hidden="true" tabindex="-1"></a>  loop<span class="op">.</span>run<span class="op">();</span></span>
+<span id="cb1-467"><a href="#cb1-467" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;completions=</span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> completions<span class="op">);</span></span>
+<span id="cb1-468"><a href="#cb1-468" aria-hidden="true" tabindex="-1"></a>  <span class="cf">return</span> completions <span class="op">==</span> <span class="dv">1</span> <span class="op">?</span> <span class="dv">0</span> <span class="op">:</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-469"><a href="#cb1-469" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-470"><a href="#cb1-470" aria-hidden="true" tabindex="-1"></a><span class="pp">#endif</span></span></code></pre></div>
+<p>A GCC-sor a <code>lab-gcc</code>, a Clang-sor a
+<code>lab-clang</code> profilhoz tartozik:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">g++</span> <span class="at">-std</span><span class="op">=</span>c++20 <span class="at">-Wall</span> <span class="at">-Wextra</span> <span class="at">-Wpedantic</span> <span class="at">-O2</span> <span class="at">-g</span> <span class="at">-o</span> echo_coro echo_coro.cpp</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">clang</span>++ <span class="at">-std</span><span class="op">=</span>c++20 <span class="at">-Wall</span> <span class="at">-Wextra</span> <span class="at">-Wpedantic</span> <span class="at">-O2</span> <span class="at">-g</span> <span class="at">-o</span> echo_coro echo_coro.cpp</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="ex">./echo_coro</span> <span class="kw">|</span> <span class="fu">cat</span>          <span class="co"># normál pipe: a teljes üzenet, 0-s kód</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="ex">./echo_coro</span> <span class="op">&gt;</span> /dev/full    <span class="co"># írási hiba: diagnosztika, nem nulla kód</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="co"># tesztbuildek ASan/UBSan alatt:</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> t <span class="kw">in</span> LOOP_CANCEL_TEST LOOP_STOP_TEST INJECT_TRANSIENT FD_LEAK_TEST<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>  <span class="ex">g++</span> <span class="at">-std</span><span class="op">=</span>c++20 <span class="at">-O1</span> <span class="at">-g</span> <span class="at">-fsanitize</span><span class="op">=</span>address,undefined <span class="at">-D</span><span class="va">$t</span> echo_coro.cpp <span class="at">-o</span> t_<span class="va">$t</span> <span class="kw">&amp;&amp;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="ex">./t_</span><span class="va">$t</span> <span class="op">&gt;</span> /dev/null<span class="kw">;</span> <span class="bu">echo</span> <span class="st">&quot;</span><span class="va">$t</span><span class="st">: </span><span class="va">$?</span><span class="st">&quot;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span></code></pre></div>
+<p>Két szerződést érdemes kiemelni. Az első a <strong>diszpécser
+pillanatképe</strong>. A <code>run()</code> egy kötegben több kész
+eseményt is feldolgozhat. Egy korábbi elem <code>resume()</code>-ja
+közben megszüntethet egy olyan coroutine-t, amelynek a művelete szintén
+kész: a frame-mel együtt az awaitable és benne az <code>Op</code> is
+megszűnik. Ha a pillanatkép nyers <code>Op*</code> pointereket tárolna,
+a következő elem feldolgozása már felszabadított memóriát érne el. Ezért
+a pillanatkép az <code>Op</code> azonosítóját tárolja, és minden elem
+előtt a <code>lookup</code> ellenőrzi, hogy a művelet még regisztrálva
+van-e. A megszűnt awaitable destruktora <code>remove</code>-olja az
+<code>Op</code>-ot, így annak sem completionje, sem resume-ja nem
+fut.</p>
+<figure id="fig-s180-loop-snapshot">
+<div class="fig-interactive"><iframe src="figures/html/s180-loop-snapshot.html" title="Időrendi ábra: két kész pipe-olvasás; az első folytatása megszünteti a másodikat, a lookup üres eredményt ad, így a második completion kimarad." loading="lazy" style="width:100%;border:0;height:700px"></iframe><noscript><img src="assets/d68b8d552e6b7072.png" style="width:100.0%"
+alt="Időrendi ábra: két kész pipe-olvasás; az első folytatása megszünteti a másodikat, a lookup üres eredményt ad, így a második completion kimarad." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="assets/d68b8d552e6b7072.png" style="width:100.0%"
+alt="Időrendi ábra: két kész pipe-olvasás; az első folytatása megszünteti a másodikat, a lookup üres eredményt ad, így a második completion kimarad." /></details></div>
+<figcaption>A run() pillanatképe azonosítókat tárol: a
+LOOP_CANCEL_TEST-ben az első művelet folytatása megszünteti a másodikat,
+a lookup(2) üres, így a megszűnt művelet nem kap completiont; nyers Op*
+pillanatképpel ugyanez use-after-free lenne</figcaption>
+</figure>
+<p>A második az <strong>eredménycsatorna</strong>. Az <code>echo</code>
+különválasztja az EOF-ot (siker), az átmeneti hibát (<code>EINTR</code>,
+<code>EAGAIN</code>: újrapróbálás) és a végleges hibát (az
+<code>errno</code> értéke). A <code>Task</code> promise-a eltárolja a
+visszatérési értéket, illetve a coroutine-ból kiszökő kivételt
+<code>std::exception_ptr</code>-ként. A <code>main</code> ebből képez
+kilépési kódot és diagnosztikát.</p>
+<p><strong>Buildjegyzőkönyv</strong> (<code>lab-gcc</code> profil). A
+program mind az öt változatban figyelmeztetés nélkül fordult. Normál
+pipe-on a kimenet <code>hello from coroutine</code>, a kód 0;
+<code>/dev/full</code>-ra <code>echo: No space left on device</code>, a
+kód 1. A lemondási próba <code>reader fd=3 n=1</code>,
+<code>completions=1</code>, 0-s kód. A leállítási próba
+(<code>LOOP_STOP_TEST</code>)
+<code>pending=Operation canceled late=Operation canceled outstanding=0</code>
+kimenettel, 0 kóddal, 5 másodperces időkorláton belül futott: a függő
+olvasás <code>ECANCELED</code>-et kapott, a <code>run()</code>
+visszatért, és a <code>stop()</code> utáni regisztrációt az adapter
+azonnal elutasította. Az <code>INJECT_TRANSIENT</code> build az első két
+<code>read</code> és az első két <code>write</code> hívásra
+<code>EAGAIN</code>, majd <code>EINTR</code> hibát injektál; a kimenet
+ekkor is a teljes <code>hello from coroutine</code>, 0-s kóddal — a
+művelet nem veszett el, és nem lett hamis siker. Az
+<code>FD_LEAK_TEST</code> 101-szer futtatja az echót: az élő fd-k száma
+előtte és utána is 3 (a javítás előtti, <code>pipe</code> olvasóvégét
+nyitva hagyó változatnál 3-ról 103-ra nőtt). Az ASan/UBSan egyik
+próbában sem jelzett. A Clang-sort Clang 22-vel (ziglang) próbáltuk:
+figyelmeztetés nélkül fordult, 0-s kóddal futott.</p>
+<p>A példában a <code>Task</code> <code>initial_suspend</code>-je
+<code>suspend_always</code>, ezért a <code>task.resume()</code> indítja
+el a coroutine-t. A <code>final_suspend</code> szintén felfüggeszt, így
+a <code>Task</code> destruktora tudja destroy-olni a frame-et. A
+<code>ReadAwaitable</code> és a <code>WriteAwaitable</code> temporális
+objektum a <code>co_await</code> kifejezésben jön létre, és a
+felfüggesztés alatt is él. Az <code>Op</code> az awaitable tagja, tehát
+a frame-ben van; a <code>Loop</code> csak pointert tárol. Ha a coroutine
+felfüggesztett állapotban megsemmisül, az awaitable destruktora
+<code>remove</code>-olja az <code>Op</code>-ot, így a <code>Loop</code>
+nem tart dangling pointert. A completion után az <code>Op</code> már
+nincs a <code>Loop</code> vektorában, ezért a destruktor
+<code>remove</code>-ja nem talál semmit.</p>
+<p>A callbackes változat ugyanezt a folyamatot explicit állapotgéppel
+írja le. Az <code>Echo</code> struct tartalmazza a buffert, az offsetet
+és a fájlleírókat; az <code>on_read</code> és <code>on_write</code>
+függvények lépkednek. A coroutine ugyanezt a lineáris kódban tartja, az
+állapot a frame-ben van. A callbacknél a cancellation a struct
+élettartamához kötött, a coroutine-nál a frame és az awaitable
+élettartamához. A callbackes változatban a buffer lehet a struct tagja,
+a coroutine-ban a frame lokális változója; mindkettő addig él, amíg a
+művelet hivatkozik rá.</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Callbackes vázlat, nem teljes program.</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Echo <span class="op">{</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>  Loop<span class="op">&amp;</span> loop<span class="op">;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> in_fd<span class="op">;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> out_fd<span class="op">;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">char</span> buf<span class="op">[</span><span class="dv">4096</span><span class="op">];</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>size_t off <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>  <span class="dt">ssize_t</span> n <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>  <span class="dt">void</span> start_read<span class="op">();</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>  <span class="dt">void</span> on_read<span class="op">();</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>  <span class="dt">void</span> on_write<span class="op">();</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A <code>start_read</code> regisztrál egy olvasási operationt,
+amelynek completionje <code>on_read</code>; az <code>on_read</code>
+elindítja a <code>start_write</code>-ot, a <code>on_write</code> pedig
+vagy befejez, vagy újabb olvasást indít. Az állapotátmeneteket a
+<code>n</code> és az <code>off</code> hordozza. A coroutine-ban ugyanez
+a <code>for</code> és <code>while</code> ciklus, az állapot a frame-ben.
+A coroutine kódja rövidebb és lineárisabb, de a frame allokálhat, és a
+debuggerben a frame-et kell érteni. A callbackes változat stacken is
+elférhet, de a hívási lánc és az állapot kézi követése nehezebb.</p>
+<h3 data-number="35.5.3"
+id="shutdown-cancellation-és-diagnosztika"><span
+class="header-section-number">35.5.3</span> Shutdown, cancellation és
+diagnosztika</h3>
+<p>Az outstanding operation számlálója a
+<code>Loop::outstanding()</code>. A <code>stop()</code> a <strong>kész
+eseménykötegen belül</strong> is érvényes: a <code>poll</code> által már
+visszaadott, de még nem feldolgozott események teljesítése megszakad
+(<code>break</code>), és a következő iteráció
+<code>cancel_all()</code>-ja <code>ECANCELED</code>-del zárja le a függő
+műveleteket — egy már teljesített művelet eredménye megmarad, a stop
+után még nem teljesített műveleté lemondódik. A leállítási policy a
+példában <strong>cancel</strong>: a <code>stop()</code> a nyitott
+állapotból leálló állapotba lép; a <code>run()</code> ekkor nem pollol
+tovább, hanem a <code>cancel_all()</code>-lal minden függő műveletet
+<code>ECANCELED</code>-del zár le, majd — ha nincs több függő művelet —
+leállt állapotban visszatér. A leállás így véges, akkor is, ha egy
+olvasásra soha nem érkezne adat. A leálló vagy leállt <code>Loop</code>
+az <code>add</code>-ot elutasítja (<code>false</code>); az awaitable
+ilyenkor nem függeszt fel, hanem azonnal <code>ECANCELED</code>-del
+folytat. (Egy <em>drain</em> policy ehelyett megvárná a függő műveletek
+befejeződését, de akkor a véges leállást egy időkorlátnak kell
+biztosítania.) A <code>Task</code> felfüggesztett állapotban is
+biztonságosan megszüntethető, mert az awaitable destruktora kiveszi az
+<code>Op</code>-ot a <code>Loop</code>-ból. Ennek feltétele, hogy a
+<code>Loop</code> minden rá hivatkozó <code>Task</code>-nál tovább éljen
+(a példában a <code>Loop</code> a <code>Task</code> előtt van
+deklarálva); a <code>Loop</code> korábbi megszűnése után a destruktor
+<code>remove</code>-ja felszabadított memóriát érne el. Ezt a laborban
+úgy ellenőrizhetjük, hogy a <code>run()</code> végén az
+<code>outstanding()</code> nulla, és a <code>Task</code>-ok a
+<code>Loop</code> előtt semmisülnek meg.</p>
+<p>A timeout, a cancel és a completion kizáró szabálya a következő. Az
+operation pontosan egy terminális eseményt kaphat. A completion a
+<code>poll</code> által jelzett esemény után, a timeout a lejárat után,
+a cancel a <code>stop()</code> vagy egy külső kérés után következik be.
+A versenyt az eseményloop szálán, az <code>Op</code> eltávolításával
+kell eldönteni: amelyik ág előbb <code>remove</code>-ol, az nyer. A
+másik ág a <code>remove</code> után nem hivatkozhat az
+<code>Op</code>-ra, és nem hívhatja meg a completiont. Ezért a
+completion és a cancel is csak a <code>remove</code> után, a resume
+előtt futhat. Ha a timeout és a <code>poll</code> esemény ugyanabban az
+iterációban érkezik, a <code>remove</code> dönti el a sorrendet; a másik
+ág már nem találja az <code>Op</code>-ot.</p>
+<p>A <code>cancel_all()</code> minden <code>Op</code>-ra beállítja a
+lemondás hibakódját, <code>remove</code>-ol, majd resume-ol. Az
+awaitable <code>await_resume()</code>-a ilyenkor <code>-1</code>-et ad
+<code>ECANCELED</code> <code>errno</code>-val. A coroutine ilyenkor
+hibát lát, és <code>co_return</code>-nal lezárhat. A timeout hasonló, de
+csak a lejárt operationre vonatkozik; a <code>poll</code> timeoutja
+önmagában nem elég, mert a lejáratot operation szinten kell
+nyilvántartani.</p>
+<p>A debuggerben a coroutine frame a <code>Task::h</code> handle-ből
+érhető el. A <code>h.done()</code> a befejezést, a
+<code>h.address()</code> a frame címét mutatja. A <code>co_await</code>
+ponton a frame a stacken vagy a heapen van; a debugger a
+<code>promise</code> és a lokális változók alapján azonosítja. Az
+AddressSanitizer a frame-allokációt és a buffer túlcsordulását, a
+ThreadSanitizer a több szálú loopot ellenőrzi. A <code>ssize_t</code> →
+<code>size_t</code> konverzió nem UB: negatív értékre is definiált
+(modulo) eredményt ad, ezért az UBSan <code>-fsanitize=undefined</code>
+nem jelez rá. A védelem a kódban van: az <code>echo</code> a konverzió
+előtt kezeli a negatív eredményt, így a
+<code>static_cast&lt;std::size_t&gt;(n)</code> már csak pozitív értéket
+kap. Ha az implicit előjelváltó konverziókat külön is figyelni akarjuk,
+az fordítófüggő kiegészítés: a Clang
+<code>-fsanitize=implicit-integer-sign-change</code> kapcsolója (GCC-ben
+nincs megfelelője). A laborban érdemes külön futtatni
+<code>-fsanitize=address,undefined</code> és
+<code>-fsanitize=thread</code> kapcsolókkal, dokumentált compiler- és
+library-verzió mellett.</p>
+<p>Gyakori hibák: a buffer a <code>co_await</code> után megszűnik, de az
+adapter még használja; a <code>Loop</code> a resume után hivatkozik az
+<code>Op</code>-ra; a <code>poll</code> kötegének pillanatképe nyers
+<code>Op*</code>-t tárol, és egy korábbi resume által megszüntetett
+műveletet is feldolgoz; a completion kétszer hívódik, mert a timeout és
+a <code>poll</code> ág is lefut; a cancel után a coroutine még
+resume-ol; a <code>Loop</code> hamarabb szűnik meg, mint a rá hivatkozó
+<code>Task</code>/awaitable. A javítás mindegyiknél ugyanaz a szerződés
+betartása: az <code>Op</code> az awaitable élettartamához kötött, a
+<code>Loop</code> csak pointert tárol, a terminális eseményt a
+<code>remove</code> dönti el, és a resume után az <code>Op</code> nem
+használható.</p>
+<h3 data-number="35.5.4" id="feladatok"><span
+class="header-section-number">35.5.4</span> Feladatok</h3>
+<h4 data-number="35.5.4.1" id="feladat-timeout-az-awaitable-ben"><span
+class="header-section-number">35.5.4.1</span> 1. feladat: timeout az
+awaitable-ben</h4>
+<p>Egészítsd ki a <code>ReadAwaitable</code>-t timeouttal. A
+<code>Loop</code> kapjon egy <code>now()</code> függvényt és egy
+timeout-listát, amely a lejáratokat tartja nyilván. A timeout cancelálja
+az operationt, ha még nincs completion. Írd le, hogyan biztosítod, hogy
+a timeout és a completion közül csak az egyik fusson le.</p>
+<h4 data-number="35.5.4.2" id="feladat-egyedi-lemondás"><span
+class="header-section-number">35.5.4.2</span> 2. feladat: egyedi
+lemondás</h4>
+<p>A példa <code>cancel_all()</code>-ja a leállításkor minden függő
+műveletet lemond. Valósíts meg egy
+<code>Loop::cancel(std::uint64_t id)</code> függvényt, amely
+<em>egyetlen</em> függő műveletet zár le <code>ECANCELED</code>-del, a
+többit érintetlenül hagyja. Ellenőrizd, hogy a lemondott coroutine
+<code>await_resume()</code>-ban kapja meg a hibát, hogy a
+<code>Task</code> destruktora nem hagy dangling <code>Op</code>-ot, és
+hogy a <code>run()</code> végén az outstanding számláló nulla.</p>
+<h4 data-number="35.5.4.3"
+id="feladat-callback-és-coroutine-összehasonlítása"><span
+class="header-section-number">35.5.4.3</span> 3. feladat: callback és
+coroutine összehasonlítása</h4>
+<p>Írd meg ugyanazt az echo-folyamatot callbackes formában, majd
+hasonlítsd össze a coroutine verzióval. Készíts táblázatot a
+kódméretről, az állapot láthatóságáról, a cancellation szerződéséről, a
+hibakezelésről és az allokációról. Mérést csak dokumentált
+laborprofillal és legalább három ismétléssel végezz; a mérés nélküli
+állítást ne tekintsd bizonyítottnak.</p>
+<h3 data-number="35.5.5" id="megoldások"><span
+class="header-section-number">35.5.5</span> Megoldások</h3>
+<h4 data-number="35.5.5.1" id="feladat-megoldása"><span
+class="header-section-number">35.5.5.1</span> 1. feladat megoldása</h4>
+<p>Az <code>Op</code> megkapja a <code>deadline</code> és
+<code>has_deadline</code> mezőt; a <code>ReadAwaitable</code> használója
+a <code>co_await</code> előtt állítja be
+(<code>aw.op.deadline = now + 50ms; aw.op.has_deadline = true;</code>).
+A <code>Loop::run()</code> a <code>poll</code> időkorlátját a
+legközelebbi lejáratig csökkenti (legfeljebb 10 ms), a <code>poll</code>
+visszatérése után pedig <strong>először</strong> az
+<code>expire(now)</code> fut: a lejárt műveleteket az azonosítójuk
+alapján <code>cancel(id, ETIMEDOUT)</code>-tal zárja le
+(<code>remove</code>, hibakód, resume). Ezután jönnek a
+<code>poll</code> eseményei: ha az <code>Op</code> már nincs a
+vektorban, a <code>lookup(id)</code> nullát ad, így a completion nem fut
+le. A kizáró szabályt a <code>remove</code> és az <code>ops_</code>
+konzisztens használata biztosítja (az nyer, aki előbb
+<code>remove</code>-ol); a két ág ugyanazon a szálon fut, ezért nincs
+adatverseny. A fenti kód a fejezet példájába be van építve; teszt
+(<code>ReadAwaitable</code> 50 ms lejárattal, adat nélküli pipe): a
+coroutine <code>ETIMEDOUT</code>-ot kap, az <code>outstanding()</code>
+nulla (GCC 13.3, ASan+UBSan, lefuttatva). Ellenőrzési feltétel: egy
+<code>Op</code>-ra sem fut le kétszer a completion, és a timeout után a
+coroutine <code>ETIMEDOUT</code>-ot kap.</p>
+<h4 data-number="35.5.5.2" id="feladat-megoldása-1"><span
+class="header-section-number">35.5.5.2</span> 2. feladat megoldása</h4>
+<p>A <code>Loop::cancel(id, error = ECANCELED)</code> a
+<code>lookup(id)</code>-vel megkeresi a műveletet; ha már nincs
+regisztrálva (közben befejeződött vagy megszűnt), <code>false</code>-t
+ad — ez a kizáró szabály: az nyer, aki előbb <code>remove</code>-ol. Ha
+megvan, <code>remove</code>, <code>cancel_error = error</code>, majd
+resume; az awaitable <code>await_resume()</code>-ja <code>-1</code>-et
+ad, az <code>errno</code> <code>ECANCELED</code>, a coroutine
+<code>co_return</code>-nel lezár. A <code>cancel_all()</code> ugyanezt
+teszi az összes műveletre. Lefuttatott teszt (két függő olvasás): az
+első <code>cancel(1)</code> igaz, a második <code>cancel(1)</code>
+hamis, az első coroutine <code>ECANCELED</code>-et kap, a második függő
+marad (<code>outstanding() == 1</code>), majd <code>stop()</code> +
+<code>run()</code> után az is <code>ECANCELED</code>-del zár és az
+<code>outstanding()</code> nulla. Ellenőrzési feltétel: a lemondott
+művelet completionje nem fut le, a többi művelet eredménye változatlan,
+a <code>Task</code> destruktora nem hagy dangling
+<code>Op</code>-ot.</p>
+<h4 data-number="35.5.5.3" id="feladat-megoldása-2"><span
+class="header-section-number">35.5.5.3</span> 3. feladat megoldása</h4>
+<p>A callbackes változatban az <code>Echo</code> struct tartalmazza a
+buffert és az állapotot; a <code>start_read</code> és
+<code>start_write</code> függvények regisztrálják az operationöket, a
+completionök pedig a struct metódusai. A coroutine változatban ugyanez a
+folyamat a <code>for</code> és <code>while</code> ciklusban van, az
+állapot a frame-ben. A táblázatban a callbackes változat kisebb frame-et
+használhat, de az állapotátmeneteket kézzel kell követni; a coroutine
+kódja lineárisabb, de a frame allokálhat. A cancellation a callbacknél a
+struct élettartamához, a coroutine-nál a frame és az awaitable
+élettartamához kötött. A mérésnél rögzíteni kell a compiler, a library,
+a target és az optimalizálási szint pontos verzióját; a mérés nélküli
+összehasonlítás csak szerződés szintű.</p>
+<h3 data-number="35.5.6" id="összefoglaló"><span
+class="header-section-number">35.5.6</span> Összefoglaló</h3>
+<p>A coroutine csak felfüggesztés; az aszinkron I/O adapter adja a
+completiont, a schedulert és a cancellationt. A laborban a
+<code>poll</code> eseményei és a coroutine frame találkoznak. A
+szerződés négy pontja: a buffer tulajdonosa a hívó, az awaitable
+élettartama fedi a felfüggesztést, a terminális esemény pontosan egyszer
+fut le, és a shutdown alatt az outstanding számláló nullázódik. A
+debugger a frame-et, a sanitizer a buffer és az <code>Op</code>
+élettartamát ellenőrzi. A callback, az állapotgép és a coroutine
+ugyanazt a folyamatot írja le, de eltérő élettartam- és
+költségszerződéssel.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="s179.html">← 35.4 Generator és streaming feldolgozás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="s181.html">36.1 Névtorzítás, layout és C++ runtime ABI →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

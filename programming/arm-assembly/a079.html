@@ -1,0 +1,1282 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>20.2 Megvalósítás: driver és ISR integrálása a minimal
+runtime-ba – ARM assembly programozás C-fejlesztőknek:
+AArch64-alkalmazásszinttől Cortex-M bare-metalig</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. RÉSZ – Cortex-M: bare-metal mikrokontroller-programozás</a> › <a href="index.html#ach19">20 Záróprojekt II: interrupt-vezérelt Cortex-M firmware-modul</a></p>
+<div class="links"><a class="prev" rel="prev" href="a078.html">← 20.1 Projektspecifikáció: periféria, megszakítás-logika és mérési terv</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="a080.html">20.3 Mérés, validáció és a QEMU-alapú teszt reprodukálhatósága →</a></div>
+</nav>
+<h2 data-number="20.2" id="a079"><span
+class="header-section-number">20.2</span> Megvalósítás: driver és ISR
+integrálása a minimal runtime-ba</h2>
+<h3 data-number="20.2.1"
+id="motiváció-a-specifikációtól-a-működő-firmware-ig"><span
+class="header-section-number">20.2.1</span> Motiváció: a specifikációtól
+a működő firmware-ig</h3>
+<p>A <a href="a078.html">Projektspecifikáció: periféria,
+megszakítás-logika és mérési terv</a> alfejezetben elkészült a
+<code>lab-m19</code> szerződése: egyetlen, QEMU-n teljesíthető
+alapfeladat (Timer0 időbázis, UART0 echo és parancsok; a
+GPIO-eseménybemenet külön hardveres szerződés), a K1–K6, F2, F3
+követelmények, az interfész-szerződés, az ISR-mátrix, az
+erőforrás-budget és a mérési terv. A specifikáció azonban önmagában nem
+fut. Ebben az alfejezetben a papíron rögzített szerződést alakítjuk át
+olyan firmware-modullá, amely a <a href="a066.html">Startup kód: .data
+másolása, .bss törlése</a> alfejezetben épített minimál runtime-ra
+támaszkodik, és a <a href="a067.html">Firmware build és QEMU-betöltés
+munkafolyamat</a> lépéssorával reprodukálható módon elindul a
+<code>qemu-system-arm -machine mps2-an385</code> emulátorban.</p>
+<p>A mérnöki nehézséget nem az egyes driverek megírása jelenti — a <a
+href="a074.html">Periféria-regiszter absztrakció C struktúrával</a>, az
+<a href="a076.html">Egyszerű UART driver</a> és a <a
+href="a077.html">Timer-alapú időzítés és periodikus feladatok</a> már
+megadta a mintákat. A valódi feladat kettős: (1) a driverek és a
+hozzájuk tartozó ISR-ek <em>illesztése</em> a vektortáblába, a startup
+kódba és az NVIC-konfigurációba, valamint (2) azon a ponton kezelni a fő
+program és az ISR közötti megosztott állapotot, ahol a naiv
+implementáció csendben adatot veszít. Ez utóbbi a tipikus „majdnem jó”
+firmware hibamódja: a kód lefordul, elindul, látszólag működik, majd
+nagy terhelésnél vagy ritka ütemezésnél elveszít egy ticket vagy egy
+bemeneti bájtot. Az alábbiakban ezért az integráció mellett kiemelt
+hangsúlyt kap a versenyhelyzet (race condition) felismerése és a
+kritikus szakasz (critical section) fegyelmezett használata.</p>
+<h3 data-number="20.2.2"
+id="definíció-mit-integrálunk-és-mi-a-szerződés"><span
+class="header-section-number">20.2.2</span> Definíció: mit integrálunk
+és mi a szerződés</h3>
+<p><strong>driver-ISR integráció (driver-ISR integration):</strong> az a
+műveletsor, amelynek során egy periféria inicializáló és I/O-függvényei,
+a hozzá tartozó megszakításkezelő rutin, a vektortábla megfelelő
+bejegyzése, az NVIC engedélyezési és prioritásbeállítása, valamint a
+megosztott állapotot védő kritikus szakasz egyetlen, konzisztens
+egységbe kerül.</p>
+<p>Az integrációnak négy, egymástól függetlenül ellenőrizhető
+szerződéselem felel meg:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Elem</th>
+<th>Hol él</th>
+<th>Mit garantál</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Vektorbejegyzés</td>
+<td>vektortábla (<code>.vectors</code>)</td>
+<td>a kivétel belépési pontja a helyes ISR-re mutat</td>
+</tr>
+<tr>
+<td>NVIC-engedélyezés</td>
+<td><code>NVIC_ISER0</code>, <code>NVIC_IPR</code></td>
+<td>a forrás képes megszakítást kérni, adott prioritással</td>
+</tr>
+<tr>
+<td>ISR-törzs</td>
+<td>C függvény</td>
+<td>a forrás-flag törlése, az adat kiolvasása, a megosztott állapot
+frissítése</td>
+</tr>
+<tr>
+<td>Kritikus szakasz</td>
+<td>fő program és ISR</td>
+<td>a megosztott állapot nem sérül a nem atomi hozzáférés miatt</td>
+</tr>
+</tbody>
+</table>
+<p>Az integráció akkor tekinthető késznek, ha a fenti négy elem
+konzisztens: a vektorban szereplő szimbólum pontosan az a függvény,
+amelyet az NVIC engedélyez, és amely a megosztott állapotot ugyanazzal a
+védelmi szerződéssel használja, mint a fő program. Ha bármelyik elem
+elcsúszik — például a vektor egy <code>Default_Handler</code>-re mutat,
+miközben az NVIC engedélyezve van —, a hiba tünete „néma”: a megszakítás
+vagy nem fut le, vagy végtelen ciklusba esik.</p>
+<h3 data-number="20.2.3" id="a-vektortábla-kiegészítése"><span
+class="header-section-number">20.2.3</span> A vektortábla
+kiegészítése</h3>
+<p>Az M-profile kivételmodellt a <a href="a068.html">A Cortex-M
+kivételmodell: prioritás és vektortábla-bejegyzések</a> tárgyalta. A
+vektortábla első szava nem utasítás, hanem az inicializáló veremmutató
+(<code>_estack</code>) értéke; a második szó a reset vektor. Ezután 14
+további rendszerkivétel következik (NMI, HardFault, MemManage, BusFault,
+UsageFault, SVC, DebugMon, PendSV, SysTick és a fenntartott helyek),
+majd 16-tól kezdődnek a külső megszakítások (IRQ0, IRQ1, …). A
+<code>lab-m19</code> esetében tehát a vektortáblát a 16. indextől kell
+kiegészíteni a Timer0 és UART0 bejegyzésekkel.</p>
+<p>Az ARM MPS2+ AN385 board IRQ-számai board-specifikusak; a pontos
+értékeket a QEMU <code>hw/arm/mps2.c</code> forrása és az MPS2 technikai
+referenciája adja meg. Az ellenőrzött kiosztás szerint az UART0 RX
+<code>IRQ0</code>, a Timer0 <code>IRQ8</code> — ezt a
+<code>lab-m19-drivers.h</code>
+<code>UART0_IRQn</code>/<code>TIMER0_IRQn</code> szimbolikus konstansai
+rögzítik, a QEMU 8.2.2-n futó <code>make test</code> ezt igazolja majd
+(a fő úti futás a hallgató feladata, itt nem futtattuk); más
+QEMU-verzión vagy hardveren a rendszertesztet újra kell futtatni. A
+vektortáblában a bejegyzés helye <code>16 + IRQn</code>; a két IRQ-szám
+közötti <strong>nem</strong> szomszédos pozíciókat (itt IRQ1–IRQ7)
+explicit kitöltő (<code>Default_Handler</code>) bejegyzésekkel kell
+kitölteni, különben a második kezelő rossz IRQ helyére kerülne.</p>
+<p>Fontos részlet, hogy a vektortábla a flash (az AN385 esetében a
+linker scriptben FLASH régiónak nevezett betöltött SSRAM) legalján van,
+és a linker garbage collection (GC) hajlamos eldobni, ha nem hivatkozik
+rá szimbólum. Ezért a linker scriptben <code>KEEP(*(.vectors))</code>
+szerepel, és a tábla <code>.global</code> szimbólummal exportált.</p>
+<h3 data-number="20.2.4" id="az-isr-ek-m-profile-szerződése"><span
+class="header-section-number">20.2.4</span> Az ISR-ek M-profile
+szerződése</h3>
+<p>Az A-profile-tól eltérően az M-profile megszakításkezelő rutinjai
+<strong>sima C függvények</strong>. A kivétel belépésekor a hardver
+automatikusan elmenti a hívó által használt regisztereket (R0–R3, R12,
+LR, PC, xPSR) az aktuális veremre, és az LR-be egy EXC_RETURN-értéket
+tölt. A visszatérést az váltja ki, hogy ez az érték Handler módban a
+PC-be kerül. A fordító szokásos epilógusa (<code>BX LR</code>, vagy hívó
+kezelőnél <code>POP {..., PC}</code>) ezt külön teendő nélkül elvégzi.
+Ezért a kezelő szignatúrája <code>void f(void)</code>, kézi
+<code>BX LR</code>-zárás nem kell. A GCC
+<code>__attribute__((interrupt))</code> Armv7-M-en érvényes, de nem
+szükséges: ott csak azt jelzi, hogy a függvény 4 bájtra igazított SP-vel
+is meghívódhat (<a href="a068.html">17.1</a>). A
+<code>CCR.STKALIGN = 1</code> alapállapot mellett a sima függvény is
+helyes. Az A-profile-os <code>__irq</code> kulcsszó ide nem
+tartozik.</p>
+<p>Két következmény érdemel figyelmet. Egyrészt az ISR-nek nincs
+visszatérési értéke és nincs paramétere. Másrészt az ISR-ben nem szabad
+hosszú, blokkoló műveletet végezni: a megszakítás-latencia — amelyet a
+<a href="a071.html">Megszakítás-latencia mérése és korlátai</a>
+definiált — a teljes ISR futási idejével nő, és a fő program
+előremenetelét késlelteti. Az ISR tipikus feladata három lépés: a
+forrás-flag azonosítása és törlése, az adat kiolvasása/írása, valamint a
+megosztott állapot minimális frissítése.</p>
+<h3 data-number="20.2.5"
+id="megosztott-állapot-az-spsc-ring-buffer"><span
+class="header-section-number">20.2.5</span> Megosztott állapot: az SPSC
+ring buffer</h3>
+<p>A <a href="a078.html">specifikáció</a> K2 és F2/F3 követelménye
+szerint a fő program a beérkező UART-bájtokat dolgozza fel. Mivel a
+bájtokat az UART0 ISR veszi át, a fő program és az ISR között megosztott
+puffer kell. A legegyszerűbb helyes szerkezet az
+egytermelős–egyfogyasztós (single-producer single-consumer, SPSC) ring
+buffer: az ISR csak a <code>head</code> indexet írja, a fő program csak
+a <code>tail</code> indexet. A puffer akkor üres, ha
+<code>head == tail</code>; eggyel kevesebb slot használható, mint a tömb
+mérete, így a tele/üres állapot megkülönböztethető külön számláló
+nélkül. A <code>RING_CAP</code> 2-hatvány voltát a fejléc
+<code>_Static_assert</code>-tel kényszeríti ki: nem 2-hatványú
+kapacitásnál a <code>%</code> osztásra (<code>UDIV</code>) fordulna, ami
+sokkal drágább, és a 20.4 determinizmus-auditja önmagában nem
+jelezné.</p>
+<p>Az SPSC minta kulcsfelismerése, hogy az indexek külön változók, és
+mindegyiket pontosan egy kontextus írja. Ekkor a <code>volatile</code>
+minősítő elegendő a láthatósághoz, és nincs szükség kritikus szakaszra a
+push/pop műveletekhez. Ennek feltétele, hogy az index típusa (itt
+<code>uint16_t</code>) egyetlen, atomi módon olvasható és írható gépi
+szón belül legyen, és hogy a termelő <strong>előbb</strong> írja az
+adatot, és csak utána a <code>head</code>-et. A puffer kódja
+hardverfüggetlen külön modul
+(<code>lab-m19-ring.h</code>/<code>.c</code>, a szerződést lásd az <a
+href="a078.html">20.1</a> alfejezetben), ezért a hoston
+egységtesztelhető (<a href="a080.html">20.3</a>).</p>
+<h3 data-number="20.2.6"
+id="a-race-condition-és-a-kritikus-szakasz"><span
+class="header-section-number">20.2.6</span> A race condition és a
+kritikus szakasz</h3>
+<p><strong>Munkakönyvtár:</strong> <code>~/arm-labor/cm/zaro2/</code> —
+az alfejezet minden laborfájlja ide kerül, és minden parancs innen
+futtatandó (a könyvtárrendet a <a
+href="a006.html">Labor-alapkörnyezet</a> alfejezet írja le). Ez a II.
+záróprojekt közös könyvtára: mind a négy alfejezete (<a
+href="a078.html">20.1</a>–<a href="a081.html">20.4</a>) itt dolgozik, és
+egymás fájljaira épít.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> ~/arm-labor/cm/zaro2</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/arm-labor/cm/zaro2</span></code></pre></div>
+<p>Tekintsük a timer oldalt. Az első, naiv tervben az ISR egy
+<code>tick_flag</code> jelzőt állít, a fő ciklus figyeli és törli:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* HIBÁS példa – szemléltetésre: egybites jelző, a fő program olvassa és törli */</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>tick_flag<span class="op">)</span> <span class="op">{</span>          <span class="co">/* (A) olvasás */</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    tick_flag <span class="op">=</span> <span class="dv">0</span><span class="op">;</span>        <span class="co">/* (B) törlés  */</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    process_tick<span class="op">();</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Egyetlen magon az ISR nem fut „párhuzamosan” a fő programmal: vagy a
+fő program egy utasítása fut, vagy az ISR egésze. Az ISR-t viszont a fő
+program <strong>bármely két utasítása közé</strong> beékelheti a
+hardver. A hiba ezért a fő program megszakítható (A) olvasása és (B)
+törlése közé beszúrt ISR-ből adódik. Végrehajtható idődiagram (minden
+sor egy lépés, felülről lefelé):</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+</colgroup>
+<thead>
+<tr>
+<th>Lépés</th>
+<th>Fő program</th>
+<th>ISR</th>
+<th><code>tick_flag</code></th>
+<th>Eltelt tick</th>
+<th>Feldolgozott tick</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>–</td>
+<td>1. tick: <code>tick_flag = 1</code></td>
+<td>1</td>
+<td>1</td>
+<td>0</td>
+</tr>
+<tr>
+<td>1</td>
+<td>(A) <code>ldr</code> → 1</td>
+<td>–</td>
+<td>1</td>
+<td>1</td>
+<td>0</td>
+</tr>
+<tr>
+<td>2</td>
+<td>–</td>
+<td>2. tick: belépés az (A) és (B) közé, <code>tick_flag = 1</code></td>
+<td>1</td>
+<td>2</td>
+<td>0</td>
+</tr>
+<tr>
+<td>3</td>
+<td>(B) <code>str</code> ← 0</td>
+<td>–</td>
+<td>0</td>
+<td>2</td>
+<td>0</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>process_tick()</code></td>
+<td>–</td>
+<td>0</td>
+<td>2</td>
+<td>1</td>
+</tr>
+<tr>
+<td>5</td>
+<td>(A) <code>ldr</code> → 0: nincs teendő</td>
+<td>–</td>
+<td>0</td>
+<td>2</td>
+<td>1</td>
+</tr>
+</tbody>
+</table>
+<p>A 2. lépés eseményét a fő program a 3. lépésben úgy törli, hogy sosem
+látta: ez a valódi read-modify-write verseny. Ha utána nem jön újabb
+tick, a fő program erről az eseményről soha nem tud. (A fordított irány,
+hogy a fő program az ISR <code>tick_count++</code>-ának betöltése és
+visszaírása közé ékelődne, egyetlen magon lehetetlen: a fő program az
+ISR alatt nem fut.)</p>
+<p>A javított jelzőkezelés az olvasást és a törlést
+<strong>egyetlen</strong> kritikus szakaszba teszi, a jelző tesztjével
+együtt, így egyetlen koherens pillanatkép keletkezik:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="dt">uint32_t</span> pm <span class="op">=</span> crit_enter<span class="op">();</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="dt">uint32_t</span> flag  <span class="op">=</span> tick_flag<span class="op">;</span>      <span class="co">/* teszt ... */</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="dt">uint32_t</span> ticks <span class="op">=</span> tick_count<span class="op">;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>tick_flag <span class="op">=</span> <span class="dv">0</span><span class="op">;</span>                   <span class="co">/* ... és törlés ugyanabban a szakaszban */</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>crit_exit<span class="op">(</span>pm<span class="op">);</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>flag<span class="op">)</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    process_tick<span class="op">(</span>ticks<span class="op">);</span></span></code></pre></div>
+<p>Ez koherens pillanatképet vesz, és a verseny ellen véd, de
+<strong>nem</strong> garantál egy feldolgozást minden tickre, mert
+<strong>nem</strong> számlál: ha a fő program lassú, és közben két tick
+történik, a jelző egyszer lesz 1, és a két tick egyetlen feldolgozásba
+olvad. Ez nem hiba, hanem a jelző természete; egy „valami történt”
+jelzéshez éppen ez kell. Négy dolgot érdemes tehát szétválasztani:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Fogalom</th>
+<th>Mit mutat</th>
+<th>Eszköz</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>eseményszámláló</td>
+<td>hány esemény történt összesen</td>
+<td><code>tick_count</code>, csak az ISR írja</td>
+</tr>
+<tr>
+<td>eseményjelző</td>
+<td>történt-e valami a legutóbbi ellenőrzés óta (összevonással)</td>
+<td><code>tick_flag</code></td>
+</tr>
+<tr>
+<td>fogyasztói lemaradás</td>
+<td>hány eseményt nem dolgozott még fel a fő program</td>
+<td><code>tick_count − seen</code></td>
+</tr>
+<tr>
+<td>RMW-race</td>
+<td>egy esemény nyoma elveszik a nem védett olvasás–írás miatt</td>
+<td>a fenti idődiagram</td>
+</tr>
+</tbody>
+</table>
+<p>A <code>lab-m19</code> K6 követelménye szerint
+<strong>minden</strong> ticket fel kell dolgozni, ezért a megvalósítás
+nem jelzőt, hanem számlálót használ: a fő program a saját
+<code>seen</code> változóját lépteti a <code>tick_count</code>-ig, és
+minden különbségre egy ticket dolgoz fel. A <code>tick_count</code>-ot
+csak az ISR írja; a K4 <code>R</code> parancs nem nullázza, hanem a fő
+program saját <code>tick_base</code> nullpontját állítja. Így a
+megosztott számlálón nincs második író, tehát nincs RMW-verseny sem. A
+<code>seen != now</code> összehasonlítás és a <code>seen++</code> előjel
+nélküli, modulo
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mn>2</mn><mn>32</mn></msup><annotation encoding="application/x-tex">2^{32}</annotation></semantics></math>
+aritmetikában dolgozik, ezért a <code>tick_count</code> körbefordulása
+(100 Hz mellett kb. 497 nap után) nem hiba. A feldolgozás addig helyes,
+amíg a fogyasztói lemaradás kisebb
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mn>2</mn><mn>32</mn></msup><annotation encoding="application/x-tex">2^{32}</annotation></semantics></math>
+ticknél, és ez a körbefordulási feltétel része a szerződésnek. A
+kritikus szakasz (<code>PRIMASK</code>) csak a maszkolható megszakítások
+ellen véd: egy NMI- vagy HardFault-kezelő ezalatt is futhat, ezért ezek
+nem férhetnek hozzá a megosztott állapothoz.</p>
+<p>A <strong>volatile önmagában nem oldja meg ezt.</strong> A
+<code>volatile</code> azt garantálja, hogy a fordító minden
+hozzáféréskor újraolvassa és kiírja a változót, és nem cache-eli
+regiszterben; nem garantál atomitást és nem zárja ki a kontextusváltást
+az RMW közben. A helyes megoldás a megszakítások letiltása a kritikus
+szakaszban. Az M-profile-on ezt a <code>PRIMASK</code> speciális
+regiszter szabályozza; a <code>cpsid i</code> utasítás letiltja a
+maszkolható megszakításokat, a <code>cpsie i</code> engedélyezi. A
+helyes minta a korábbi állapot mentése és visszaállítása, hogy a
+beágyazott kritikus szakaszok működjenek:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* lab-m19-crit.h – kritikus szakasz M-profile-on, a PRIMASK megőrzésével */</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#ifndef LAB_M19_CRIT_H</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define LAB_M19_CRIT_H</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdint.h&gt;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="kw">inline</span> <span class="dt">uint32_t</span> crit_enter<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> pm<span class="op">;</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    __asm <span class="dt">volatile</span> <span class="op">(</span><span class="st">&quot;mrs %0, primask&quot;</span> <span class="op">:</span> <span class="st">&quot;=r&quot;</span><span class="op">(</span>pm<span class="op">));</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    __asm <span class="dt">volatile</span> <span class="op">(</span><span class="st">&quot;cpsid i&quot;</span> <span class="op">:::</span> <span class="st">&quot;memory&quot;</span><span class="op">);</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> pm<span class="op">;</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="kw">inline</span> <span class="dt">void</span> crit_exit<span class="op">(</span><span class="dt">uint32_t</span> pm<span class="op">)</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    __asm <span class="dt">volatile</span> <span class="op">(</span><span class="st">&quot;msr primask, %0</span><span class="sc">\n\t</span><span class="st">isb&quot;</span> <span class="op">::</span> <span class="st">&quot;r&quot;</span><span class="op">(</span>pm<span class="op">)</span> <span class="op">:</span> <span class="st">&quot;memory&quot;</span><span class="op">);</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a><span class="pp">#endif</span></span></code></pre></div>
+<p>A <code>"memory"</code> clobber megakadályozza, hogy a fordító
+memóriahozzáféréseket mozgasson a kritikus szakaszba vagy ki belőle. A
+mentett <code>PRIMASK</code> visszaállítása azért fontos, mert a
+<code>cpsie i</code> feltétel nélküli engedélyezése egy külső kritikus
+szakasz belsejében hibásan korábban nyitná vissza a megszakításokat. Az
+<code>msr primask</code> után az <code>ISB</code> biztosítja, hogy a
+módosítás a következő utasításoktól érvényes legyen; ezért szerepel a
+<code>crit_exit</code>-ben.</p>
+<p>A kritikus szakasz mindössze néhány utasítás: a megszakítás-letiltás
+ideje rövid, így a megszakítás-latencia növekedése elhanyagolható. A fő
+szabály: <strong>a kritikus szakaszban nem hívunk függvényt, nem írunk
+soros portra, nem várunk.</strong> Ha a védendő művelet hosszú, a mintát
+újra kell tervezni (például dupla pufferrel vagy atomi cserével).</p>
+<h3 data-number="20.2.7" id="build-integráció"><span
+class="header-section-number">20.2.7</span> Build-integráció</h3>
+<p>A <code>lab-m19</code> build a korábbi fejezetek elemeit egyetlen
+projektbe fogja össze. Az alábbi táblázat a forrásokat és a hozzájuk
+tartozó korábbi alfejezetet rendeli:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Fájl / elem</th>
+<th>Szerep</th>
+<th>Előzmény</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>lab-m19.ld</code></td>
+<td>szekciók, <code>_estack</code>, <code>_sidata</code>,
+<code>.data</code>/<code>.bss</code></td>
+<td><a href="a065.html">Linker script alapjai</a></td>
+</tr>
+<tr>
+<td><code>lab-m19-startup.S</code></td>
+<td>reset vektor, <code>.data</code> másolás, <code>.bss</code> törlés,
+vektortábla</td>
+<td><a href="a066.html">Startup kód</a></td>
+</tr>
+<tr>
+<td><code>lab-m19-drivers.h</code>/<code>.c</code></td>
+<td>UART0, Timer0 regiszterstruktúra, init-függvények, pollozó TX (a
+<code>.c</code>-t a Makefile önállóan fordítja, ezért a megosztott
+deklarációk a <code>.h</code>-ban élnek)</td>
+<td><a href="a074.html">Periféria-regiszter absztrakció</a>, <a
+href="a076.html">UART driver</a></td>
+</tr>
+<tr>
+<td><code>lab-m19-ring.h</code>/<code>.c</code></td>
+<td>hardverfüggetlen SPSC ring buffer (F2, F3)</td>
+<td><a href="a078.html">20.1</a> szerződése</td>
+</tr>
+<tr>
+<td><code>lab-m19-crit.h</code></td>
+<td>kritikus szakasz a <code>PRIMASK</code> megőrzésével</td>
+<td><a href="a071.html">Megszakítás-latencia</a></td>
+</tr>
+<tr>
+<td><code>lab-m19-isr.h</code>/<code>.c</code></td>
+<td><code>TIMER0_Handler</code>, <code>UART0_Handler</code>, a
+megosztott (nem <code>static</code>) ISR-állapot, DWT-mintavétel
+(K5)</td>
+<td><a href="a070.html">ISR írása</a></td>
+</tr>
+<tr>
+<td><code>lab-m19-main.c</code></td>
+<td>fő ciklus, parancsértelmezés (K1–K6), versenymentes alvás</td>
+<td><a href="a075.html">Polling versus interrupt-vezérelt I/O</a></td>
+</tr>
+<tr>
+<td><code>lab-m19-ring-test.c</code>,
+<code>lab-m19-systest.py</code></td>
+<td>egységteszt (hoston) és rendszerteszt (soros bemenettel)</td>
+<td><a href="a080.html">20.3</a></td>
+</tr>
+<tr>
+<td><code>Makefile</code></td>
+<td>cross-build <code>-lgcc</code>-vel, <code>run</code>,
+<code>ringtest</code>, <code>systest</code>, <code>test</code></td>
+<td><a href="a067.html">Firmware build</a></td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="20.2.8" id="kidolgozott-példa-a-lab-m19-firmware"><span
+class="header-section-number">20.2.8</span> Kidolgozott példa: a lab-m19
+firmware</h3>
+<h4 data-number="20.2.8.1" id="linker-script-és-memóriaelrendezés"><span
+class="header-section-number">20.2.8.1</span> Linker script és
+memóriaelrendezés</h4>
+<p>Az AN385 memóriatérképét a <a href="a063.html">Memóriatérkép és a
+bare-metal futási modell</a> vezette be. A projekt <strong>nem ír saját
+linker scriptet</strong>: a <code>lab-m19.ld</code> a II. rész kanonikus
+<code>lab-mps2.ld</code>-jének (<a href="a065.html">Linker script
+alapjai</a>) változatlan másolata. Így ugyanaz a szerződés érvényes,
+mint a korábbi laborokban: <code>.vectors</code> a
+<code>0x00000000</code>-n, 4 MiB <code>FLASH</code> (betöltött SSRAM) és
+a 4 MiB-os kanonikus RAM (a <code>0x20400000</code>-tól látszó tükör
+nélkül), szóhatárra igazított <code>.data</code>/<code>.bss</code>
+határok, és <code>ASSERT</code> a verem és az adatok ütközésére.</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> ~/arm-labor/cm/a065/lab-mps2.ld lab-m19.ld</span></code></pre></div>
+<h4 data-number="20.2.8.2" id="startup-és-vektortábla"><span
+class="header-section-number">20.2.8.2</span> Startup és
+vektortábla</h4>
+<p>A startup kód a <a href="a066.html">Startup kód</a> kanonikus
+<code>lab-startup.s</code>-e, egyetlen bővítéssel: a vektortábla a 16
+rendszerbejegyzés után a projekt két külső megszakítását is tartalmazza.
+A <code>Reset_Handler</code> (elöltesztelő, előjel nélküli
+<code>bhs</code> ciklusok), a <code>Default_Handler</code> és a gyenge
+aliasok változatlanok:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode asm"><code class="sourceCode fasm"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a>/* lab<span class="op">-</span>m19<span class="op">-</span>startup<span class="op">.</span>S — a kanonikus lab<span class="op">-</span>startup<span class="op">.</span>s<span class="op">,</span> kiegészítve a lab<span class="op">-</span>m19</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a> * külső megszakításaival <span class="op">(</span>IRQ0 <span class="op">=</span> UART0 RX<span class="op">,</span> IRQ8 <span class="op">=</span> Timer0<span class="op">).</span> A Reset_Handler<span class="op">,</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a> * a Default_Handler és a gyenge aliasok változatlanok<span class="op">.</span> <span class="op">*/</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    .syntax unified</span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    .cpu cortex<span class="op">-</span>m3</span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    .thumb</span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>    .<span class="bu">section</span> <span class="op">.</span>vectors<span class="op">,</span> <span class="st">&quot;a&quot;</span><span class="op">,</span> <span class="op">%</span>progbits</span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>    .<span class="bu">align</span> <span class="dv">2</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    .global __vectors</span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="fu">__vectors:</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>    .<span class="dt">word</span> _estack                 <span class="op">/*</span> <span class="bn">0x00</span><span class="op">:</span> kezdeti <span class="kw">SP</span> <span class="op">(</span>MSP<span class="op">)</span>      <span class="op">*/</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>    .<span class="dt">word</span> Reset_Handler           <span class="op">/*</span> <span class="bn">0x04</span><span class="op">:</span> Reset <span class="op">(</span>bit0 <span class="op">=</span> <span class="dv">1</span><span class="op">)</span>      <span class="op">*/</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>    .<span class="dt">word</span> NMI_Handler             <span class="op">/*</span> <span class="bn">0x08</span><span class="op">:</span> NMI                   <span class="op">*/</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>    .<span class="dt">word</span> HardFault_Handler       <span class="op">/*</span> <span class="bn">0x0C</span><span class="op">:</span> HardFault             <span class="op">*/</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>    .<span class="dt">word</span> MemManage_Handler       <span class="op">/*</span> <span class="bn">0x10</span><span class="op">:</span> MemManage             <span class="op">*/</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>    .<span class="dt">word</span> BusFault_Handler        <span class="op">/*</span> <span class="bn">0x14</span><span class="op">:</span> BusFault              <span class="op">*/</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>    .<span class="dt">word</span> UsageFault_Handler      <span class="op">/*</span> <span class="bn">0x18</span><span class="op">:</span> UsageFault            <span class="op">*/</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>    .<span class="dt">word</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span>              <span class="op">/*</span> <span class="bn">0x1C</span><span class="op">-</span><span class="bn">0x28</span><span class="op">:</span> fenntartott      <span class="op">*/</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>    .<span class="dt">word</span> SVC_Handler             <span class="op">/*</span> <span class="bn">0x2C</span><span class="op">:</span> SVCall                <span class="op">*/</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>    .<span class="dt">word</span> DebugMon_Handler        <span class="op">/*</span> <span class="bn">0x30</span><span class="op">:</span> DebugMonitor          <span class="op">*/</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>    .<span class="dt">word</span> <span class="dv">0</span>                       <span class="op">/*</span> <span class="bn">0x34</span><span class="op">:</span> fenntartott           <span class="op">*/</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>    .<span class="dt">word</span> PendSV_Handler          <span class="op">/*</span> <span class="bn">0x38</span><span class="op">:</span> PendSV                <span class="op">*/</span></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a>    .<span class="dt">word</span> SysTick_Handler         <span class="op">/*</span> <span class="bn">0x3C</span><span class="op">:</span> SysTick               <span class="op">*/</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a>    /* 16-tól<span class="op">:</span> külső IRQ<span class="op">-</span>k<span class="op">.</span> Az ellenőrzött AN385<span class="op">-</span>kiosztásban UART0 RX <span class="op">=</span> IRQ0<span class="op">,</span></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a>       Timer0 <span class="op">=</span> IRQ8<span class="co">; a kettő között 7 helyet (IRQ1-IRQ7) explicit kitöltő</span></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a>       (Default_Handler<span class="op">)</span> bejegyzésekkel KELL kitölteni<span class="op">,</span> különben a második</span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a>       bejegyzés tévesen IRQ1 helyére kerülne<span class="op">,</span> nem IRQ8<span class="op">-</span>ra<span class="op">.</span> <span class="op">*/</span></span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a>    .<span class="dt">word</span> UART0_Handler           <span class="op">/*</span> <span class="bn">0x40</span><span class="op">:</span> IRQ0 <span class="op">(</span>UART0 RX<span class="op">)</span>       <span class="op">*/</span></span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a>    .<span class="pp">rept</span> <span class="dv">7</span>                       <span class="op">/*</span> <span class="bn">0x44</span><span class="op">-</span><span class="bn">0x5C</span><span class="op">:</span> IRQ1<span class="op">-</span>IRQ7        <span class="op">*/</span></span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a>    .<span class="dt">word</span> Default_Handler</span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a>    .endr</span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a>    .<span class="dt">word</span> TIMER0_Handler          <span class="op">/*</span> <span class="bn">0x60</span><span class="op">:</span> IRQ8 <span class="op">(</span>Timer0<span class="op">)</span>         <span class="op">*/</span></span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a>    .text</span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a>    .thumb_func</span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a>    .global Reset_Handler</span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a>    .type   Reset_Handler<span class="op">,</span> <span class="op">%</span>function</span>
+<span id="cb6-39"><a href="#cb6-39" aria-hidden="true" tabindex="-1"></a><span class="fu">Reset_Handler:</span></span>
+<span id="cb6-40"><a href="#cb6-40" aria-hidden="true" tabindex="-1"></a>    /* 1. .<span class="bu">data</span> másolása FLASH <span class="op">(</span>LMA<span class="op">)</span> <span class="op">-&gt;</span> RAM <span class="op">(</span>VMA<span class="op">),</span> szavanként<span class="op">.</span></span>
+<span id="cb6-41"><a href="#cb6-41" aria-hidden="true" tabindex="-1"></a>       Elöltesztelő ciklus<span class="op">,</span> előjel nélküli összehasonlítással<span class="op">:</span> üres</span>
+<span id="cb6-42"><a href="#cb6-42" aria-hidden="true" tabindex="-1"></a>       szekciónál egyszer sem fut<span class="op">,</span> és a végcímen pontosan megáll<span class="op">.</span> <span class="op">*/</span></span>
+<span id="cb6-43"><a href="#cb6-43" aria-hidden="true" tabindex="-1"></a>    ldr   r0<span class="op">,</span> <span class="op">=</span>_sidata</span>
+<span id="cb6-44"><a href="#cb6-44" aria-hidden="true" tabindex="-1"></a>    ldr   r1<span class="op">,</span> <span class="op">=</span>_sdata</span>
+<span id="cb6-45"><a href="#cb6-45" aria-hidden="true" tabindex="-1"></a>    ldr   r2<span class="op">,</span> <span class="op">=</span>_edata</span>
+<span id="cb6-46"><a href="#cb6-46" aria-hidden="true" tabindex="-1"></a>1:  <span class="bu">cmp</span>   r1<span class="op">,</span> r2</span>
+<span id="cb6-47"><a href="#cb6-47" aria-hidden="true" tabindex="-1"></a>    bhs   <span class="fl">2</span><span class="bn">f</span></span>
+<span id="cb6-48"><a href="#cb6-48" aria-hidden="true" tabindex="-1"></a>    ldr   r3<span class="op">,</span> <span class="op">[</span>r0<span class="op">],</span> <span class="op">#</span><span class="dv">4</span></span>
+<span id="cb6-49"><a href="#cb6-49" aria-hidden="true" tabindex="-1"></a>    <span class="bu">str</span>   r3<span class="op">,</span> <span class="op">[</span>r1<span class="op">],</span> <span class="op">#</span><span class="dv">4</span></span>
+<span id="cb6-50"><a href="#cb6-50" aria-hidden="true" tabindex="-1"></a>    b     <span class="bn">1b</span></span>
+<span id="cb6-51"><a href="#cb6-51" aria-hidden="true" tabindex="-1"></a>    /* 2. .bss nullázása<span class="op">,</span> szavanként<span class="op">.</span> <span class="op">*/</span></span>
+<span id="cb6-52"><a href="#cb6-52" aria-hidden="true" tabindex="-1"></a>2:  ldr   r1<span class="op">,</span> <span class="op">=</span>_sbss</span>
+<span id="cb6-53"><a href="#cb6-53" aria-hidden="true" tabindex="-1"></a>    ldr   r2<span class="op">,</span> <span class="op">=</span>_ebss</span>
+<span id="cb6-54"><a href="#cb6-54" aria-hidden="true" tabindex="-1"></a>    <span class="bu">movs</span>  r3<span class="op">,</span> <span class="op">#</span><span class="dv">0</span></span>
+<span id="cb6-55"><a href="#cb6-55" aria-hidden="true" tabindex="-1"></a>3:  <span class="bu">cmp</span>   r1<span class="op">,</span> r2</span>
+<span id="cb6-56"><a href="#cb6-56" aria-hidden="true" tabindex="-1"></a>    bhs   <span class="fl">4</span><span class="bn">f</span></span>
+<span id="cb6-57"><a href="#cb6-57" aria-hidden="true" tabindex="-1"></a>    <span class="bu">str</span>   r3<span class="op">,</span> <span class="op">[</span>r1<span class="op">],</span> <span class="op">#</span><span class="dv">4</span></span>
+<span id="cb6-58"><a href="#cb6-58" aria-hidden="true" tabindex="-1"></a>    b     <span class="dv">3</span><span class="er">b</span></span>
+<span id="cb6-59"><a href="#cb6-59" aria-hidden="true" tabindex="-1"></a>    /* 3. main<span class="op">()</span><span class="co">; ha visszatérne, végtelen ciklus. */</span></span>
+<span id="cb6-60"><a href="#cb6-60" aria-hidden="true" tabindex="-1"></a>4:  bl    main</span>
+<span id="cb6-61"><a href="#cb6-61" aria-hidden="true" tabindex="-1"></a>5:  b     <span class="dv">5</span><span class="er">b</span></span>
+<span id="cb6-62"><a href="#cb6-62" aria-hidden="true" tabindex="-1"></a>    .size Reset_Handler<span class="op">,</span> <span class="op">.</span> <span class="op">-</span> Reset_Handler</span>
+<span id="cb6-63"><a href="#cb6-63" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-64"><a href="#cb6-64" aria-hidden="true" tabindex="-1"></a>    .thumb_func</span>
+<span id="cb6-65"><a href="#cb6-65" aria-hidden="true" tabindex="-1"></a>    .global Default_Handler</span>
+<span id="cb6-66"><a href="#cb6-66" aria-hidden="true" tabindex="-1"></a>    .type   Default_Handler<span class="op">,</span> <span class="op">%</span>function</span>
+<span id="cb6-67"><a href="#cb6-67" aria-hidden="true" tabindex="-1"></a><span class="fu">Default_Handler:</span></span>
+<span id="cb6-68"><a href="#cb6-68" aria-hidden="true" tabindex="-1"></a>    b     <span class="op">.</span></span>
+<span id="cb6-69"><a href="#cb6-69" aria-hidden="true" tabindex="-1"></a>    .size Default_Handler<span class="op">,</span> <span class="op">.</span> <span class="op">-</span> Default_Handler</span>
+<span id="cb6-70"><a href="#cb6-70" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-71"><a href="#cb6-71" aria-hidden="true" tabindex="-1"></a>    /* Gyenge aliasok<span class="op">:</span> amit a firmware nem definiál<span class="op">,</span> az a Default_Handlerre fut<span class="op">.</span> <span class="op">*/</span></span>
+<span id="cb6-72"><a href="#cb6-72" aria-hidden="true" tabindex="-1"></a>    .<span class="pp">macro</span> lab_default_handler name</span>
+<span id="cb6-73"><a href="#cb6-73" aria-hidden="true" tabindex="-1"></a>    .weak       <span class="op">\</span>name</span>
+<span id="cb6-74"><a href="#cb6-74" aria-hidden="true" tabindex="-1"></a>    .thumb_set  <span class="op">\</span>name<span class="op">,</span> Default_Handler</span>
+<span id="cb6-75"><a href="#cb6-75" aria-hidden="true" tabindex="-1"></a>    .endm</span>
+<span id="cb6-76"><a href="#cb6-76" aria-hidden="true" tabindex="-1"></a>    lab_default_handler NMI_Handler</span>
+<span id="cb6-77"><a href="#cb6-77" aria-hidden="true" tabindex="-1"></a>    lab_default_handler HardFault_Handler</span>
+<span id="cb6-78"><a href="#cb6-78" aria-hidden="true" tabindex="-1"></a>    lab_default_handler MemManage_Handler</span>
+<span id="cb6-79"><a href="#cb6-79" aria-hidden="true" tabindex="-1"></a>    lab_default_handler BusFault_Handler</span>
+<span id="cb6-80"><a href="#cb6-80" aria-hidden="true" tabindex="-1"></a>    lab_default_handler UsageFault_Handler</span>
+<span id="cb6-81"><a href="#cb6-81" aria-hidden="true" tabindex="-1"></a>    lab_default_handler SVC_Handler</span>
+<span id="cb6-82"><a href="#cb6-82" aria-hidden="true" tabindex="-1"></a>    lab_default_handler DebugMon_Handler</span>
+<span id="cb6-83"><a href="#cb6-83" aria-hidden="true" tabindex="-1"></a>    lab_default_handler PendSV_Handler</span>
+<span id="cb6-84"><a href="#cb6-84" aria-hidden="true" tabindex="-1"></a>    lab_default_handler SysTick_Handler</span></code></pre></div>
+<p>A <code>TIMER0_Handler</code> és <code>UART0_Handler</code>
+szimbólumok C függvények, amelyeket a linker old fel; mivel nem
+<code>.weak</code>-ként szerepelnek, ha valamelyik hiányzik, a linker
+<strong>hibát jelez</strong> (“undefined reference to …”), és a linkelés
+megszakad — a GNU <code>ld</code> alapértelmezett viselkedése a fel nem
+oldott, nem gyenge szimbólumokra a hibajelzés, <em>nem</em> a
+vektorbejegyzés csendes 0-ra állítása. A rendszer-kivételek
+(<code>NMI_Handler</code>, <code>HardFault_Handler</code>,
+<code>SVC_Handler</code>, <code>PendSV_Handler</code>,
+<code>SysTick_Handler</code>) ezzel szemben a fent látott
+<code>.weak</code>/<code>.thumb_set Default_Handler</code> mintát
+követik (lásd <a href="a066.html">16.6</a>): ha a firmware nem
+definiálja felül őket, a linker a <code>Default_Handler</code>-re köti,
+amely egy végtelen ciklus — ez debuggerben azonnal jelzi, hogy egy
+kezelt kivétel lefutott, de a tényleges logika hiányzik. Ezért érdemes a
+vektortáblát <code>KEEP</code>-pel védeni, hogy a linker a
+<code>--gc-sections</code> során ne dobja el a futásidőben szükséges, de
+a kódból közvetlenül nem hivatkozott bejegyzéseket.</p>
+<h4 data-number="20.2.8.3" id="driverek"><span
+class="header-section-number">20.2.8.3</span> Driverek</h4>
+<p>A periféria-regisztereket a <a href="a074.html">Periféria-regiszter
+absztrakció C struktúrával</a> mintájára struktúrába szervezzük. Az
+alábbi címek és bitmezők az MPS2 AN385 CMSDK perifériáinak értékei; a fő
+úton a <code>make test</code> futása igazolja majd őket (a futtatás a
+hallgató feladata; más QEMU-verzióra és fizikai kártyára újrafuttatás
+kell).</p>
+<p>A struktúrákat és a függvényprototípusokat egy
+<strong>fejlécbe</strong> tesszük, nem a <code>.c</code> fájlba: a
+<code>lab-m19</code> build minden <code>.c</code> fájlt önállóan fordít
+(lásd a Makefile-t), és ha egy <code>.c</code> fájlt egy másik
+<code>#include</code>-dal is beemelne, a megosztott szimbólumok (pl.
+<code>uart0_init</code>) kétszer definiálódnának, és a linker „multiple
+definition” hibával állna el.</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* lab-m19-drivers.h */</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#ifndef LAB_M19_DRIVERS_H</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define LAB_M19_DRIVERS_H</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdint.h&gt;</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">volatile</span> <span class="dt">uint32_t</span> DATA<span class="op">;</span>       <span class="co">/* 0x000 */</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">volatile</span> <span class="dt">uint32_t</span> STATE<span class="op">;</span>      <span class="co">/* 0x004 bit0 TXFULL, bit1 RXFULL */</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">volatile</span> <span class="dt">uint32_t</span> CTRL<span class="op">;</span>       <span class="co">/* 0x008 bit0 TXEN, bit1 RXEN, bit3 RXINTEN */</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">volatile</span> <span class="dt">uint32_t</span> INTSTATUS<span class="op">;</span>  <span class="co">/* 0x00C olvasás: bit0 TXINT, bit1 RXINT; írás: W1C */</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">volatile</span> <span class="dt">uint32_t</span> BAUDDIV<span class="op">;</span>    <span class="co">/* 0x010 legalább 16 */</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> cmsdk_uart_t<span class="op">;</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">volatile</span> <span class="dt">uint32_t</span> CTRL<span class="op">;</span>       <span class="co">/* 0x000 bit0 ENABLE, bit3 IRQEN */</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>    <span class="dt">volatile</span> <span class="dt">uint32_t</span> VALUE<span class="op">;</span>      <span class="co">/* 0x004 */</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>    <span class="dt">volatile</span> <span class="dt">uint32_t</span> RELOAD<span class="op">;</span>     <span class="co">/* 0x008 írása a VALUE-t is beállítja */</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>    <span class="dt">volatile</span> <span class="dt">uint32_t</span> INTSTATUS<span class="op">;</span>  <span class="co">/* 0x00C olvasás: pending; írás: W1C (INTCLEAR) */</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> cmsdk_timer_t<span class="op">;</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a><span class="pp">#define UART0  </span><span class="op">((</span><span class="pp">cmsdk_uart_t </span><span class="op">*)</span><span class="bn">0x40004000</span><span class="bu">u</span><span class="op">)</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a><span class="pp">#define TIMER0 </span><span class="op">((</span><span class="pp">cmsdk_timer_t </span><span class="op">*)</span><span class="bn">0x40000000</span><span class="bu">u</span><span class="op">)</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a><span class="pp">#define UART0_IRQn   </span><span class="dv">0</span><span class="bu">u</span><span class="pp">           </span><span class="co">/* AN385: UART0 RX */</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a><span class="pp">#define TIMER0_IRQn  </span><span class="dv">8</span><span class="bu">u</span><span class="pp">           </span><span class="co">/* AN385: Timer0   */</span></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a><span class="pp">#define LAB_SYSCLK_HZ  </span><span class="dv">25000000</span><span class="bu">u</span><span class="pp">  </span><span class="co">/* QEMU AN385; laborparaméter */</span></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a><span class="pp">#define LAB_TICK_HZ    </span><span class="dv">100</span><span class="bu">u</span><span class="pp">       </span><span class="co">/* 10 ms tick */</span></span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> uart0_init<span class="op">(</span><span class="dt">uint32_t</span> bauddiv<span class="op">);</span></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> timer0_init<span class="op">(</span><span class="dt">uint32_t</span> reload<span class="op">);</span></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> uart_puts<span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>s<span class="op">);</span>    <span class="co">/* blokkoló, pollozó TX (az alapfeladat szerződése) */</span></span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> uart_putc<span class="op">(</span><span class="dt">char</span> c<span class="op">);</span></span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> uart_put_u32<span class="op">(</span><span class="dt">uint32_t</span> v<span class="op">);</span></span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a><span class="pp">#endif</span></span></code></pre></div>
+<div class="sourceCode" id="cb8"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* lab-m19-drivers.c */</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;lab-m19-drivers.h&quot;</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> uart0_init<span class="op">(</span><span class="dt">uint32_t</span> bauddiv<span class="op">)</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    UART0<span class="op">-&gt;</span>BAUDDIV <span class="op">=</span> bauddiv<span class="op">;</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    UART0<span class="op">-&gt;</span>CTRL    <span class="op">=</span> <span class="op">(</span><span class="dv">1</span><span class="bu">u</span> <span class="op">&lt;&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">|</span> <span class="op">(</span><span class="dv">1</span><span class="bu">u</span> <span class="op">&lt;&lt;</span> <span class="dv">1</span><span class="op">)</span> <span class="op">|</span> <span class="op">(</span><span class="dv">1</span><span class="bu">u</span> <span class="op">&lt;&lt;</span> <span class="dv">3</span><span class="op">);</span>   <span class="co">/* TXEN, RXEN, RXINTEN */</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> timer0_init<span class="op">(</span><span class="dt">uint32_t</span> reload<span class="op">)</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>    TIMER0<span class="op">-&gt;</span>CTRL      <span class="op">=</span> <span class="dv">0</span><span class="op">;</span>          <span class="co">/* előbb leállít */</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>    TIMER0<span class="op">-&gt;</span>INTSTATUS <span class="op">=</span> <span class="dv">1</span><span class="bu">u</span><span class="op">;</span>         <span class="co">/* függő kérés törlése (W1C) */</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>    TIMER0<span class="op">-&gt;</span>RELOAD    <span class="op">=</span> reload<span class="op">;</span>     <span class="co">/* a VALUE-t is beállítja: az első periódus is pontos */</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>    TIMER0<span class="op">-&gt;</span>CTRL      <span class="op">=</span> <span class="op">(</span><span class="dv">1</span><span class="bu">u</span> <span class="op">&lt;&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">|</span> <span class="op">(</span><span class="dv">1</span><span class="bu">u</span> <span class="op">&lt;&lt;</span> <span class="dv">3</span><span class="op">);</span>            <span class="co">/* ENABLE, IRQEN */</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> uart_putc<span class="op">(</span><span class="dt">char</span> c<span class="op">)</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>UART0<span class="op">-&gt;</span>STATE <span class="op">&amp;</span> <span class="op">(</span><span class="dv">1</span><span class="bu">u</span> <span class="op">&lt;&lt;</span> <span class="dv">0</span><span class="op">))</span> <span class="op">{</span> <span class="op">}</span>    <span class="co">/* amíg TXFULL = 1, várunk */</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>    UART0<span class="op">-&gt;</span>DATA <span class="op">=</span> <span class="op">(</span><span class="dt">uint8_t</span><span class="op">)</span>c<span class="op">;</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> uart_puts<span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>s<span class="op">)</span></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(*</span>s<span class="op">)</span> uart_putc<span class="op">(*</span>s<span class="op">++);</span></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> uart_put_u32<span class="op">(</span><span class="dt">uint32_t</span> v<span class="op">)</span></span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span> d<span class="op">[</span><span class="dv">10</span><span class="op">];</span></span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> n <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a>    <span class="cf">do</span> <span class="op">{</span> d<span class="op">[</span>n<span class="op">++]</span> <span class="op">=</span> <span class="op">(</span><span class="dt">char</span><span class="op">)(</span><span class="ch">&#39;0&#39;</span> <span class="op">+</span> v <span class="op">%</span> <span class="dv">10</span><span class="bu">u</span><span class="op">);</span> v <span class="op">/=</span> <span class="dv">10</span><span class="bu">u</span><span class="op">;</span> <span class="op">}</span> <span class="cf">while</span> <span class="op">(</span>v<span class="op">);</span></span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>n<span class="op">)</span> uart_putc<span class="op">(</span>d<span class="op">[--</span>n<span class="op">]);</span></span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A CMSDK UART <code>DATA</code> regiszter olvasása a
+<code>STATE.RXFULL</code> bitet üríti, de <strong>nem</strong> törli
+önmagában az <code>INTSTATUS.RXINT</code> megszakításjelzőt — azt külön,
+write-1-to-clear móddal kell törölni (lásd <a href="a076.html">Egyszerű
+UART driver</a>). A CMSDK timernek nincs önálló <code>INTCLR</code>
+regisztere: ugyanaz az <code>INTSTATUS</code> regiszter szolgál a
+pending állapot olvasására és az 1-et író, write-1-to-clear törlésre. A
+pontos bitmezők (TX/RX enable, interrupt enable) ellenőrzést
+igényelnek.</p>
+<h4 data-number="20.2.8.4" id="isr-ek"><span
+class="header-section-number">20.2.8.4</span> ISR-ek</h4>
+<p>Az ISR-ek sima C függvények. Az UART RX bájtot az SPSC ring bufferbe
+tesszük, a timer számlál. A megosztott állapotot (<code>rx_ring</code>,
+<code>tick_count</code>) a fő programnak is látnia kell, ezért ezek
+<strong>nem</strong> lehetnek <code>static</code>: a tényleges definíció
+itt, a deklarációjuk (<code>extern</code>) egy közös fejlécben van,
+amelyet a <code>lab-m19-main.c</code> is <code>#include</code>-ol. A
+DWT-mintavétel (K5) csak elmenti a törzsidőt; a statisztikát és a
+kiírást a fő program végzi, az ISR-en kívül.</p>
+<div class="sourceCode" id="cb9"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* lab-m19-isr.h */</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#ifndef LAB_M19_ISR_H</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define LAB_M19_ISR_H</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdint.h&gt;</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;lab-m19-ring.h&quot;</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="kw">extern</span> ring_t rx_ring<span class="op">;</span>                     <span class="co">/* termelő: UART0_Handler */</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="kw">extern</span> <span class="dt">volatile</span> <span class="dt">uint32_t</span> tick_count<span class="op">;</span>       <span class="co">/* csak a TIMER0_Handler írja */</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="co">/* ISR-törzsidő-minták (DWT); a gyűjtés az ISR-ben, a kiértékelés a fő programban */</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a><span class="pp">#define LAB_SAMPLES </span><span class="dv">64</span><span class="bu">u</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a><span class="kw">extern</span> <span class="dt">int</span> lab_have_dwt<span class="op">;</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span class="kw">extern</span> <span class="dt">volatile</span> <span class="dt">uint32_t</span> isr_body<span class="op">[</span>LAB_SAMPLES<span class="op">];</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a><span class="kw">extern</span> <span class="dt">volatile</span> <span class="dt">uint32_t</span> isr_body_n<span class="op">;</span></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> UART0_Handler<span class="op">(</span><span class="dt">void</span><span class="op">);</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> TIMER0_Handler<span class="op">(</span><span class="dt">void</span><span class="op">);</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span>  lab_dwt_start<span class="op">(</span><span class="dt">void</span><span class="op">);</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a><span class="pp">#endif</span></span></code></pre></div>
+<div class="sourceCode" id="cb10"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* lab-m19-ring.c */</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;lab-m19-ring.h&quot;</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> ring_push<span class="op">(</span>ring_t <span class="op">*</span>r<span class="op">,</span> <span class="dt">uint8_t</span> b<span class="op">)</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint16_t</span> next <span class="op">=</span> <span class="op">(</span><span class="dt">uint16_t</span><span class="op">)((</span>r<span class="op">-&gt;</span>head <span class="op">+</span> <span class="dv">1</span><span class="bu">u</span><span class="op">)</span> <span class="op">%</span> RING_CAP<span class="op">);</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>next <span class="op">==</span> r<span class="op">-&gt;</span>tail<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>        r<span class="op">-&gt;</span>overrun<span class="op">++;</span>                    <span class="co">/* tele: az új bájt elveszik, de számoljuk */</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a>    r<span class="op">-&gt;</span>buf<span class="op">[</span>r<span class="op">-&gt;</span>head<span class="op">]</span> <span class="op">=</span> b<span class="op">;</span>                 <span class="co">/* előbb az adat, ... */</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a>    r<span class="op">-&gt;</span>head <span class="op">=</span> next<span class="op">;</span>                      <span class="co">/* ... utána a közzététel */</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> ring_pop<span class="op">(</span>ring_t <span class="op">*</span>r<span class="op">,</span> <span class="dt">uint8_t</span> <span class="op">*</span>out<span class="op">)</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>r<span class="op">-&gt;</span>tail <span class="op">==</span> r<span class="op">-&gt;</span>head<span class="op">)</span> <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span>    <span class="co">/* üres: nem olvas, a tail helyben marad */</span></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a>    <span class="op">*</span>out <span class="op">=</span> r<span class="op">-&gt;</span>buf<span class="op">[</span>r<span class="op">-&gt;</span>tail<span class="op">];</span></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a>    r<span class="op">-&gt;</span>tail <span class="op">=</span> <span class="op">(</span><span class="dt">uint16_t</span><span class="op">)((</span>r<span class="op">-&gt;</span>tail <span class="op">+</span> <span class="dv">1</span><span class="bu">u</span><span class="op">)</span> <span class="op">%</span> RING_CAP<span class="op">);</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> ring_empty<span class="op">(</span><span class="dt">const</span> ring_t <span class="op">*</span>r<span class="op">)</span> <span class="op">{</span> <span class="cf">return</span> r<span class="op">-&gt;</span>tail <span class="op">==</span> r<span class="op">-&gt;</span>head<span class="op">;</span> <span class="op">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb11"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* lab-m19-isr.c */</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;lab-m19-drivers.h&quot;</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;lab-m19-isr.h&quot;</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#define DEMCR      </span><span class="op">(*(</span><span class="dt">volatile</span><span class="pp"> </span><span class="dt">uint32_t</span><span class="pp"> </span><span class="op">*)</span><span class="bn">0xE000EDFC</span><span class="bu">u</span><span class="op">)</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#define DWT_CTRL   </span><span class="op">(*(</span><span class="dt">volatile</span><span class="pp"> </span><span class="dt">uint32_t</span><span class="pp"> </span><span class="op">*)</span><span class="bn">0xE0001000</span><span class="bu">u</span><span class="op">)</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#define DWT_CYCCNT </span><span class="op">(*(</span><span class="dt">volatile</span><span class="pp"> </span><span class="dt">uint32_t</span><span class="pp"> </span><span class="op">*)</span><span class="bn">0xE0001004</span><span class="bu">u</span><span class="op">)</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>ring_t rx_ring<span class="op">;</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="dt">volatile</span> <span class="dt">uint32_t</span> tick_count<span class="op">;</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> lab_have_dwt<span class="op">;</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="dt">volatile</span> <span class="dt">uint32_t</span> isr_body<span class="op">[</span>LAB_SAMPLES<span class="op">];</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a><span class="dt">volatile</span> <span class="dt">uint32_t</span> isr_body_n<span class="op">;</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> lab_dwt_start<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a>    DEMCR <span class="op">|=</span> <span class="dv">1</span><span class="bu">u</span> <span class="op">&lt;&lt;</span> <span class="dv">24</span><span class="op">;</span>              <span class="co">/* TRCENA */</span></span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a>    DWT_CYCCNT <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a>    DWT_CTRL <span class="op">|=</span> <span class="dv">1</span><span class="bu">u</span><span class="op">;</span>                 <span class="co">/* CYCCNTENA */</span></span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a>    __asm <span class="dt">volatile</span> <span class="op">(</span><span class="st">&quot;dsb</span><span class="sc">\n\t</span><span class="st">isb&quot;</span> <span class="op">:::</span> <span class="st">&quot;memory&quot;</span><span class="op">);</span></span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> before <span class="op">=</span> DWT_CYCCNT<span class="op">;</span></span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">64</span><span class="op">;</span> i<span class="op">++)</span> __asm <span class="dt">volatile</span> <span class="op">(</span><span class="st">&quot;nop&quot;</span><span class="op">);</span></span>
+<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> DWT_CYCCNT <span class="op">!=</span> before<span class="op">;</span></span>
+<span id="cb11-24"><a href="#cb11-24" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb11-25"><a href="#cb11-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-26"><a href="#cb11-26" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> UART0_Handler<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb11-27"><a href="#cb11-27" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb11-28"><a href="#cb11-28" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> t0 <span class="op">=</span> lab_have_dwt <span class="op">?</span> DWT_CYCCNT <span class="op">:</span> <span class="dv">0</span><span class="bu">u</span><span class="op">;</span>   <span class="co">/* ISR-TÖRZS eleje (nem az esemény ideje) */</span></span>
+<span id="cb11-29"><a href="#cb11-29" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>UART0<span class="op">-&gt;</span>INTSTATUS <span class="op">&amp;</span> <span class="op">(</span><span class="dv">1</span><span class="bu">u</span> <span class="op">&lt;&lt;</span> <span class="dv">1</span><span class="op">))</span> <span class="op">{</span>             <span class="co">/* RXINT */</span></span>
+<span id="cb11-30"><a href="#cb11-30" aria-hidden="true" tabindex="-1"></a>        UART0<span class="op">-&gt;</span>INTSTATUS <span class="op">=</span> <span class="dv">1</span><span class="bu">u</span> <span class="op">&lt;&lt;</span> <span class="dv">1</span><span class="op">;</span>                 <span class="co">/* nyugtázás (W1C) */</span></span>
+<span id="cb11-31"><a href="#cb11-31" aria-hidden="true" tabindex="-1"></a>        ring_push<span class="op">(&amp;</span>rx_ring<span class="op">,</span> <span class="op">(</span><span class="dt">uint8_t</span><span class="op">)</span>UART0<span class="op">-&gt;</span>DATA<span class="op">);</span>  <span class="co">/* a DATA olvasása üríti az RXFULL-t */</span></span>
+<span id="cb11-32"><a href="#cb11-32" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-33"><a href="#cb11-33" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>lab_have_dwt <span class="op">&amp;&amp;</span> isr_body_n <span class="op">&lt;</span> LAB_SAMPLES<span class="op">)</span>   <span class="co">/* csak mentés; formázás a fő programban */</span></span>
+<span id="cb11-34"><a href="#cb11-34" aria-hidden="true" tabindex="-1"></a>        isr_body<span class="op">[</span>isr_body_n<span class="op">++]</span> <span class="op">=</span> DWT_CYCCNT <span class="op">-</span> t0<span class="op">;</span></span>
+<span id="cb11-35"><a href="#cb11-35" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb11-36"><a href="#cb11-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-37"><a href="#cb11-37" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> TIMER0_Handler<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb11-38"><a href="#cb11-38" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb11-39"><a href="#cb11-39" aria-hidden="true" tabindex="-1"></a>    TIMER0<span class="op">-&gt;</span>INTSTATUS <span class="op">=</span> <span class="dv">1</span><span class="bu">u</span><span class="op">;</span>         <span class="co">/* nyugtázás (W1C) */</span></span>
+<span id="cb11-40"><a href="#cb11-40" aria-hidden="true" tabindex="-1"></a>    tick_count<span class="op">++;</span>                   <span class="co">/* egyetlen író: nincs RMW-verseny a fő programmal */</span></span>
+<span id="cb11-41"><a href="#cb11-41" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Az ISR-ben minden megosztott változó <code>volatile</code>, és minden
+változót pontosan egy kontextus ír: az UART-ISR a <code>head</code>-et
+és az <code>overrun</code>-t, a timer-ISR a <code>tick_count</code>-ot,
+a fő program a <code>tail</code>-t. A DWT-mérés két mérőpontja az ISR
+<strong>törzsén belül</strong> van, ezért a mért szám az ISR-törzsidő.
+Nem tartalmazza a hardveres belépést (az esemény és az első utasítás
+közti időt), és a fordító prológusának a mérőpont előtti részét sem (<a
+href="a080.html">20.3</a>).</p>
+<h4 data-number="20.2.8.5" id="nvic-konfiguráció-és-prioritás"><span
+class="header-section-number">20.2.8.5</span> NVIC-konfiguráció és
+prioritás</h4>
+<p>Az NVIC engedélyezése és prioritásbeállítása a <a
+href="a069.html">NVIC konfiguráció: engedélyezés és prioritás</a>
+mintáját követi. A prioritásbitek száma implementációfüggő. A példában a
+<code>nvic_enable</code> már balra igazított, nyers IPR-bájtot kap; így
+nem feltételezünk négy implementált bitet. A <code>0x40</code> timer- és
+<code>0x60</code> UART-prioritás <code>LAB_NVIC_PRIO_BITS = 3</code>
+mellett a 2-es és a 3-as logikai szint (<a href="a068.html">17.1</a>);
+más hardveren ezt visszaolvasással is ellenőrizni kell.</p>
+<div class="sourceCode" id="cb12"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* részlet – a teljes fájl lent */</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define NVIC_ISER0 </span><span class="op">(*(</span><span class="dt">volatile</span><span class="pp"> </span><span class="dt">uint32_t</span><span class="pp"> </span><span class="op">*)</span><span class="bn">0xE000E100</span><span class="bu">u</span><span class="op">)</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define NVIC_IPR   </span><span class="op">((</span><span class="dt">volatile</span><span class="pp"> </span><span class="dt">uint8_t</span><span class="pp">  </span><span class="op">*)</span><span class="bn">0xE000E400</span><span class="bu">u</span><span class="op">)</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> nvic_enable<span class="op">(</span><span class="dt">uint32_t</span> irqn<span class="op">,</span> <span class="dt">uint8_t</span> raw_prio<span class="op">)</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a>    NVIC_IPR<span class="op">[</span>irqn<span class="op">]</span> <span class="op">=</span> raw_prio<span class="op">;</span>              <span class="co">/* balra igazított IPR-bájt */</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>    NVIC_ISER0 <span class="op">=</span> <span class="op">(</span><span class="dv">1</span><span class="bu">u</span> <span class="op">&lt;&lt;</span> irqn<span class="op">);</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A prioritási sorrend a <code>lab-m19</code> esetében: a timer
+(magasabb prioritás, mert ő az időbázis), majd az UART RX (alacsonyabb).
+A prioritásértékek konkrét száma az implementált prioritásbitektől
+függ.</p>
+<h4 data-number="20.2.8.6" id="fő-program"><span
+class="header-section-number">20.2.8.6</span> Fő program</h4>
+<p>A fő ciklus a ring buffert fogyasztja és a tickeket dolgozza fel;
+minden követelmény (K1–K6) a kommentekben megjelölt helyen valósul meg.
+A ciklus végén versenymentes alvás áll (<a href="a075.html">19.1</a>): a
+feltétel vizsgálata és a <code>WFI</code> ugyanabban a kritikus
+szakaszban van, így egy közben érkező megszakítás nem veszhet el.</p>
+<div class="sourceCode" id="cb13"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* lab-m19-main.c — a lab-m19 alapfeladat (QEMU mps2-an385): UART0 + Timer0 */</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdint.h&gt;</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;lab-m19-drivers.h&quot;</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;lab-m19-isr.h&quot;</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;lab-m19-crit.h&quot;</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#define NVIC_ISER0 </span><span class="op">(*(</span><span class="dt">volatile</span><span class="pp"> </span><span class="dt">uint32_t</span><span class="pp"> </span><span class="op">*)</span><span class="bn">0xE000E100</span><span class="bu">u</span><span class="op">)</span></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#define NVIC_IPR   </span><span class="op">((</span><span class="dt">volatile</span><span class="pp"> </span><span class="dt">uint8_t</span><span class="pp">  </span><span class="op">*)</span><span class="bn">0xE000E400</span><span class="bu">u</span><span class="op">)</span></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> nvic_enable<span class="op">(</span><span class="dt">uint32_t</span> irqn<span class="op">,</span> <span class="dt">uint8_t</span> raw_prio<span class="op">)</span></span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a>    NVIC_IPR<span class="op">[</span>irqn<span class="op">]</span> <span class="op">=</span> raw_prio<span class="op">;</span>               <span class="co">/* nyers, balra igazított IPR-bájt */</span></span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a>    NVIC_ISER0 <span class="op">=</span> <span class="dv">1</span><span class="bu">u</span> <span class="op">&lt;&lt;</span> irqn<span class="op">;</span></span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-16"><a href="#cb13-16" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">uint32_t</span> tick_base<span class="op">,</span> overrun_base<span class="op">;</span>     <span class="co">/* &#39;R&#39; nullpontja: csak a fő program írja */</span></span>
+<span id="cb13-17"><a href="#cb13-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-18"><a href="#cb13-18" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> status_line<span class="op">(</span><span class="dt">void</span><span class="op">)</span>                <span class="co">/* K3 */</span></span>
+<span id="cb13-19"><a href="#cb13-19" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb13-20"><a href="#cb13-20" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> pm <span class="op">=</span> crit_enter<span class="op">();</span>              <span class="co">/* koherens pillanatkép a két számlálóról */</span></span>
+<span id="cb13-21"><a href="#cb13-21" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> t  <span class="op">=</span> tick_count<span class="op">;</span></span>
+<span id="cb13-22"><a href="#cb13-22" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> ov <span class="op">=</span> rx_ring<span class="op">.</span>overrun<span class="op">;</span></span>
+<span id="cb13-23"><a href="#cb13-23" aria-hidden="true" tabindex="-1"></a>    crit_exit<span class="op">(</span>pm<span class="op">);</span></span>
+<span id="cb13-24"><a href="#cb13-24" aria-hidden="true" tabindex="-1"></a>    uart_puts<span class="op">(</span><span class="st">&quot;status: ticks=&quot;</span><span class="op">);</span></span>
+<span id="cb13-25"><a href="#cb13-25" aria-hidden="true" tabindex="-1"></a>    uart_put_u32<span class="op">(</span>t <span class="op">-</span> tick_base<span class="op">);</span></span>
+<span id="cb13-26"><a href="#cb13-26" aria-hidden="true" tabindex="-1"></a>    uart_puts<span class="op">(</span><span class="st">&quot; overrun=&quot;</span><span class="op">);</span></span>
+<span id="cb13-27"><a href="#cb13-27" aria-hidden="true" tabindex="-1"></a>    uart_put_u32<span class="op">(</span>ov <span class="op">-</span> overrun_base<span class="op">);</span></span>
+<span id="cb13-28"><a href="#cb13-28" aria-hidden="true" tabindex="-1"></a>    uart_puts<span class="op">(</span><span class="st">&quot; raw=&quot;</span><span class="op">);</span>                      <span class="co">/* K4: a nyers számláló, a bázispróbához */</span></span>
+<span id="cb13-29"><a href="#cb13-29" aria-hidden="true" tabindex="-1"></a>    uart_put_u32<span class="op">(</span>t<span class="op">);</span></span>
+<span id="cb13-30"><a href="#cb13-30" aria-hidden="true" tabindex="-1"></a>    uart_puts<span class="op">(</span><span class="st">&quot;</span><span class="sc">\r\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb13-31"><a href="#cb13-31" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb13-32"><a href="#cb13-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-33"><a href="#cb13-33" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> measure_line<span class="op">(</span><span class="dt">void</span><span class="op">)</span>               <span class="co">/* K5 */</span></span>
+<span id="cb13-34"><a href="#cb13-34" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb13-35"><a href="#cb13-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>lab_have_dwt<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-36"><a href="#cb13-36" aria-hidden="true" tabindex="-1"></a>        uart_puts<span class="op">(</span><span class="st">&quot;isr_body: SKIP (DWT CYCCNT nem halad)</span><span class="sc">\r\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb13-37"><a href="#cb13-37" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb13-38"><a href="#cb13-38" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-39"><a href="#cb13-39" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> n <span class="op">=</span> isr_body_n<span class="op">,</span> mn <span class="op">=</span> <span class="bn">0xFFFFFFFF</span><span class="bu">u</span><span class="op">,</span> mx <span class="op">=</span> <span class="dv">0</span><span class="op">,</span> q <span class="op">=</span> <span class="dv">0</span><span class="op">,</span> r <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb13-40"><a href="#cb13-40" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">uint32_t</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> n<span class="op">;</span> i<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb13-41"><a href="#cb13-41" aria-hidden="true" tabindex="-1"></a>        <span class="dt">uint32_t</span> v <span class="op">=</span> isr_body<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb13-42"><a href="#cb13-42" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>v <span class="op">&lt;</span> mn<span class="op">)</span> mn <span class="op">=</span> v<span class="op">;</span></span>
+<span id="cb13-43"><a href="#cb13-43" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>v <span class="op">&gt;</span> mx<span class="op">)</span> mx <span class="op">=</span> v<span class="op">;</span></span>
+<span id="cb13-44"><a href="#cb13-44" aria-hidden="true" tabindex="-1"></a>        q <span class="op">+=</span> v <span class="op">/</span> n<span class="op">;</span>                 <span class="co">/* floor(mean) túlcsordulás nélkül: sum(v) = n*sum(v/n) + sum(v%n) */</span></span>
+<span id="cb13-45"><a href="#cb13-45" aria-hidden="true" tabindex="-1"></a>        r <span class="op">+=</span> v <span class="op">%</span> n<span class="op">;</span>                 <span class="co">/* (32 bites osztás, nincs 64 bites helper) */</span></span>
+<span id="cb13-46"><a href="#cb13-46" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-47"><a href="#cb13-47" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> mean <span class="op">=</span> n <span class="op">?</span> q <span class="op">+</span> r <span class="op">/</span> n <span class="op">:</span> <span class="dv">0</span><span class="op">;</span>   <span class="co">/* n == 0: nincs minta, a sor nem írja ki */</span></span>
+<span id="cb13-48"><a href="#cb13-48" aria-hidden="true" tabindex="-1"></a>    uart_puts<span class="op">(</span><span class="st">&quot;isr_body: n=&quot;</span><span class="op">);</span> uart_put_u32<span class="op">(</span>n<span class="op">);</span></span>
+<span id="cb13-49"><a href="#cb13-49" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-50"><a href="#cb13-50" aria-hidden="true" tabindex="-1"></a>        uart_puts<span class="op">(</span><span class="st">&quot; min=&quot;</span><span class="op">);</span> uart_put_u32<span class="op">(</span>mn<span class="op">);</span></span>
+<span id="cb13-51"><a href="#cb13-51" aria-hidden="true" tabindex="-1"></a>        uart_puts<span class="op">(</span><span class="st">&quot; max=&quot;</span><span class="op">);</span> uart_put_u32<span class="op">(</span>mx<span class="op">);</span></span>
+<span id="cb13-52"><a href="#cb13-52" aria-hidden="true" tabindex="-1"></a>        uart_puts<span class="op">(</span><span class="st">&quot; mean=&quot;</span><span class="op">);</span> uart_put_u32<span class="op">(</span>mean<span class="op">);</span></span>
+<span id="cb13-53"><a href="#cb13-53" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-54"><a href="#cb13-54" aria-hidden="true" tabindex="-1"></a>    uart_puts<span class="op">(</span><span class="st">&quot;</span><span class="sc">\r\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb13-55"><a href="#cb13-55" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb13-56"><a href="#cb13-56" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-57"><a href="#cb13-57" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> handle_byte<span class="op">(</span><span class="dt">uint8_t</span> c<span class="op">)</span></span>
+<span id="cb13-58"><a href="#cb13-58" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb13-59"><a href="#cb13-59" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>c <span class="op">==</span> <span class="ch">&#39;S&#39;</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-60"><a href="#cb13-60" aria-hidden="true" tabindex="-1"></a>        status_line<span class="op">();</span></span>
+<span id="cb13-61"><a href="#cb13-61" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* K4: új nullpont, nem a megosztott számlálók írása */</span></span>
+<span id="cb13-62"><a href="#cb13-62" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>c <span class="op">==</span> <span class="ch">&#39;R&#39;</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-63"><a href="#cb13-63" aria-hidden="true" tabindex="-1"></a>        <span class="dt">uint32_t</span> pm <span class="op">=</span> crit_enter<span class="op">();</span></span>
+<span id="cb13-64"><a href="#cb13-64" aria-hidden="true" tabindex="-1"></a>        <span class="dt">uint32_t</span> base <span class="op">=</span> tick_count<span class="op">;</span></span>
+<span id="cb13-65"><a href="#cb13-65" aria-hidden="true" tabindex="-1"></a>        tick_base    <span class="op">=</span> base<span class="op">;</span></span>
+<span id="cb13-66"><a href="#cb13-66" aria-hidden="true" tabindex="-1"></a>        overrun_base <span class="op">=</span> rx_ring<span class="op">.</span>overrun<span class="op">;</span></span>
+<span id="cb13-67"><a href="#cb13-67" aria-hidden="true" tabindex="-1"></a>        crit_exit<span class="op">(</span>pm<span class="op">);</span></span>
+<span id="cb13-68"><a href="#cb13-68" aria-hidden="true" tabindex="-1"></a>        uart_puts<span class="op">(</span><span class="st">&quot;reset ok base=&quot;</span><span class="op">);</span>         <span class="co">/* a válasz a rögzített új bázist hordozza */</span></span>
+<span id="cb13-69"><a href="#cb13-69" aria-hidden="true" tabindex="-1"></a>        uart_put_u32<span class="op">(</span>base<span class="op">);</span></span>
+<span id="cb13-70"><a href="#cb13-70" aria-hidden="true" tabindex="-1"></a>        uart_puts<span class="op">(</span><span class="st">&quot;</span><span class="sc">\r\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb13-71"><a href="#cb13-71" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>c <span class="op">==</span> <span class="ch">&#39;M&#39;</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-72"><a href="#cb13-72" aria-hidden="true" tabindex="-1"></a>        measure_line<span class="op">();</span></span>
+<span id="cb13-73"><a href="#cb13-73" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb13-74"><a href="#cb13-74" aria-hidden="true" tabindex="-1"></a>        uart_putc<span class="op">((</span><span class="dt">char</span><span class="op">)</span>c<span class="op">);</span>                  <span class="co">/* K2: echo */</span></span>
+<span id="cb13-75"><a href="#cb13-75" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-76"><a href="#cb13-76" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb13-77"><a href="#cb13-77" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-78"><a href="#cb13-78" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb13-79"><a href="#cb13-79" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb13-80"><a href="#cb13-80" aria-hidden="true" tabindex="-1"></a>    __asm <span class="dt">volatile</span> <span class="op">(</span><span class="st">&quot;cpsid i&quot;</span> <span class="op">:::</span> <span class="st">&quot;memory&quot;</span><span class="op">);</span></span>
+<span id="cb13-81"><a href="#cb13-81" aria-hidden="true" tabindex="-1"></a>    uart0_init<span class="op">(</span>LAB_SYSCLK_HZ <span class="op">/</span> <span class="dv">115200</span><span class="bu">u</span><span class="op">);</span></span>
+<span id="cb13-82"><a href="#cb13-82" aria-hidden="true" tabindex="-1"></a>    lab_have_dwt <span class="op">=</span> lab_dwt_start<span class="op">();</span></span>
+<span id="cb13-83"><a href="#cb13-83" aria-hidden="true" tabindex="-1"></a>    timer0_init<span class="op">(</span>LAB_SYSCLK_HZ <span class="op">/</span> LAB_TICK_HZ <span class="op">-</span> <span class="dv">1</span><span class="bu">u</span><span class="op">);</span>   <span class="co">/* 10 ms */</span></span>
+<span id="cb13-84"><a href="#cb13-84" aria-hidden="true" tabindex="-1"></a>    nvic_enable<span class="op">(</span>TIMER0_IRQn<span class="op">,</span> <span class="bn">0x40</span><span class="bu">u</span><span class="op">);</span></span>
+<span id="cb13-85"><a href="#cb13-85" aria-hidden="true" tabindex="-1"></a>    nvic_enable<span class="op">(</span>UART0_IRQn<span class="op">,</span>  <span class="bn">0x60</span><span class="bu">u</span><span class="op">);</span></span>
+<span id="cb13-86"><a href="#cb13-86" aria-hidden="true" tabindex="-1"></a>    uart_puts<span class="op">(</span><span class="st">&quot;lab-m19 boot</span><span class="sc">\r\n</span><span class="st">&quot;</span><span class="op">);</span>                    <span class="co">/* K1 */</span></span>
+<span id="cb13-87"><a href="#cb13-87" aria-hidden="true" tabindex="-1"></a>    __asm <span class="dt">volatile</span> <span class="op">(</span><span class="st">&quot;cpsie i&quot;</span> <span class="op">:::</span> <span class="st">&quot;memory&quot;</span><span class="op">);</span></span>
+<span id="cb13-88"><a href="#cb13-88" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-89"><a href="#cb13-89" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> seen <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb13-90"><a href="#cb13-90" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb13-91"><a href="#cb13-91" aria-hidden="true" tabindex="-1"></a>        <span class="dt">uint8_t</span> c<span class="op">;</span></span>
+<span id="cb13-92"><a href="#cb13-92" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="op">(</span>ring_pop<span class="op">(&amp;</span>rx_ring<span class="op">,</span> <span class="op">&amp;</span>c<span class="op">))</span></span>
+<span id="cb13-93"><a href="#cb13-93" aria-hidden="true" tabindex="-1"></a>            handle_byte<span class="op">(</span>c<span class="op">);</span></span>
+<span id="cb13-94"><a href="#cb13-94" aria-hidden="true" tabindex="-1"></a>        <span class="dt">uint32_t</span> now <span class="op">=</span> tick_count<span class="op">;</span>           <span class="co">/* 32 bites, igazított olvasás: atomi */</span></span>
+<span id="cb13-95"><a href="#cb13-95" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* K6: minden tick feldolgozva, nem csak &quot;volt-e&quot; */</span></span>
+<span id="cb13-96"><a href="#cb13-96" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="op">(</span>seen <span class="op">!=</span> now<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-97"><a href="#cb13-97" aria-hidden="true" tabindex="-1"></a>            seen<span class="op">++;</span></span>
+<span id="cb13-98"><a href="#cb13-98" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>seen <span class="op">%</span> LAB_TICK_HZ <span class="op">==</span> <span class="dv">0</span><span class="bu">u</span><span class="op">)</span></span>
+<span id="cb13-99"><a href="#cb13-99" aria-hidden="true" tabindex="-1"></a>                uart_puts<span class="op">(</span><span class="st">&quot;tick</span><span class="sc">\r\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb13-100"><a href="#cb13-100" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb13-101"><a href="#cb13-101" aria-hidden="true" tabindex="-1"></a>        <span class="dt">uint32_t</span> pm <span class="op">=</span> crit_enter<span class="op">();</span>          <span class="co">/* versenymentes alvás */</span></span>
+<span id="cb13-102"><a href="#cb13-102" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>ring_empty<span class="op">(&amp;</span>rx_ring<span class="op">)</span> <span class="op">&amp;&amp;</span> seen <span class="op">==</span> tick_count<span class="op">)</span></span>
+<span id="cb13-103"><a href="#cb13-103" aria-hidden="true" tabindex="-1"></a>            __asm <span class="dt">volatile</span> <span class="op">(</span><span class="st">&quot;dsb</span><span class="sc">\n\t</span><span class="st">wfi&quot;</span> <span class="op">:::</span> <span class="st">&quot;memory&quot;</span><span class="op">);</span></span>
+<span id="cb13-104"><a href="#cb13-104" aria-hidden="true" tabindex="-1"></a>        crit_exit<span class="op">(</span>pm<span class="op">);</span></span>
+<span id="cb13-105"><a href="#cb13-105" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-106"><a href="#cb13-106" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h4 data-number="20.2.8.7"
+id="build-és-reprodukálható-qemu-indítás"><span
+class="header-section-number">20.2.8.7</span> Build és reprodukálható
+QEMU-indítás</h4>
+<p>A <code>lab-m19.elf</code> buildje a GCC-driverrel linkel, és
+<code>-lgcc</code>-t ad hozzá: a fordító a C-kódhoz (például 64 bites
+osztáshoz) segédfüggvényeket hívhat, amelyeket közvetlen
+<code>ld</code>-hívás nem találna meg. A <code>test</code> cél a két
+tesztréteget futtatja (<a href="a080.html">20.3</a>):</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode makefile"><code class="sourceCode makefile"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Makefile — lab-m19 (II. záróprojekt): build, futtatás, tesztek</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="dt">CROSS</span>   <span class="ch">?=</span><span class="st"> arm-none-eabi-</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="dt">CC</span>      <span class="ch">:=</span><span class="st"> </span><span class="ch">$(</span><span class="dt">CROSS</span><span class="ch">)</span><span class="st">gcc</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="dt">SIZE</span>    <span class="ch">:=</span><span class="st"> </span><span class="ch">$(</span><span class="dt">CROSS</span><span class="ch">)</span><span class="st">size</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="dt">CFLAGS</span>  <span class="ch">:=</span><span class="st"> -mcpu=cortex-m3 -mthumb -ffreestanding -O1 -g -Wall -Wextra</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a><span class="dt">LDFLAGS</span> <span class="ch">:=</span><span class="st"> -nostdlib -T lab-m19.ld -Wl,--gc-sections -Wl,-Map=lab-m19.map</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a><span class="dt">LDLIBS</span>  <span class="ch">:=</span><span class="st"> -lgcc            </span><span class="co"># pl. 64 bites osztáshoz vagy más fordítói segédfüggvényhez</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a><span class="dt">SRCS</span>    <span class="ch">:=</span><span class="st"> lab-m19-startup.S lab-m19-drivers.c lab-m19-ring.c lab-m19-isr.c lab-m19-main.c</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a><span class="dt">OBJS</span>    <span class="ch">:=</span><span class="st"> </span><span class="ch">$(</span><span class="kw">patsubst</span><span class="st"> %.S</span><span class="kw">,</span><span class="st">%.o</span><span class="kw">,</span><span class="ch">$(</span><span class="dt">SRCS</span><span class="kw">:</span><span class="ss">.c</span><span class="kw">=</span><span class="ss">.o</span><span class="ch">))</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a><span class="dt">HDRS</span>    <span class="ch">:=</span><span class="st"> </span><span class="ch">$(</span><span class="kw">wildcard</span><span class="st"> lab-m19-*.h</span><span class="ch">)</span></span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a><span class="dt">QEMU</span>    <span class="ch">:=</span><span class="st"> qemu-system-arm -machine mps2-an385 -cpu cortex-m3 </span><span class="ch">\</span></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a><span class="st">           -display none -monitor none -serial stdio</span></span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a><span class="dv">all:</span><span class="dt"> lab-m19.elf</span></span>
+<span id="cb14-15"><a href="#cb14-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-16"><a href="#cb14-16" aria-hidden="true" tabindex="-1"></a><span class="dv">lab-m19.elf:</span><span class="dt"> </span><span class="ch">$(</span><span class="dt">OBJS</span><span class="ch">)</span><span class="dt"> lab-m19.ld</span></span>
+<span id="cb14-17"><a href="#cb14-17" aria-hidden="true" tabindex="-1"></a>	<span class="ch">$(</span><span class="dt">CC</span><span class="ch">)</span> <span class="ch">$(</span><span class="dt">CFLAGS</span><span class="ch">)</span> <span class="ch">$(</span><span class="dt">LDFLAGS</span><span class="ch">)</span> <span class="ch">$(</span><span class="dt">OBJS</span><span class="ch">)</span> <span class="ch">$(</span><span class="dt">LDLIBS</span><span class="ch">)</span> -o <span class="ch">$@</span></span>
+<span id="cb14-18"><a href="#cb14-18" aria-hidden="true" tabindex="-1"></a>	<span class="ch">$(</span><span class="dt">SIZE</span><span class="ch">)</span> <span class="ch">$@</span></span>
+<span id="cb14-19"><a href="#cb14-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-20"><a href="#cb14-20" aria-hidden="true" tabindex="-1"></a><span class="dv">%.o:</span><span class="dt"> %.c </span><span class="ch">$(</span><span class="dt">HDRS</span><span class="ch">)</span></span>
+<span id="cb14-21"><a href="#cb14-21" aria-hidden="true" tabindex="-1"></a>	<span class="ch">$(</span><span class="dt">CC</span><span class="ch">)</span> <span class="ch">$(</span><span class="dt">CFLAGS</span><span class="ch">)</span> -c <span class="ch">$&lt;</span> -o <span class="ch">$@</span></span>
+<span id="cb14-22"><a href="#cb14-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-23"><a href="#cb14-23" aria-hidden="true" tabindex="-1"></a><span class="dv">%.o:</span><span class="dt"> %.S</span></span>
+<span id="cb14-24"><a href="#cb14-24" aria-hidden="true" tabindex="-1"></a>	<span class="ch">$(</span><span class="dt">CC</span><span class="ch">)</span> <span class="ch">$(</span><span class="dt">CFLAGS</span><span class="ch">)</span> -c <span class="ch">$&lt;</span> -o <span class="ch">$@</span></span>
+<span id="cb14-25"><a href="#cb14-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-26"><a href="#cb14-26" aria-hidden="true" tabindex="-1"></a><span class="dv">run:</span><span class="dt"> lab-m19.elf</span></span>
+<span id="cb14-27"><a href="#cb14-27" aria-hidden="true" tabindex="-1"></a>	<span class="ch">$(</span><span class="dt">QEMU</span><span class="ch">)</span> -kernel lab-m19.elf</span>
+<span id="cb14-28"><a href="#cb14-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-29"><a href="#cb14-29" aria-hidden="true" tabindex="-1"></a><span class="dv">ringtest:</span><span class="dt"> lab-m19-ring-test.c lab-m19-ring.c lab-m19-ring.h</span></span>
+<span id="cb14-30"><a href="#cb14-30" aria-hidden="true" tabindex="-1"></a>	gcc -std=c11 -Wall -Wextra -o lab-m19-ring-test lab-m19-ring-test.c lab-m19-ring.c</span>
+<span id="cb14-31"><a href="#cb14-31" aria-hidden="true" tabindex="-1"></a>	./lab-m19-ring-test</span>
+<span id="cb14-32"><a href="#cb14-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-33"><a href="#cb14-33" aria-hidden="true" tabindex="-1"></a><span class="dv">systest:</span><span class="dt"> lab-m19.elf</span></span>
+<span id="cb14-34"><a href="#cb14-34" aria-hidden="true" tabindex="-1"></a>	python3 lab-m19-systest.py <span class="ch">$(</span><span class="dt">SYSTEST_FLAGS</span><span class="ch">)</span>   <span class="co"># pl. --isr-band LO:HI, --no-timing</span></span>
+<span id="cb14-35"><a href="#cb14-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-36"><a href="#cb14-36" aria-hidden="true" tabindex="-1"></a><span class="dv">test:</span><span class="dt"> ringtest systest</span></span>
+<span id="cb14-37"><a href="#cb14-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-38"><a href="#cb14-38" aria-hidden="true" tabindex="-1"></a><span class="dv">clean:</span></span>
+<span id="cb14-39"><a href="#cb14-39" aria-hidden="true" tabindex="-1"></a>	rm -f <span class="ch">$(</span><span class="dt">OBJS</span><span class="ch">)</span> lab-m19.elf lab-m19.map lab-m19-ring-test</span>
+<span id="cb14-40"><a href="#cb14-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-41"><a href="#cb14-41" aria-hidden="true" tabindex="-1"></a><span class="ot">.PHONY:</span><span class="dt"> all run ringtest systest test clean</span></span></code></pre></div>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> ~/arm-labor/cm/a065/lab-mps2.ld lab-m19.ld   <span class="co"># ha még nincs meg</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span>            <span class="co"># lab-m19.elf + méretösszesítő</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> run        <span class="co"># interaktív: a UART0 a terminál stdin/stdout-ja (kilépés: Ctrl-C)</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> test       <span class="co"># ringtest (hoston) + systest (QEMU, host-oldali soros bemenettel)</span></span></code></pre></div>
+<p>A <code>-serial stdio</code> a UART0-t a QEMU-folyamat standard
+bemenetére és kimenetére köti; a
+<code>-monitor none -display none</code> miatt a terminálon csak a
+firmware kimenete jelenik meg. A <code>qemu-system-arm</code> az ELF
+szegmenseit a betöltési címükre tölti, és a resetet a vektortábla
+<code>_estack</code> és <code>Reset_Handler</code> bejegyzésével
+indítja.</p>
+<h4 data-number="20.2.8.8" id="várható-viselkedés"><span
+class="header-section-number">20.2.8.8</span> Várható viselkedés</h4>
+<p>Indítás után a soros kimeneten megjelenik a
+<code>lab-m19 boot</code>, majd másodpercenként (100 tick) egy
+<code>tick</code>. A beírt bájtok visszaíródnak; az <code>S</code> a
+<code>status: ticks=… overrun=… raw=…</code>, az <code>R</code> a
+<code>reset ok base=…</code>, az <code>M</code> a K5 sort adja. A
+<code>raw</code> a nyers <code>tick_count</code>, a <code>base</code> a
+resetkor rögzített új nullpont; a <code>ticks</code> mindig
+<code>raw − base</code>. A fő úti build és <code>make test</code>
+(arm-none-eabi-gcc + QEMU 8.2.2) a hallgató feladata, itt nem futtattuk.
+Az <code>abSRSM</code> bemenetre a kimenet a hamis DUT-tal /
+<code>cm-run.py</code>-jal kapott minta (a számok az időzítéstől
+függnek):</p>
+<pre class="text"><code>lab-m19 boot
+abstatus: ticks=96 overrun=0 raw=96
+reset ok base=96
+status: ticks=0 overrun=0 raw=96
+isr_body: SKIP (DWT CYCCNT nem halad)
+tick
+tick</code></pre>
+<p>A teljes, automatizált ellenőrzést az <a href="a080.html">20.3</a>
+rendszertesztje végzi; a fenti kimenet hamis DUT-tal /
+<code>cm-run.py</code>-jal kapott minta, nem fő úti mérés; a szögletes
+zárójel nélküli számok az időzítéstől függően eltérhetnek.</p>
+<h3 data-number="20.2.9" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">20.2.9</span> Tipikus hibák és
+ellenpróbák</h3>
+<p><strong>1. A <code>volatile</code> elhagyása.</strong> Tünet: a fő
+ciklus nem látja a <code>tick_count</code> vagy az
+<code>rx_ring.head</code> változását. Hipotézis: a fordító a változót
+regiszterben tartja. Adatgyűjtés: <code>objdump -d lab-m19.elf</code>, a
+fő ciklusban keresd a <code>tick_count</code> betöltését. Javítás:
+<code>volatile</code> minősítő minden megosztott változóra.</p>
+<p><strong>2. Hiányzó vagy nulla vektorbejegyzés.</strong> Tünet: egy
+véletlenül engedélyezett, de a táblában 0-val kitöltött IRQ (pl. IRQ1 =
+UART0 TX) HardFault-ot (INVSTATE) okoz. Hipotézis: a tábla adott helyén
+0 áll. Adatgyűjtés: <code>lab-check-vectors.py</code>,
+<code>NVIC_ISER0</code>. Javítás: a kitöltő helyek
+<code>Default_Handler</code>-re mutassanak (ahogy a 19.3 csinálja), ne
+0-ra. (A nem gyenge, fel nem oldott szimbólumra a GNU <code>ld</code>
+ezzel szemben „undefined reference” hibát ad, tehát az nem csendes 0-s
+vektort eredményez.)</p>
+<p><strong>3. Két író egy megosztott számlálón.</strong> Tünet:
+<code>'R'</code> után a státusz ritkán inkonzisztens (a
+<code>ticks</code> már nullázott, az <code>overrun</code> még nem, vagy
+fordítva). Hipotézis: a fő program több megosztott változót egymás után
+ír, és egy ISR a két írás közé ékelődik; vagy a fő program is írja azt a
+számlálót, amelyet az ISR növel. Javítás: a megosztott számlálót csak az
+ISR írja, a fő program nullpontot tárol (<code>tick_base</code>), és a
+nullpontokat egyetlen kritikus szakaszban rögzíti.</p>
+<p><strong>4. Hosszú kritikus szakasz.</strong> Tünet: a
+megszakítás-latencia nő, az UART RX túlcsordul. Hipotézis: a kritikus
+szakaszon belül <code>uart_puts</code>-t hívunk. Javítás: a kritikus
+szakaszból csak az adatmozgatást tartsuk bent.</p>
+<p><strong>5. <code>cpsie i</code> a
+<code>crit_exit</code>-ben.</strong> Tünet: beágyazott kritikus
+szakaszban a megszakítások túl korán engedélyeződnek. Javítás: a mentett
+<code>PRIMASK</code> visszaállítása.</p>
+<h3 data-number="20.2.10" id="feladatok"><span
+class="header-section-number">20.2.10</span> Feladatok</h3>
+<p><strong>1. (magyarázó)</strong> Magyarázd el, miért nem elegendő a
+<code>volatile</code> minősítő a naiv <code>tick_flag</code>-kezelésnél.
+Add meg utasításszinten (<code>ldr</code>/<code>str</code>) azt a
+sorrendet, amelyben egy tick nyoma elveszik, és jelöld, melyik két
+utasítás közé ékelődik az ISR. Indokold, miért nem lehetséges a
+fordított eset, hogy a fő program az ISR <code>tick_count++</code>-ának
+közepére ékelődik.</p>
+<p><strong>2. (implementációs)</strong> Egészítsd ki a
+<code>lab-m19</code> firmware-t egy TX ring bufferrel. A
+<code>uart_puts</code> ne várjon a TX pufferen, hanem a TX interruptra
+támaszkodjon. Integráld az új ISR-t a vektortáblába és az NVIC-be, és
+gondoskodj a termelő/fogyasztó indexek védelméről.</p>
+<p><strong>3. (hibakeresési/mérési)</strong> Egy jelzőalapú változatban
+a <code>tick</code> sorok száma kevesebb, mint az eltelt tickeké.
+Tervezz mérést, amely szétválasztja a három lehetséges okot: (a) a jelző
+szándékos összevonása lassú fogyasztó mellett, (b) a fogyasztói
+lemaradás, (c) a védtelen olvasás–törlés versenye. Melyik mennyiséget
+méred melyikhez, és melyik változat (jelző védelem nélkül, jelző
+kritikus szakaszban, számlálókülönbség) mit mutat?</p>
+<h3 data-number="20.2.11" id="megoldások"><span
+class="header-section-number">20.2.11</span> Megoldások</h3>
+<p><strong>1. megoldás.</strong> A <code>volatile</code> csak azt
+biztosítja, hogy a fordító minden hozzáféréskor ténylegesen olvas és ír;
+atomitást nem ad. A naiv kód utasításszinten:
+<code>ldr r0, [tick_flag]</code> (A), feltételes ugrás,
+<code>str r1(=0), [tick_flag]</code> (B). Ha az ISR az (A) és a (B) közé
+ékelődik és <code>tick_flag = 1</code>-et ír, a (B) ezt az új értéket
+írja felül 0-ra, mielőtt a fő program látta volna: a tick nyoma elveszik
+(lásd az idődiagramot). A fordított eset azért lehetetlen, mert egyetlen
+magon az ISR a fő programot szakítja meg, és lefut a végéig, mielőtt a
+fő program folytatódna. Az ISR
+<code>ldr</code>/<code>adds</code>/<code>str</code> hármasa közé a fő
+program nem ékelődhet. (Egy magasabb prioritású másik ISR igen, de az a
+<code>tick_count</code>-ot nem írja.) Javítás: a teszt és a törlés egy
+kritikus szakaszban, vagy a jelző helyett számláló, egyetlen íróval.</p>
+<p><strong>2. megoldás.</strong> A TX oldalon a TXINT akkor áll be,
+amikor egy bájt elküldése után a puffer kiürül — üres pufferrel a TXIE
+bekapcsolása önmagában nem kér megszakítást. Ezért a
+<code>uart_puts_irq</code> <strong>priming</strong> lépést végez: a
+bájtokat először a TX ringbe teszi, majd kritikus szakaszban, ha a TX
+tétlen (<code>tx_busy == 0</code>), az első bájtot kiveszi és a
+<code>DATA</code>-ba írja, <code>tx_busy = 1</code>-gyel. A
+<code>TXIE</code>-t az inicializáláskor egyszer kapcsoljuk be (a
+<code>TXINT</code> csak küldés után áll be). Az ISR a nyugtázást
+<strong>előbb</strong> végzi (W1C az <code>INTSTATUS</code>-ba), és csak
+utána nyúl a <code>DATA</code>-hoz, mind az RX-, mind a TX-ágban: ha a
+bájt a W1C előtt menne ki, a W1C az új <code>TXINT</code>-et is törölné,
+és a ring többi bájtja nem menne ki. A <code>tx_busy</code> 0 → 1
+átmenetét kritikus szakasz védi, így az ISR 1 → 0 átmenetével nem
+fedheti át egymást (a kritikus szakaszban a fő program is hívja a
+<code>tx_ring_pop</code>-ot, de az ISR addig nem futhat, tehát a
+<code>tx_tail</code> írója egyidejűleg egy). Az indexek SPSC mintát
+követnek: a <code>tx_head</code>-et a fő program, a
+<code>tx_tail</code>-t az ISR (a kritikus szakaszban a fő program)
+írja.</p>
+<div class="sourceCode" id="cb17"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* TX ring: a fő program a head-et, az ISR a tail-t írja (SPSC) */</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define TX_CAP </span><span class="dv">64</span><span class="bu">u</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="kw">_Static_assert</span><span class="op">((</span>TX_CAP <span class="op">&amp;</span> <span class="op">(</span>TX_CAP <span class="op">-</span> <span class="dv">1</span><span class="bu">u</span><span class="op">))</span> <span class="op">==</span> <span class="dv">0</span><span class="op">,</span> <span class="st">&quot;TX_CAP: 2 hatványa&quot;</span><span class="op">);</span></span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">volatile</span> <span class="dt">uint8_t</span>  tx_buf<span class="op">[</span>TX_CAP<span class="op">];</span></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">volatile</span> <span class="dt">uint16_t</span> tx_head<span class="op">,</span> tx_tail<span class="op">;</span></span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">volatile</span> <span class="dt">uint8_t</span>  tx_busy<span class="op">;</span></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> tx_ring_push<span class="op">(</span><span class="dt">uint8_t</span> b<span class="op">)</span></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint16_t</span> next <span class="op">=</span> <span class="op">(</span><span class="dt">uint16_t</span><span class="op">)((</span>tx_head <span class="op">+</span> <span class="dv">1</span><span class="bu">u</span><span class="op">)</span> <span class="op">%</span> TX_CAP<span class="op">);</span></span>
+<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>next <span class="op">==</span> tx_tail<span class="op">)</span> <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span>       <span class="co">/* tele: a bájt elveszik */</span></span>
+<span id="cb17-12"><a href="#cb17-12" aria-hidden="true" tabindex="-1"></a>    tx_buf<span class="op">[</span>tx_head<span class="op">]</span> <span class="op">=</span> b<span class="op">;</span></span>
+<span id="cb17-13"><a href="#cb17-13" aria-hidden="true" tabindex="-1"></a>    tx_head <span class="op">=</span> next<span class="op">;</span></span>
+<span id="cb17-14"><a href="#cb17-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb17-15"><a href="#cb17-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb17-16"><a href="#cb17-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-17"><a href="#cb17-17" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> tx_ring_pop<span class="op">(</span><span class="dt">uint8_t</span> <span class="op">*</span>out<span class="op">)</span></span>
+<span id="cb17-18"><a href="#cb17-18" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb17-19"><a href="#cb17-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>tx_tail <span class="op">==</span> tx_head<span class="op">)</span> <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span>    <span class="co">/* üres */</span></span>
+<span id="cb17-20"><a href="#cb17-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">*</span>out <span class="op">=</span> tx_buf<span class="op">[</span>tx_tail<span class="op">];</span></span>
+<span id="cb17-21"><a href="#cb17-21" aria-hidden="true" tabindex="-1"></a>    tx_tail <span class="op">=</span> <span class="op">(</span><span class="dt">uint16_t</span><span class="op">)((</span>tx_tail <span class="op">+</span> <span class="dv">1</span><span class="bu">u</span><span class="op">)</span> <span class="op">%</span> TX_CAP<span class="op">);</span></span>
+<span id="cb17-22"><a href="#cb17-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb17-23"><a href="#cb17-23" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb17-24"><a href="#cb17-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-25"><a href="#cb17-25" aria-hidden="true" tabindex="-1"></a><span class="co">/* inicializáláskor egyszer: UART0-&gt;CTRL |= (1u &lt;&lt; 2);   TXIE */</span></span>
+<span id="cb17-26"><a href="#cb17-26" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> uart_puts_irq<span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>s<span class="op">)</span></span>
+<span id="cb17-27"><a href="#cb17-27" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb17-28"><a href="#cb17-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(*</span>s<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb17-29"><a href="#cb17-29" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="op">(!</span>tx_ring_push<span class="op">((</span><span class="dt">uint8_t</span><span class="op">)*</span>s<span class="op">))</span>   <span class="co">/* tele: várunk az ISR-re */</span></span>
+<span id="cb17-30"><a href="#cb17-30" aria-hidden="true" tabindex="-1"></a>            __asm <span class="dt">volatile</span> <span class="op">(</span><span class="st">&quot;wfi&quot;</span><span class="op">);</span></span>
+<span id="cb17-31"><a href="#cb17-31" aria-hidden="true" tabindex="-1"></a>        s<span class="op">++;</span></span>
+<span id="cb17-32"><a href="#cb17-32" aria-hidden="true" tabindex="-1"></a>        <span class="dt">uint32_t</span> pm <span class="op">=</span> crit_enter<span class="op">();</span></span>
+<span id="cb17-33"><a href="#cb17-33" aria-hidden="true" tabindex="-1"></a>        <span class="dt">uint8_t</span> b<span class="op">;</span></span>
+<span id="cb17-34"><a href="#cb17-34" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(!</span>tx_busy <span class="op">&amp;&amp;</span> tx_ring_pop<span class="op">(&amp;</span>b<span class="op">))</span> <span class="op">{</span>   <span class="co">/* priming */</span></span>
+<span id="cb17-35"><a href="#cb17-35" aria-hidden="true" tabindex="-1"></a>            tx_busy <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb17-36"><a href="#cb17-36" aria-hidden="true" tabindex="-1"></a>            UART0<span class="op">-&gt;</span>DATA <span class="op">=</span> b<span class="op">;</span></span>
+<span id="cb17-37"><a href="#cb17-37" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb17-38"><a href="#cb17-38" aria-hidden="true" tabindex="-1"></a>        crit_exit<span class="op">(</span>pm<span class="op">);</span></span>
+<span id="cb17-39"><a href="#cb17-39" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-40"><a href="#cb17-40" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb17-41"><a href="#cb17-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-42"><a href="#cb17-42" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> UART0_Handler<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb17-43"><a href="#cb17-43" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb17-44"><a href="#cb17-44" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> st <span class="op">=</span> UART0<span class="op">-&gt;</span>INTSTATUS<span class="op">;</span></span>
+<span id="cb17-45"><a href="#cb17-45" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>st <span class="op">&amp;</span> <span class="op">(</span><span class="dv">1</span><span class="bu">u</span> <span class="op">&lt;&lt;</span> <span class="dv">1</span><span class="op">))</span> <span class="op">{</span>           <span class="co">/* RXINT */</span></span>
+<span id="cb17-46"><a href="#cb17-46" aria-hidden="true" tabindex="-1"></a>        UART0<span class="op">-&gt;</span>INTSTATUS <span class="op">=</span> <span class="dv">1</span><span class="bu">u</span> <span class="op">&lt;&lt;</span> <span class="dv">1</span><span class="op">;</span>          <span class="co">/* W1C előbb */</span></span>
+<span id="cb17-47"><a href="#cb17-47" aria-hidden="true" tabindex="-1"></a>        ring_push<span class="op">(&amp;</span>rx_ring<span class="op">,</span> <span class="op">(</span><span class="dt">uint8_t</span><span class="op">)</span>UART0<span class="op">-&gt;</span>DATA<span class="op">);</span></span>
+<span id="cb17-48"><a href="#cb17-48" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-49"><a href="#cb17-49" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>st <span class="op">&amp;</span> <span class="op">(</span><span class="dv">1</span><span class="bu">u</span> <span class="op">&lt;&lt;</span> <span class="dv">0</span><span class="op">))</span> <span class="op">{</span>           <span class="co">/* TXINT: a puffer kiürült */</span></span>
+<span id="cb17-50"><a href="#cb17-50" aria-hidden="true" tabindex="-1"></a>        <span class="dt">uint8_t</span> b<span class="op">;</span></span>
+<span id="cb17-51"><a href="#cb17-51" aria-hidden="true" tabindex="-1"></a>        UART0<span class="op">-&gt;</span>INTSTATUS <span class="op">=</span> <span class="dv">1</span><span class="bu">u</span> <span class="op">&lt;&lt;</span> <span class="dv">0</span><span class="op">;</span>          <span class="co">/* W1C előbb */</span></span>
+<span id="cb17-52"><a href="#cb17-52" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>tx_ring_pop<span class="op">(&amp;</span>b<span class="op">))</span> UART0<span class="op">-&gt;</span>DATA <span class="op">=</span> b<span class="op">;</span></span>
+<span id="cb17-53"><a href="#cb17-53" aria-hidden="true" tabindex="-1"></a>        <span class="cf">else</span> tx_busy <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb17-54"><a href="#cb17-54" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-55"><a href="#cb17-55" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A TX-ringes változat a K1–K6 rendszerteszt elvárásait nem változtatja
+meg: a <code>make test</code> ugyanazt a kimenetet adja, mert a
+protokoll és a válaszok változatlanok. A TX-ringes változatot a hallgató
+a <a href="a080.html">20.3</a> rendszertesztjével ellenőrzi; a szerző
+nem futtatta, és a kód nincs lefordítva (a
+<code>crit_enter</code>/<code>crit_exit</code> a fejezet korábbi
+függvényei).</p>
+<p><strong>3. megoldás.</strong> Három külön mennyiséget kell mérni. (1)
+Az eltelt tickek száma: a <code>tick_count</code>, amelyet csak az ISR
+növel. (2) A feldolgozott tickek száma: a fő program saját számlálója. A
+kettő különbsége a <strong>lemaradás</strong>. (3) Az összevont
+események száma: az ISR növelhet egy <code>merged</code> számlálót, ha
+belépéskor a jelző már 1. Ez <strong>nem</strong> bizonyít versenyt,
+csak azt, hogy a fogyasztó két tick között nem ért oda. A
+<code>merged</code> számláló a versenyt is összevonásnak látja: a résbe
+érkező tick a még 1-es jelzőt találja, ezért az eltelt − feldolgozott −
+összevont különbség a jelző-alapú tervben soha nem pozitív; a verseny és
+az összevonás ugyanazt a végeredményt adja (elveszett tick), csak az
+okuk más. A verseny szétválasztásához olyan mérés kell, amely a tick
+sorsát a fő program oldaláról követi: az ISR a jelző mellett
+<code>tick_count</code>-ot növel; a fő program az (A) olvasás közvetlen
+előtt és a (B) törlés után azonnal kiolvassa a
+<code>tick_count</code>-ot; ha a két érték különbözik, a tick(ek) az
+(A)–(B) résbe érkeztek, és jelzőjüket a (B) törölte: a különbséget
+<code>race_lost</code>-ként számoljuk (védett változatban, ahol az
+(A)–(B) kritikus szakaszban van, <code>race_lost</code> = 0).
+Determinisztikus próbához az (A) és (B) közé <code>NVIC_ISPR0</code>-val
+szoftveresen pendingelt timer-IRQ-t kell injektálni (a <a
+href="a070.html">17.3</a> mintájára). Számlálókülönbséges változatnál a
+feldolgozott tickek száma a lemaradás ledolgozása után mindig megegyezik
+az eltelttel. A tesztnek ezt az azonosságot kell ellenőriznie, nem azt,
+hogy az összevonás „nullához közeli”: az összevonás mértéke a
+terheléstől függ, és nem hiba. QEMU-ban az időzítés nem valós idejű,
+ezért az arányok csak relatívak.</p>
+<div class="sourceCode" id="cb18"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* a jelzőalapú változat ISR-jében: az összevonás mérése */</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>tick_flag<span class="op">)</span> merged<span class="op">++;</span>      <span class="co">/* az előző ticket még nem dolgozta fel a fő program */</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a>tick_flag <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a>tick_count<span class="op">++;</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a><span class="co">/* a mérési változat &#39;S&#39; válasza: a három mennyiség egy sorban */</span></span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a>status<span class="op">:</span> ticks<span class="op">=&lt;</span>n<span class="op">&gt;</span> seen<span class="op">=&lt;</span>s<span class="op">&gt;</span> merged<span class="op">=&lt;</span>m<span class="op">&gt;</span> overrun<span class="op">=&lt;</span>o<span class="op">&gt;</span> raw<span class="op">=&lt;</span>r<span class="op">&gt;</span></span></code></pre></div>
+<h3 data-number="20.2.12" id="rövid-összefoglaló"><span
+class="header-section-number">20.2.12</span> Rövid összefoglaló</h3>
+<p>A driver és ISR integrációja a vektortábla, az NVIC, az ISR-törzs és
+a megosztott állapot védelmének konzisztens egysége, és pontosan az <a
+href="a078.html">20.1</a> specifikációját (K1–K6, F2, F3) valósítja meg.
+Az M-profile ISR sima C függvény; a hardver menti a kontextust. Minden
+megosztott változót egyetlen kontextus ír; az SPSC ring buffer így
+kritikus szakasz nélkül működik, a tickeket számláló viszi át, és a
+kritikus szakasz csak a koherens pillanatképhez és a versenymentes
+alváshoz kell. A <code>volatile</code> láthatóságot ad, atomitást nem. A
+build a korábbi fejezetek elemeit egyetlen, QEMU-ban reprodukálható
+firmware-be fűzi.</p>
+<p><strong>Továbbhasznált definíciók:</strong></p>
+<ul>
+<li><strong>driver-ISR integráció:</strong> periféria-driver, ISR,
+vektorbejegyzés, NVIC-beállítás és kritikus szakasz konzisztens
+egysége.</li>
+<li><strong>SPSC ring buffer:</strong> egytermelős–egyfogyasztós puffer,
+ahol a <code>head</code>-et csak az ISR, a <code>tail</code>-t csak a fő
+program írja.</li>
+<li><strong>kritikus szakasz:</strong> megszakítás-letiltással védett,
+rövid, nem blokkoló utasítássorozat a megosztott állapot atomi
+frissítésére.</li>
+</ul>
+<h3 data-number="20.2.13" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">20.2.13</span> Források és ellenőrzési
+hiányok</h3>
+<p>Az alábbiak <strong>dokumentációs kiindulópontok</strong>
+(forrásállapot: lásd az <a href="guide.html#a000">Olvasói útmutató</a>
+tábláját):</p>
+<ul>
+<li><a href="https://developer.arm.com/documentation/ddi0403/">Armv7-M
+Architecture Reference Manual, DDI0403E</a> — kivételmodell,
+vektortábla, <code>PRIMASK</code>, kivétel-belépés/visszatérés.</li>
+<li><a
+href="https://developer.arm.com/architectures/cpu-architecture/m-profile/docs">Arm
+M-profile architektúra dokumentáció</a> — NVIC-engedélyezés, prioritás,
+ISR-szerződés.</li>
+<li><a href="https://www.qemu.org/docs/master/">QEMU dokumentáció</a> —
+<code>mps2-an385</code> machine, <code>-kernel</code> betöltés,
+<code>-nographic</code> soros I/O.</li>
+</ul>
+<p><strong>Ellenőrzési állapot és hiányok:</strong> a közölt kimenet a
+helyettesítő eszközlánccal (Clang + <code>ld.lld</code>) épített
+firmware-en, a <code>tools/cm-run.py</code> Cortex-M3 emulátorban és a
+hamis DUT-tal végzett funkcionális próbából származik; a fő úti (GNU
+<code>arm-none-eabi-gcc</code> + QEMU 8.2.2) <code>make</code> és
+<code>make test</code> a hallgató feladata, nem futtattuk. Az emulátor a
+Timer0-t, a UART0 RX-et és a megszakítás-kézbesítést funkcionálisan, nem
+cikluspontosan modellezi, ezért abszolút időre nem használható. A fenti
+címek, IRQ-számok, bitmezők és a 25 MHz-es tick QEMU 8.2.2-n a
+<code>make test</code> futásával igazolandók. Fizikai MPS2+ kártyán és
+más QEMU-verzión a rendszertesztet is futtatni kell; az
+<code>NVIC_IPR</code> implementált bitszámát a <a
+href="a069.html">17.2</a> visszaolvasásos próbája adja. A
+QEMU-emulációban mért periódus relatív, nem hardverhű abszolút idő.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="a078.html">← 20.1 Projektspecifikáció: periféria, megszakítás-logika és mérési terv</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="a080.html">20.3 Mérés, validáció és a QEMU-alapú teszt reprodukálhatósága →</a></div>
+</nav>
+</body>
+</html>

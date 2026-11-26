@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>35.1 Coroutine mint felfüggeszthető állapotgép – C és modern
+C++ rendszerszemléletben DevOps szakembereknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. rész: Modern C++</a> › <a href="index.html#ch35">35 Coroutine-ok és aszinkron erőforrás-életciklus</a></p>
+<div class="links"><a class="prev" rel="prev" href="s175.html">← 34.6 shared ownership, reclamation és konkurens review</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="s177.html">35.2 promise_type, awaiter és coroutine_handle →</a></div>
+</nav>
+<h2 data-number="35.1" id="s176"><span
+class="header-section-number">35.1</span> Coroutine mint felfüggeszthető
+állapotgép</h2>
+<p>A C eseményvezérelt szolgáltatásokban a legtöbb bonyolultságot nem az
+algoritmus, hanem az állapot megőrzése okozza: a
+<code>poll</code>/<code>epoll</code> ciklus visszatér, a félkész üzenet
+a pufferen marad, a „hol tartottunk” információt pedig egy
+<code>enum</code> és néhány <code>struct</code> tag hordozza. A C++20
+coroutine ugyanezt a feladatot fordító által generált állapotgépre
+bízza. Ez a rész kizárólag a <strong>nyelvi mechanikát</strong> tanítja:
+hogyan lesz egy függvényből újraindítható állapotgép, mi történik a
+coroutine frame-ben tárolt lokális állapottal, és mit nem ad hozzá a
+nyelv. Hogy milyen ütemező, hálózati runtime vagy szálpolitika hajtja a
+coroutine-t, az későbbi, alkalmazásszintű szerződés (<a
+href="s180.html">Aszinkron I/O adapter és coroutine-labor (35.5)</a>);
+itt csak annyit rögzítünk, amennyi a frame és a felfüggesztés
+megértéséhez kell.</p>
+<h3 data-number="35.1.1"
+id="definíció-mikor-coroutine-egy-függvény"><span
+class="header-section-number">35.1.1</span> Definíció: mikor coroutine
+egy függvény</h3>
+<p><strong>Definíció.</strong> Egy C++20 függvény akkor és csak akkor
+<em>coroutine</em>, ha a függvénytörzse tartalmaz legalább egy
+<code>co_await</code> kifejezést, <code>co_yield</code> kifejezést vagy
+<code>co_return</code> utasítást, és a függvény nem <code>main</code>,
+nem konstruktor, nem destruktor. A besorolás a függvénytörzsre
+vonatkozik: ha a <code>co_await</code> egy belső lambda testében van,
+akkor a lambda a coroutine, a külső függvény nem.</p>
+<p>A fordító ilyenkor nem hagyományos hívást generál, hanem a törzset
+egy <em>állapotgéppé</em> alakítja, amelynek állapotát egy a fordító
+által előállított <em>coroutine frame</em> (más néven activation record)
+hordozza. A <code>co_return</code> a hagyományos <code>return</code>
+helyett kötelező: ha egy coroutine törzsében <code>return</code> áll, a
+program hibás (ill-formed), mert a visszatérés a
+<code>promise_type</code> protokollján keresztül történik.</p>
+<p>A feltétel második fele a visszatérési típusra vonatkozik: a típusnak
+ki kell elégítenie a coroutine-követelményeket, azaz rendelkeznie kell
+<code>promise_type</code>-tal — közvetlenül beágyazott típusként, vagy a
+<code>std::coroutine_traits&lt;R, Args...&gt;</code> specializációján
+keresztül. A promise típusnak rendelkeznie kell a
+<code>get_return_object</code>, <code>initial_suspend</code>,
+<code>final_suspend</code> és <code>unhandled_exception</code> tagokkal;
+a <code>co_return;</code> (vagy a törzs vége) a
+<code>return_void</code>-ot, a <code>co_return e;</code> a
+<code>return_value</code>-t követeli meg (a kettő együtt hibás); a
+<code>yield_value</code> csak <code>co_yield</code> használata esetén
+kell. Ha egy szükséges tag hiányzik, a program hibás. Ez a pont azért
+fontos, mert a „coroutine” nem egy önálló típus, hanem egy
+<em>protokoll</em>: ugyanaz a <code>co_await</code> mást jelent egy
+<code>Task&lt;int&gt;</code>-ben és egy
+<code>std::generator&lt;int&gt;</code>-ben (C++23).</p>
+<p>A <code>co_yield e</code> nem újabb primitív, hanem a
+<code>co_await promise.yield_value(e)</code> rövidítése — ezt érdemes
+fejben tartani, mert a hibakeresésnél a <code>co_yield</code> is
+ugyanazon az await-mechanizmuson megy keresztül.</p>
+<h3 data-number="35.1.2"
+id="a-felfüggesztési-pont-és-a-visszatérés-a-hívóhoz"><span
+class="header-section-number">35.1.2</span> A felfüggesztési pont és a
+visszatérés a hívóhoz</h3>
+<p>Egy <code>co_await</code> kifejezés kiértékelése három, a várakozó
+(awaitable) típuson meghívott műveletből áll:</p>
+<ol type="1">
+<li><code>await_ready()</code> — ha <code>true</code>, nem történik
+felfüggesztés, azonnal jön az <code>await_resume()</code>.</li>
+<li><code>await_suspend(handle)</code> — a felfüggesztés pillanata; a
+<code>handle</code> a futó coroutine azonosítója. Visszatérési típusa
+<code>void</code> (mindig felfüggeszt), <code>bool</code> (a
+<code>false</code> azt jelenti, hogy mégsem függesztünk fel), vagy
+<code>coroutine_handle&lt;&gt;</code> (szimmetrikus átadás egy másik
+coroutine-nak).</li>
+<li><code>await_resume()</code> — a folytatás értéke, ez lesz a
+<code>co_await</code> kifejezés eredménye.</li>
+</ol>
+<p>A felfüggesztés lényege: a vezérlés <strong>visszatér ahhoz</strong>,
+aki a coroutine-t életre hívta vagy utoljára <code>resume()</code>-olta.
+Nem történik szálváltás, nem jön létre új szál, nem mozdul a veremmutató
+egy másik veremre — a coroutine ugyanazon a szálon fut tovább, amelyik a
+<code>resume()</code>-t hívja. A <code>coroutine_handle::resume()</code>
+a frame-ben tárolt folytatási ponttól indítja újra a végrehajtást,
+egészen a következő felfüggesztésig vagy a
+<code>co_return</code>-ig.</p>
+<p>A hívó szempontjából a coroutine „visszatérése” kétszer történik meg.
+Először a függvény meghívásakor: a <code>get_return_object()</code>
+által előállított objektum a coroutine első felfüggesztésekor (vagy
+befejezésekor) kerül a hívóhoz: lusta induláskor
+(<code>initial_suspend = suspend_always</code>) ez még a törzs futása
+előtt van — ezért tud a hívó kezet kapni egy lazán induló coroutine-ra
+—, eager induláskor (<code>suspend_never</code>) a törzs az első
+felfüggesztésig lefut, mielőtt a hívó megkapná a return objectet.
+Másodszor minden felfüggesztésnél: a vezérlés visszaáramlik, de a frame
+nem semmisül meg, hanem „lefagy”. A hívó a visszakapott objektumon
+keresztül később újraindíthatja.</p>
+<h3 data-number="35.1.3"
+id="a-coroutine-frame-és-a-lokális-állapot-élettartama"><span
+class="header-section-number">35.1.3</span> A coroutine frame és a
+lokális állapot élettartama</h3>
+<p>A frame tipikusan a következőket tartalmazza: a promise objektumot; a
+paraméterek frame-be másolt példányait (a paraméterek
+másolással/mozgatással kerülnek a frame-be, nem a hívó stackjén
+maradnak; ha a paraméter referencia, a frame csak a hivatkozást őrzi, az
+objektum élettartamát a hívónak kell biztosítania — lásd 35.3); minden
+olyan lokálist és temporáriust, amelynek élettartama átnyúlik egy
+felfüggesztési ponton; valamint a folytatási pontot azonosító indexet,
+amiből a fordító a <code>switch</code>-öt generálja.</p>
+<p>A frame élettartama a coroutine-létrehozástól a frame
+megsemmisítéséig tart, <strong>nem</strong> a függvényhívás végéig. A
+megsemmisítés a <code>coroutine_handle::destroy()</code> hívással vagy a
+frame-et birtokló visszatérési objektum destruktorával történik;
+ilyenkor lefutnak a hatókörben lévő lokálisok destruktorai és a promise
+destruktora. A frame-et a <code>promise_type::operator new</code>
+allokálja (ha van), de a szabvány megengedi az allokáció elhagyását
+(allocation elision), ha a fordító bizonyítani tudja, hogy a frame
+élettartama szigorúan beágyazódik a hívóéba. Ez implementációfüggő
+optimalizálás: a „coroutine mindig heapen lakik” állítás nem igaz, és
+méréssel kell ellenőrizni, nem feltételezéssel.</p>
+<p>Ebből következik a legfontosabb élettartam-szabály: <strong>a
+frame-hez mutató hivatkozás csak addig érvényes, amíg a frame
+él.</strong> Ha egy coroutine <code>co_return</code>-nal visszaad egy
+referenciát egy frame-lokálisra, vagy egy
+<code>std::string_view</code>-t a frame-ben tárolt bufferre, az a hívó
+oldalán dangling lesz — pontosan az az eset, amit a temporary/value
+category szabályoknál (<a href="s099.html">Temporary, value category és
+dangling (20.4)</a>) már láttunk. Ugyanígy: felfüggesztett coroutine
+frame-jét megsemmisíteni szabad (ekkor a lokálisok destruktorai
+lefutnak), de egy <em>futó</em> coroutine-t megsemmisíteni, vagy egy már
+megsemmisített frame-re <code>resume()</code>-t hívni nem definiált
+viselkedés.</p>
+<h3 data-number="35.1.4"
+id="initial_suspend-és-final_suspend-előkép"><span
+class="header-section-number">35.1.4</span> initial_suspend és
+final_suspend előkép</h3>
+<p>A coroutine életciklusának két végét a promise két művelete
+szabályozza. Az <code>initial_suspend()</code> a törzs első utasítása
+előtt fut: <code>std::suspend_always</code> esetén a coroutine
+<em>lazy</em> módon indul (a hívó azonnal visszakapja a visszatérési
+objektumot, a test csak az első <code>resume()</code>-ra fut),
+<code>std::suspend_never</code> esetén <em>eager</em> módon, azonnal
+futni kezd. A <code>final_suspend()</code> a <code>co_return</code> után
+fut: <code>suspend_always</code> esetén a frame a végső felfüggesztési
+ponton marad, <code>done()</code> igaz lesz, de a frame csak a
+<code>destroy()</code>-ig él — így a promise-ból kiolvasható az
+eredmény. <code>suspend_never</code> esetén a frame automatikusan
+megsemmisül, a <code>handle</code> érvénytelenné válik, és a rá
+hivatkozó objektum dangling.</p>
+<p>Ez a két döntés adja a coroutine-típus „karakterét”: a lazy
+<code>Task</code> az <code>initial_suspend = suspend_always</code> és
+<code>final_suspend = suspend_always</code> kombinációjával lesz
+biztonságosan birtokolható, míg egy <code>std::generator</code> (C++23,
+lásd 35.4) a végső felfüggesztést használja arra, hogy az utolsó elem is
+kiolvasható legyen.</p>
+<h3 data-number="35.1.5"
+id="kidolgozott-példa-három-lépés-felfüggesztve"><span
+class="header-section-number">35.1.5</span> Kidolgozott példa: három
+lépés felfüggesztve</h3>
+<p>Az alábbi példa szándékosan minimális: nem hálózat, nem ütemező, csak
+a frame és a <code>resume()</code> viszonya. A <code>Resumable</code> a
+frame egyetlen tulajdonosa; a destruktor megsemmisíti a frame-et, a
+mozgatás átadja a tulajdonjogot.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// steps.cpp — C++20: &lt;coroutine&gt;, &lt;cstdio&gt; és &lt;exception&gt; (std::terminate)</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;coroutine&gt;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;exception&gt;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Resumable <span class="op">{</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> <span class="dt">promise_type</span> <span class="op">{</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>        Resumable get_return_object<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> Resumable<span class="op">{</span><span class="bu">std::</span>coroutine_handle<span class="op">&lt;</span><span class="dt">promise_type</span><span class="op">&gt;::</span>from_promise<span class="op">(*</span><span class="kw">this</span><span class="op">)};</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>suspend_always initial_suspend<span class="op">()</span> <span class="kw">noexcept</span> <span class="op">{</span> <span class="cf">return</span> <span class="op">{};</span> <span class="op">}</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>suspend_always final_suspend<span class="op">()</span>   <span class="kw">noexcept</span> <span class="op">{</span> <span class="cf">return</span> <span class="op">{};</span> <span class="op">}</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>        <span class="dt">void</span> return_void<span class="op">()</span> <span class="kw">noexcept</span> <span class="op">{}</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>        <span class="dt">void</span> unhandled_exception<span class="op">()</span> <span class="op">{</span> <span class="bu">std::</span>terminate<span class="op">();</span> <span class="op">}</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">};</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>    <span class="kw">using</span> <span class="dt">handle_type</span> <span class="op">=</span> <span class="bu">std::</span>coroutine_handle<span class="op">&lt;</span><span class="dt">promise_type</span><span class="op">&gt;;</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>    <span class="kw">explicit</span> Resumable<span class="op">(</span><span class="dt">handle_type</span> h<span class="op">)</span> <span class="kw">noexcept</span> <span class="op">:</span> <span class="va">h_</span><span class="op">(</span>h<span class="op">)</span> <span class="op">{}</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>    Resumable<span class="op">(</span><span class="at">const</span> Resumable<span class="op">&amp;)</span>            <span class="op">=</span> <span class="kw">delete</span><span class="op">;</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>    Resumable<span class="op">&amp;</span> <span class="kw">operator</span><span class="op">=(</span><span class="at">const</span> Resumable<span class="op">&amp;)</span> <span class="op">=</span> <span class="kw">delete</span><span class="op">;</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>    Resumable<span class="op">(</span>Resumable<span class="op">&amp;&amp;</span> o<span class="op">)</span> <span class="kw">noexcept</span> <span class="op">:</span> <span class="va">h_</span><span class="op">(</span>o<span class="op">.</span><span class="va">h_</span><span class="op">)</span> <span class="op">{</span> o<span class="op">.</span><span class="va">h_</span> <span class="op">=</span> <span class="op">{};</span> <span class="op">}</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a>    Resumable<span class="op">&amp;</span> <span class="kw">operator</span><span class="op">=(</span>Resumable<span class="op">&amp;&amp;</span> o<span class="op">)</span> <span class="kw">noexcept</span> <span class="op">{</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span><span class="kw">this</span> <span class="op">!=</span> <span class="op">&amp;</span>o<span class="op">)</span> <span class="op">{</span> <span class="cf">if</span> <span class="op">(</span><span class="va">h_</span><span class="op">)</span> <span class="va">h_</span><span class="op">.</span>destroy<span class="op">();</span> <span class="va">h_</span> <span class="op">=</span> o<span class="op">.</span><span class="va">h_</span><span class="op">;</span> o<span class="op">.</span><span class="va">h_</span> <span class="op">=</span> <span class="op">{};</span> <span class="op">}</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">*</span><span class="kw">this</span><span class="op">;</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">~</span>Resumable<span class="op">()</span> <span class="op">{</span> <span class="cf">if</span> <span class="op">(</span><span class="va">h_</span><span class="op">)</span> <span class="va">h_</span><span class="op">.</span>destroy<span class="op">();</span> <span class="op">}</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a>    <span class="co">// true: van még folytatás; false: a coroutine befejeződött vagy üres</span></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> resume<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(!</span><span class="va">h_</span> <span class="op">||</span> <span class="va">h_</span><span class="op">.</span>done<span class="op">())</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a>        <span class="va">h_</span><span class="op">.</span>resume<span class="op">();</span></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">!</span><span class="va">h_</span><span class="op">.</span>done<span class="op">();</span></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a>    <span class="dt">handle_type</span> <span class="va">h_</span><span class="op">{};</span></span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-40"><a href="#cb1-40" aria-hidden="true" tabindex="-1"></a>Resumable steps<span class="op">(</span><span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-41"><a href="#cb1-41" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> n<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-42"><a href="#cb1-42" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;step </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> i<span class="op">);</span></span>
+<span id="cb1-43"><a href="#cb1-43" aria-hidden="true" tabindex="-1"></a>        <span class="cf">co_await</span> <span class="bu">std::</span>suspend_always<span class="op">{};</span>   <span class="co">// itt visszaadjuk a vezérlést a hívónak</span></span>
+<span id="cb1-44"><a href="#cb1-44" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-45"><a href="#cb1-45" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;done</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb1-46"><a href="#cb1-46" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>   <span class="co">// implicit co_return</span></span>
+<span id="cb1-47"><a href="#cb1-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-48"><a href="#cb1-48" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-49"><a href="#cb1-49" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> r <span class="op">=</span> steps<span class="op">(</span><span class="dv">3</span><span class="op">);</span></span>
+<span id="cb1-50"><a href="#cb1-50" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>r<span class="op">.</span>resume<span class="op">())</span></span>
+<span id="cb1-51"><a href="#cb1-51" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>puts<span class="op">(</span><span class="st">&quot;  ... a hivo kozben fut&quot;</span><span class="op">);</span></span>
+<span id="cb1-52"><a href="#cb1-52" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Fordítás:
+<code>g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -o steps steps.cpp</code>.
+A <code>std::terminate</code> az <code>&lt;exception&gt;</code>
+fejlécben van deklarálva, ezért azt közvetlenül be kell vonni; nem
+szabad arra építeni, hogy a <code>&lt;coroutine&gt;</code> vagy a
+<code>&lt;cstdio&gt;</code> tranzitívan behúzza.
+<strong>Buildjegyzőkönyv</strong> (<code>lab-gcc</code> profil): a
+program figyelmeztetés nélkül fordult, és a következő sorrendet adta: a
+<code>main</code> először <code>step 0</code>-t, majd a hívó sorát,
+aztán <code>step 1</code>-et, ismét a hívó sorát, <code>step 2</code>-t,
+a hívó sorát, végül <code>done</code>-t ír, majd a ciklus kilép, és a
+destruktor megsemmisíti a frame-et. Figyeljük meg: a hívó sosem
+„blokkolódik”, a ciklusváltozó <code>i</code> és a <code>n</code>
+paraméter a felfüggesztés alatt is a frame-ben él.</p>
+<h3 data-number="35.1.6"
+id="a-scheduler-és-az-executor-nem-része-a-nyelvnek"><span
+class="header-section-number">35.1.6</span> A scheduler és az executor
+nem része a nyelvnek</h3>
+<p>A C++20 coroutine-mechanizmus kizárólag a következőket adja: a frame
+allokációját és élettartamát, a felfüggesztés/folytatás primitíveit és a
+handle-t. <strong>Nem</strong> ad szálat, időzítőt, I/O-t, prioritást,
+megszakítást (cancellation) vagy futásütemezőt. A <code>resume()</code>
+hívója maga a „scheduler”: az, hogy mikor és melyik szálon hívjuk meg,
+alkalmazásszintű döntés. Ha a <code>resume()</code> egy másik szálon
+történik, mint a korábbi felfüggesztés, akkor a frame állapotának
+átadása szinkronizációs kérdés, és a szálak közötti publikálás szabályai
+érvényesek (<a href="s175.html">shared ownership, reclamation és
+konkurens review (34.6)</a>): a coroutine nem tesz automatikusan
+atomic-ot, mutexet vagy memóriakerítést. Ugyanígy a
+<code>co_await</code> önmagában nem hálózati művelet: az awaitable
+<code>await_suspend</code>-jében kell regisztrálni az eseményt (például
+<code>epoll</code>-ba, <a href="s061.html">poll/epoll és explicit
+eseményállapotgép (12.6)</a>), és a kész esemény kezelőjének kell
+<code>resume()</code>-ot hívnia.</p>
+<h3 data-number="35.1.7"
+id="összehasonlítás-az-explicit-c-eseményállapotgéppel"><span
+class="header-section-number">35.1.7</span> Összehasonlítás az explicit
+C eseményállapotgéppel</h3>
+<p>Nézzük ugyanazt a feladatot C-ben: hossz-előtagos keretek dekódolása
+nem blokkoló byte-streamen. Az állapot egy <code>struct</code>, a
+folytatási pont egy <code>enum</code>, a „felfüggesztés” pedig a
+függvény visszatérése.</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* decoder.h — explicit allapotgep, C17 */</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stddef.h&gt;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdint.h&gt;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="kw">enum</span> dec_state <span class="op">{</span> DEC_LEN<span class="op">,</span> DEC_BODY<span class="op">,</span> DEC_DONE<span class="op">,</span> DEC_ERR <span class="op">};</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> decoder <span class="op">{</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">enum</span> dec_state state<span class="op">;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span>        len<span class="op">;</span>        <span class="co">/* vart torzshossz */</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span>         got<span class="op">;</span>        <span class="co">/* eddig beolvasott bajt */</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span>        buf<span class="op">[</span><span class="dv">255</span><span class="op">];</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="co">/* Visszateres: elhasznalt bajtok szama; 0 = nem tudott tovabblepni. */</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">size_t</span> decoder_feed<span class="op">(</span><span class="kw">struct</span> decoder <span class="op">*</span>d<span class="op">,</span> <span class="dt">const</span> <span class="dt">uint8_t</span> <span class="op">*</span>p<span class="op">,</span> <span class="dt">size_t</span> n<span class="op">)</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> used <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>used <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>        <span class="cf">switch</span> <span class="op">(</span>d<span class="op">-&gt;</span>state<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> DEC_LEN<span class="op">:</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>            d<span class="op">-&gt;</span>len <span class="op">=</span> p<span class="op">[</span>used<span class="op">++];</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>            d<span class="op">-&gt;</span>got <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>            d<span class="op">-&gt;</span>state <span class="op">=</span> <span class="op">(</span>d<span class="op">-&gt;</span>len <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">?</span> DEC_DONE <span class="op">:</span> DEC_BODY<span class="op">;</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> DEC_BODY<span class="op">:</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>            <span class="cf">while</span> <span class="op">(</span>used <span class="op">&lt;</span> n <span class="op">&amp;&amp;</span> d<span class="op">-&gt;</span>got <span class="op">&lt;</span> d<span class="op">-&gt;</span>len<span class="op">)</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>                d<span class="op">-&gt;</span>buf<span class="op">[</span>d<span class="op">-&gt;</span>got<span class="op">++]</span> <span class="op">=</span> p<span class="op">[</span>used<span class="op">++];</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>d<span class="op">-&gt;</span>got <span class="op">==</span> d<span class="op">-&gt;</span>len<span class="op">)</span> d<span class="op">-&gt;</span>state <span class="op">=</span> DEC_DONE<span class="op">;</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>            <span class="cf">else</span> <span class="cf">return</span> used<span class="op">;</span>              <span class="co">/* tobb adat kell: &quot;felfuggesztes&quot; */</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> DEC_DONE<span class="op">:</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> DEC_ERR<span class="op">:</span></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> used<span class="op">;</span>                   <span class="co">/* a keret kesz, a hivo dolga */</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> used<span class="op">;</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A megfeleltetés tanulságos, mert a coroutine frame pontosan ezeket a
+szerepeket tölti be, csak a fordító generálja:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Szerep</th>
+<th>Explicit C állapotgép</th>
+<th>C++20 coroutine frame</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Folytatási pont</td>
+<td><code>enum dec_state</code> + <code>switch</code></td>
+<td>fordító által generált index + <code>switch</code></td>
+</tr>
+<tr>
+<td>Helyi állapot</td>
+<td><code>struct decoder</code> tagjai</td>
+<td>frame-lokálisok, paramétermásolatok</td>
+</tr>
+<tr>
+<td>Felfüggesztés</td>
+<td><code>return used;</code> a ciklusból</td>
+<td><code>co_await</code> / <code>co_yield</code> felfüggesztése</td>
+</tr>
+<tr>
+<td>Folytatás</td>
+<td>hívó újra meghívja <code>decoder_feed</code>-et</td>
+<td>hívó <code>handle.resume()</code>-ot hív</td>
+</tr>
+<tr>
+<td>Tulajdonos</td>
+<td>a <code>struct decoder</code> gazdája</td>
+<td>a visszatérési objektum (pl. <code>Resumable</code>)</td>
+</tr>
+<tr>
+<td>Élettartam vége</td>
+<td><code>free</code>/destruktor a gazdánál</td>
+<td><code>destroy()</code> / a birtokló destruktora</td>
+</tr>
+</tbody>
+</table>
+<p>A coroutine nem tünteti el a bonyolultságot, hanem
+<strong>áthelyezi</strong>: a kézi <code>switch</code>-t és a tagok
+életben tartását a fordító végzi, cserébe a frame allokációjáért, a
+promise-protokollért és a felfüggesztés élettartam-szabályaiért kell
+felelni. A C változat explicit, debuggerben könnyen olvasható, és nem
+igényel allokációt; a coroutine változat lineáris kódként olvasható, de
+a vezérlésfolyam a frame-ben „rejtőzik”.</p>
+<h3 data-number="35.1.8" id="tipikus-hibák"><span
+class="header-section-number">35.1.8</span> Tipikus hibák</h3>
+<p>A leggyakoribb félreértés, hogy a <code>co_await</code> szálat indít.
+Nem: ugyanazon a szálon marad a végrehajtás, amíg valaki más szálon nem
+hív <code>resume()</code>-t. Második hiba a <code>final_suspend</code>
+<code>suspend_never</code>-re állítása, miközben a hívó továbbra is
+használja a handle-t — ilyenkor a frame a <code>co_return</code> után
+azonnal megsemmisül, a handle dangling. Harmadik:
+referencia-paraméterrel hívni egy coroutine-t, és a hivatkozott
+objektumot a felfüggesztés alatt megsemmisíteni (a frame csak a
+hivatkozást őrzi; lásd 35.3), vagy a coroutine-ból referenciát vagy
+<code>string_view</code>-t visszaadni egy frame-lokálisra. Negyedik: a
+<code>Resumable</code>-hez hasonló típust másolhatóvá tenni — a
+frame-nek egy tulajdonosa legyen. Ötödik: egy felfüggesztett coroutine-t
+úgy megsemmisíteni, hogy közben egy másik szál éppen
+<code>resume()</code>-ol rá; ez adatverseny, nem „coroutine-bug”.</p>
+<h3 data-number="35.1.9" id="összefoglaló"><span
+class="header-section-number">35.1.9</span> Összefoglaló</h3>
+<p>A coroutine egy fordító által generált, felfüggeszthető állapotgép: a
+<code>co_await</code>/<code>co_yield</code>/<code>co_return</code>
+jelenléte teszi azzá, a visszatérési típus <code>promise_type</code>-ja
+szabja meg a viselkedését. A frame a paramétereket, a felfüggesztésen
+átnyúló lokálisokat és a folytatási pontot hordozza, élettartama a
+létrehozástól a <code>destroy()</code>-ig tart, nem a hívás végéig. A
+felfüggesztés nem szálváltás: a vezérlés a hívóhoz tér vissza, és a
+<code>resume()</code> folytatja. Az
+<code>initial_suspend</code>/<code>final_suspend</code> a két végpont
+politikája. Ütemező, I/O és cancellation nincs a nyelvben — az a fölötte
+épített szerződés.</p>
+<h3 data-number="35.1.10" id="feladatok"><span
+class="header-section-number">35.1.10</span> Feladatok</h3>
+<p><strong>1. feladat (magyarázó).</strong> Döntse el mindegyik esetről,
+coroutine-e, és ha nem, miért hibás a program: (a)
+<code>Task&lt;void&gt; f() { co_await g(); }</code>; (b)
+<code>int f() { co_return 0; }</code>; (c)
+<code>void f() { auto l = [](){ co_await std::suspend_always{}; }; }</code>;
+(d) <code>Task&lt;void&gt; f() { return; }</code>.</p>
+<p><strong>2. feladat (kódolási).</strong> Egészítse ki a
+<code>Resumable</code> példát úgy, hogy a coroutine
+<code>co_return 42;</code>-vel adjon vissza egy <code>int</code>
+eredményt, amely a befejezés után a birtokló objektumon
+<code>value()</code>-vel kiolvasható. Adja meg a promise módosításait és
+az élettartam-szerződést.</p>
+<p><strong>3. feladat (diagnosztikai).</strong> Az alábbi kódrészlet egy
+<code>Task</code>-ot birtokló objektumot mozgat, majd a korábban
+kimentett handle-t használja. Mutassa meg, hol sérül a frame
+élettartama, és javítsa a tulajdonlási szerződést:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">auto</span> owner <span class="op">=</span> make_task<span class="op">();</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>owner<span class="op">.</span>resume<span class="op">();</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="kw">auto</span> raw <span class="op">=</span> owner<span class="op">.</span>handle<span class="op">();</span>     <span class="co">// nem tulajdonlo handle</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>owner <span class="op">=</span> make_task<span class="op">();</span>           <span class="co">// a move-assignment destroy()-olja a regi frame-et</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>raw<span class="op">.</span>resume<span class="op">();</span>                  <span class="co">// ???</span></span></code></pre></div>
+<h3 data-number="35.1.11" id="megoldások"><span
+class="header-section-number">35.1.11</span> Megoldások</h3>
+<p><strong>1. megoldás.</strong> (a) Igen, coroutine:
+<code>co_await</code> a törzsben, a <code>Task&lt;void&gt;</code> adja a
+promise-t. (b) Coroutine (a törzsben <code>co_return</code> áll), de a
+program hibás: az <code>int</code>-hez nincs <code>promise_type</code>
+(<code>std::coroutine_traits&lt;int&gt;</code>), ezért a
+coroutine-követelmény nem teljesül (g++ 15.2:
+<code>unable to find the promise type for this coroutine</code>). (c) A
+<code>co_await</code> a lambda törzsében van, ezért a lambda a
+coroutine, a külső <code>f</code> nem; a lambda visszatérési típusa
+viszont <code>void</code>, amelyhez nincs <code>promise_type</code>,
+ezért a program hibás. Javítás:
+<code>[]() -&gt; Task&lt;void&gt; { co_await std::suspend_always{}; co_return; }</code>.
+(d) Nem coroutine (a törzsben nincs
+<code>co_await</code>/<code>co_yield</code>/<code>co_return</code>),
+tehát közönséges függvény; a hiba az, hogy a
+<code>Task&lt;void&gt;</code> nem <code>void</code>, és a
+<code>return;</code> nem ad értéket (g++ 15.2:
+<code>return-statement with no value, in function returning ‘Task&lt;void&gt;’</code>).
+Coroutine-ná a törzsbe írt <code>co_return;</code> tenné (ekkor a
+<code>Task&lt;void&gt;</code> promise-ának <code>return_void</code>
+kell). Ellenőrzési feltétel: minden állítás a törzs és a visszatérési
+típus kapcsolatára hivatkozik, nem a szintaxisra.</p>
+<p><strong>2. megoldás.</strong> A promise-ba
+<code>int value = 0;</code> tag és
+<code>void return_value(int v) noexcept { value = v; }</code> kerül a
+<code>return_void()</code> helyére; a birtokló osztály
+<code>int value() const { return h_.promise().value; }</code>
+hozzáférést ad. A szerződés: <code>value()</code> csak akkor hívható, ha
+a frame még él (a <code>final_suspend</code>
+<code>suspend_always</code>), és a coroutine <code>done()</code>; a hívó
+felelőssége ezt ellenőrizni. A <code>final_suspend</code>-et tehát nem
+szabad <code>suspend_never</code>-re váltani, különben a promise is a
+frame-mel együtt megsemmisül. Ellenőrzési feltétel: <code>done()</code>
+nélkül ne olvassuk az értéket, és a mozgatás után a forrás handle-je
+legyen üres.</p>
+<p><strong>3. megoldás.</strong> A hiba nem a <code>resume()</code>
+szintaxisában, hanem a tulajdonjogban van: a <code>raw</code> nem
+tulajdonló handle, a <code>move-assignment</code> viszont a régi frame
+<code>destroy()</code>-ját futtatja, így a <code>raw.resume()</code> egy
+már megsemmisített frame-re hivatkozik — nem definiált viselkedés,
+kimenet nem garantált. Javítás: a handle-t csak addig szabad kimenteni,
+amíg a birtokló objektum él és nem mozgatták; a helyes minta az, hogy a
+<code>resume()</code> mindig a birtoklón keresztül történik, a nyers
+<code>coroutine_handle</code>-t pedig csak olyan awaitable kapja meg,
+amelynek élettartama bizonyítottan rövidebb a frame-énél. Ellenőrzési
+feltétel: a javított változatot AddressSanitizerrel futtatva nem
+jelenhet meg use-after-free, és a <code>raw</code> használata előtt a
+tulajdonos érvényessége ellenőrizhető.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="s175.html">← 34.6 shared ownership, reclamation és konkurens review</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="s177.html">35.2 promise_type, awaiter és coroutine_handle →</a></div>
+</nav>
+</body>
+</html>

@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>17.2 Pin, Unpin, async trait-ek és a Send-határok – Rust
+programozás C++-fejlesztőknek – a nulláról a mesterszintig</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – Párhuzamosság és aszinkronitás</a> › <a href="index.html#rch16">17 Aszinkron Rust</a></p>
+<div class="links"><a class="prev" rel="prev" href="r037.html">← 17.1 Future-ök és async/await: mi történik a motorháztető alatt</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="r039.html">17.3 Tokio: taskok, I/O, csatornák, select és megszakítás →</a></div>
+</nav>
+<h2 data-number="17.2" id="r038"><span
+class="header-section-number">17.2</span> Pin, Unpin, async trait-ek és
+a Send-határok</h2>
+<h3 data-number="17.2.1"
+id="motiváció-az-önhivatkozó-future-ök-és-a-mozgatás-problémája"><span
+class="header-section-number">17.2.1</span> Motiváció: az önhivatkozó
+future-ök és a mozgatás problémája</h3>
+<p>Tegyük fel, hogy egy C++ osztály az <em>objektumon belül tárolt</em>
+mezőre mutató pointert tárol. Ha az objektumot áthelyezzük (move), a
+pointer a régi helyre mutat, hacsak a move konstruktor nem frissíti:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> SelfRef <span class="op">{</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> data<span class="op">;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span><span class="op">*</span> p<span class="op">;</span> <span class="co">// az objektumon belüli mezőre mutat</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">explicit</span> SelfRef<span class="op">(</span><span class="dt">int</span> x<span class="op">)</span> <span class="op">:</span> data<span class="op">{</span>x<span class="op">},</span> p<span class="op">{&amp;</span>data<span class="op">}</span> <span class="op">{}</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>SelfRef a<span class="op">{</span><span class="dv">1</span><span class="op">};</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>SelfRef b <span class="op">=</span> <span class="bu">std::</span>move<span class="op">(</span>a<span class="op">);</span>  <span class="co">// az implicit move bitenként másol: b.p még &amp;a.data</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="co">// b.p != &amp;b.data: elavult hivatkozás</span></span></code></pre></div>
+<p>Fontos a különbség egy <em>kupacpuffer birtokosa</em> és egy
+<em>objektumon belüli cím</em> között. Ha a <code>data</code> egy
+<code>std::vector&lt;int&gt;</code> lenne, és a <code>p</code> az
+elemére mutatna (<code>&amp;data[0]</code>), a vektor move-ja a
+kupacpuffer címét <strong>nem</strong> változtatná meg (csak a birtokló
+struktúra költözik), ezért az ilyen <code>p</code> a move után is
+érvényes marad; az invalidálás ott a vektor növekedésekor (reallokáció)
+lép fel. Az önhivatkozás problémája az objektumon <em>belül</em> tárolt
+(inline) mezőre mutató cím, mert az az objektummal együtt elmozdul. A
+javított C++ osztály kézzel írt move konstruktora ezt frissíti:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a>SelfRefFixed<span class="op">(</span>SelfRefFixed<span class="op">&amp;&amp;</span> other<span class="op">)</span> <span class="kw">noexcept</span> <span class="op">:</span> data<span class="op">{</span>other<span class="op">.</span>data<span class="op">},</span> p<span class="op">{&amp;</span>data<span class="op">}</span> <span class="op">{}</span></span></code></pre></div>
+<p>A Rust async/await modelljében a fordító által generált future-ök
+gyakran hasonlóan önhivatkozóak: a future egy belső állapotgépet
+tartalmaz, amelyben a helyi változók egymásra hivatkozhatnak. Ha ezt a
+future-t megmozgatnánk, a belső referenciák érvénytelenné válnának. A
+Rust ezt a <code>Pin</code> típussal és az <code>Unpin</code>
+automatikus traittel zárja ki.</p>
+<h3 data-number="17.2.2" id="fogalmak-és-szabályok"><span
+class="header-section-number">17.2.2</span> Fogalmak és szabályok</h3>
+<p><strong>Definíció.</strong> A <code>Pin&lt;P&gt;</code> egy olyan
+wrapper, ahol <code>P</code> pointer típus – leggyakrabban
+<code>&amp;mut T</code> vagy <code>Box&lt;T&gt;</code>. Ha
+<code>T</code> <strong>nem</strong> <code>Unpin</code>, a
+<code>Pin&lt;P&gt;</code> garantálja, hogy az általa mutatott
+<code>T</code> érték attól kezdve, hogy pinned lett, <strong>a pointee
+eldobásáig nem mozdul el</strong> (a <code>Pin&lt;&amp;mut T&gt;</code>
+fogantyú eldobása ezt a kötelezettséget nem oldja fel) a memóriában. A
+garancia azt jelenti, hogy a <code>Pin&lt;&amp;mut T&gt;</code>-ből nem
+kaphatunk közvetlen <code>&amp;mut T</code> hozzáférést, így nem
+hívhatunk olyan műveletet, amely a <code>T</code>-t mozgatná (például
+<code>mem::swap</code>, <code>mem::replace</code>).</p>
+<p><strong>Definíció.</strong> Az <code>Unpin</code> egy automatikus
+trait. Ha egy típus <code>Unpin</code>, akkor biztonságosan mozgatható
+pinned állapotban is. A legtöbb primitív és standard típus
+(<code>i32</code>, <code>String</code>, <code>Vec&lt;T&gt;</code>)
+<code>Unpin</code>. A generált async future-k általában
+<strong>nem</strong> <code>Unpin</code>, mert önhivatkozóak lehetnek. Ha
+<code>T: Unpin</code>, akkor <code>Pin&lt;&amp;mut T&gt;</code>
+egyszerűen <code>&amp;mut T</code>-re dereferálható.</p>
+<p><strong>Szabály.</strong> A <code>Future</code> trait
+<code>poll</code> metódusának aláírása:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> poll(<span class="kw">self</span><span class="op">:</span> Pin<span class="op">&lt;&amp;</span><span class="kw">mut</span> <span class="dt">Self</span><span class="op">&gt;,</span> cx<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> Context<span class="op">&lt;</span><span class="ot">&#39;_</span><span class="op">&gt;</span>) <span class="op">-&gt;</span> Poll<span class="op">&lt;</span><span class="dt">Self</span><span class="pp">::</span>Output<span class="op">&gt;;</span></span></code></pre></div>
+<p>A <code>self: Pin&lt;&amp;mut Self&gt;</code> azt jelenti, hogy a
+poll implementáció csak pinned referencián keresztül kapja meg a
+future-t. Ezért a jövőbeni <code>poll</code> hívások között a future nem
+mozgatható, és a belső önhivatkozások érvényesek maradnak.</p>
+<p>A <code>Pin</code> létrehozásának leggyakoribb módjai:</p>
+<ul>
+<li><code>Box::pin(future)</code> – heapre pin-neli a future-t,
+<code>Pin&lt;Box&lt;F&gt;&gt;</code> típust ad vissza. Ez akkor hasznos,
+ha a future-t hosszabb ideig szeretnénk tárolni, például egy
+<code>Vec</code>-ben tárolt vagy függvényből visszaadott future-höz (a
+<code>tokio::spawn</code>-nak nem kell, az maga allokál és pinel).</li>
+<li><code>std::pin::pin!</code> makró – stackre pin-neli az értéket,
+<code>Pin&lt;&amp;mut T&gt;</code>-t ad.</li>
+<li><code>unsafe</code> <code>Pin::new_unchecked</code> – csak akkor, ha
+a fejlesztő garantálja, hogy a <code>T</code> (a <code>!Unpin</code>
+pointee) a <strong>pointee eldobásáig</strong> nem mozdul és nem
+érvényteleníthető; a <code>Pin</code> fogantyú eldobása nem szünteti meg
+a kötelezettséget.</li>
+</ul>
+<p>A <code>Pin</code> projekció a pinned struktúra mezőinek elérését
+jelenti. Ha egy <code>!Unpin</code> típusba beágyazott mezőt szeretnénk
+elérni, nem kapunk közvetlen hozzáférést, mert a mező mozgatása sértheti
+a garanciát. Ezt <code>unsafe</code> blokkal vagy erre szolgáló
+crate-ekkel (például <code>pin-project</code>) lehet megoldani; a
+részletes projekció kívül esik a jelen alfejezet hatókörén.</p>
+<h3 data-number="17.2.3" id="c-és-rust-összevetés"><span
+class="header-section-number">17.2.3</span> C++ és Rust összevetés</h3>
+<p>C++-ban az önhivatkozó objektumok mozgatása a fejlesztő felelőssége,
+és a move konstruktorban kell frissíteni a belső mutatókat. Rustban ezt
+a kölcsönzés-ellenőrző és a <code>Pin</code> együttese szabályozza. Az
+async függvény által generált future egy olyan struktúra, amely a helyi
+változókat tartalmazza, és a köztük lévő kölcsönzéseket a generált
+kódban referencia-mezőkként reprezentálja. A Rust fordító ezt a future-t
+<code>!Unpin</code>-ként jelöli, így a poll-hoz csak
+<code>Pin&lt;&amp;mut Self&gt;</code>-et használhatunk, ami kizárja a
+mozgatást.</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> example() <span class="op">{</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> data <span class="op">=</span> <span class="pp">vec!</span>[<span class="dv">1</span><span class="op">,</span> <span class="dv">2</span><span class="op">,</span> <span class="dv">3</span>]<span class="op">;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> r <span class="op">=</span> <span class="op">&amp;</span>data<span class="op">;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="pp">tokio::time::</span>sleep(<span class="pp">std::time::Duration::</span>from_millis(<span class="dv">100</span>))<span class="op">.</span><span class="kw">await</span><span class="op">;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;{:?}&quot;</span><span class="op">,</span> r)<span class="op">;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ebben a példában a <code>r</code> referencia a <code>data</code>-ra
+mutat, és az <code>await</code> alatt is él. Ha a future-t
+megmozgatnánk, a <code>r</code> elavulna. A <code>Pin</code> garancia
+miatt ez nem történhet meg.</p>
+<h3 data-number="17.2.4"
+id="kidolgozott-példa-rc-a-future-ben-és-a-send-határ"><span
+class="header-section-number">17.2.4</span> Kidolgozott példa:
+<code>Rc</code> a future-ben és a Send-határ</h3>
+<p>A <code>tokio::spawn</code> megköveteli, hogy a future
+<code>Send + 'static</code> legyen, mert a tokio más szálakra is
+mozgathatja a taskot. A future akkor <code>Send</code>, ha minden benne
+birtokolt érték <code>Send</code>. Az <code>Rc</code> nem
+<code>Send</code>, mert a referencia-számláló nem atomi. Ez a
+leggyakoribb hiba, amikor egy async blokkban <code>Rc</code>-t
+használunk, majd megpróbáljuk spawnolni.</p>
+<p>Ez a változat szándékosan nem fordul le:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::rc::</span>Rc<span class="op">;</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::time::</span>Duration<span class="op">;</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">tokio::time::</span>sleep<span class="op">;</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> bad_future() <span class="op">{</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> data <span class="op">=</span> <span class="pp">Rc::</span>new(<span class="pp">vec!</span>[<span class="dv">1</span><span class="op">,</span> <span class="dv">2</span><span class="op">,</span> <span class="dv">3</span>])<span class="op">;</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    sleep(<span class="pp">Duration::</span>from_millis(<span class="dv">100</span>))<span class="op">.</span><span class="kw">await</span><span class="op">;</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;len = {}&quot;</span><span class="op">,</span> data<span class="op">.</span>len())<span class="op">;</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="pp">tokio::</span>main<span class="at">]</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>    <span class="pp">tokio::</span>spawn(bad_future())<span class="op">;</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A hiba lényege (a pontos szöveg verziófüggő):
+<code>future cannot be sent between threads safely</code>, és a
+diagnosztika megjelöli az <code>Rc</code>-t mint nem <code>Send</code>
+típust. A javítás: <code>std::sync::Arc</code> használata.</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::time::</span>Duration<span class="op">;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">tokio::time::</span>sleep<span class="op">;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> good_future() <span class="op">{</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> data <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">vec!</span>[<span class="dv">1</span><span class="op">,</span> <span class="dv">2</span><span class="op">,</span> <span class="dv">3</span>])<span class="op">;</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    sleep(<span class="pp">Duration::</span>from_millis(<span class="dv">100</span>))<span class="op">.</span><span class="kw">await</span><span class="op">;</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;len = {}&quot;</span><span class="op">,</span> data<span class="op">.</span>len())<span class="op">;</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="pp">tokio::</span>main<span class="at">]</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> handle <span class="op">=</span> <span class="pp">tokio::</span>spawn(good_future())<span class="op">;</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A JoinHandle megvárása nélkül a main visszatérhetne a task befejezése előtt.</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="kw">let</span> <span class="cn">Err</span>(e) <span class="op">=</span> handle<span class="op">.</span><span class="kw">await</span> <span class="op">{</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>        <span class="pp">eprintln!</span>(<span class="st">&quot;a task hibával állt le: {e}&quot;</span>)<span class="op">;</span> <span class="co">// JoinError: pánik vagy megszakítás</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Az <code>Arc</code> atomi számlálót használ, ezért
+<code>Send + Sync</code>, így a future megfelel a követelménynek. A
+<code>tokio::spawn</code> maga pin-neli a future-t a heapre, ezért nincs
+szükség explicit <code>Box::pin</code>-re. A <code>main</code> megvárja
+a <code>JoinHandle</code>-t, különben a runtime a program kilépésekor
+megszakíthatná a még futó taskot, és a példa futáskor nem írná ki a
+<code>len = 3</code> sort; a <code>JoinError</code> a task pánikját vagy
+megszakítását jelzi. (A tokio az operációs rendszeres szerver-környezet
+runtime-ja; mikrovezérlőn <code>no_std</code> executort, például az
+Embassyt használunk, lásd <a href="r050.html">no_std, embedded-hal és
+Embassy: Rust mikrovezérlőn</a>.) Ha a futurében <code>Rc</code> marad,
+és mégis egy szálon akarjuk futtatni, a
+<code>tokio::task::LocalSet</code> és a <code>spawn_local</code> való,
+mert az nem követel <code>Send</code>-et.</p>
+<p>Hasonló probléma lép fel, ha a
+<strong><code>std::sync::MutexGuard</code></strong>-ot tartjuk egy
+<code>.await</code>-en át. A <code>std</code> guard <strong>nem
+<code>Send</code></strong> (a zárat azon a szálon kell elengedni,
+amelyik megszerezte), ezért az a future, amelyben az
+<code>.await</code>-en át él, nem <code>Send</code>, és a
+<code>tokio::spawn</code> elutasítja:</p>
+<p><em>Kódblokk</em> — önálló példa · <strong>szándékosan hibás</strong>
+· várt hiba: <code>future cannot be sent between threads safely</code>
+(<code>the trait Send is not implemented for std::sync::MutexGuard&lt;'_, i32&gt;</code>)</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span><span class="op">{</span>Arc<span class="op">,</span> Mutex<span class="op">};</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::time::</span>Duration<span class="op">;</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">tokio::time::</span>sleep<span class="op">;</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> process(mutex<span class="op">:</span> Arc<span class="op">&lt;</span>Mutex<span class="op">&lt;</span><span class="dt">i32</span><span class="op">&gt;&gt;</span>) <span class="op">{</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> guard <span class="op">=</span> mutex<span class="op">.</span>lock()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    sleep(<span class="pp">Duration::</span>from_millis(<span class="dv">50</span>))<span class="op">.</span><span class="kw">await</span><span class="op">;</span> <span class="co">// a std guard az await-en át él</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;value = {}&quot;</span><span class="op">,</span> <span class="op">*</span>guard)<span class="op">;</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="pp">tokio::</span>main<span class="at">]</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>    <span class="pp">tokio::</span>spawn(process(<span class="pp">Arc::</span>new(<span class="pp">Mutex::</span>new(<span class="dv">1</span>))))<span class="op">.</span><span class="kw">await</span><span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A javítás: szűkítsük a lock élettartamát egy belső blokkra, hogy a
+guard az <code>.await</code> előtt eldobódjon (futtatva:
+<code>value = 1</code>):</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span><span class="op">{</span>Arc<span class="op">,</span> Mutex<span class="op">};</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::time::</span>Duration<span class="op">;</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">tokio::time::</span>sleep<span class="op">;</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> process(mutex<span class="op">:</span> Arc<span class="op">&lt;</span>Mutex<span class="op">&lt;</span><span class="dt">i32</span><span class="op">&gt;&gt;</span>) <span class="op">{</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> guard <span class="op">=</span> mutex<span class="op">.</span>lock()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>        <span class="pp">println!</span>(<span class="st">&quot;value = {}&quot;</span><span class="op">,</span> <span class="op">*</span>guard)<span class="op">;</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="co">// a guard az await előtt eldobódik</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>    sleep(<span class="pp">Duration::</span>from_millis(<span class="dv">50</span>))<span class="op">.</span><span class="kw">await</span><span class="op">;</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="pp">tokio::</span>main<span class="at">]</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>    <span class="pp">tokio::</span>spawn(process(<span class="pp">Arc::</span>new(<span class="pp">Mutex::</span>new(<span class="dv">1</span>))))<span class="op">.</span><span class="kw">await</span><span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Az alábbi ábra a szabályt mutatja: a fordító a felfüggesztési ponton
+(<code>.await</code>) átnyúló lokálisokból képzi a generált állapotgép
+mezőit, és a future akkor <code>Send</code>, ha mindegyik mező
+<code>Send</code>. A hibás változatban a <code>std</code> guard sávja
+átnyúlik a felfüggesztési ponton, ezért <code>!Send</code> mező kerül a
+future-be; a blokkba szűkített guard sávja előtte véget ér, így csak a
+<code>mutex</code> marad mező.</p>
+<figure id="fig-r038-send-hatar">
+<div class="fig-interactive"><iframe src="figures/html/r038-send-hatar.html" title="A felfüggesztési ponton átnyúló std MutexGuard nem Send mezőt ad a future-nek; a blokkba zárt guard nem nyúlik át, így a future Send." loading="lazy" style="width:100%;border:0;height:560px"></iframe><noscript><img src="figures/img/r038-send-hatar.png" style="width:100.0%"
+alt="A felfüggesztési ponton átnyúló std MutexGuard nem Send mezőt ad a future-nek; a blokkba zárt guard nem nyúlik át, így a future Send." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/r038-send-hatar.png" style="width:100.0%"
+alt="A felfüggesztési ponton átnyúló std MutexGuard nem Send mezőt ad a future-nek; a blokkba zárt guard nem nyúlik át, így a future Send." /></details></div>
+<figcaption>A Send-határ: csak az .await-en át élő értékek
+számítanak</figcaption>
+</figure>
+<p>A <strong><code>tokio::sync::MutexGuard</code></strong> viszont
+<code>Send</code> (ha a védett típus <code>Send</code>) és
+<code>Sync</code> (ha <code>Send + Sync</code>): az aszinkron zár nincs
+szálhoz kötve, ezért az <code>.await</code>-en át tartott tokio guard
+<strong>nem teszi</strong> a future-t <code>!Send</code>-dé, a
+<code>tokio::spawn</code> elfogadja. Ez <em>típus szerint</em>
+megengedett, de nem ingyenes: a zár az egész várakozás alatt foglalt
+marad, a többi task blokkol rajta, és ha a várakozott művelet maga is
+ugyanezt a zárat kérné, holtpont keletkezik. Ezért a tokio guardot is
+csak akkor tartjuk <code>.await</code>-en át, ha a zár
+<em>szándékosan</em> védi a várakozás alatti állapotot (például egy
+kapcsolat kizárólagos írása).</p>
+<h3 data-number="17.2.5" id="önhivatkozó-future-memóriaábra"><span
+class="header-section-number">17.2.5</span> Önhivatkozó future
+memóriaábra</h3>
+<figure>
+<img src="assets/r038-diagram-1.png"
+alt="Önhivatkozó future állapotgép Pin alatt - A future a heapen, Pin-nelt állapotban. A belső ref mező a saját data mezőre mutat; a Pin megakadályozza a future mozgatását, így a mutató érvényes marad." />
+<figcaption aria-hidden="true">Önhivatkozó future állapotgép Pin alatt -
+A future a heapen, Pin-nelt állapotban. A belső ref mező a saját data
+mezőre mutat; a Pin megakadályozza a future mozgatását, így a mutató
+érvényes marad.</figcaption>
+</figure>
+<p>Az ábra azt mutatja, hogy a future a heapre kerül, és a
+<code>Pin</code> miatt a címe rögzített. A future struct egyik mezője
+(<code>data</code>) a tényleges adatot tartalmazza, egy másik mezője
+(<code>ref</code>) a <code>data</code>-ra mutat. Ha a future-t
+megmozgatnánk, a <code>ref</code> elavulna; a <code>Pin</code> ezt
+akadályozza meg.</p>
+<h3 data-number="17.2.6"
+id="async-fn-traitekben-és-dyn-kompatibilitás"><span
+class="header-section-number">17.2.6</span> async fn traitekben és
+dyn-kompatibilitás</h3>
+<p>A Rust stabilizálta az async fn-eket trait-ekben (Async Fn in Trait,
+AFIT). Ez lehetővé teszi, hogy egy trait metódusa async legyen. Fontos
+azonban: a <code>dyn</code> trait objektum nem tud közvetlenül async
+metódust hívni, mert az async fn visszatérési típusa
+<code>impl Future&lt;Output = ...&gt;</code>, ami opak típus, és ezért
+nem dyn-kompatibilis. A dyn Trait-ekhez vagy az <code>async_trait</code>
+crate-et szokták használni (amely
+<code>Pin&lt;Box&lt;dyn Future&lt;Output = …&gt; + Send&gt;&gt;</code>-t
+állít elő egy makróval), vagy enum-alapú dispatch-et. A stabilizálás
+pontos részletei és a dyn-kompatibilis async trait-ek esetleges későbbi
+kiterjesztései verziófüggőek, ezért a konkrét Rust-verzió
+dokumentációját ellenőrizni kell.</p>
+<p>Az <code>async fn</code> trait-ekben a Rust 1.75-től stabil nyelvi
+képesség (nem az edition függvénye: edition 2021-ben is elérhető).
+Statikus generikus kódban használható (például
+<code>fn f&lt;T: MyTrait&gt;(t: T)</code>), de a
+<code>dyn MyTrait</code> objektumokon továbbra is korlátok vannak. Ezért
+a gyakorlatban a trait-objektumos async kódnál gyakran az
+<code>async_trait</code>-et alkalmazzák.</p>
+<h3 data-number="17.2.7" id="tipikus-hibák-és-átállási-csapdák"><span
+class="header-section-number">17.2.7</span> Tipikus hibák és átállási
+csapdák</h3>
+<ol type="1">
+<li><strong><code>Rc</code> a future-ben.</strong> Ha Rc-t használunk
+egy async blokkban, a future <code>!Send</code> lesz, és
+<code>tokio::spawn</code>-nal nem futtatható. <strong>Javítás:</strong>
+használjunk <code>Arc</code>-ot, vagy ne tartsuk az <code>Rc</code>-t az
+<code>.await</code>-en át, ha lehetséges.</li>
+<li><strong><code>MutexGuard</code> tartása <code>.await</code>
+alatt.</strong> A <code>std::sync::MutexGuard</code> nem
+<code>Send</code>; ha az async blokkban a guard az <code>await</code>-ig
+él, a future nem lesz <code>Send</code>, és a <code>tokio::spawn</code>
+elutasítja. A <code>tokio::sync::MutexGuard</code> <code>Send</code>,
+így a future <code>Send</code> marad, de a zár a várakozás alatt
+foglalt, ami teljesítmény- és holtpontkockázat.
+<strong>Javítás:</strong> zárjuk blokkba a kritikus szekciót, és a
+guardot az <code>await</code> előtt engedjük el.</li>
+<li><strong>A <code>Pin</code> félreértelmezése.</strong> A
+<code>Pin</code> nem a <code>T</code> belső változását tiltja, hanem a
+<code>T</code> mozgatását. Nem akadályozza meg például, hogy
+<code>&amp;mut T</code>-n keresztül módosítsuk az adatot, ha a típus
+<code>Unpin</code>. Csak <code>!Unpin</code> típusoknál korlátozza a
+mozgató műveleteket.</li>
+<li><strong><code>Box::pin</code> és <code>pin!</code> helytelen
+választása.</strong> Ha a future-t rövid ideig, egy adott scope-ban
+használjuk, a <code>pin!</code> elegendő; ha tárolni kell vagy vissza
+kell adni, akkor <code>Box::pin</code>. A
+<code>Pin&lt;Box&lt;F&gt;&gt;</code> <code>Send</code> lehet, ha
+<code>F: Send</code>, így spawnolható.</li>
+</ol>
+<p><strong>Továbbvitt eredmény.</strong> A <code>Send</code>-határok és
+a <code>Pin</code> ismerete alapvető lesz a <a href="r039.html">Tokio:
+taskok, I/O, csatornák, select és megszakítás</a> alfejezetben, ahol
+spawn-olt taskokat készítünk, és az <a href="r040.html">Az rkv hálózati
+szerver: TCP, protokoll, kecses leállás</a> alfejezetben, ahol a handler
+future-öknek <code>Send</code>-nek kell lenniük, és a megosztott
+állapotot a <a href="r034.html">Mutex, RwLock, csatornák és a megosztott
+rkv</a> <code>SharedStore</code>-jával
+(<code>Arc&lt;std::sync::Mutex&lt;...&gt;&gt;</code>) oldjuk meg. A
+<code>Pin</code> garanciáját a <code>Future::poll</code> szignatúra
+betartásakor használjuk.</p>
+<h3 data-number="17.2.8" id="feladatok"><span
+class="header-section-number">17.2.8</span> Feladatok</h3>
+<ol type="1">
+<li><strong>Fogalmi kérdés.</strong> Miért nem <code>Unpin</code> a
+legtöbb generált async future? Mi a különbség a <code>Pin</code> és az
+<code>Unpin</code> között?</li>
+<li><strong>C++-ból Rustba.</strong> Adott a fenti C++
+<code>SelfRef</code> osztály, amelynek implicit move-ja nem frissíti a
+belső pointert (a javított változatban a kézzel írt move konstruktor
+igen). Magyarázd el, hogyan kerüli el a Rust ugyanezt a hibát a
+<code>Pin</code> segítségével az async future-ökben.</li>
+<li><strong>Implementáció.</strong> Írj egy async függvényt, amely
+<code>Rc&lt;Vec&lt;i32&gt;&gt;</code>-ot használ, és próbáld
+<code>tokio::spawn</code>-nal futtatni. Javítsd <code>Arc</code>-ra, és
+indokold, miért lesz a future <code>Send</code>.</li>
+<li><strong>Hibajavítás.</strong> Adott a következő kód:</li>
+</ol>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span><span class="op">{</span>Arc<span class="op">,</span> Mutex<span class="op">};</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">tokio::time::</span><span class="op">{</span>sleep<span class="op">,</span> Duration<span class="op">};</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> process(mutex<span class="op">:</span> Arc<span class="op">&lt;</span>Mutex<span class="op">&lt;</span><span class="dt">i32</span><span class="op">&gt;&gt;</span>) <span class="op">{</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> guard <span class="op">=</span> mutex<span class="op">.</span>lock()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    sleep(<span class="pp">Duration::</span>from_millis(<span class="dv">50</span>))<span class="op">.</span><span class="kw">await</span><span class="op">;</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;value = {}&quot;</span><span class="op">,</span> <span class="op">*</span>guard)<span class="op">;</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>tokio::spawn(process(..))</code> nem fordul le. Miért?
+Módosítsd úgy, hogy a <code>guard</code> ne élje túl az
+<code>await</code>-et, és a future <code>Send</code> legyen. Mi
+változna, ha a <code>std::sync::Mutex</code> helyett a
+<code>tokio::sync::Mutex</code>-et használnád
+(<code>lock().await</code>)? Elég-e ez a csere a <code>Send</code>
+követelményhez, és mit nyersz vagy veszítesz vele?</p>
+<ol start="5" type="1">
+<li><strong>Tervezési döntés.</strong> Az rkv hálózati szerverben minden
+klienshez egy task tartozik, és a <code>Store</code>-t több task is
+eléri. Milyen kombinációt választanál a megosztott
+<code>Store</code>-hoz, hogy a handler future-ök <code>Send</code>-ek
+legyenek? (Gondolj <code>Arc</code>, tokio <code>Mutex</code> vagy
+<code>RwLock</code> használatára, és a lock élettartamának
+minimalizálására.)</li>
+</ol>
+<h3 data-number="17.2.9" id="megoldások"><span
+class="header-section-number">17.2.9</span> Megoldások</h3>
+<ol type="1">
+<li>A generált async future azért nem <code>Unpin</code>, mert a fordító
+a helyi változókat és a köztük lévő referenciákat egy structba
+csomagolja; ha ezt a structot mozgatnánk, a belső referenciák
+elavulnának. Az <code>Unpin</code> automatikus trait, amely azt jelzi,
+hogy a típus pinned állapotban is mozgatható; a <code>Pin</code> pedig
+olyan wrapper, amely a <code>!Unpin</code> típusok mozgatását
+akadályozza meg.</li>
+<li>C++-ban a move konstruktor felel a pointer frissítéséért; Rustban az
+async future-ök <code>!Unpin</code>-ek, és a <code>Future::poll</code>
+csak <code>Pin&lt;&amp;mut Self&gt;</code>-et kap, így a future nem
+mozgatható az élettartama alatt. Ez garantálja, hogy a belső referenciák
+mindig érvényesek maradnak, anélkül hogy a fejlesztőnek manuálisan
+frissítenie kellene őket.</li>
+<li>A kód:</li>
+</ol>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::rc::</span>Rc<span class="op">;</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::time::</span>Duration<span class="op">;</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">tokio::time::</span>sleep<span class="op">;</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> bad() <span class="op">{</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> data <span class="op">=</span> <span class="pp">Rc::</span>new(<span class="pp">vec!</span>[<span class="dv">1</span><span class="op">,</span> <span class="dv">2</span><span class="op">,</span> <span class="dv">3</span>])<span class="op">;</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>    sleep(<span class="pp">Duration::</span>from_millis(<span class="dv">100</span>))<span class="op">.</span><span class="kw">await</span><span class="op">;</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;{:?}&quot;</span><span class="op">,</span> data)<span class="op">;</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="pp">tokio::</span>main<span class="at">]</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>    <span class="pp">tokio::</span>spawn(bad())<span class="op">;</span> <span class="co">// hiba: future cannot be sent between threads safely</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Javítás <code>Arc</code>-cal:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::time::</span>Duration<span class="op">;</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">tokio::time::</span>sleep<span class="op">;</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> good() <span class="op">{</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> data <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">vec!</span>[<span class="dv">1</span><span class="op">,</span> <span class="dv">2</span><span class="op">,</span> <span class="dv">3</span>])<span class="op">;</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>    sleep(<span class="pp">Duration::</span>from_millis(<span class="dv">100</span>))<span class="op">.</span><span class="kw">await</span><span class="op">;</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;{:?}&quot;</span><span class="op">,</span> data)<span class="op">;</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="pp">tokio::</span>main<span class="at">]</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a>    <span class="pp">tokio::</span>spawn(good())<span class="op">.</span><span class="kw">await</span><span class="op">.</span>expect(<span class="st">&quot;a task pánikolt&quot;</span>)<span class="op">;</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Várt kimenet: <code>[1, 2, 3]</code>. (A <code>JoinHandle</code>
+megvárása nélkül a <code>main</code> kilépne a task befejezése előtt, és
+a program semmit nem írna ki.)</p>
+<ol start="4" type="1">
+<li>A hiba oka: a <code>std::sync::MutexGuard</code> nem
+<code>Send</code>, és az <code>.await</code>-en át él, ezért a future
+nem <code>Send</code> (<code>tokio::spawn</code> elutasítja). A javított
+kód:</li>
+</ol>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> process(mutex<span class="op">:</span> Arc<span class="op">&lt;</span>Mutex<span class="op">&lt;</span><span class="dt">i32</span><span class="op">&gt;&gt;</span>) <span class="op">{</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> guard <span class="op">=</span> mutex<span class="op">.</span>lock()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>        <span class="pp">println!</span>(<span class="st">&quot;value = {}&quot;</span><span class="op">,</span> <span class="op">*</span>guard)<span class="op">;</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="co">// a guard az await előtt eldobódik</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>    sleep(<span class="pp">Duration::</span>from_millis(<span class="dv">50</span>))<span class="op">.</span><span class="kw">await</span><span class="op">;</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>tokio::sync::Mutex</code> (<code>lock().await</code>)
+önmagában is <code>Send</code> guardot ad, tehát a <em><code>Send</code>
+követelményt</em> a csere megoldaná, a kritikus szakasz viszont továbbra
+is 50 ms-ig tartana: a többi task ennyit várna a zárra. Hosszú,
+<code>.await</code>-et tartalmazó kritikus szakaszhoz a tokio mutex
+való, rövid, <code>.await</code>-mentes szakaszhoz a (gyorsabb)
+<code>std</code> mutex a blokkba szűkített guarddal.</p>
+<ol start="5" type="1">
+<li>Az rkv szerverben a <a href="r034.html">Mutex, RwLock, csatornák és
+a megosztott rkv</a> <code>SharedStore</code>-ját (belül
+<code>Arc&lt;std::sync::Mutex&lt;Box&lt;dyn Storage + Send&gt;&gt;&gt;</code>)
+használjuk: a guard sosem él <code>.await</code>-en át, ezért a
+<code>std</code> mutex elég és gyorsabb; a blokkoló (fájl-I/O-s)
+műveletet <code>spawn_blocking</code>-be tesszük (<a href="r040.html">Az
+rkv hálózati szerver: TCP, protokoll, kecses leállás</a>). A burkolás
+nem teszi a tárolót <code>Sync</code>-ké:
+<code>RwLock&lt;T&gt;: Sync</code> csak <code>T: Send + Sync</code>
+esetén áll, a <code>dyn Storage + Send</code> pedig nem
+<code>Sync</code>, ezért <code>RwLock</code> csak
+<code>Storage: Sync</code> esetén adna több olvasót. Tokio-zár csak
+akkor kell, ha a kritikus szakasz <code>.await</code>-et tartalmaz.</li>
+</ol>
+<h3 data-number="17.2.10" id="rövid-összefoglaló"><span
+class="header-section-number">17.2.10</span> Rövid összefoglaló</h3>
+<p>A <code>Pin</code> a Rust válasza az önhivatkozó future-ök
+mozgatásából eredő memóriabiztonsági problémára. A
+<code>Future::poll</code> szignatúrája
+<code>self: Pin&lt;&amp;mut Self&gt;</code>, így a future nem mozgatható
+a poll hívások között. Az <code>Unpin</code> automatikus trait jelzi,
+hogy egy típus pinned állapotban is mozgatható; a generált async
+future-k általában <code>!Unpin</code>. <code>Box::pin</code> és a
+<code>pin!</code> makró pin-nelt future-öket hoz létre. A
+<code>tokio::spawn</code> megköveteli, hogy a future
+<code>Send + 'static</code> legyen; az <code>Rc</code> és a
+<code>.await</code>-en át tartott <code>std::sync::MutexGuard</code> nem
+<code>Send</code>, ezért helyettük <code>Arc</code>-ot és az
+<code>.await</code> előtt eldobott (blokkba szűkített) guardot
+használunk; a <code>tokio::sync::MutexGuard</code> <code>Send</code>, de
+a zárat a várakozás alatt is foglalja. Az async fn traitekben (AFIT)
+stabil, de dyn-kompatibilis használata korlátozott; ilyenkor
+<code>async_trait</code>-et vagy enum-dispatchet alkalmazunk.
+<strong>Továbbvitt eredmény:</strong> a Send-határok és a Pin ismerete
+elengedhetetlen a <a href="r039.html">Tokio: taskok, I/O, csatornák,
+select és megszakítás</a> és az <a href="r040.html">Az rkv hálózati
+szerver: TCP, protokoll, kecses leállás</a> alfejezetekhez, ahol
+spawn-olt taskok és megosztott állapotok kezelik ezeket.</p>
+<h3 data-number="17.2.11" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">17.2.11</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li>Standard könyvtár: <a
+href="https://doc.rust-lang.org/std/pin/"><code>std::pin</code></a></li>
+<li>The Rust Async Book: <a
+href="https://rust-lang.github.io/async-book/04_pinning/01_chapter.html">Pinning</a></li>
+<li>Tokio dokumentáció: <a
+href="https://tokio.rs/tokio/tutorial/spawning">Spawning</a></li>
+<li>Az async fn traitekben (AFIT) az 1.75-ös Rustban stabilizálódott; a
+dyn-kompatibilitás korlátai a Reference-ben olvashatók. A
+<code>pin!</code> makró a Rust 1.68 óta stabil. A
+<code>tokio::sync::MutexGuard</code> <code>Send</code>-tulajdonságát a
+tokio dokumentációja rögzíti; a <code>std::sync::MutexGuard</code> nem
+<code>Send</code>.</li>
+</ul>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="r037.html">← 17.1 Future-ök és async/await: mi történik a motorháztető alatt</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="r039.html">17.3 Tokio: taskok, I/O, csatornák, select és megszakítás →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>35.3 Dangling capture, resumption és cancellation – C és modern
+C++ rendszerszemléletben DevOps szakembereknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. rész: Modern C++</a> › <a href="index.html#ch35">35 Coroutine-ok és aszinkron erőforrás-életciklus</a></p>
+<div class="links"><a class="prev" rel="prev" href="s177.html">← 35.2 promise_type, awaiter és coroutine_handle</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="s179.html">35.4 Generator és streaming feldolgozás →</a></div>
+</nav>
+<h2 data-number="35.3" id="s178"><span
+class="header-section-number">35.3</span> Dangling capture, resumption
+és cancellation</h2>
+<p>A coroutine nem kerül ki a memóriából akkor, amikor a létrehozó
+kifejezés véget ér: a fordító egy úgynevezett <em>coroutine
+frame</em>-et (activation record) készít, amely a promise objektumot, a
+paraméterek másolatait, a felfüggesztési pont indexét és a
+felfüggesztéseket átélő lokálisokat tartalmazza. A frame élettartama
+független a létrehozó lexikális hatókörétől, és éppen ez a különbség
+szüli a coroutine-ok saját hibacsaládját: a nem tulajdonló hivatkozások
+(referencia, <code>this</code>, pointer, <code>string_view</code>,
+iterator, <code>span</code>) túlélhetik azt az objektumot, amire
+mutatnak. Ebben az alfejezetben ezt a jelenséget nevezzük
+<strong>dangling capture</strong>-nek, és három tipikus alakját, majd a
+cancellation–completion–destroy versenyhelyzet kezelését tárgyaljuk. A
+<a href="s177.html">promise_type, awaiter és coroutine_handle (35.2)</a>
+részben felépített fogalmakra építünk; a nem tulajdonló nézetek
+élettartam-szabályait a <a href="s153.html">Borrowed range, dangling és
+iterator lifetime (30.5)</a> rögzítette, a publikálási mintákat pedig a
+<a href="s172.html">C++ atomics, atomic_ref és publication
+(34.3)</a>.</p>
+<h3 data-number="35.3.1" id="a-frame-mint-élettartam-tartomány"><span
+class="header-section-number">35.3.1</span> A frame mint
+élettartam-tartomány</h3>
+<p>A szabvány a coroutine state-ben csak a promise objektumot, a
+paraméterek másolatait és az implementációfüggő további állapotot írja
+elő; a gyakorlatban a fordító itt tárolja a nem statikus tagfüggvényként
+definiált coroutine <code>*this</code> elérését, valamint azokat az
+automatikus tárolási idejű változókat, amelyek élettartama átnyúlik egy
+felfüggesztési ponton, és a folytatási pontot. Fontos árnyalat: a
+<strong>paraméter másolata</strong> nem azt jelenti, hogy a hivatkozott
+objektum is bemásolódik. Ha a paraméter típusa <code>T const&amp;</code>
+vagy <code>T&amp;</code>, a frame-be kerülő „másolat” maga a hivatkozás
+(a gyakorlatban egy pointer), a hivatkozott objektum pedig a hívó
+oldalon marad. Ugyanez igaz a <code>*this</code>-re: a frame nem a
+closure másolatát, hanem a closure elérési útját őrzi.</p>
+<p>Ebből két feltétel adódik, amelyeket minden coroutine-alapú API-nak
+dokumentálnia kell:</p>
+<ol type="1">
+<li><strong>Hívói élettartam-feltétel:</strong> a coroutine által nem
+tulajdonolt minden objektumnak életben kell maradnia addig, amíg a
+coroutine azt utoljára használja – nem addig, amíg a létrehozó kifejezés
+véget ér.</li>
+<li><strong>Frame-tulajdonosi feltétel:</strong> a
+<code>std::coroutine_handle</code> nem tulajdonló; a frame-et pontosan
+egyszer kell megszüntetni (<code>destroy()</code>), és csakis
+felfüggesztett állapotban, más szál részvételének kizárásával.
+Befejezett (final suspendet elért) coroutine-ra <code>resume()</code>
+hívása, illetve futó coroutine <code>destroy()</code>-ja nem definiált
+viselkedés.</li>
+</ol>
+<p>A két feltétel együtt adja a coroutine-típus szerződését; a
+<code>task</code> típus, amelyet az alábbi példák használnak, egy
+szálon, sorrendben futtatható, nem kezel cancellationt, és a frame-et a
+destruktora szünteti meg.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// task.h -- minimalis, egy szalon, sorrendben futtathato task (oktatasi cel)</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#pragma once</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;coroutine&gt;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;exception&gt;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;utility&gt;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> task <span class="op">{</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> <span class="dt">promise_type</span> <span class="op">{</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>exception_ptr err<span class="op">{};</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>coroutine_handle<span class="op">&lt;&gt;</span> cont<span class="op">{};</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>        task get_return_object<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> task<span class="op">{</span><span class="bu">std::</span>coroutine_handle<span class="op">&lt;</span><span class="dt">promise_type</span><span class="op">&gt;::</span>from_promise<span class="op">(*</span><span class="kw">this</span><span class="op">)};</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>suspend_always initial_suspend<span class="op">()</span> <span class="kw">noexcept</span> <span class="op">{</span> <span class="cf">return</span> <span class="op">{};</span> <span class="op">}</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>        <span class="kw">struct</span> final_awaiter <span class="op">{</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>            <span class="dt">bool</span> await_ready<span class="op">()</span> <span class="kw">noexcept</span> <span class="op">{</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>coroutine_handle<span class="op">&lt;&gt;</span> await_suspend<span class="op">(</span><span class="bu">std::</span>coroutine_handle<span class="op">&lt;</span><span class="dt">promise_type</span><span class="op">&gt;</span> h<span class="op">)</span> <span class="kw">noexcept</span> <span class="op">{</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>                <span class="kw">auto</span> c <span class="op">=</span> h<span class="op">.</span>promise<span class="op">().</span>cont<span class="op">;</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>                <span class="cf">return</span> c <span class="op">?</span> c <span class="op">:</span> <span class="bu">std::</span>noop_coroutine<span class="op">();</span>   <span class="co">// symmetric transfer</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a>            <span class="dt">void</span> await_resume<span class="op">()</span> <span class="kw">noexcept</span> <span class="op">{}</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>        <span class="op">};</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>        final_awaiter final_suspend<span class="op">()</span> <span class="kw">noexcept</span> <span class="op">{</span> <span class="cf">return</span> <span class="op">{};</span> <span class="op">}</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>        <span class="dt">void</span> return_void<span class="op">()</span> <span class="kw">noexcept</span> <span class="op">{}</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>        <span class="dt">void</span> unhandled_exception<span class="op">()</span> <span class="kw">noexcept</span> <span class="op">{</span> err <span class="op">=</span> <span class="bu">std::</span>current_exception<span class="op">();</span> <span class="op">}</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a>    <span class="op">};</span></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a>    <span class="kw">using</span> <span class="dt">handle_t</span> <span class="op">=</span> <span class="bu">std::</span>coroutine_handle<span class="op">&lt;</span><span class="dt">promise_type</span><span class="op">&gt;;</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a>    <span class="dt">handle_t</span> h<span class="op">{};</span></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a>    task<span class="op">()</span> <span class="op">=</span> <span class="cf">default</span><span class="op">;</span></span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a>    <span class="kw">explicit</span> task<span class="op">(</span><span class="dt">handle_t</span> hh<span class="op">)</span> <span class="kw">noexcept</span> <span class="op">:</span> h<span class="op">(</span>hh<span class="op">)</span> <span class="op">{}</span></span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a>    task<span class="op">(</span>task<span class="op">&amp;&amp;</span> o<span class="op">)</span> <span class="kw">noexcept</span> <span class="op">:</span> h<span class="op">(</span><span class="bu">std::</span>exchange<span class="op">(</span>o<span class="op">.</span>h<span class="op">,</span> <span class="op">{}))</span> <span class="op">{}</span></span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a>    task<span class="op">&amp;</span> <span class="kw">operator</span><span class="op">=(</span>task<span class="op">&amp;&amp;</span> o<span class="op">)</span> <span class="kw">noexcept</span> <span class="op">{</span></span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span><span class="kw">this</span> <span class="op">!=</span> <span class="op">&amp;</span>o<span class="op">)</span> <span class="op">{</span> <span class="cf">if</span> <span class="op">(</span>h<span class="op">)</span> h<span class="op">.</span>destroy<span class="op">();</span> h <span class="op">=</span> <span class="bu">std::</span>exchange<span class="op">(</span>o<span class="op">.</span>h<span class="op">,</span> <span class="op">{});</span> <span class="op">}</span></span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">*</span><span class="kw">this</span><span class="op">;</span></span>
+<span id="cb1-40"><a href="#cb1-40" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-41"><a href="#cb1-41" aria-hidden="true" tabindex="-1"></a>    task<span class="op">(</span><span class="at">const</span> task<span class="op">&amp;)</span> <span class="op">=</span> <span class="kw">delete</span><span class="op">;</span></span>
+<span id="cb1-42"><a href="#cb1-42" aria-hidden="true" tabindex="-1"></a>    task<span class="op">&amp;</span> <span class="kw">operator</span><span class="op">=(</span><span class="at">const</span> task<span class="op">&amp;)</span> <span class="op">=</span> <span class="kw">delete</span><span class="op">;</span></span>
+<span id="cb1-43"><a href="#cb1-43" aria-hidden="true" tabindex="-1"></a>    <span class="op">~</span>task<span class="op">()</span> <span class="op">{</span> <span class="cf">if</span> <span class="op">(</span>h<span class="op">)</span> h<span class="op">.</span>destroy<span class="op">();</span> <span class="op">}</span></span>
+<span id="cb1-44"><a href="#cb1-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-45"><a href="#cb1-45" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> valid<span class="op">()</span> <span class="at">const</span> <span class="kw">noexcept</span> <span class="op">{</span> <span class="cf">return</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">bool</span><span class="op">&gt;(</span>h<span class="op">);</span> <span class="op">}</span></span>
+<span id="cb1-46"><a href="#cb1-46" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> await_ready<span class="op">()</span> <span class="at">const</span> <span class="kw">noexcept</span> <span class="op">{</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb1-47"><a href="#cb1-47" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>coroutine_handle<span class="op">&lt;&gt;</span> await_suspend<span class="op">(</span><span class="bu">std::</span>coroutine_handle<span class="op">&lt;&gt;</span> caller<span class="op">)</span> <span class="kw">noexcept</span> <span class="op">{</span></span>
+<span id="cb1-48"><a href="#cb1-48" aria-hidden="true" tabindex="-1"></a>        h<span class="op">.</span>promise<span class="op">().</span>cont <span class="op">=</span> caller<span class="op">;</span></span>
+<span id="cb1-49"><a href="#cb1-49" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> h<span class="op">;</span></span>
+<span id="cb1-50"><a href="#cb1-50" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-51"><a href="#cb1-51" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> await_resume<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-52"><a href="#cb1-52" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>h<span class="op">.</span>promise<span class="op">().</span>err<span class="op">)</span> <span class="bu">std::</span>rethrow_exception<span class="op">(</span>h<span class="op">.</span>promise<span class="op">().</span>err<span class="op">);</span></span>
+<span id="cb1-53"><a href="#cb1-53" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-54"><a href="#cb1-54" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<h3 data-number="35.3.2"
+id="by-reference-paraméter-és-az-életüket-túlélő-hívó"><span
+class="header-section-number">35.3.2</span> By-reference paraméter és az
+életüket túlélő hívó</h3>
+<p>A leggyakoribb hibaforma: a coroutine referenciaparamétert kap, a
+hívó pedig egy temporaryt ad át, vagy lokális változót, amely a
+coroutine befejezése előtt kimegy a hatóköréből. A temporary a
+<em>teljes kifejezés</em> végén megszűnik, nem a coroutine végén.</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// NEGATIV PELDA -- szandekosan hibas, ne masold a termekkodbe</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;task.h&quot;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string&gt;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>task log_after_gap<span class="op">(</span><span class="bu">std::</span>string <span class="at">const</span><span class="op">&amp;</span> msg<span class="op">)</span> <span class="op">{</span>   <span class="co">// referenciaparameter</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">co_await</span> <span class="bu">std::</span>suspend_always<span class="op">{};</span>            <span class="co">// felfuggesztes: a hivo tovabblep</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>puts<span class="op">(</span>msg<span class="op">.</span>c_str<span class="op">());</span>                    <span class="co">// msg -&gt; a hivo objektuma</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> caller<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> t <span class="op">=</span> log_after_gap<span class="op">(</span><span class="bu">std::</span>string<span class="op">(</span><span class="st">&quot;kesz&quot;</span><span class="op">));</span>  <span class="co">// temporary ertek</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A temporary a kifejezes vegen megszunik; a frame tovabb el,</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">// es a kesobbi resume utan a msg hivatkozas dangling.</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">(</span><span class="dt">void</span><span class="op">)</span>t<span class="op">;</span>                                       <span class="co">// későbbi co_await/await_resume: UB</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A hiba nem azért következik be, mert a frame „elfelejtette” másolni
+az objektumot, hanem azért, mert a paraméter típusa nem kért másolatot.
+A javítás mintái:</p>
+<ul>
+<li><strong>Érték szerinti paraméter.</strong>
+<code>task log_after_gap(std::string msg)</code> – a frame a string
+másolatát tárolja, a hívó bármikor megszűnhet. Költsége egy másolás
+(vagy mozgatás, ha a hívó <code>std::move</code>-val adja át).</li>
+<li><strong>Tulajdonosi lánc.</strong> A hívó egy
+<code>std::shared_ptr&lt;std::string&gt;</code>-et ad át, vagy a
+coroutine-t egy olyan objektum tagjaként indítja, amelynek élettartama
+igazoltan hosszabb.</li>
+<li><strong>Strukturális garancia.</strong> Az <code>await_resume</code>
+addig nem tér vissza, amíg a coroutine be nem fejeződött, tehát ha a
+hívó a <code>co_await</code> előtt létrehozza az objektumot és csak
+utána engedi ki, a hivatkozás biztonságos. Ezt a szerződést a
+<code>task</code> típus dokumentációjában kell rögzíteni, mert a nyelv
+nem kényszeríti ki.</li>
+</ul>
+<p>Vigyázat: a <code>std::string_view</code> paraméter különösen
+csapdás, mert érték szerinti átadása is nem tulajdonló. Egy string
+literálból képzett <code>string_view</code> statikus tárolású adatra
+mutat, ezért biztonságos; egy <code>std::string</code>-ből képzett
+viszont ugyanúgy dangling, mint a referencia.</p>
+<h3 data-number="35.3.3"
+id="coroutine-lambda-és-a-closure-élettartama"><span
+class="header-section-number">35.3.3</span> Coroutine lambda és a
+closure élettartama</h3>
+<p>A lambda <code>operator()</code>-a nem statikus tagfüggvény, ezért
+coroutine-ként a frame a closure objektumra mutató elérési utat tárolja,
+a <em>capture-öket</em> viszont a closure tartalmazza. Ha a closure
+temporary, a <code>co_await</code> utáni hozzáférés a megszűnt
+closure-re mutat.</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// NEGATIV PELDA -- temporary closure + coroutine lambda</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;task.h&quot;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string&gt;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="kw">auto</span> make_source<span class="op">(</span><span class="bu">std::</span>string path<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">[</span>path<span class="op">](</span><span class="dt">int</span><span class="op">&amp;</span> out<span class="op">)</span> <span class="op">-&gt;</span> task <span class="op">{</span>              <span class="co">// by-value capture a closure-ben</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>        <span class="cf">co_await</span> <span class="bu">std::</span>suspend_always<span class="op">{};</span>            <span class="co">// felfuggesztes</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>        out <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;(</span>path<span class="op">.</span>size<span class="op">());</span>       <span class="co">// path: a closure tagja</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">};</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> caller_bad<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> n <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> t <span class="op">=</span> make_source<span class="op">(</span><span class="st">&quot;/var/log/app.log&quot;</span><span class="op">)(</span>n<span class="op">);</span>   <span class="co">// temporary closure</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A closure a teljes kifejezes vegen megszunik, a frame tovabb el.</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">(</span><span class="dt">void</span><span class="op">)</span>t<span class="op">;</span>                                       <span class="co">// UB a resume utan</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> caller_ok<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> n <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> closure <span class="op">=</span> make_source<span class="op">(</span><span class="st">&quot;/var/log/app.log&quot;</span><span class="op">);</span> <span class="co">// nevesitett closure</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> t <span class="op">=</span> closure<span class="op">(</span>n<span class="op">);</span>                            <span class="co">// a closure tulel a task-ot?</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>    <span class="co">// csak akkor helyes, ha a closure a task befejezeseig el</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Érték szerinti capture-nél (<code>[path]</code>,
+<code>[path = std::move(path)]</code>) a másolat a closure-ben lakik,
+ezért a closure élettartama a korlát. Referencia-capture-nél
+(<code>[&amp;path]</code>) a closure csak hivatkozást tárol, a korlát a
+hivatkozott objektum élettartama — ha az például a
+<code>make_source</code> paramétere, akkor az már a visszatéréskor
+megszűnik, tehát nevesített closure mellett is lógó hivatkozás marad.
+Két helyes stratégia van (érték szerinti capture-rel, illetve a
+hivatkozott objektum élettartamának külön biztosításával):</p>
+<ol type="1">
+<li><strong>Ne írj coroutine lambdát.</strong> A coroutine legyen szabad
+függvény, a szükséges adatokat érték szerinti paraméterként kapja; így a
+frame a paramétereket birtokolja.</li>
+<li><strong>Nevesített, igazoltan hosszú életű closure.</strong> A
+closure-t egy hosszabb életű objektum tagjaként vagy a futtató környezet
+élettartamához kötve tárold, és a <code>task</code> destruktora előbb
+fusson le, mint a closure-é.</li>
+</ol>
+<p>A coroutine lambda ráadásul megnehezíti a diagnózist, mert a hibahely
+a lambdan belül látszik, a kiváltó ok viszont a hívási kifejezésben van.
+Ezért a <code>-Wall -Wextra</code> mellett érdemes a fordító
+coroutine-specifikus figyelmeztetéseit is bekapcsolni; ezek támogatása
+és pontos szövege fordítóverziótól függ, a labor során ellenőrizd.</p>
+<h3 data-number="35.3.4"
+id="felfüggesztett-io-buffer-tulajdonlás-és-pinning"><span
+class="header-section-number">35.3.4</span> Felfüggesztett I/O buffer:
+tulajdonlás és pinning</h3>
+<p>Aszinkron I/O-nál a kernel vagy az I/O végrehajtó (io_uring, epoll +
+read, Windows overlapped) a művelet indításakor átveszi a buffer
+<em>címét</em>, és a befejezés pillanatában ír oda. Amíg a művelet „in
+flight”, a buffer címének stabilnak és a tárterületnek élőnek kell
+lennie. A coroutine frame ezt nem garantálja: a <code>destroy()</code> a
+frame lokálisait is megszünteti.</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// NEGATIV PELDA -- felfuggesztett I/O buffer a frame-ben</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co">// RESZLET: feltetelezi a task&lt;T&gt; sablont (a task.h task tipusa nem sablon) es egy</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="co">// async_read awaitable-t; egyik sem resze a task.h-nak.</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;task.h&quot;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>task<span class="op">&lt;</span><span class="bu">std::</span>size_t<span class="op">&gt;</span> read_chunk<span class="op">(</span><span class="dt">int</span> fd<span class="op">,</span> <span class="bu">std::</span>size_t n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">char</span><span class="op">&gt;</span> buf<span class="op">(</span>n<span class="op">);</span>                                  <span class="co">// frame-ben él</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t k <span class="op">=</span> <span class="cf">co_await</span> async_read<span class="op">(</span>fd<span class="op">,</span> buf<span class="op">.</span>data<span class="op">(),</span> n<span class="op">);</span>    <span class="co">// cím átadva</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">co_return</span> k<span class="op">;</span>                                               <span class="co">// buf itt szunik meg</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="co">// Két hiba:</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="co">//  (1) ha a coroutine-t felfuggesztve destroy()-oljuk, a kernel meg irhat</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="co">//      a felszabaditott taruletre -&gt; memoria-korrupcio;</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="co">//  (2) ha kozben a buf-ot noveljuk (resize/push_back), a regisztralt</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="co">//      pointer mar a felszabaditott regi puffert mutatja.</span></span></code></pre></div>
+<p>A helyes szerződés három eleme:</p>
+<ul>
+<li><strong>Tulajdonlás:</strong> a buffer élettartamát valami olyan
+objektum garantálja, amely túlél minden befejezési eseményt. Lehet maga
+a frame (fix méretű <code>std::array</code> vagy
+<code>std::unique_ptr&lt;std::byte[]&gt;</code>), lehet az I/O objektum,
+lehet egy pool.</li>
+<li><strong>Pinning:</strong> a művelet befejezéséig a bufferre sem
+átméretezés, sem <code>free</code>, sem <code>mmap</code>-módosítás nem
+történhet. Ezt a típussal kell kikényszeríteni (pl.
+<code>std::array</code> és konstans kapacitás), vagy dokumentált
+invariánssal.</li>
+<li><strong>Drain a lezárás előtt:</strong> megszakítás esetén először a
+műveletet kell visszavonni és a befejezést megvárni, és csak utána
+szabad a frame-et megszüntetni. A „cancellation = azonnali destroy”
+minta pontosan a fenti memóriakorrupciót okozza.</li>
+</ul>
+<h3 data-number="35.3.5"
+id="cancellation-completion-és-destroy-versenyhelyzet"><span
+class="header-section-number">35.3.5</span> Cancellation, completion és
+destroy versenyhelyzet</h3>
+<p>A coroutine-alapú I/O-ban három szereplő van: a
+<strong>futtató</strong> (resume), a <strong>befejezési esemény</strong>
+(completion) és a <strong>tulajdonos</strong> (aki a
+<code>task</code>-ot megszünteti). A versenyhelyzet akkor keletkezik, ha
+ezek nem ugyanazon a szálon és nem szigorú sorrendben futnak.</p>
+<h4 data-number="35.3.5.1" id="a-destroyresume-verseny"><span
+class="header-section-number">35.3.5.1</span> A destroy–resume
+verseny</h4>
+<p>Tipikus hibaminta: a befejezési kezelő egy
+<code>coroutine_handle</code>-t tárol, a <code>task</code> destruktora
+viszont közben <code>destroy()</code>-t hív. Eredmény: a kezelő egy
+felszabadított frame-re hív <code>resume()</code>-t. A minimális
+protokoll:</p>
+<ol type="1">
+<li><strong>Megszakítás kérése</strong> (<code>stop_requested</code>
+flag és a művelet visszavonása a végrehajtó saját mechanizmusával, pl.
+<code>io_uring_prep_cancel</code>, epoll-nál a figyelés törlése és
+ébresztés eventfd-vel/self-pipe-pal, socketnél <code>shutdown()</code>);
+az fd-t a <code>close()</code> csak a drain után zárja le, lásd <a
+href="s170.html">thread, jthread és kooperatív cancellation
+(34.1)</a>.</li>
+<li><strong>Kivárás:</strong> a tulajdonos megvárja, hogy a befejezési
+kezelő lefusson és a számláló nullára csökkenjen (atomic fetch_sub +
+acquire, vagy condition_variable).</li>
+<li><strong>Csak ezután <code>destroy()</code></strong>, és a kezelő
+regisztrációját előbb törölni kell a nyilvántartásból.</li>
+</ol>
+<p>A <code>resume()</code> és a <code>destroy()</code> egymásra nem
+versenyezhet: a <code>resume()</code> csak akkor legális, ha a coroutine
+felfüggesztett, a <code>destroy()</code> csak akkor, ha a coroutine
+felfüggesztett és senki nem fogja resume-olni. Ezt a gyakorlatban egy
+állapotváltozóval (pl. <code>std::atomic&lt;int&gt;</code> a
+promise-ban: suspended / running / completed / destroyed) kell
+kikényszeríteni, és minden átmenetnél compare-exchange-szel kell
+dönteni. Ha két szál egyszerre próbál resume-olni, az már adatverseny,
+nem „csak” logikai hiba.</p>
+<h4 data-number="35.3.5.2" id="resume-thread-és-publikálás"><span
+class="header-section-number">35.3.5.2</span> Resume thread és
+publikálás</h4>
+<p>A <code>co_await</code> önmagában nem jelent szálat, schedulert vagy
+thread-affinitást. Azt, hogy melyik szálon folytatódik a coroutine, a
+futtató dönti el; ezt a <code>task</code>/<code>executor</code>
+típusának szerződése rögzíti. Három tipikus politika: egy szálú
+eseményhurok (a coroutine mindig ugyanazon a szálon fut), szálpool
+(bármelyik szálon folytatódhat), dedikált szál coroutine-onként. A
+középső esetben a coroutine teste által elért megosztott állapotot vagy
+atomikusan, vagy zárral kell védeni.</p>
+<p>A befejezési esemény és a resume közötti <em>happens-before</em> nem
+a <code>resume()</code> hívásból származik, hanem a köztük lévő
+szinkronizációból. Ha a befejező szál release-store-ot végez, a folytató
+szál acquire-load-dal olvassa az állapotot, a befejező szál által írt
+buffer tartalma látható lesz. Ha a befejezés egy zárral védett sorba
+kerül, a zár adja ugyanezt. A <code>resume()</code> csupán
+vezérlésátadás; nem tesz semmit thread-safe-é.</p>
+<h4 data-number="35.3.5.3" id="hibaterjedés-és-raii-a-frame-ben"><span
+class="header-section-number">35.3.5.3</span> Hibaterjedés és RAII a
+frame-ben</h4>
+<p>A frame lokálisai akkor is megszűnnek, amikor a coroutine-t
+<code>destroy()</code>-oljuk: a fordító a frame megszüntetésekor
+lefuttatja a hatókörben lévő objektumok destruktorait, mintha a
+coroutine teste volna visszatekerve. Ez teszi lehetővé, hogy a
+cancellation könyvelését RAII-val végezzük.</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;atomic&gt;</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> in_flight <span class="op">{</span>                       <span class="co">// a frame-ben el, a destroy is futtatja</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;&amp;</span> counter<span class="op">;</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">explicit</span> in_flight<span class="op">(</span><span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;&amp;</span> c<span class="op">)</span> <span class="kw">noexcept</span> <span class="op">:</span> counter<span class="op">(</span>c<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>        counter<span class="op">.</span>fetch_add<span class="op">(</span><span class="dv">1</span><span class="op">,</span> <span class="bu">std::</span>memory_order_relaxed<span class="op">);</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">~</span>in_flight<span class="op">()</span> <span class="op">{</span> counter<span class="op">.</span>fetch_sub<span class="op">(</span><span class="dv">1</span><span class="op">,</span> <span class="bu">std::</span>memory_order_release<span class="op">);</span> <span class="op">}</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    in_flight<span class="op">(</span><span class="at">const</span> in_flight<span class="op">&amp;)</span> <span class="op">=</span> <span class="kw">delete</span><span class="op">;</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    in_flight<span class="op">&amp;</span> <span class="kw">operator</span><span class="op">=(</span><span class="at">const</span> in_flight<span class="op">&amp;)</span> <span class="op">=</span> <span class="kw">delete</span><span class="op">;</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="co">// hasznalat: task read_chunk(...) { in_flight guard{g_inflight}; ... }</span></span></code></pre></div>
+<p>A guard nem véd meg a kernellel szemben: ha a művelet még fut, a
+<code>destroy()</code> után is írhat a bufferbe. A guard csak azt
+garantálja, hogy a tulajdonos <em>tudja</em>, van-e folyamatban lévő
+művelet, és meg tudja várni a drain-t.</p>
+<p>A hibaterjedés a promise <code>unhandled_exception()</code> →
+<code>std::exception_ptr</code> → <code>await_resume()</code> újradobás
+útvonalon megy. Két buktató: az <code>exception_ptr</code>-t a frame
+megszüntetése előtt ki kell nyerni, különben a hiba csendben elvész; és
+az újradobás csak egyszer történhet meg, különben a hívó kétszer látja
+ugyanazt a kivételt. A hibás ágon is ugyanaz a <code>task</code>
+destruktor fut, tehát a frame felszabadul – de csak a drain után.</p>
+<h3 data-number="35.3.6" id="gyakori-hibák-és-javításuk"><span
+class="header-section-number">35.3.6</span> Gyakori hibák és
+javításuk</h3>
+<ul>
+<li><strong><code>co_await</code> mint felfüggesztés a hívó
+vermére.</strong> A hívó stackje nem marad meg; a <code>co_await</code>
+előtti pointerek és referenciák csak akkor érvényesek, ha a hivatkozott
+objektum máshol él. Javítás: érték szerinti paraméter vagy tulajdonosi
+lánc.</li>
+<li><strong>Coroutine lambda temporary closure-rel.</strong> A closure
+élettartama a korlát. Javítás: szabad függvény, vagy nevesített closure
+hosszabb élettartammal.</li>
+<li><strong>Buffer a frame-ben folyamatban lévő I/O közben.</strong>
+Javítás: fix méretű, nem átméretezhető buffer és drain a destroy
+előtt.</li>
+<li><strong>Kétszeres destroy vagy resume a befejezés után.</strong>
+Javítás: explicit állapotgép compare-exchange-szel, vagy egy tulajdonos,
+aki a drain után egyedül szünteti meg a frame-et.</li>
+<li><strong>Kezelő regisztrációban maradt
+<code>coroutine_handle</code>.</strong> Javítás: a
+<code>destroy()</code> előtti deregisztráció, és a befejezési számláló
+nullára vitele.</li>
+<li><strong>Feltételezés, hogy a <code>co_await</code> szálat
+vált.</strong> Javítás: a resume-politika dokumentálása és a megosztott
+állapot védelme.</li>
+</ul>
+<h3 data-number="35.3.7" id="összefoglaló"><span
+class="header-section-number">35.3.7</span> Összefoglaló</h3>
+<p>A coroutine frame élettartama független a létrehozó kifejezésétől,
+ezért minden nem tulajdonló hivatkozás, <code>this</code>-elérés,
+<code>string_view</code> és buffer-pointer új élettartam-szerződést
+igényel. A paraméterek a frame-be másolódnak, de a referenciaparaméter
+csak a hivatkozást viszi magával; a coroutine lambda a closure-re mutat,
+nem a closure másolatát őrzi; a felfüggesztett I/O buffer pedig addig
+marad „pinelve”, amíg a befejezés be nem következett. A cancellation nem
+egyetlen <code>destroy()</code> hívás, hanem három lépés: kérés, drain,
+megszüntetés. A resume nem szinkronizációs művelet, a
+<em>happens-before</em>-t a befejezés és a folytatás közötti atomikus
+vagy zárral védett publikálás adja. A frame lokálisainak destruktorai a
+<code>destroy()</code>-nál is lefutnak, ezért a RAII a cancellation
+könyvelésének elsődleges eszköze.</p>
+<p>A fejezetrész nem végzett forrásellenőrzést; a coroutine-mechanika
+leírása a C++20 modellre támaszkodik, a pontos szabványparagrafusok, a
+fordítók figyelmeztetéseinek szövege és a <code>std::generator</code>
+(C++23) támogatottsága verziófüggő, a labor során feature-test makróval
+és fordítási próbával ellenőrizendő.</p>
+<h3 data-number="35.3.8" id="feladatok"><span
+class="header-section-number">35.3.8</span> Feladatok</h3>
+<p><strong>1. feladat (magyarázó).</strong> Három változatban
+deklaráljuk ugyanazt a coroutine-t:
+<code>task f(std::string const&amp;)</code>,
+<code>task f(std::string)</code> és
+<code>task f(std::string_view)</code>. Melyikben dangling a temporaryval
+történő hívás <code>f(std::string("x"))</code> esetén, és melyikben nem?
+Indokold a frame tartalma alapján.</p>
+<p><strong>2. feladat (kódolási).</strong> Alakítsd át a
+<code>make_source</code> coroutine lambdát olyan szabad függvénnyé,
+amelynek nincs closure-függősége, és add meg a hívó oldalt is. A
+megoldás forduljon <code>-std=c++20 -Wall -Wextra</code> mellett
+figyelmeztetés nélkül.</p>
+<p><strong>3. feladat (diagnosztikai).</strong> Egy
+<code>read_chunk</code> coroutine <code>std::vector&lt;char&gt;</code>
+puffert használ, és a <code>task</code> destruktora
+<code>destroy()</code>-t hív. Sorolj fel legalább három konkrét
+eseménysorrendet, amely memóriakorrupcióhoz vezet, és mindegyikhez adj
+egy-egy minimális javítást.</p>
+<p><strong>4. feladat (tervezési, nehezebb).</strong> Tervezz a
+<code>task</code> típushoz cancellation-protokollt: milyen állapotokat
+vezetsz be, milyen atomikus műveletekkel lépsz át köztük, és hogyan
+biztosítod, hogy a <code>destroy()</code> csak a drain után történjen?
+Fogalmazz meg legalább négy ellenőrzési feltételt, amelyet egy teszt
+ellenőrizni tud.</p>
+<h3 data-number="35.3.9" id="megoldások"><span
+class="header-section-number">35.3.9</span> Megoldások</h3>
+<p><strong>1. megoldás.</strong> A <code>std::string const&amp;</code>
+változat dangling: a frame a hivatkozást (gyakorlatban pointert)
+tárolja, a temporary a teljes kifejezés végén megszűnik, a coroutine
+viszont később folytatódik. A <code>std::string</code> változat
+biztonságos: a paraméter másolata a frame-be kerül, és a frame
+megszüntetésekor fut le a destruktora. A <code>std::string_view</code>
+változat érték szerinti átadás esetén is nem tulajdonló: a
+<code>string_view</code> egy <code>std::string</code> belsejére mutat,
+ezért a temporary megszűnésével dangling; string literálból képzett
+<code>string_view</code> esetén viszont statikus tárolású adatra mutat,
+tehát biztonságos. Ellenőrzési feltétel: minden esetben nevezd meg, ki a
+tulajdonos, és meddig él.</p>
+<p><strong>2. megoldás.</strong> A closure-t megszüntetjük azzal, hogy a
+coroutine szabad függvény, a paramétert érték szerint kapja:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">// lab.cpp — closure nélküli coroutine (2. feladat megoldása)</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;task.h&quot;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string&gt;</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="co">// Érték szerinti paraméter: a frame birtokolja a path másolatát. Az eredményt</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="co">// a fejezet task típusa (return_void) helyett a hívó out változója kapja.</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>task source_size<span class="op">(</span><span class="bu">std::</span>string path<span class="op">,</span> <span class="dt">int</span><span class="op">&amp;</span> out<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">co_await</span> <span class="bu">std::</span>suspend_always<span class="op">{};</span>            <span class="co">// tetszoleges felfuggesztes</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    out <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;(</span>path<span class="op">.</span>size<span class="op">());</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> n <span class="op">=</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>    task t <span class="op">=</span> source_size<span class="op">(</span><span class="st">&quot;/var/log/app.log&quot;</span><span class="op">,</span> n<span class="op">);</span>   <span class="co">// a temporary string a frame-be másolódik</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>    t<span class="op">.</span>h<span class="op">.</span>resume<span class="op">();</span>                                  <span class="co">// initial_suspend után: a co_await-ig</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>    t<span class="op">.</span>h<span class="op">.</span>resume<span class="op">();</span>                                  <span class="co">// a co_await után: befejezi</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;size=</span><span class="sc">%d</span><span class="st"> done=</span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> n<span class="op">,</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;(</span>t<span class="op">.</span>h<span class="op">.</span>done<span class="op">()));</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">(</span>n <span class="op">==</span> <span class="dv">16</span> <span class="op">&amp;&amp;</span> t<span class="op">.</span>h<span class="op">.</span>done<span class="op">())</span> <span class="op">?</span> <span class="dv">0</span> <span class="op">:</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A fejezet <code>task</code> típusa <code>return_void</code>-os, ezért
+az eredményt a hívó <code>out</code> változója kapja. Build:
+<code>g++ -std=c++20 -O2 -Wall -Wextra -o lab lab.cpp</code> (Clang
+esetén <code>clang++ -std=c++20 -O2 -Wall -Wextra</code>). Indoklás: a
+frame a <code>path</code> másolatát tárolja, a hívó a
+<code>source_size</code> visszatérése után bármikor megszűnhet.
+Ellenőrzési feltétel: a <code>task</code> élettartama alatt a
+<code>path</code> címét senki nem használja a frame-en kívül; a program
+a <code>co_await</code> után is helyes <code>size()</code>-ot ad.
+<strong>Buildjegyzőkönyv</strong> (<code>lab-gcc</code> profil): a fenti
+<code>task.h</code>-val <code>-fsanitize=address,undefined</code>
+mellett is figyelmeztetés nélkül fordult, a kimenet
+<code>size=16 done=1</code>, 0-s kód, ASan/UBSan-jelzés nélkül.</p>
+<p><strong>3. megoldás.</strong> (a) A coroutine felfüggesztve van az
+<code>async_read</code> alatt, a tulajdonos <code>destroy()</code>-ol, a
+kernel később a felszabadított <code>buf.data()</code>-ra ír →
+heap-korrupció. Javítás: drain a destroy előtt (a befejezési számláló
+nullára vitele) és fix méretű <code>std::array</code> buffer. (b) A
+coroutine fut, közben a <code>buf</code> átméreteződik
+(<code>resize</code>), az I/O végrehajtó a régi pointert használja → a
+régi puffer felszabadul, az új címre nem érkezik adat, a régi címre
+viszont igen. Javítás: a buffer soha nem méreteződik át a művelet alatt;
+a méret a coroutine paramétere és konstans kapacitás. (c) A coroutine
+<code>destroy()</code>-ol, miközben a befejezési kezelő még a
+regisztrációban van és <code>resume()</code>-ot hív → felszabadított
+frame. Javítás: deregisztráció a destroy előtt, a kezelőben
+<code>done()</code>-ellenőrzés és a számláló kezelése. Ellenőrzési
+feltétel: minden esethez nevezd meg a tulajdonost, az invalidáló
+műveletet és a hibakimenetet.</p>
+<p><strong>4. megoldás.</strong> Négy állapot: <code>suspended</code>,
+<code>running</code>, <code>completed</code>, <code>destroyed</code>; az
+átmeneteket <code>std::atomic&lt;int&gt;</code>-en compare-exchange
+végzi. A cancellation két flag: <code>cancel_requested</code> és
+<code>completion_count</code>. A tulajdonos <code>cancel()</code>-je
+beállítja a kérést és visszavonja az I/O-t, majd
+<code>drain()</code>-ben megvárja a <code>completion_count == 0</code>-t
+(acquire), és csak ezután hív <code>destroy()</code>-t. A befejezési
+kezelő csak akkor <code>resume()</code>-ol, ha az állapot
+<code>suspended</code> és nem <code>destroyed</code>. Ellenőrzési
+feltételek: (1) <code>destroy()</code> után nincs <code>resume()</code>;
+(2) kétszeres <code>destroy()</code> nem fordulhat elő; (3)
+<code>resume()</code> és <code>destroy()</code> soha nem fut egyszerre
+ugyanarra a handle-re; (4) a befejezési kezelő regisztrációja a
+<code>destroy()</code> előtt törlődik. Megjegyzés: a teljes, éles
+futtató implementációja (scheduler, io_uring adapter) kívül esik ezen az
+alfejezeten; itt csak a szerződés és a minimális protokoll a cél.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="s177.html">← 35.2 promise_type, awaiter és coroutine_handle</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="s179.html">35.4 Generator és streaming feldolgozás →</a></div>
+</nav>
+</body>
+</html>

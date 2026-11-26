@@ -1,0 +1,917 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>24.1 GEMM és a deep learning – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – CUDA-ökoszisztéma és mélytanulás</a> › <a href="index.html#gpuch23">24 Deep learning kernelek: GEMM, conv és attention</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu089.html">← 23.4 Tensor Core optimalizálás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu091.html">24.2 Convolution kernelek →</a></div>
+</nav>
+<h2 data-number="24.1" id="gpu090"><span
+class="header-section-number">24.1</span> GEMM és a deep learning</h2>
+<p>A fejezet a mélytanulási kernelek (GEMM, konvolúció, attention)
+gyakorlati megvalósítását tárgyalja; ez az első alfejezet a lineáris
+réteget és a GEMM-et veszi sorra. A cél, hogy az olvasó (1) levezesse a
+lineáris réteg GEMM-alakját és műveletigényét, (2) helyesen hívja a
+column-major cuBLAS-t row-major adatokra, (3) összevesse a cuBLAS, a
+CUTLASS és egy saját tiled kernel megközelítését. A tiled GEMM a korábbi
+tiling-alfejezeteken, a leading dimension a korábbi cuBLAS-alfejezeten,
+a CUTLASS-hierarchia és a mixed precision a megelőző CUTLASS- és mixed
+precision-alfejezeteken alapul; ezeket itt csak a lineáris réteg
+szempontjából foglaljuk össze.</p>
+<h3 data-number="24.1.1"
+id="a-lineáris-réteg-és-a-gemm-kapcsolata"><span
+class="header-section-number">24.1.1</span> A lineáris réteg és a GEMM
+kapcsolata</h3>
+<p>A mélytanulási hálózatok leggyakoribb építőköve a <strong>lineáris
+réteg</strong>, amelyet sok keretrendszer <em>fully connected</em>,
+<em>dense</em> vagy <em>linear</em> néven ismer. A réteg matematikailag
+egy affin transzformációt hajt végre:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝐘</mi><mo>=</mo><mi>𝐗</mi><mspace width="0.167em"></mspace><msup><mi>𝐖</mi><mi>𝖳</mi></msup><mo>+</mo><mi>𝐛</mi><mo>,</mo></mrow><annotation encoding="application/x-tex">
+\mathbf{Y} = \mathbf{X}\,\mathbf{W}^{\mathsf{T}} + \mathbf{b},
+</annotation></semantics></math></p>
+<p>ahol</p>
+<ul>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝐗</mi><mo>∈</mo><msup><mi>ℝ</mi><mrow><mi>N</mi><mo>×</mo><mi>K</mi></mrow></msup></mrow><annotation encoding="application/x-tex">\mathbf{X} \in \mathbb{R}^{N \times K}</annotation></semantics></math>
+a bemeneti köteg (batch),
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>
+mintával és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+bemeneti jellemzővel,</li>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝐖</mi><mo>∈</mo><msup><mi>ℝ</mi><mrow><mi>M</mi><mo>×</mo><mi>K</mi></mrow></msup></mrow><annotation encoding="application/x-tex">\mathbf{W} \in \mathbb{R}^{M \times K}</annotation></semantics></math>
+a súlymátrix,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>M</mi><annotation encoding="application/x-tex">M</annotation></semantics></math>
+kimeneti jellemzővel,</li>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝐛</mi><mo>∈</mo><msup><mi>ℝ</mi><mi>M</mi></msup></mrow><annotation encoding="application/x-tex">\mathbf{b} \in \mathbb{R}^{M}</annotation></semantics></math>
+a torzítás (bias),</li>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝐘</mi><mo>∈</mo><msup><mi>ℝ</mi><mrow><mi>N</mi><mo>×</mo><mi>M</mi></mrow></msup></mrow><annotation encoding="application/x-tex">\mathbf{Y} \in \mathbb{R}^{N \times M}</annotation></semantics></math>
+a kimeneti aktiváció.</li>
+</ul>
+<p>A kifejezés egy mátrixszorzásból és egy soronkénti eltolásból áll. A
+mátrixszorzás a <strong>GEMM</strong> (general matrix multiply) művelet,
+amely a számítási igény túlnyomó részét adja. Egyetlen kimeneti elem
+kiszámítása
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+szorzást és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>−</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">K-1</annotation></semantics></math>
+összeadást igényel, a bias még egy összeadást, így a réteg műveletigénye
+pontosan</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mspace width="0.167em"></mspace><mi>M</mi><mspace width="0.167em"></mspace><mo stretchy="false" form="prefix">(</mo><mn>2</mn><mi>K</mi><mo>−</mo><mn>1</mn><mo stretchy="false" form="postfix">)</mo><mo>+</mo><mi>N</mi><mspace width="0.167em"></mspace><mi>M</mi><mo>=</mo><mn>2</mn><mspace width="0.167em"></mspace><mi>N</mi><mspace width="0.167em"></mspace><mi>M</mi><mspace width="0.167em"></mspace><mi>K</mi></mrow><annotation encoding="application/x-tex">
+N\,M\,(2K-1) + N\,M = 2\,N\,M\,K
+</annotation></semantics></math></p>
+<p>lebegőpontos művelet. (A GEMM-et a szakirodalom szokásosan
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mi>N</mi><mi>M</mi><mi>K</mi></mrow><annotation encoding="application/x-tex">2NMK</annotation></semantics></math>-nak
+veszi; a bias ehhez képest
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mi>M</mi></mrow><annotation encoding="application/x-tex">NM</annotation></semantics></math>,
+nagy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+mellett elhanyagolható, és a művelet gyakorlatilag tisztán GEMM.)</p>
+<p>A CPU-n megszokott mátrixszorzás-optimalizálások (blokkosítás,
+vektorizáció, cache-barát sorrend) a GPU-n is érvényesek, de a GPU
+hierarchikus végrehajtási modellje miatt a tile-ok mérete, a shared
+memory használata és a warp-szintű adatcsere válik kulcskérdéssé. A
+lineáris réteg GPU-ra vitele ezért nem egyszerűen egy könyvtári hívás:
+meg kell értenünk a batch és layout fogalmát, a GEMM hívási konvencióit,
+és azt, hogy a különböző könyvtárak (cuBLAS, CUTLASS) hogyan térképezik
+a réteget hardveres erőforrásokra.</p>
+<h3 data-number="24.1.2" id="batch-és-layout"><span
+class="header-section-number">24.1.2</span> Batch és layout</h3>
+<p>A mélytanulási keretrendszerekben a bemeneti adatokat általában
+kétféle elrendezésben tárolják:</p>
+<ul>
+<li><strong>row-major (C-szerű) layout:</strong> az utolsó index
+változik leggyorsabban. A
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>𝐗</mi><annotation encoding="application/x-tex">\mathbf{X}</annotation></semantics></math>
+mátrix
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><mi>n</mi><mo>,</mo><mi>k</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">(n,k)</annotation></semantics></math>
+eleme a memóriában az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>n</mi><mo>⋅</mo><mi>K</mi><mo>+</mo><mi>k</mi></mrow><annotation encoding="application/x-tex">n \cdot K + k</annotation></semantics></math>
+pozíción van.</li>
+<li><strong>column-major (Fortran-szerű) layout:</strong> az első index
+változik leggyorsabban. Itt az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><mi>n</mi><mo>,</mo><mi>k</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">(n,k)</annotation></semantics></math>
+elem pozíciója
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>k</mi><mo>⋅</mo><mi>N</mi><mo>+</mo><mi>n</mi></mrow><annotation encoding="application/x-tex">k \cdot N + n</annotation></semantics></math>.</li>
+</ul>
+<p>A C/C++ tömbök alapértelmezésben row-major tárolásúak (a CUDA nyelv
+maga nem ír elő tárolási sorrendet), ezért a saját kerneleinkben
+általában row-majort használunk. A cuBLAS viszont – a BLAS szabványnak
+megfelelően – <strong>column-major</strong> tárolást vár. Ez a forrása a
+leggyakoribb hibáknak, mert ugyanaz az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>×</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">N \times K</annotation></semantics></math>
+mátrix row-major és column-major értelmezésben egymás transzponáltjának
+tűnik.</p>
+<p>Tekintsük a lineáris réteg számítását:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝐘</mi><mo>=</mo><mi>𝐗</mi><msup><mi>𝐖</mi><mi>𝖳</mi></msup><mo>+</mo><mi>𝐛</mi><mi>.</mi></mrow><annotation encoding="application/x-tex">
+\mathbf{Y} = \mathbf{X} \mathbf{W}^{\mathsf{T}} + \mathbf{b}.
+</annotation></semantics></math></p>
+<p>Ha
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>𝐗</mi><annotation encoding="application/x-tex">\mathbf{X}</annotation></semantics></math>
+row-major, akkor a memóriában a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>×</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">N \times K</annotation></semantics></math>
+mátrix sorai egymás után helyezkednek el. A
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>𝐖</mi><annotation encoding="application/x-tex">\mathbf{W}</annotation></semantics></math>
+súlymátrixot általában
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><mi>M</mi><mo>,</mo><mi>K</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">(M, K)</annotation></semantics></math>
+alakban tároljuk, ahol a sorok a kimeneti neuronok, az oszlopok a
+bemeneti jellemzők. A GEMM számára ez azt jelenti, hogy</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝐂</mi><mo>=</mo><mi>𝐀</mi><mo>⋅</mo><msup><mi>𝐁</mi><mi>𝖳</mi></msup><mo>,</mo></mrow><annotation encoding="application/x-tex">
+\mathbf{C} = \mathbf{A} \cdot \mathbf{B}^{\mathsf{T}},
+</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝐀</mi><mo>=</mo><mi>𝐗</mi></mrow><annotation encoding="application/x-tex">\mathbf{A} = \mathbf{X}</annotation></semantics></math>
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>×</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">N \times K</annotation></semantics></math>),
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝐁</mi><mo>=</mo><mi>𝐖</mi></mrow><annotation encoding="application/x-tex">\mathbf{B} = \mathbf{W}</annotation></semantics></math>
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>M</mi><mo>×</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">M \times K</annotation></semantics></math>),
+és a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>𝐁</mi><annotation encoding="application/x-tex">\mathbf{B}</annotation></semantics></math>-t
+transzponálni kell, hogy a belső dimenzió
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+legyen. Egy szokványos column-major GEMM-ben ezt a
+<code>CUBLAS_OP_T</code> (transzponált) művelet adná meg; a cuBLAS
+hívásnál azonban az alább ismertetett row-major/column-major megfordítás
+miatt az operandusok sorrendje is megváltozik.</p>
+<p>A <strong>leading dimension</strong> (vezető dimenzió) fogalma a
+BLAS-ban elengedhetetlen. Egy mátrixnál a leading dimension (általában
+<code>lda</code>) a memóriában két szomszédos „főirányú” szelet
+kezdőcíme közötti távolság elemekben: row-major tárolásnál két
+szomszédos sor, column-major tárolásnál két szomszédos oszlop kezdőcíme
+között. Egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>×</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">N \times K</annotation></semantics></math>
+mátrixnál row-major tárolásnál <code>lda = K</code>, mert egy sor hossza
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+elem. Column-major tárolásnál <code>lda = N</code>, mert egy oszlop
+hossza
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>
+elem. Ha a mátrixot nagyobb memóriaterületbe ágyazzuk (például
+paddinggel), a leading dimension eltérhet a logikai dimenziótól. A
+cuBLAS hívásokban a leading dimension paramétereket mindig a tényleges
+memóriaelrendezéshez kell igazítani.</p>
+<p><strong>Batch feldolgozás</strong> azt jelenti, hogy a bemeneti
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>𝐗</mi><annotation encoding="application/x-tex">\mathbf{X}</annotation></semantics></math>
+mátrix első dimenziója a batch méret
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>.
+A lineáris réteg egyetlen GEMM-mel feldolgozza az összes mintát. A
+kimenet
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>𝐘</mi><annotation encoding="application/x-tex">\mathbf{Y}</annotation></semantics></math>
+alakja
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>×</mo><mi>M</mi></mrow><annotation encoding="application/x-tex">N \times M</annotation></semantics></math>.
+Amennyiben a hálózat több, független réteget futtat párhuzamosan
+(például egy-egy minta különböző ágakon), használhatunk <strong>batched
+GEMM</strong>-et is, amely egyszerre több mátrixpárt szoroz össze, de ez
+a lineáris rétegnél ritkábban szükséges.</p>
+<h3 data-number="24.1.3" id="cublas-és-a-gemm"><span
+class="header-section-number">24.1.3</span> cuBLAS és a GEMM</h3>
+<p>A cuBLAS a NVIDIA által szállított, nagy teljesítményű BLAS
+implementáció. A lineáris réteg leggyakrabban a <code>cublasSgemm</code>
+(FP32), <code>cublasDgemm</code> (FP64), <code>cublasHgemm</code> (FP16)
+vagy a <code>cublasGemmEx</code> (vegyes pontosság) függvénnyel
+valósítható meg. A következő példa egy FP32 lineáris réteg forward
+passzát mutatja be cuBLAS-szal.</p>
+<pre class="cuda"><code>// CUDA C++ (C++17) – lineáris réteg cuBLAS-szal (FP32); nem lett lefordítva vagy futtatva
+// Fordítás: nvcc -O3 -arch=sm_80 -o linear_cublas linear_cublas.cu -lcublas
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cublas_v2.h&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+
+#define CUDA_CHECK(call)                                            \
+    do {                                                            \
+        cudaError_t err = (call);                                   \
+        if (err != cudaSuccess) {                                   \
+            fprintf(stderr, &quot;CUDA error at %s:%d: %s\n&quot;, __FILE__,  \
+                    __LINE__, cudaGetErrorString(err));             \
+            exit(EXIT_FAILURE);                                     \
+        }                                                           \
+    } while (0)
+
+#define CUBLAS_CHECK(call)                                          \
+    do {                                                            \
+        cublasStatus_t st = (call);                                 \
+        if (st != CUBLAS_STATUS_SUCCESS) {                          \
+            fprintf(stderr, &quot;cuBLAS error at %s:%d\n&quot;, __FILE__,    \
+                    __LINE__);                                      \
+            exit(EXIT_FAILURE);                                     \
+        }                                                           \
+    } while (0)
+
+// Bias hozzáadása: Y(n,m) += b(m); blockIdx.y = n, a szálak az m indexen futnak
+__global__ void add_bias(float* Y, const float* b, int N, int M) {
+    int m = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = blockIdx.y;
+    if (n &lt; N &amp;&amp; m &lt; M) Y[(size_t)n * M + m] += b[m];
+}
+
+int main(int argc, char** argv) {
+    int N = 1024;          // batch méret
+    int K = 4096;          // bemeneti jellemzők
+    int M = 4096;          // kimeneti jellemzők
+
+    // Host memória (row-major, mint a keretrendszerekben)
+    float* h_X = (float*)malloc((size_t)N * K * sizeof(float));
+    float* h_W = (float*)malloc((size_t)M * K * sizeof(float));
+    float* h_b = (float*)malloc(M * sizeof(float));
+    float* h_Y = (float*)malloc((size_t)N * M * sizeof(float));
+
+    // Inicializálás (pl. véletlen vagy determinisztikus értékek)
+    for (int i = 0; i &lt; N * K; ++i) h_X[i] = 0.001f * (i % 100);
+    for (int i = 0; i &lt; M * K; ++i) h_W[i] = 0.0001f * (i % 97);
+    for (int i = 0; i &lt; M; ++i)     h_b[i] = 0.01f;
+
+    // Device memória
+    float *d_X, *d_W, *d_b, *d_Y;
+    CUDA_CHECK(cudaMalloc(&amp;d_X, (size_t)N * K * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;d_W, (size_t)M * K * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;d_b, M * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;d_Y, (size_t)N * M * sizeof(float)));
+
+    CUDA_CHECK(cudaMemcpy(d_X, h_X, (size_t)N * K * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_W, h_W, (size_t)M * K * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b, M * sizeof(float), cudaMemcpyHostToDevice));
+
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&amp;handle));
+
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;  // a bias-t külön kernel adja hozzá, mert a GEMM itt nem kezeli
+
+    // Row-major Y (N x M) = X (N x K) * W^T (K x M) + b
+    // A cuBLAS column-major szemléletében: Y^T (M x N, ldc = M) = W * X^T,
+    // ahol d_W column-major K x M (lda = K), OP_T után M x K,
+    //       d_X column-major K x N (ldb = K), OP_N.
+    CUBLAS_CHECK(cublasSgemm(
+        handle,
+        CUBLAS_OP_T,        // A = W: K x M column-major, transzponálva M x K
+        CUBLAS_OP_N,        // B = X: K x N column-major
+        M,                  // m: C (= Y^T) sorainak száma = kimeneti jellemzők
+        N,                  // n: C oszlopainak száma = batch
+        K,                  // k: belső dimenzió
+        &amp;alpha,
+        d_W, K,             // lda = K
+        d_X, K,             // ldb = K
+        &amp;beta,
+        d_Y, M              // ldc = M
+    ));
+    // Bias hozzáadása: Y(n,m) += b(m), külön kernellel
+    {
+        dim3 bb(256), bg((M + 255) / 256, N);
+        add_bias&lt;&lt;&lt;bg, bb&gt;&gt;&gt;(d_Y, d_b, N, M);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_Y, d_Y, (size_t)N * M * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Ellenőrzés: egy kimeneti elem CPU-referenciája (a teljes ellenőrzés a laborban)
+    {
+        int n = 0, m = 0; double ref = h_b[m];
+        for (int k = 0; k &lt; K; ++k)
+            ref += (double)h_X[(size_t)n * K + k] * h_W[(size_t)m * K + k];
+        printf(&quot;Y[0,0] GPU = %f, CPU = %f\n&quot;, h_Y[0], ref);
+    }
+
+    cublasDestroy(handle);
+    cudaFree(d_X); cudaFree(d_W); cudaFree(d_b); cudaFree(d_Y);
+    free(h_X); free(h_W); free(h_b); free(h_Y);
+    return 0;
+}</code></pre>
+<p>A példa jól mutatja a layout-konvenció fontosságát. A cuBLAS
+column-major bemenetet vár, a mi mátrixaink viszont row-major
+tárolásúak. Egy row-major
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>×</mo><mi>M</mi></mrow><annotation encoding="application/x-tex">N \times M</annotation></semantics></math>
+mátrix a memóriában pontosan úgy néz ki, mint a column-major
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>M</mi><mo>×</mo><mi>N</mi></mrow><annotation encoding="application/x-tex">M \times N</annotation></semantics></math>
+transzponáltja, ezért a row-major
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝐘</mi><mo>=</mo><mi>𝐗</mi><msup><mi>𝐖</mi><mi>𝖳</mi></msup></mrow><annotation encoding="application/x-tex">\mathbf{Y} = \mathbf{X}\mathbf{W}^{\mathsf{T}}</annotation></semantics></math>
+számítást a cuBLAS-ban az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mi>𝐘</mi><mi>𝖳</mi></msup><mo>=</mo><mi>𝐖</mi><msup><mi>𝐗</mi><mi>𝖳</mi></msup></mrow><annotation encoding="application/x-tex">\mathbf{Y}^{\mathsf{T}} = \mathbf{W}\mathbf{X}^{\mathsf{T}}</annotation></semantics></math>
+alakban kérjük. A <code>d_W</code> row-major
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>M</mi><mo>×</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">M \times K</annotation></semantics></math>,
+azaz a cuBLAS számára column-major
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>×</mo><mi>M</mi></mrow><annotation encoding="application/x-tex">K \times M</annotation></semantics></math>
+mátrix <code>lda = K</code>-val; <code>CUBLAS_OP_T</code>-vel ez
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>M</mi><mo>×</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">M \times K</annotation></semantics></math>-ként
+vesz részt a szorzásban. A <code>d_X</code> row-major
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>×</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">N \times K</annotation></semantics></math>,
+azaz column-major
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>×</mo><mi>N</mi></mrow><annotation encoding="application/x-tex">K \times N</annotation></semantics></math>
+mátrix <code>ldb = K</code>-val; <code>CUBLAS_OP_N</code>-nel ez
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>×</mo><mi>N</mi></mrow><annotation encoding="application/x-tex">K \times N</annotation></semantics></math>
+marad. Az eredmény column-major
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>M</mi><mo>×</mo><mi>N</mi></mrow><annotation encoding="application/x-tex">M \times N</annotation></semantics></math>,
+<code>ldc = M</code>, ami a memóriában éppen a row-major
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>×</mo><mi>M</mi></mrow><annotation encoding="application/x-tex">N \times M</annotation></semantics></math>
+mátrix
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>𝐘</mi><annotation encoding="application/x-tex">\mathbf{Y}</annotation></semantics></math>.
+A cuBLAS-paraméterek ezért <code>m = M</code>, <code>n = N</code>,
+<code>k = K</code> (nem a fejezet fenti jelölésének sorrendjében!). A
+kis (például 2×3-as) méretű CPU-referenciás teszt a leggyorsabb módja
+annak, hogy a dimenzió-hozzárendelés hibáit felfedezzük.</p>
+<figure id="fig-gpu090-cublas-layout">
+<div class="fig-interactive"><iframe src="figures/html/gpu090-cublas-layout.html" title="Három sáv. Az X hat elemű memóriasora row-major 2×3-as és column-major 3×2-es nézetben, ez utóbbi X transzponáltja, ldb = 3. A W tizenkét elemű memóriasora row-major 4×3-as és column-major 3×4-es nézetben, ez W transzponáltja, lda = 3, az OP_T visszaadja W-t. Az Y nyolc elemű memóriasora row-major 2×4-es és column-major 4×2-es nézetben, ez Y transzponáltja, ldc = 4. A cellákban a memóriabeli sorszám mindkét nézetben ugyanaz. Alul a képlet és a cublasSgemm paraméterdoboza: m = 4, n = 2, k = 3, lda = 3, ldb = 3, ldc = 4." loading="lazy" style="width:100%;border:0;height:720px"></iframe><noscript><img src="figures/img/gpu090-cublas-layout.png" style="width:100.0%"
+alt="Három sáv. Az X hat elemű memóriasora row-major 2×3-as és column-major 3×2-es nézetben, ez utóbbi X transzponáltja, ldb = 3. A W tizenkét elemű memóriasora row-major 4×3-as és column-major 3×4-es nézetben, ez W transzponáltja, lda = 3, az OP_T visszaadja W-t. Az Y nyolc elemű memóriasora row-major 2×4-es és column-major 4×2-es nézetben, ez Y transzponáltja, ldc = 4. A cellákban a memóriabeli sorszám mindkét nézetben ugyanaz. Alul a képlet és a cublasSgemm paraméterdoboza: m = 4, n = 2, k = 3, lda = 3, ldb = 3, ldc = 4." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu090-cublas-layout.png" style="width:100.0%"
+alt="Három sáv. Az X hat elemű memóriasora row-major 2×3-as és column-major 3×2-es nézetben, ez utóbbi X transzponáltja, ldb = 3. A W tizenkét elemű memóriasora row-major 4×3-as és column-major 3×4-es nézetben, ez W transzponáltja, lda = 3, az OP_T visszaadja W-t. Az Y nyolc elemű memóriasora row-major 2×4-es és column-major 4×2-es nézetben, ez Y transzponáltja, ldc = 4. A cellákban a memóriabeli sorszám mindkét nézetben ugyanaz. Alul a képlet és a cublasSgemm paraméterdoboza: m = 4, n = 2, k = 3, lda = 3, ldb = 3, ldc = 4." /></details></div>
+<figcaption>Ugyanaz a memória row-major és column-major nézetben
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>=</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">N = 2</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>=</mo><mn>3</mn></mrow><annotation encoding="application/x-tex">K = 3</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>M</mi><mo>=</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">M = 4</annotation></semantics></math>):
+a row-major
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>×</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">N \times K</annotation></semantics></math>
+mátrix column-major
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>×</mo><mi>N</mi></mrow><annotation encoding="application/x-tex">K \times N</annotation></semantics></math>-ként
+a transzponáltja, ezért a cuBLAS az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mi>𝐘</mi><mi>𝖳</mi></msup><mo>=</mo><mi>𝐖</mi><msup><mi>𝐗</mi><mi>𝖳</mi></msup></mrow><annotation encoding="application/x-tex">\mathbf{Y}^{\mathsf{T}} = \mathbf{W}\mathbf{X}^{\mathsf{T}}</annotation></semantics></math>
+szorzatot számolja
+<code>m = 4, n = 2, k = 3, lda = 3, ldb = 3, ldc = 4</code>
+paraméterekkel.</figcaption>
+</figure>
+<p>A bias hozzáadását a GEMM önmagában nem végzi el; azt külön kernelben
+vagy egy második,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>k</mi><mo>=</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">k = 1</annotation></semantics></math>
+belső dimenziós GEMM-mel (az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>×</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">N \times 1</annotation></semantics></math>
+csupa-egyes vektor és az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>×</mo><mi>M</mi></mrow><annotation encoding="application/x-tex">1 \times M</annotation></semantics></math>
+bias-sorvektor szorzata,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>β</mi><mo>=</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">\beta = 1</annotation></semantics></math>-gyel
+az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>𝐘</mi><annotation encoding="application/x-tex">\mathbf{Y}</annotation></semantics></math>-ra
+akkumulálva; ugyanez <code>cublasSger</code>-rel rangegy-frissítésként)
+lehet megoldani. A cuBLAS column-major szemléletében ez
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mi>𝐘</mi><mi>𝖳</mi></msup><mo>+</mo><mo>=</mo><mi>𝐛</mi><mspace width="0.167em"></mspace><msubsup><mn>𝟏</mn><mi>N</mi><mi>𝖳</mi></msubsup></mrow><annotation encoding="application/x-tex">\mathbf{Y}^{\mathsf T} \mathrel{+}= \mathbf{b}\,\mathbf{1}_N^{\mathsf T}</annotation></semantics></math>,
+<code>m = M, n = N, k = 1</code>. A gyakorlatban a keretrendszerek
+gyakran egy <strong>fused</strong> kernelt használnak, amely a GEMM
+epilógusában adja hozzá a bias-t, így elkerülve egy külön globális
+memória kört. Ezt a CUTLASS „epilogue” mechanizmusa támogatja.</p>
+<p>A <code>cublasGemmEx</code> és a <code>cublasLt</code> lehetővé teszi
+vegyes pontosságú számítást, például TF32, FP16 vagy BF16 bemenettel és
+FP32 akkumulációval. Ez a modern GPU-k Tensor Core egységeit használja,
+és a lineáris réteg teljesítményét az FP32 CUDA-magos számításhoz képest
+nagyságrendileg (a hardvertől függően körülbelül egy nagyságrenddel)
+növelheti, de a numerikus pontosságot gondosan ellenőrizni kell. A
+következő alfejezet a konvolúciós kernelekkel foglalkozik, a rá
+következő az attention kernelekkel, ahol a cuBLAS és a CUTLASS
+integrációja még fontosabb.</p>
+<h3 data-number="24.1.4" id="cutlass-szerepe"><span
+class="header-section-number">24.1.4</span> CUTLASS szerepe</h3>
+<p>A <strong>CUTLASS</strong> (CUDA Templates for Linear Algebra
+Subroutines and Solvers) egy nyílt forráskódú sablonkönyvtár, amely a
+GEMM és más lineáris algebrai műveletek hatékony implementálásához ad
+építőelemeket. A cuBLAS-szal ellentétben a CUTLASS nem egy előre
+lefordított könyvtár, hanem C++ sablonok gyűjteménye, amelyek a
+fordítási időben specializálódnak a pontos adattípusra, tile méretre,
+warp elrendezésre és az úgynevezett <strong>epilógus</strong>
+műveletre.</p>
+<p>A CUTLASS alapvető szerkezete a hierarchikus tiling:</p>
+<ol type="1">
+<li><strong>Thread block tile:</strong> minden blokk egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>C</mi><annotation encoding="application/x-tex">C</annotation></semantics></math>
+kimeneti mátrix blokkját számítja ki, például
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>128</mn><mo>×</mo><mn>128</mn></mrow><annotation encoding="application/x-tex">128 \times 128</annotation></semantics></math>
+elemet. A bemeneti
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>A</mi><annotation encoding="application/x-tex">A</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>B</mi><annotation encoding="application/x-tex">B</annotation></semantics></math>
+mátrixok megfelelő tile-jait shared memory-ba tölti.</li>
+<li><strong>Warp tile:</strong> a blokkon belül minden warp egy kisebb
+részt, például
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>64</mn><mo>×</mo><mn>64</mn></mrow><annotation encoding="application/x-tex">64 \times 64</annotation></semantics></math>
+elemet kap.</li>
+<li><strong>Thread-level:</strong> a SIMT (nem Tensor Core) kerneleknél
+a szál egy kis, például
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>8</mn><mo>×</mo><mn>8</mn></mrow><annotation encoding="application/x-tex">8 \times 8</annotation></semantics></math>-as
+mikro-tile-t számol; Tensor Core-nál a warp közösen hajtja végre az
+<code>mma</code> utasítást, és a szálak egy-egy fragmentet
+tartanak.</li>
+</ol>
+<p>A CUTLASS a <strong>tensor core</strong> használatát teszi elérhetővé
+a <code>mma</code> utasításokon keresztül. Az <code>mma.sync</code>
+warp-szintű utasítás: a warp 32 szála közösen hajt végre egy kis
+mátrixszorzást (PTX szinten például m16n8k8 vagy m16n8k16 alakban; a
+16×16×16 a WMMA API absztrakciója). A FP16, BF16 és TF32 bemenetekkel az
+FP32 akkumulátorban számoló <code>mma</code> utasítások a mélytanulási
+terhelések gerincét adják. A CUTLASS emellett támogatja az
+<strong>epilógus</strong> kiterjesztést, amely a GEMM kimenetére további
+műveleteket alkalmazhat, például bias hozzáadást, ReLU aktivációt vagy
+kvantálást, anélkül hogy a kimenetet visszaírnánk a globális memóriába.
+Ez különösen fontos a lineáris rétegnél, mert a bias hozzáadása és az
+aktiváció egy lépésben elvégezhető, csökkentve a memóriaforgalmat.</p>
+<p>Egy CUTLASS alapú lineáris réteg váza a következőképpen nézhet
+ki:</p>
+<pre class="cuda"><code>// CUDA C++ (C++17) – CUTLASS vázlat (nem lefordított, csak koncepcionális; TF32, sm_80)
+#include &lt;cutlass/gemm/device/gemm.h&gt;
+#include &lt;cutlass/epilogue/thread/linear_combination_relu.h&gt;
+
+using ElementA = cutlass::tfloat32_t;   // TF32 Tensor Core bemenet (a memóriában float)
+using ElementB = cutlass::tfloat32_t;
+using ElementC = float;
+using Accumulator = float;
+
+using ThreadblockShape = cutlass::gemm::GemmShape&lt;128, 128, 32&gt;;
+using WarpShape        = cutlass::gemm::GemmShape&lt;64, 64, 32&gt;;
+using InstructionShape = cutlass::gemm::GemmShape&lt;16, 8, 8&gt;;   // TF32 mma m16n8k8
+
+// A bias-t a C operandus adja ({d_bias, 0} TensorRef, azaz 0 sorlépésköz),
+// így minden sor ugyanazt a bias-vektort kapja; a beta-skálázás kikapcsolva.
+using EpilogueOp = cutlass::epilogue::thread::LinearCombinationRelu&lt;
+    ElementC, 128 / cutlass::sizeof_bits&lt;ElementC&gt;::value,
+    Accumulator, Accumulator,
+    cutlass::epilogue::thread::ScaleType::NoBetaScaling&gt;;
+
+using Gemm = cutlass::gemm::device::Gemm&lt;
+    ElementA, cutlass::layout::RowMajor,
+    ElementB, cutlass::layout::RowMajor,
+    ElementC, cutlass::layout::RowMajor,
+    Accumulator,
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    ThreadblockShape, WarpShape, InstructionShape,
+    EpilogueOp,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle&lt;&gt;,
+    2&gt;;
+
+// A tényleges hívásnál a CUTLASS elvégzi a tilinget, a shared memória
+// feltöltést és az mma utasításokat. A fenti sablon paraméterezés
+// illusztráció, a pontos típusok a CUTLASS verziójától függenek.</code></pre>
+<p>A CUTLASS előnye, hogy a fejlesztő pontosan szabályozhatja a tile
+méreteket, a warp elrendezést és az adatfolyamot, míg a cuBLAS egy
+fekete doboz. A hátránya a hosszabb fejlesztési idő és a sablonok
+bonyolultsága. A gyakorlatban a mélytanulási keretrendszerek (PyTorch,
+TensorFlow) sokszor a cuBLAS-t vagy a CUTLASS-t használják a lineáris
+réteg mögött, attól függően, hogy melyik adott hardveren gyorsabb.</p>
+<h3 data-number="24.1.5"
+id="lineáris-réteg-saját-kernelből-tiled-gemm"><span
+class="header-section-number">24.1.5</span> Lineáris réteg saját
+kernelből: tiled GEMM</h3>
+<p>A tanulás szempontjából elengedhetetlen, hogy a lineáris réteget egy
+saját, oktatási célú kernelben is megvalósítsuk. Az alábbi CUDA kernel
+egy batch lineáris réteget számol shared memory tilinggel, bias
+hozzáadással. A kernel <code>TM = TN = TILE_DIM</code> méretű kimeneti
+tile-okat állít elő, és a bemeneti
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>𝐗</mi><annotation encoding="application/x-tex">\mathbf{X}</annotation></semantics></math>
+valamint a transzponált
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>𝐖</mi><annotation encoding="application/x-tex">\mathbf{W}</annotation></semantics></math>
+tile-jait shared memory-ba tölti.</p>
+<pre class="cuda"><code>// CUDA C++ (C++17) – lineáris réteg saját kernel, FP32, tiled GEMM
+#define TILE_DIM 32
+
+__global__ void linear_layer_kernel(
+    const float* __restrict__ X,      // (N, K) row-major
+    const float* __restrict__ W,      // (M, K) row-major
+    const float* __restrict__ bias,   // (M) vagy nullptr
+    float* __restrict__ Y,            // (N, M) row-major
+    int N, int K, int M)
+{
+    // A block dim (TILE_DIM, TILE_DIM). A blockIdx.x az oszlop (M)
+    // irányt, blockIdx.y a batch (N) irányt jelöli.
+    int c_row = blockIdx.y * TILE_DIM + threadIdx.y;   // batch index
+    int c_col = blockIdx.x * TILE_DIM + threadIdx.x;   // kimeneti index
+
+    __shared__ float As[TILE_DIM][TILE_DIM];   // X tile (TM x K-tile)
+    // W^T tile (TN x K-tile), +1 padding: nincs bank conflict
+    __shared__ float Bs[TILE_DIM][TILE_DIM + 1];
+
+    float acc = 0.0f;
+    int tiles = (K + TILE_DIM - 1) / TILE_DIM;
+
+    for (int t = 0; t &lt; tiles; ++t) {
+        int k = t * TILE_DIM + threadIdx.x;   // belső dimenzió index
+
+        // As betöltése: As[threadIdx.y][threadIdx.x] = X[c_row][k]
+        if (c_row &lt; N &amp;&amp; k &lt; K) {
+            As[threadIdx.y][threadIdx.x] = X[c_row * K + k];
+        } else {
+            As[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        // Bs betöltése: Bs[threadIdx.y][threadIdx.x] = W[out][k],
+        // ahol out = blockIdx.x * TILE_DIM + threadIdx.y.
+        int out_idx = blockIdx.x * TILE_DIM + threadIdx.y;
+        if (out_idx &lt; M &amp;&amp; k &lt; K) {
+            Bs[threadIdx.y][threadIdx.x] = W[out_idx * K + k];
+        } else {
+            Bs[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+        __syncthreads();
+
+        // Accumulate: C[threadIdx.y][threadIdx.x] +=
+        //   sum_k As[threadIdx.y][k] * Bs[threadIdx.x][k]
+        #pragma unroll
+        for (int kk = 0; kk &lt; TILE_DIM; ++kk) {
+            acc += As[threadIdx.y][kk] * Bs[threadIdx.x][kk];
+        }
+        __syncthreads();
+    }
+
+    if (c_row &lt; N &amp;&amp; c_col &lt; M) {
+        float val = acc + (bias ? bias[c_col] : 0.0f);
+        Y[c_row * M + c_col] = val;
+    }
+}</code></pre>
+<p>A kernel működése:</p>
+<ul>
+<li>Minden blokk egy <code>TILE_DIM x TILE_DIM</code> méretű kimeneti
+részt számol. A <code>threadIdx.x</code> az oszlopot, a
+<code>threadIdx.y</code> a sort azonosítja a kimeneti tile-on
+belül.</li>
+<li>A <code>K</code> dimenziót <code>tiles</code> számú szakaszra
+bontjuk. Minden iterációban a szükséges
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>X</mi><annotation encoding="application/x-tex">X</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mi>W</mi><mi>𝖳</mi></msup><annotation encoding="application/x-tex">W^{\mathsf{T}}</annotation></semantics></math>
+tile-okat a shared memóriába másoljuk, ott szinkronizálunk, majd minden
+szál egy belső szorzatot halmoz fel az <code>acc</code>
+regiszterben.</li>
+<li>A <code>Bs</code> betöltésekor a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>W</mi><annotation encoding="application/x-tex">W</annotation></semantics></math>
+mátrixból a kimeneti index (<code>out_idx</code>) és a belső index
+(<code>k</code>) segítségével olvasunk. Mivel a <code>Bs</code>
+sorindexe az <code>out</code> dimenzió, oszlopindexe a <code>k</code>
+dimenzió, ezért a <code>Bs</code> a transzponált súlymátrix tile-ját
+tárolja. A számítás során <code>Bs[threadIdx.x][kk]</code> a
+<code>threadIdx.x</code> kimeneti oszlophoz tartozó súlyvektor
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>k</mi><annotation encoding="application/x-tex">k</annotation></semantics></math>-adik
+eleme, míg <code>As[threadIdx.y][kk]</code> a bemeneti sorvektoré. A
+<code>Bs</code> sorhossza <code>TILE_DIM + 1</code> (padding): enélkül a
+<code>Bs[threadIdx.x][kk]</code> olvasás 32-utas bank conflictot okozna
+(lásd a „Tipikus hibák” 8. pontját).</li>
+<li>A határok kezelése paddinggel történik: ha a globális index túlmutat
+a mátrixon, nullát töltünk. Ez egyszerűsíti a kódot, de a valós
+implementációkban gyakran hatékonyabb, ha a határfeltételeket a kernel
+végén csak a tényleges elemekre írjuk ki.</li>
+<li>A bias hozzáadása a kimeneti elem kiszámítása után történik,
+feltéve, hogy a <code>bias</code> mutató nem <code>nullptr</code>.</li>
+</ul>
+<p>A kernel launch alakja:</p>
+<pre class="cuda"><code>dim3 block(TILE_DIM, TILE_DIM);
+dim3 grid((M + TILE_DIM - 1) / TILE_DIM,
+          (N + TILE_DIM - 1) / TILE_DIM);
+linear_layer_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_X, d_W, d_bias, d_Y, N, K, M);</code></pre>
+<p>Ez a kernel didaktikus, de nem éri el a cuBLAS vagy CUTLASS
+teljesítményét, mivel nem használ Tensor Core-okat, nem végez dupla
+bufferinget, és a shared memory betöltés nem vektorizált. A későbbi
+alfejezetek és a profilozásról szóló rész mutatják, hogyan lehet ezt
+tovább optimalizálni.</p>
+<h3 data-number="24.1.6" id="tipikus-hibák-és-a-helyes-megoldás"><span
+class="header-section-number">24.1.6</span> Tipikus hibák és a helyes
+megoldás</h3>
+<p>A lineáris réteg GEMM-mel történő implementálásakor a következő hibák
+a leggyakoribbak:</p>
+<ol type="1">
+<li><p><strong>Layout mismatch:</strong> A bemeneti mátrixot
+row-majorban tároljuk, de a cuBLAS column-major konvenciót vár. A
+megoldás vagy a transzponálási flag-ek és a dimenziók átgondolt
+megválasztása (mint a fenti hívásban, ahol a row-major
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>Y</mi><annotation encoding="application/x-tex">Y</annotation></semantics></math>
+a cuBLAS szemében
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mi>Y</mi><mi>𝖳</mi></msup><annotation encoding="application/x-tex">Y^{\mathsf{T}}</annotation></semantics></math>),
+vagy a mátrixok tényleges transzponálása a memóriában. Hibás
+<code>CUBLAS_OP_*</code> vagy dimenzió esetén a hívás érvénytelen
+paramétert jelez (<code>CUBLAS_STATUS_INVALID_VALUE</code>), vagy rossz
+alakú/értékű eredményt ad; a hiba csak kis, CPU-referenciás teszttel
+biztosan felfedezhető.</p></li>
+<li><p><strong>Hibás leading dimension:</strong> Az <code>lda</code>,
+<code>ldb</code>, <code>ldc</code> paramétereket a tényleges
+memóriaelrendezéshez kell igazítani. Ha a mátrixot paddinggel tároljuk,
+a leading dimension nagyobb, mint a logikai dimenzió. A cuBLAS hibás
+lépésközzel túlindexel, ami memóriahibához vagy rossz eredményhez
+vezet.</p></li>
+<li><p><strong>Transzponálási hiba a saját kernelben:</strong> A
+<code>Bs</code> betöltésekor könnyű felcserélni a
+<code>threadIdx.x</code> és <code>threadIdx.y</code> indexeket. A fenti
+kernelben a
+<code>Bs[threadIdx.y][threadIdx.x] = W[out_idx * K + k]</code> sor
+helyesen a <code>threadIdx.y</code>-t használja a kimeneti dimenzióhoz,
+mert a <code>Bs</code> sorindexe az out dimenzió. Ha valaki
+<code>W[k * M + out_idx]</code>-et ír, az a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>W</mi><annotation encoding="application/x-tex">W</annotation></semantics></math>
+transzponáltjának rossz elrendezését eredményezi.</p></li>
+<li><p><strong>Bias hozzáadásának elmulasztása:</strong> A GEMM
+önmagában nem adja hozzá a bias-t. Ha a bias-t külön kernelben adjuk
+hozzá, győződjünk meg arról, hogy a kernel a kimeneti dimenzió mentén
+fut, és a batch dimenziót nem keveri.</p></li>
+<li><p><strong>Batch és feature dimenziók felcserélése:</strong> A
+bemeneti mátrix alakja
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><mi>N</mi><mo>,</mo><mi>K</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">(N, K)</annotation></semantics></math>,
+a súlyé
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><mi>M</mi><mo>,</mo><mi>K</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">(M, K)</annotation></semantics></math>.
+Ha a felhasználó
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><mi>K</mi><mo>,</mo><mi>N</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">(K, N)</annotation></semantics></math>
+alakú bemenetet ad meg, a GEMM dimenziói rosszak lesznek, és a kimenet
+mérete sem egyezik. Figyelem: a cuBLAS <code>m</code>, <code>n</code>,
+<code>k</code> paraméterei a column-major szemléletű GEMM dimenziói, nem
+a fejezet
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>M</mi><annotation encoding="application/x-tex">M</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+betűi; a fenti hívásban <code>m = M</code> (kimeneti jellemzők),
+<code>n = N</code> (batch).</p></li>
+<li><p><strong>Osztási maradék és tile padding:</strong> A saját
+kernelben a <code>tiles</code> számítást
+<code>(K + TILE_DIM - 1) / TILE_DIM</code> képlettel végezzük, hogy
+akkor is minden elem sorra kerüljön, ha a <code>K</code> nem osztható
+<code>TILE_DIM</code>-mel. A határfeltételeknél a <code>k &lt; K</code>
+ellenőrzés elengedhetetlen, különben a global memory-ból való olvasás
+túlmutat a lefoglalt területen.</p></li>
+<li><p><strong>Szinkronizáció hiánya:</strong> A shared memory
+feltöltése után <code>__syncthreads()</code> nélkül a szálak még azelőtt
+olvashatják a shared memóriát, hogy minden szál befejezte volna az
+írást. Ez versenyhelyzetet okoz. A fenti kernelben mind a betöltés után,
+mind a belső ciklus végén van szinkronizáció.</p></li>
+<li><p><strong>Bank conflict a shared memóriában:</strong> a belső
+szorzatban az <code>As[threadIdx.y][kk]</code> hozzáférés broadcast (a
+warp azonos <code>threadIdx.y</code>-jú szálai ugyanazt a szót
+olvassák), a <code>Bs[threadIdx.x][kk]</code> viszont
+<code>TILE_DIM = 32</code> mellett a <code>threadIdx.x * 32 + kk</code>
+címekre mutat: a warp 32 szála ugyanabba a bankba esik, ez 32-utas bank
+conflict. Kettő hatvány méretnél a padding nélküli oszlopelérés tehát
+konfliktusos. A javítás:
+<code>__shared__ float Bs[TILE_DIM][TILE_DIM + 1];</code> (a címek
+<code>threadIdx.x * 33 + kk</code>, így különböző bankok), vagy a
+<code>Bs</code> transzponált tárolása. Ellenőrzés: Nsight Compute
+<code>l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum</code>.</p></li>
+</ol>
+<h3 data-number="24.1.7"
+id="labor-lineáris-réteg-kernel-implementálása"><span
+class="header-section-number">24.1.7</span> Labor: lineáris réteg kernel
+implementálása</h3>
+<p>A labor célja, hogy a fenti saját kernelt egy teljes programban
+futtassa, összehasonlítsa a CPU referencia implementációval, és mérést
+végezzen. Az alábbiakban megadjuk a szükséges környezetet, build- és
+futtatási parancsokat, valamint a mérési napló sablonját.</p>
+<h4 data-number="24.1.7.1" id="környezet"><span
+class="header-section-number">24.1.7.1</span> Környezet</h4>
+<ul>
+<li><strong>GPU:</strong> (kitöltendő; a példa A100 40 GB vagy hasonló,
+pl. RTX 3090)</li>
+<li><strong>Driver:</strong> (kitöltendő; a <code>nvidia-smi</code>
+kimenetéből)</li>
+<li><strong>CUDA Toolkit:</strong> (kitöltendő)</li>
+<li><strong>Operációs rendszer:</strong> (kitöltendő)</li>
+<li><strong>Compute capability:</strong> (kitöltendő; A100: 8.0)</li>
+<li><strong>Power limit / ECC / MIG:</strong> (kitöltendő)</li>
+</ul>
+<h4 data-number="24.1.7.2" id="build-parancs"><span
+class="header-section-number">24.1.7.2</span> Build parancs</h4>
+<p>A forrásfájl neve <code>linear_layer.cu</code> (a fenti kernel és az
+alább vázolt <code>main</code>). Fordítás:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-Xptxas</span> <span class="at">-v</span> <span class="at">-o</span> linear_layer linear_layer.cu</span></code></pre></div>
+<p>A <code>-Xptxas -v</code> kiírja a regiszterhasználatot és a shared
+memory méretet, amely a mérési naplóhoz szükséges. A cuBLAS-t használó
+változathoz a fordítási parancs <code>-lcublas</code>-szal egészül ki
+(<code>nvcc -O3 -arch=sm_80 -o linear_cublas linear_cublas.cu -lcublas</code>;
+a <code>linear_cublas.cu</code> a 24.1.3 cuBLAS-programja, amelyet
+ugyanígy, eseményekkel mérj meg).</p>
+<p>A <code>linear_layer.cu</code> <code>main</code> vázlata (a fenti
+kernellel és a <code>CUDA_CHECK</code> makróval; nem lett lefordítva
+vagy futtatva):</p>
+<pre class="cuda"><code>// CUDA C++17 – a linear_layer.cu főprogramjának vázlata
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;cmath&gt;
+#include &lt;vector&gt;
+#include &lt;algorithm&gt;
+// ... CUDA_CHECK és linear_layer_kernel a fenti kódból ...
+
+int main(int argc, char** argv) {
+    int N = argc &gt; 1 ? atoi(argv[1]) : 1024;
+    int K = argc &gt; 2 ? atoi(argv[2]) : 4096;
+    int M = argc &gt; 3 ? atoi(argv[3]) : 4096;
+    std::vector&lt;float&gt; X((size_t)N * K), W((size_t)M * K), b(M), Y((size_t)N * M);
+    for (size_t i = 0; i &lt; X.size(); ++i) X[i] = 0.001f * (i % 100);
+    for (size_t i = 0; i &lt; W.size(); ++i) W[i] = 0.0001f * (i % 97);
+    for (int i = 0; i &lt; M; ++i) b[i] = 0.01f;
+
+    float *dX, *dW, *db, *dY;
+    CUDA_CHECK(cudaMalloc(&amp;dX, X.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;dW, W.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;db, b.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;dY, Y.size() * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(dX, X.data(), X.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dW, W.data(), W.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(db, b.data(), b.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+    dim3 block(TILE_DIM, TILE_DIM);
+    dim3 grid((M + TILE_DIM - 1) / TILE_DIM, (N + TILE_DIM - 1) / TILE_DIM);
+    for (int i = 0; i &lt; 5; ++i)                       // warm-up
+        linear_layer_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(dX, dW, db, dY, N, K, M);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    const int iters = 20;
+    cudaEvent_t t0, t1;
+    CUDA_CHECK(cudaEventCreate(&amp;t0)); CUDA_CHECK(cudaEventCreate(&amp;t1));
+    std::vector&lt;float&gt; ts(iters);
+    for (int i = 0; i &lt; iters; ++i) {
+        CUDA_CHECK(cudaEventRecord(t0));
+        linear_layer_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(dX, dW, db, dY, N, K, M);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(t1));
+        CUDA_CHECK(cudaEventSynchronize(t1));
+        CUDA_CHECK(cudaEventElapsedTime(&amp;ts[i], t0, t1));
+    }
+    std::sort(ts.begin(), ts.end());
+    float median_ms = 0.5f * (ts[iters / 2 - 1] + ts[iters / 2]);
+    float iqr_ms = ts[3 * iters / 4] - ts[iters / 4];
+    double gflops = 2.0 * N * M * K / (median_ms * 1e6);
+    printf(&quot;medián: %f ms, IQR: %f ms, %f GFLOP/s\n&quot;, median_ms, iqr_ms, gflops);
+
+    CUDA_CHECK(cudaMemcpy(Y.data(), dY, Y.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    // CPU referencia (double), mintavételezve
+    double max_err = 0.0;
+    for (int n = 0; n &lt; N; n += 97)
+        for (int m = 0; m &lt; M; m += 89) {
+            double ref = b[m];
+            for (int k = 0; k &lt; K; ++k)
+                ref += (double)X[(size_t)n * K + k] * W[(size_t)m * K + k];
+            max_err = fmax(max_err, fabs(ref - Y[(size_t)n * M + m]));
+        }
+    printf(&quot;max abszolút hiba (mintavételezett): %g\n&quot;, max_err);
+    CUDA_CHECK(cudaFree(dX)); CUDA_CHECK(cudaFree(dW));
+    CUDA_CHECK(cudaFree(db)); CUDA_CHECK(cudaFree(dY));
+    return 0;
+}</code></pre>
+<h4 data-number="24.1.7.3" id="futtatási-parancs"><span
+class="header-section-number">24.1.7.3</span> Futtatási parancs</h4>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./linear_layer</span> 1024 4096 4096</span></code></pre></div>
+<p>ahol az argumentumok: <code>N</code> (batch), <code>K</code>
+(bemeneti jellemzők), <code>M</code> (kimeneti jellemzők). A program a
+bemeneteket determinisztikusan inicializálja, lefuttatja a saját CUDA
+kernelt, mintavételezve ellenőrzi az eredményt a CPU referencia ellen,
+és kiírja a futásidőt (lásd a fenti vázlatot; a program nem lett
+lefordítva vagy futtatva). A cuBLAS-változat a 24.1.3
+<code>linear_cublas.cu</code> programja, amelyet ugyanígy meg kell
+mérni; a kettő összevetése (a 24.1 célkitűzésének 3. pontja) a mérési
+naplóban külön sort kap.</p>
+<h4 data-number="24.1.7.4" id="mérési-napló-sablon"><span
+class="header-section-number">24.1.7.4</span> Mérési napló sablon</h4>
+<table>
+<colgroup>
+<col style="width: 61%" />
+<col style="width: 38%" />
+</colgroup>
+<thead>
+<tr>
+<th>Paraméter</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU modell</td>
+<td>[kitöltendő]</td>
+</tr>
+<tr>
+<td>Driver verzió</td>
+<td>[kitöltendő]</td>
+</tr>
+<tr>
+<td>CUDA verzió</td>
+<td>[kitöltendő]</td>
+</tr>
+<tr>
+<td>Compute capability</td>
+<td>[kitöltendő]</td>
+</tr>
+<tr>
+<td>Batch (N)</td>
+<td>1024</td>
+</tr>
+<tr>
+<td>Bemeneti jellemzők (K)</td>
+<td>4096</td>
+</tr>
+<tr>
+<td>Kimeneti jellemzők (M)</td>
+<td>4096</td>
+</tr>
+<tr>
+<td>Precision</td>
+<td>FP32</td>
+</tr>
+<tr>
+<td>Futásidő (medián, 20 ismétlés)</td>
+<td>[kitöltendő] ms</td>
+</tr>
+<tr>
+<td>IQR</td>
+<td>[kitöltendő] ms</td>
+</tr>
+<tr>
+<td>Regiszterhasználat szálanként</td>
+<td>[kitöltendő]</td>
+</tr>
+<tr>
+<td>Shared memory blokkonként</td>
+<td>[kitöltendő] byte</td>
+</tr>
+<tr>
+<td>Occupancy (elméleti)</td>
+<td>[kitöltendő] %</td>
+</tr>
+<tr>
+<td>Elért sávszélesség</td>
+<td>[kitöltendő] GB/s (a minimális forgalom:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><mi>N</mi><mi>K</mi><mo>+</mo><mi>M</mi><mi>K</mi><mo>+</mo><mi>N</mi><mi>M</mi><mo>+</mo><mi>M</mi><mo stretchy="false" form="postfix">)</mo><mo>⋅</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">(NK + MK + NM + M)\cdot 4</annotation></semantics></math>
+B osztva a mediánnal)</td>
+</tr>
+<tr>
+<td>Effektív FLOPs</td>
+<td>[kitöltendő] GFLOP/s
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mi>N</mi><mi>M</mi><mi>K</mi></mrow><annotation encoding="application/x-tex">2NMK</annotation></semantics></math>
+/ medián)</td>
+</tr>
+<tr>
+<td>cuBLAS medián idő (<code>linear_cublas.cu</code>)</td>
+<td>[kitöltendő] ms</td>
+</tr>
+<tr>
+<td>Gyorsulás (saját kernel / cuBLAS)</td>
+<td>[kitöltendő]</td>
+</tr>
+<tr>
+<td>Max abszolút hiba (CPU-hoz képest)</td>
+<td>[kitöltendő]</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Várt eredmény:</strong> a CUDA kernel kimenete és a CPU
+referencia (dupla pontosságú összegzéssel számolt) közötti max abszolút
+hiba FP32 esetén a bemeneti adatokkal és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>=</mo><mn>4096</mn></mrow><annotation encoding="application/x-tex">K = 4096</annotation></semantics></math>-tal
+várhatóan kicsi (nagyságrendi becslés, mérést igényel). A futásidőt és a
+regiszterhasználatot nem becsüljük: azokat a <code>-Xptxas -v</code>
+kimenetből és a mérésből kell kitölteni. A shared memória blokkonként a
+<code>Bs</code> paddingjével
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>32</mn><mo>⋅</mo><mn>32</mn><mo>⋅</mo><mn>4</mn><mo>+</mo><mn>32</mn><mo>⋅</mo><mn>33</mn><mo>⋅</mo><mn>4</mn><mo>=</mo><mn>8320</mn></mrow><annotation encoding="application/x-tex">32 \cdot 32 \cdot 4 + 32 \cdot 33 \cdot 4 = 8320</annotation></semantics></math>
+bájt (padding nélkül 8192 bájt).</p>
+<p><strong>Mért eredmény:</strong> (Ez a rész üres, amíg a labort
+ténylegesen el nem végezted. A fenti sablonba írd be a mért értékeket.
+Ne mutass be nem futtatott adatot ellenőrzöttként.)</p>
+<p>A program a futás előtt 5 <strong>warm-up</strong> futtatást végez,
+majd 20 ismétlést mér indításonként külön eseménypárral, és a mediánt és
+az IQR-t közli (a könyv mérési protokollja: legalább 5 warm-up, legalább
+20 mért ismétlés, medián és szórás vagy IQR). A mérés során a
+<code>cudaEvent</code> időmérőket használjuk, és a kernel indítása után
+<code>cudaDeviceSynchronize</code> hívunk. A mérési naplóhoz a
+<code>nvidia-smi</code> kimenetét is csatoljuk, amely mutatja az
+órajelet és a hőmérsékletet.</p>
+<h3 data-number="24.1.8" id="önellenőrző-kérdés"><span
+class="header-section-number">24.1.8</span> Önellenőrző kérdés</h3>
+<p>Magyarázd el, miért szükséges a <code>CUBLAS_OP_T</code> flag a
+<code>cublasSgemm</code> hívásában, ha a súlymátrixot
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><mi>M</mi><mo>,</mo><mi>K</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">(M, K)</annotation></semantics></math>
+alakban, row-major tárolásban adjuk meg, és a lineáris réteg
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>Y</mi><mo>=</mo><mi>X</mi><msup><mi>W</mi><mi>𝖳</mi></msup><mo>+</mo><mi>b</mi></mrow><annotation encoding="application/x-tex">Y = X W^{\mathsf{T}} + b</annotation></semantics></math>
+műveletet valósítja meg. Mi történne, ha <code>CUBLAS_OP_N</code>-t
+használnánk?</p>
+<p><em>Válasz:</em> A cuBLAS a row-major
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><mi>M</mi><mo>,</mo><mi>K</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">(M, K)</annotation></semantics></math>
+alakú
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>W</mi><annotation encoding="application/x-tex">W</annotation></semantics></math>-t
+column-major
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>×</mo><mi>M</mi></mrow><annotation encoding="application/x-tex">K \times M</annotation></semantics></math>
+mátrixnak látja (<code>lda = K</code>). Az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mi>Y</mi><mi>𝖳</mi></msup><mo>=</mo><mi>W</mi><mspace width="0.167em"></mspace><msup><mi>X</mi><mi>𝖳</mi></msup></mrow><annotation encoding="application/x-tex">Y^{\mathsf T} = W\,X^{\mathsf T}</annotation></semantics></math>
+szorzathoz
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>M</mi><mo>×</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">M \times K</annotation></semantics></math>
+tényező kell, ezért <code>CUBLAS_OP_T</code>. <code>CUBLAS_OP_N</code>
+mellett az A operandus
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>M</mi><mo>×</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">M \times K</annotation></semantics></math>
+column-major mátrix lenne <code>lda ≥ M</code> vezető dimenzióval: ha
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>&lt;</mo><mi>M</mi></mrow><annotation encoding="application/x-tex">K &lt; M</annotation></semantics></math>,
+a hívás <code>CUBLAS_STATUS_INVALID_VALUE</code>-val tér vissza; ha
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>≥</mo><mi>M</mi></mrow><annotation encoding="application/x-tex">K \ge M</annotation></semantics></math>
+(például a labor
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>=</mo><mi>M</mi><mo>=</mo><mn>4096</mn></mrow><annotation encoding="application/x-tex">K = M = 4096</annotation></semantics></math>
+esetén), a hívás jellemzően sikeres, de a memóriát rossz elrendezésben
+olvassa, és az eredmény hibás (a lektor saját kis tesztje szerint;
+nálunk nem futtatva). Ezért kell a kis méretű CPU-referenciás teszt.</p>
+<h3 data-number="24.1.9" id="összegzés"><span
+class="header-section-number">24.1.9</span> Összegzés</h3>
+<p>Ebben az alfejezetben megvizsgáltuk a lineáris réteg és a GEMM
+kapcsolatát. Láttuk, hogy a batch feldolgozás egyetlen mátrixszorzással
+megoldható, de a layout és a leading dimension pontos ismerete
+elengedhetetlen. A cuBLAS és a CUTLASS bemutatásával megértettük, hogyan
+használhatók a gyakorlatban a nagy teljesítményű könyvtárak, és egy
+saját, oktatási célú tiled GEMM kernel segítségével betekintést nyertünk
+a réteg hardverközeli megvalósításába. A labor elvégzésével a tanultakat
+kézzelfoghatóvá tesszük; a fejezet következő alfejezete a konvolúciós
+kernelekkel, az azt követő pedig az attention kernelekkel
+folytatódik.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu089.html">← 23.4 Tensor Core optimalizálás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu091.html">24.2 Convolution kernelek →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

@@ -1,0 +1,998 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>16.2 Mutex, RwLock, csatornák és a megosztott rkv – Rust
+programozás C++-fejlesztőknek – a nulláról a mesterszintig</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – Párhuzamosság és aszinkronitás</a> › <a href="index.html#rch15">16 Szálak és megosztott állapot</a></p>
+<div class="links"><a class="prev" rel="prev" href="r033.html">← 16.1 Szálak, Send és Sync: data race fordítási időben kizárva</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="r035.html">16.3 Atomikus műveletek és memóriarendezés →</a></div>
+</nav>
+<h2 data-number="16.2" id="r034"><span
+class="header-section-number">16.2</span> Mutex, RwLock, csatornák és a
+megosztott rkv</h2>
+<h3 data-number="16.2.1" id="motiváció"><span
+class="header-section-number">16.2.1</span> Motiváció</h3>
+<p>C++-ban a szálbiztos megosztott állapot kézi fegyelmet igényel: a
+<code>std::mutex</code> és a védett adat külön tagváltozók, és a fordító
+nem tudja, melyik zár melyik adatot védi. Ha elfelejtünk
+<code>lock_guard</code>-ot írni, adatversenyt kapunk; ha rossz
+sorrendben zárunk, holtpontot. A Rust ezt a típust egyesíti: a
+<code>Mutex&lt;T&gt;</code> és az <code>RwLock&lt;T&gt;</code>
+<strong>birtokolja</strong> a védett értéket, és a zár megszerzése egy
+RAII guardot ad, amelyen keresztül csak a zár élettartama alatt
+férhetünk az adathoz. Ez a <a href="r020.html">Belső mutabilitás: Cell,
+RefCell és a futásidejű kölcsönzés</a> alfejezetben megismert
+<code>RefCell&lt;T&gt;</code> szálbiztos párja: a zár futásidejű
+kölcsönzést valósít meg, de ott nem pánikol kölcsönzési
+szabálysértéskor, hanem blokkol.</p>
+<h3 data-number="16.2.2" id="fogalmak-és-szabályok"><span
+class="header-section-number">16.2.2</span> Fogalmak és szabályok</h3>
+<p><strong>Definíció.</strong> A <code>std::sync::Mutex&lt;T&gt;</code>
+kölcsönös kizárást (mutual exclusion) biztosító szinkronizációs
+primitív. A <code>T</code> érték a zár mögött él; a <code>lock()</code>
+metódus <code>LockResult&lt;MutexGuard&lt;'_, T&gt;&gt;</code> értéket
+ad vissza. A <code>MutexGuard&lt;'_, T&gt;</code> egy RAII guard, amely
+<code>Deref&lt;T&gt;</code>-et és <code>DerefMut&lt;T&gt;</code>-et
+implementál, tehát <code>&amp;T</code>-ként vagy
+<code>&amp;mut T</code>-ként használható. Amikor a guard eldobódik
+(például kimegy a hatókörből), a zár automatikusan felszabadul.</p>
+<p><strong>Szabály.</strong> A <code>Mutex&lt;T&gt;</code> akkor
+<code>Send</code> és <code>Sync</code>, ha <code>T: Send</code> (a zár
+kizárólagossága miatt a <code>T</code>-nek nem kell
+<code>Sync</code>-nek lennie: egy
+<code>Mutex&lt;Cell&lt;i32&gt;&gt;</code> is <code>Sync</code>). A
+<code>RwLock&lt;T&gt;</code> ezzel szemben csak akkor <code>Sync</code>,
+ha <code>T: Send + Sync</code>, mert az olvasók egyszerre több szálon
+osztoznak a <code>&amp;T</code>-n. A
+<code>std::sync::MutexGuard&lt;'_, T&gt;</code> <strong>nem
+<code>Send</code></strong> (a zárat azon a szálon kell elengedni,
+amelyik megszerezte), viszont <code>Sync</code>, ha
+<code>T: Sync</code>. Ugyanez igaz az <code>RwLockReadGuard</code>-ra és
+az <code>RwLockWriteGuard</code>-ra. A tokio
+<code>tokio::sync::MutexGuard</code> ezzel szemben <code>Send</code> (ha
+<code>T: Send</code>) és <code>Sync</code> (ha
+<code>T: Send + Sync</code>), mert az aszinkron zár nincs szálhoz kötve.
+Következmény: egy <code>std</code> guardot tartó <code>async</code>
+blokk <code>Send</code> future-je nem lehet, ha a guard az
+<code>.await</code>-en át él (a <code>tokio::spawn</code> ilyet
+elutasít), a tokio guardé igen; ez utóbbi a <em>típusrendszer</em>
+szerint megengedett, de hosszú kritikus szakaszt,
+áteresztőképesség-romlást és holtpont-kockázatot jelent (lásd az <a
+href="r037.html">Future-ök és async/await: mi történik a motorháztető
+alatt</a> alfejezetet).</p>
+<p><strong>Definíció.</strong> A <code>std::sync::RwLock&lt;T&gt;</code>
+többszörös olvasó / egy író zárat biztosít. A <code>read()</code>
+metódus <code>RwLockReadGuard</code>-ot, a <code>write()</code> metódus
+<code>RwLockWriteGuard</code>-ot ad. Egyszerre több <code>read</code>
+guard élhet, de <code>write</code> guard csak egyedül. A
+<code>RwLock</code> nem támogatja a read-guard upgrade-jét
+write-guard-ra, ezért a read lock alatt nem szabad write-ot kérni
+ugyanarra a zárra, mert holtpontot kaphatunk.</p>
+<p><strong>Szabály.</strong> Ha egy szál pánikol, miközben a
+<code>Mutex</code> guardját tartja, a zár <strong>mérgezetté</strong>
+(poisoned) válik. Az <code>RwLock</code> csak akkor mérgeződik, ha az
+<strong>író</strong> (<code>write()</code> guard) pánikol; egy olvasó
+(<code>read()</code> guard) pánikja nem mérgezi a zárat (ellenőrzött:
+olvasói pánik után <code>is_poisoned() == false</code>, írói pánik után
+<code>true</code>). A következő
+<code>lock()</code>/<code>read()</code>/<code>write()</code> hívás
+mérgezett zárnál <code>Err(PoisonError&lt;_&gt;)</code> értéket ad
+vissza; a belső adat a <code>PoisonError::into_inner()</code> metódussal
+nyerhető ki (lásd az alábbi példát). Gyakran <code>unwrap()</code>-ot
+használunk, mert a pánik már megtörtént, és a konzisztens állapotot
+amúgy sem garantálhatjuk; ha az invariánsok védettek, az
+<code>into_inner()</code> folytatást enged.</p>
+<p><em>Kódblokk</em> — önálló példa · futtatva: rustc 1.99.1 (a szál
+pánikja a stderr-re ír, a program sikeresen véget ér)</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span><span class="op">{</span>Arc<span class="op">,</span> Mutex<span class="op">,</span> PoisonError<span class="op">};</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::</span>thread<span class="op">;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> m <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">Mutex::</span>new(<span class="dv">5</span>))<span class="op">;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> m2 <span class="op">=</span> <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>m)<span class="op">;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> _ <span class="op">=</span> <span class="pp">thread::</span>spawn(<span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> _g <span class="op">=</span> m2<span class="op">.</span>lock()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>        <span class="pp">panic!</span>(<span class="st">&quot;x&quot;</span>)<span class="op">;</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>)</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>join()<span class="op">;</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    <span class="pp">assert!</span>(m<span class="op">.</span>is_poisoned())<span class="op">;</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> v <span class="op">=</span> m<span class="op">.</span>lock()<span class="op">.</span>unwrap_or_else(<span class="pp">PoisonError::</span>into_inner)<span class="op">;</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    <span class="pp">assert_eq!</span>(<span class="op">*</span>v<span class="op">,</span> <span class="dv">5</span>)<span class="op">;</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong>Definíció.</strong> Az <code>std::sync::mpsc</code> modul
+<strong>több termelő, egy fogyasztó</strong> (multi-producer,
+single-consumer) csatornát ad, két alakban. Az
+<code>mpsc::channel()</code> <strong>korlátlan</strong> csatornát hoz
+létre: a <code>send()</code> sosem blokkol (a puffer a memória erejéig
+nő, ellenőrzött: 100 000 üzenet küldése olvasó nélkül is lefut), ezért
+gyors termelő és lassú fogyasztó esetén a memóriahasználat nőhet. Az
+<code>mpsc::sync_channel(n)</code> <strong>korlátos</strong> csatornát
+hoz létre <code>n</code> elemű pufferrel: a <code>send()</code> blokkol,
+ha a puffer tele van (a <code>try_send()</code> ilyenkor
+<code>TrySendError::Full</code> hibát ad), <code>n = 0</code> esetén
+pedig a küldő és a fogadó találkozásáig (rendezvous). A
+<code>Sender&lt;T&gt;</code> (és a <code>SyncSender&lt;T&gt;</code>)
+klónozható, a <code>Receiver&lt;T&gt;</code> nem. A <code>recv()</code>
+blokkol, ha a csatorna üres; ha az összes küldő eldobódik, a
+<code>recv()</code> <code>Err(RecvError)</code> értékkel tér vissza, és
+a <code>Receiver</code> feletti <code>for</code> ciklus automatikusan
+leáll.</p>
+<p><strong>Röviden.</strong> A <code>std::sync::Condvar</code>
+feltételváltozót ad, amely egy <code>MutexGuard</code>-ot vár a
+<code>wait()</code> hívásakor, elengedi a zárat, amíg értesítik, majd
+újra megszerzi. A <code>wait()</code> <strong>hamis ébredéseket</strong>
+(spurious wakeup) is adhat, ezért kizárólag
+<strong>predikátumhurokkal</strong> használjuk:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span><span class="op">{</span>Arc<span class="op">,</span> Condvar<span class="op">,</span> Mutex<span class="op">};</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::</span>thread<span class="op">;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> pair <span class="op">=</span> <span class="pp">Arc::</span>new((<span class="pp">Mutex::</span>new(<span class="cn">false</span>)<span class="op">,</span> <span class="pp">Condvar::</span>new()))<span class="op">;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> p2 <span class="op">=</span> <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>pair)<span class="op">;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> h <span class="op">=</span> <span class="pp">thread::</span>spawn(<span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> (m<span class="op">,</span> c) <span class="op">=</span> <span class="op">&amp;*</span>p2<span class="op">;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">*</span>m<span class="op">.</span>lock()<span class="op">.</span>unwrap() <span class="op">=</span> <span class="cn">true</span><span class="op">;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    c<span class="op">.</span>notify_one()<span class="op">;</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> (m<span class="op">,</span> c) <span class="op">=</span> <span class="op">&amp;*</span>pair<span class="op">;</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> ready <span class="op">=</span> m<span class="op">.</span>lock()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="cf">while</span> <span class="op">!*</span>ready <span class="op">{</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    ready <span class="op">=</span> c<span class="op">.</span>wait(ready)<span class="op">.</span>unwrap()<span class="op">;</span> <span class="co">// a feltételt újra ellenőrizzük</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>drop(ready)<span class="op">;</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>h<span class="op">.</span>join()<span class="op">.</span>unwrap()<span class="op">;</span></span></code></pre></div>
+<p>Sok esetben a csatornák vagy magasabb szintű absztrakciók kiváltják a
+<code>Condvar</code>-t. A külső <code>parking_lot</code> crate gyorsabb,
+de <strong>nem API-azonos</strong> alternatíva: a <code>lock()</code>
+közvetlenül a guardot adja (nincs <code>Result</code>, nincs mérgezés),
+ezért a <code>std</code>-ről <code>parking_lot</code>-ra váltáskor el
+kell hagyni az <code>unwrap()</code>-ot és a mérgezéskezelést, a
+<code>Condvar::wait</code> pedig a guardot <code>&amp;mut</code>-ként
+veszi át. A <code>crossbeam</code> csatornái több fogyasztót is
+támogatnak (lásd az ellenőrzési hiányokat).</p>
+<h3 data-number="16.2.3" id="c-és-rust-összevetés"><span
+class="header-section-number">16.2.3</span> C++ és Rust összevetés</h3>
+<p>A C++-ban a zár és az adat külön van; a védett hozzáférést minden
+metódusban kézzel kell biztosítani:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;mutex&gt;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;map&gt;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string&gt;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;optional&gt;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> Store <span class="op">{</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>mutex mtx<span class="op">;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>map<span class="op">&lt;</span><span class="bu">std::</span>string<span class="op">,</span> <span class="bu">std::</span>string<span class="op">&gt;</span> data<span class="op">;</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> set<span class="op">(</span><span class="bu">std::</span>string key<span class="op">,</span> <span class="bu">std::</span>string value<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>lock_guard<span class="op">&lt;</span><span class="bu">std::</span>mutex<span class="op">&gt;</span> lock<span class="op">(</span>mtx<span class="op">);</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>        data<span class="op">[</span><span class="bu">std::</span>move<span class="op">(</span>key<span class="op">)]</span> <span class="op">=</span> <span class="bu">std::</span>move<span class="op">(</span>value<span class="op">);</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>optional<span class="op">&lt;</span><span class="bu">std::</span>string<span class="op">&gt;</span> get<span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> key<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>lock_guard<span class="op">&lt;</span><span class="bu">std::</span>mutex<span class="op">&gt;</span> lock<span class="op">(</span>mtx<span class="op">);</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>        <span class="kw">auto</span> it <span class="op">=</span> data<span class="op">.</span>find<span class="op">(</span>key<span class="op">);</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>it <span class="op">!=</span> data<span class="op">.</span>end<span class="op">())</span> <span class="cf">return</span> it<span class="op">-&gt;</span>second<span class="op">;</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="bu">std::</span>nullopt<span class="op">;</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>Rustban a <code>Mutex&lt;HashMap&lt;...&gt;&gt;</code> magában
+foglalja a zárat és az adatot, és a metódusok <code>&amp;self</code>-et
+vesznek, mert a zár belső mutabilitást ad (a példa
+<code>LockedMap</code> típusa szemléltető; az rkv saját szálbiztos
+típusa a <code>SharedStore</code>):</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::collections::</span>HashMap<span class="op">;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Mutex<span class="op">;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> LockedMap <span class="op">{</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    data<span class="op">:</span> Mutex<span class="op">&lt;</span>HashMap<span class="op">&lt;</span><span class="dt">String</span><span class="op">,</span> <span class="dt">String</span><span class="op">&gt;&gt;,</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> LockedMap <span class="op">{</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> new() <span class="op">-&gt;</span> <span class="dt">Self</span> <span class="op">{</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>        <span class="dt">Self</span> <span class="op">{</span> data<span class="op">:</span> <span class="pp">Mutex::</span>new(<span class="pp">HashMap::</span>new()) <span class="op">}</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> set(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> key<span class="op">:</span> <span class="dt">String</span><span class="op">,</span> value<span class="op">:</span> <span class="dt">String</span>) <span class="op">{</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> <span class="kw">mut</span> guard <span class="op">=</span> <span class="kw">self</span><span class="op">.</span>data<span class="op">.</span>lock()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>        guard<span class="op">.</span>insert(key<span class="op">,</span> value)<span class="op">;</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> get(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> key<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span>) <span class="op">-&gt;</span> <span class="dt">Option</span><span class="op">&lt;</span><span class="dt">String</span><span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> guard <span class="op">=</span> <span class="kw">self</span><span class="op">.</span>data<span class="op">.</span>lock()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>        guard<span class="op">.</span>get(key)<span class="op">.</span>cloned()</span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A kulcskülönbség: a Rust-fordító típusrendszerrel kényszeríti ki,
+hogy a <code>HashMap</code>-et csak a <code>MutexGuard</code>-on
+keresztül érjük el. A C++-ban semmi sem akadályozza meg, hogy a
+<code>data</code>-t zár nélkül olvassuk vagy írjuk.</p>
+<h3 data-number="16.2.4"
+id="kidolgozott-példa-szálbiztos-számláló"><span
+class="header-section-number">16.2.4</span> Kidolgozott példa:
+szálbiztos számláló</h3>
+<p>A legegyszerűbb szálbiztos megosztott állapot egy
+<code>Arc&lt;Mutex&lt;i32&gt;&gt;</code>. Több szál növeli a számlálót,
+és a <code>MutexGuard</code> RAII-ja biztosítja a zár
+felszabadítását:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span><span class="op">{</span>Arc<span class="op">,</span> Mutex<span class="op">};</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::</span>thread<span class="op">;</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> counter <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">Mutex::</span>new(<span class="dv">0</span>))<span class="op">;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> handles <span class="op">=</span> <span class="pp">vec!</span>[]<span class="op">;</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _ <span class="kw">in</span> <span class="dv">0</span><span class="op">..</span><span class="dv">10</span> <span class="op">{</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> counter <span class="op">=</span> <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>counter)<span class="op">;</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> handle <span class="op">=</span> <span class="pp">thread::</span>spawn(<span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>            <span class="cf">for</span> _ <span class="kw">in</span> <span class="dv">0</span><span class="op">..</span><span class="dv">1000</span> <span class="op">{</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>                <span class="kw">let</span> <span class="kw">mut</span> guard <span class="op">=</span> counter<span class="op">.</span>lock()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>                <span class="op">*</span>guard <span class="op">+=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>        handles<span class="op">.</span>push(handle)<span class="op">;</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> handle <span class="kw">in</span> handles <span class="op">{</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>        handle<span class="op">.</span>join()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;végső érték: {}&quot;</span><span class="op">,</span> <span class="op">*</span>counter<span class="op">.</span>lock()<span class="op">.</span>unwrap())<span class="op">;</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Várt kimenet (gépfüggő sorrendű, de a végső érték determinisztikus):
+<code>végső érték: 10000</code>. A <code>Mutex</code> nélkül az
+<code>Arc&lt;i32&gt;</code> ugyan megosztható
+(<code>Send + Sync</code>), de <strong>közvetlenül nem
+módosítható</strong>: az <code>Arc</code> csak <code>&amp;i32</code>-t
+ad, ezért a <code>*counter += 1</code> fordítási hibát okozna
+(<code>E0594</code>: „cannot assign to data in an <code>Arc</code>”). A
+módosításhoz belső mutabilitás kell, a szálbiztos változata a
+<code>Mutex</code> (vagy egy atomikus típus). Az
+<code>Arc&lt;Cell&lt;i32&gt;&gt;</code> például nem küldhető szálnak,
+mert a <code>Cell</code> nem <code>Sync</code>; így a
+<code>Send</code>/<code>Sync</code> határok a kétféle hibát (megosztás,
+módosítás) külön kezelik.</p>
+<h3 data-number="16.2.5"
+id="labor-szálbiztos-rkv-sharedstore-és-csatornás-munkásszál"><span
+class="header-section-number">16.2.5</span> Labor: szálbiztos rkv
+<code>SharedStore</code> és csatornás munkásszál</h3>
+<p><strong>Munkakönyvtár:</strong> <code>~/rust-labor/rkv/</code>. A
+kiinduló állapot a <a href="r033.html">Szálak, Send és Sync: data race
+fordítási időben kizárva</a> 3. feladatának megoldása: az
+<code>rkv-core/src/shared.rs</code>-ben a <code>SharedStore</code>
+(<code>new</code>, <code>set</code>, <code>get</code>,
+<code>report</code>) és a <code>tests/shared.rs</code>. (Aki a feladatot
+kihagyta, a kódot a <a href="r033.html">Szálak, Send és Sync: data race
+fordítási időben kizárva</a> megoldásai között találja.) A labor célja,
+hogy ezt a <strong>meglévő</strong> szálbiztos burkolót kiegészítsük, és
+minden meglévő <code>Storage</code>-implementációt
+(<code>MemStore</code>, <code>FileStore</code>) együtt, ugyanazzal a
+tesztsorral vizsgáljunk többszálú használatban; majd egy csatornás
+munkásszál-mintát építünk rá. Új <code>Store</code> vagy
+<code>Storage</code> típust nem hozunk létre, és a <code>Storage</code>
+trait szignatúrája nem változik: a metódusok továbbra is
+<code>&amp;mut self</code>-et vesznek, a zár ad a burkolón belül
+kizárólagos hozzáférést.</p>
+<h4 data-number="16.2.5.1" id="lépés-zár-választása"><span
+class="header-section-number">16.2.5.1</span> 1. lépés: zár
+választása</h4>
+<p>Miért <code>Mutex</code> és nem <code>RwLock</code>? Mert a tároló
+<code>Box&lt;dyn Storage + Send&gt;</code>: a
+<code>Mutex&lt;T&gt;</code> <code>Sync</code>, ha <code>T: Send</code>,
+az <code>RwLock&lt;T&gt;</code> viszont csak akkor, ha
+<code>T: Send + Sync</code>, és a trait-objektum nem <code>Sync</code>.
+Ráadásul a <code>get</code> is <code>&amp;self</code>-et kér ugyan, de a
+<code>FileStore</code> és a <code>MemStore</code> nincs olvasásra
+optimalizálva, ezért az <code>RwLock</code> előnye (párhuzamos olvasók)
+itt nem érné meg a <code>Sync</code> korlát miatti átalakítást. A zárat
+mérgezés (poisoning) esetén is kezelni kell: ha egy szál a zár alatt
+pánikol, a <code>lock()</code> <code>Err</code>-t ad. A
+<code>SharedStore</code> alapértelmezése a <em>hiba</em>: a
+<code>lock()</code> <code>Err</code>-t ad (<code>Error::Io</code>), mert
+egy tetszőleges <code>Storage</code> invariánsait a pánik megsérthette;
+automatikus továbbfolytatás (<code>PoisonError::into_inner</code>) csak
+olyan háttérre indokolt, amelynek panic-biztonsága igazolt, és ezt
+explicit, külön helyreállító API-nak kell vállalnia.</p>
+<h4 data-number="16.2.5.2" id="lépés-a-sharedstore-kiegészítése"><span
+class="header-section-number">16.2.5.2</span> 2. lépés: a
+<code>SharedStore</code> kiegészítése</h4>
+<p>A <code>shared.rs</code> teljes, kiegészített változata: a
+<code>lock()</code> segéd, a <code>delete</code>, a <code>list</code> és
+az <code>apply</code> (egy parancs végrehajtása egyetlen zárfoglalással)
+kerül hozzá, a meglévő metódusok pedig a segédet használják:</p>
+<p><em>Kódblokk</em> — fájl: <code>rkv-core/src/shared.rs</code> ·
+művelet: teljes csere · ellenőrzés:
+<code>cargo build -p rkv-core</code></p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span><span class="op">{</span>Arc<span class="op">,</span> Mutex<span class="op">,</span> MutexGuard<span class="op">};</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="kw">crate</span><span class="pp">::</span><span class="op">{</span>apply<span class="op">,</span> Command<span class="op">,</span> <span class="bu">Error</span><span class="op">,</span> Response<span class="op">,</span> <span class="dt">Result</span><span class="op">,</span> Storage<span class="op">};</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="co">/// Szálak között megosztható tároló: bármely `Storage` implementációt burkol.</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>derive<span class="at">(</span><span class="bu">Clone</span><span class="at">)]</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> SharedStore <span class="op">{</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>    inner<span class="op">:</span> Arc<span class="op">&lt;</span>Mutex<span class="op">&lt;</span><span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> Storage <span class="op">+</span> <span class="bu">Send</span><span class="op">&gt;&gt;&gt;,</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> SharedStore <span class="op">{</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> new(store<span class="op">:</span> <span class="kw">impl</span> Storage <span class="op">+</span> <span class="bu">Send</span> <span class="op">+</span> <span class="ot">&#39;static</span>) <span class="op">-&gt;</span> <span class="dt">Self</span> <span class="op">{</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>        <span class="dt">Self</span> <span class="op">{</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>            inner<span class="op">:</span> <span class="pp">Arc::</span>new(<span class="pp">Mutex::</span>new(<span class="dt">Box</span><span class="pp">::</span>new(store)))<span class="op">,</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// A zár megszerzése. Ha egy korábbi szál pánikolt a zár alatt, a zár mérgezett.</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Az absztrakció alapértelmezése a *hiba*: tetszőleges `Storage` invariánsait</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// egy pánik megsérthette (például egy félig lefutott, nem naplózott módosítás),</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// ezért nem folytatunk automatikusan. Helyreállításhoz a hívónak új tárolót kell</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// nyitnia (a `FileStore` a naplóból visszaépíti az állapotát).</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> lock(<span class="op">&amp;</span><span class="kw">self</span>) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span>MutexGuard<span class="op">&lt;</span><span class="ot">&#39;_</span><span class="op">,</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> Storage <span class="op">+</span> <span class="bu">Send</span><span class="op">&gt;&gt;&gt;</span> <span class="op">{</span></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a>        <span class="kw">self</span><span class="op">.</span>inner<span class="op">.</span>lock()<span class="op">.</span>map_err(<span class="op">|</span>_<span class="op">|</span> <span class="op">{</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a>            <span class="bu">Error</span><span class="pp">::</span>Io(<span class="pp">std::io::</span><span class="bu">Error</span><span class="pp">::</span>other(</span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a>                <span class="st">&quot;a megosztott tároló mérgezett: egy szál pánikolt a zár alatt&quot;</span><span class="op">,</span></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a>            ))</span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span>)</span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> set(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> key<span class="op">:</span> <span class="dt">String</span><span class="op">,</span> value<span class="op">:</span> <span class="dt">Vec</span><span class="op">&lt;</span><span class="dt">u8</span><span class="op">&gt;</span>) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a>        <span class="kw">self</span><span class="op">.</span>lock()<span class="op">?.</span>set(key<span class="op">,</span> value)</span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> get(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> key<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span>) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span><span class="dt">Option</span><span class="op">&lt;</span><span class="dt">Vec</span><span class="op">&lt;</span><span class="dt">u8</span><span class="op">&gt;&gt;&gt;</span> <span class="op">{</span></span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a>        <span class="kw">self</span><span class="op">.</span>lock()<span class="op">?.</span>get(key)</span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-39"><a href="#cb6-39" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> delete(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> key<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span>) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span><span class="dt">bool</span><span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb6-40"><a href="#cb6-40" aria-hidden="true" tabindex="-1"></a>        <span class="kw">self</span><span class="op">.</span>lock()<span class="op">?.</span>delete(key)</span>
+<span id="cb6-41"><a href="#cb6-41" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-42"><a href="#cb6-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-43"><a href="#cb6-43" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> list(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> prefix<span class="op">:</span> <span class="dt">Option</span><span class="op">&lt;&amp;</span><span class="dt">str</span><span class="op">&gt;</span>) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span><span class="dt">Vec</span><span class="op">&lt;</span>(<span class="dt">String</span><span class="op">,</span> <span class="dt">Vec</span><span class="op">&lt;</span><span class="dt">u8</span><span class="op">&gt;</span>)<span class="op">&gt;&gt;</span> <span class="op">{</span></span>
+<span id="cb6-44"><a href="#cb6-44" aria-hidden="true" tabindex="-1"></a>        <span class="kw">self</span><span class="op">.</span>lock()<span class="op">?.</span>list(prefix)</span>
+<span id="cb6-45"><a href="#cb6-45" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-46"><a href="#cb6-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-47"><a href="#cb6-47" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Egy parancs végrehajtása egyetlen zárfoglalással.</span></span>
+<span id="cb6-48"><a href="#cb6-48" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> apply(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> command<span class="op">:</span> <span class="op">&amp;</span>Command) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span>Response<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb6-49"><a href="#cb6-49" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> <span class="kw">mut</span> guard <span class="op">=</span> <span class="kw">self</span><span class="op">.</span>lock()<span class="op">?;</span></span>
+<span id="cb6-50"><a href="#cb6-50" aria-hidden="true" tabindex="-1"></a>        apply(<span class="op">&amp;</span><span class="kw">mut</span> <span class="op">**</span>guard<span class="op">,</span> command)</span>
+<span id="cb6-51"><a href="#cb6-51" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-52"><a href="#cb6-52" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-53"><a href="#cb6-53" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// A tárolt kulcsok száma és listája (egyetlen zárfoglalással).</span></span>
+<span id="cb6-54"><a href="#cb6-54" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> report(<span class="op">&amp;</span><span class="kw">self</span>) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span><span class="dt">String</span><span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb6-55"><a href="#cb6-55" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> keys<span class="op">:</span> <span class="dt">Vec</span><span class="op">&lt;</span><span class="dt">String</span><span class="op">&gt;</span> <span class="op">=</span> <span class="kw">self</span><span class="op">.</span>list(<span class="cn">None</span>)<span class="op">?.</span>into_iter()<span class="op">.</span>map(<span class="op">|</span>(k<span class="op">,</span> _)<span class="op">|</span> k)<span class="op">.</span>collect()<span class="op">;</span></span>
+<span id="cb6-56"><a href="#cb6-56" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Ok</span>(<span class="pp">format!</span>(<span class="st">&quot;A tárolóban {} kulcs van: {:?}&quot;</span><span class="op">,</span> keys<span class="op">.</span>len()<span class="op">,</span> keys))</span>
+<span id="cb6-57"><a href="#cb6-57" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-58"><a href="#cb6-58" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Az <code>apply</code> a <a href="r024.html">Trait-ek és generikusok:
+sablonok és concepts helyett</a> alfejezet <code>apply</code> függvényét
+hívja; ez a <code>&amp;mut **guard</code> kifejezéssel kapott
+<code>&amp;mut (dyn Storage + Send)</code> értékkel is működik, mert az
+<code>apply</code> <code>S: Storage + ?Sized</code> korlátot használ (a
+<code>?Sized</code> engedi a trait-objektumot).</p>
+<h4 data-number="16.2.5.3"
+id="lépés-többszálú-teszt-minden-háttérre"><span
+class="header-section-number">16.2.5.3</span> 3. lépés: többszálú teszt
+minden háttérre</h4>
+<p>Ugyanaz a tesztsor fut a memóriabeli és a fájl-alapú háttéren is; egy
+új háttér hozzáadásakor elég egy újabb <code>#[test]</code>, amely a
+<code>hammer</code>-t hívja:</p>
+<p><em>Kódblokk</em> — fájl:
+<code>rkv-core/tests/shared_backends.rs</code> · művelet: új fájl ·
+ellenőrzés: <code>cargo test -p rkv-core --test shared_backends</code> →
+2 sikeres teszt</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::</span>thread<span class="op">;</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">rkv_core::</span><span class="op">{</span>FileStore<span class="op">,</span> MemStore<span class="op">,</span> SharedStore<span class="op">};</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="co">/// Közös szerződés: minden háttér ugyanazt kapja, ugyanazzal a többszálú tesztsorral.</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> hammer(store<span class="op">:</span> SharedStore) <span class="op">{</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> handles<span class="op">:</span> <span class="dt">Vec</span><span class="op">&lt;</span>_<span class="op">&gt;</span> <span class="op">=</span> (<span class="dv">0</span><span class="op">..</span><span class="dv">4</span>)</span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>map(<span class="op">|</span>i<span class="op">|</span> <span class="op">{</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>            <span class="kw">let</span> store <span class="op">=</span> store<span class="op">.</span>clone()<span class="op">;</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>            <span class="pp">thread::</span>spawn(<span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>                <span class="cf">for</span> j <span class="kw">in</span> <span class="dv">0</span><span class="op">..</span><span class="dv">100</span> <span class="op">{</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>                    <span class="kw">let</span> key <span class="op">=</span> <span class="pp">format!</span>(<span class="st">&quot;kulcs-{i}-{j}&quot;</span>)<span class="op">;</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>                    store<span class="op">.</span>set(key<span class="op">,</span> <span class="pp">format!</span>(<span class="st">&quot;ertek-{i}-{j}&quot;</span>)<span class="op">.</span>into_bytes())<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span>)</span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span>)</span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>collect()<span class="op">;</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> h <span class="kw">in</span> handles <span class="op">{</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>        h<span class="op">.</span>join()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> items <span class="op">=</span> store<span class="op">.</span>list(<span class="cn">Some</span>(<span class="st">&quot;kulcs-&quot;</span>))<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a>    <span class="pp">assert_eq!</span>(items<span class="op">.</span>len()<span class="op">,</span> <span class="dv">400</span>)<span class="op">;</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a>    <span class="pp">assert!</span>(items<span class="op">.</span>windows(<span class="dv">2</span>)<span class="op">.</span>all(<span class="op">|</span>w<span class="op">|</span> w[<span class="dv">0</span>]<span class="op">.</span><span class="dv">0</span> <span class="op">&lt;</span> w[<span class="dv">1</span>]<span class="op">.</span><span class="dv">0</span>))<span class="op">;</span> <span class="co">// rendezett</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a>    <span class="pp">assert_eq!</span>(store<span class="op">.</span>get(<span class="st">&quot;kulcs-3-99&quot;</span>)<span class="op">.</span>unwrap()<span class="op">,</span> <span class="cn">Some</span>(<span class="st">b&quot;ertek-3-99&quot;</span><span class="op">.</span>to_vec()))<span class="op">;</span></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a>    <span class="pp">assert!</span>(store<span class="op">.</span>delete(<span class="st">&quot;kulcs-0-0&quot;</span>)<span class="op">.</span>unwrap())<span class="op">;</span></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a>    <span class="pp">assert!</span>(<span class="op">!</span>store<span class="op">.</span>delete(<span class="st">&quot;kulcs-0-0&quot;</span>)<span class="op">.</span>unwrap())<span class="op">;</span></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> mem_backend_survives_concurrent_writers() <span class="op">{</span></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a>    hammer(<span class="pp">SharedStore::</span>new(<span class="pp">MemStore::</span>new()))<span class="op">;</span></span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> file_backend_survives_concurrent_writers() <span class="op">{</span></span>
+<span id="cb7-37"><a href="#cb7-37" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> dir <span class="op">=</span> <span class="pp">tempfile::</span>tempdir()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb7-38"><a href="#cb7-38" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> store <span class="op">=</span> <span class="pp">FileStore::</span>open(dir<span class="op">.</span>path()<span class="op">.</span>join(<span class="st">&quot;state.json&quot;</span>)<span class="op">,</span> dir<span class="op">.</span>path()<span class="op">.</span>join(<span class="st">&quot;append.log&quot;</span>))<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb7-39"><a href="#cb7-39" aria-hidden="true" tabindex="-1"></a>    hammer(<span class="pp">SharedStore::</span>new(store))<span class="op">;</span></span>
+<span id="cb7-40"><a href="#cb7-40" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h4 data-number="16.2.5.4" id="lépés-csatornás-munkásszál"><span
+class="header-section-number">16.2.5.4</span> 4. lépés: csatornás
+munkásszál</h4>
+<p>A közvetlenül megosztott <code>SharedStore</code> helyett gyakran
+kényelmesebb egy munkásszálat (worker) indítani, amely egy csatornán
+fogadja a kéréseket. Itt <strong>minden kérés a saját válaszcsatornáját
+hordozza</strong>, ezért több kliens esetén sem keveredhetnek a
+válaszok: a kliens a sajátját várja. Ez nem a blokkolás elkerülése: a
+<code>call</code> szinkron <code>recv()</code>-en várja a worker
+válaszát, a worker pedig sorosítja a tárolóműveleteket, ugyanúgy, mint a
+<code>Mutex</code>. A parancs- és választípus nem új: az
+<code>rkv_core::Command</code> (<a href="r008.html">Az enum mint
+összeg-típus és az Option a null helyett</a>) és a <code>Response</code>
+(<a href="r024.html">Trait-ek és generikusok: sablonok és concepts
+helyett</a>), a hibát a kanonikus <code>Error</code> hordozza.</p>
+<p><em>Kódblokk</em> — fájl: <code>rkv-core/src/worker.rs</code> ·
+művelet: új fájl; a <code>lib.rs</code>-be <code>pub mod worker;</code>
+· ellenőrzés: <code>cargo build -p rkv-core</code></p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::mpsc::</span><span class="op">{</span><span class="kw">self</span><span class="op">,</span> Receiver<span class="op">,</span> Sender<span class="op">};</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::thread::</span><span class="op">{</span><span class="kw">self</span><span class="op">,</span> JoinHandle<span class="op">};</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="kw">crate</span><span class="pp">::</span><span class="op">{</span>Command<span class="op">,</span> <span class="bu">Error</span><span class="op">,</span> Response<span class="op">,</span> <span class="dt">Result</span><span class="op">,</span> SharedStore<span class="op">};</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="co">/// Egy kérés: a parancs és a csatorna, amelyen a kliens a válaszát várja.</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> Request <span class="op">{</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> command<span class="op">:</span> Command<span class="op">,</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> reply<span class="op">:</span> Sender<span class="op">&lt;</span><span class="dt">Result</span><span class="op">&lt;</span>Response<span class="op">&gt;&gt;,</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a><span class="co">/// Elindítja a munkásszálat. A szál addig fut, amíg van élő `Sender&lt;Request&gt;`.</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">fn</span> spawn(store<span class="op">:</span> SharedStore) <span class="op">-&gt;</span> (Sender<span class="op">&lt;</span>Request<span class="op">&gt;,</span> JoinHandle<span class="op">&lt;</span>()<span class="op">&gt;</span>) <span class="op">{</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> (tx<span class="op">,</span> rx) <span class="op">=</span> <span class="pp">mpsc::channel::</span><span class="op">&lt;</span>Request<span class="op">&gt;</span>()<span class="op">;</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> handle <span class="op">=</span> <span class="pp">thread::</span>spawn(<span class="kw">move</span> <span class="op">||</span> run(<span class="op">&amp;</span>store<span class="op">,</span> <span class="op">&amp;</span>rx))<span class="op">;</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>    (tx<span class="op">,</span> handle)</span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> run(store<span class="op">:</span> <span class="op">&amp;</span>SharedStore<span class="op">,</span> rx<span class="op">:</span> <span class="op">&amp;</span>Receiver<span class="op">&lt;</span>Request<span class="op">&gt;</span>) <span class="op">{</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> request <span class="kw">in</span> rx <span class="op">{</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> response <span class="op">=</span> store<span class="op">.</span>apply(<span class="op">&amp;</span>request<span class="op">.</span>command)<span class="op">;</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Ha a kliens már nem vár a válaszra, a küldés hibáját figyelmen kívül hagyjuk.</span></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> _ <span class="op">=</span> request<span class="op">.</span>reply<span class="op">.</span>send(response)<span class="op">;</span></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a><span class="co">/// Kliens oldali segéd: parancs küldése és a saját válasz megvárása.</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">fn</span> call(tx<span class="op">:</span> <span class="op">&amp;</span>Sender<span class="op">&lt;</span>Request<span class="op">&gt;,</span> command<span class="op">:</span> Command) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span>Response<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> (reply<span class="op">,</span> wait) <span class="op">=</span> <span class="pp">mpsc::</span>channel()<span class="op">;</span></span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a>    tx<span class="op">.</span>send(Request <span class="op">{</span> command<span class="op">,</span> reply <span class="op">}</span>)<span class="op">.</span>map_err(<span class="op">|</span>_<span class="op">|</span> closed())<span class="op">?;</span></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a>    wait<span class="op">.</span>recv()<span class="op">.</span>map_err(<span class="op">|</span>_<span class="op">|</span> closed())<span class="op">?</span></span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> closed() <span class="op">-&gt;</span> <span class="bu">Error</span> <span class="op">{</span></span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a>    <span class="bu">Error</span><span class="pp">::</span>Io(<span class="pp">std::io::</span><span class="bu">Error</span><span class="pp">::</span>new(</span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a>        <span class="pp">std::io::ErrorKind::</span>BrokenPipe<span class="op">,</span></span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;a munkásszál leállt&quot;</span><span class="op">,</span></span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a>    ))</span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><em>Kódblokk</em> — fájl: <code>rkv-core/src/lib.rs</code> · művelet:
+beillesztés a <code>pub mod</code> sorok közé · ellenőrzés:
+<code>cargo build -p rkv-core</code></p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">mod</span> worker<span class="op">;</span></span></code></pre></div>
+<p>A <code>spawn</code> elindítja a munkásszálat, és visszaadja a
+kéréseket fogadó <code>Sender&lt;Request&gt;</code>-et és a szál
+<code>JoinHandle</code>-jét. A <code>for request in rx</code> ciklus
+automatikusan leáll, ha az összes <code>Sender</code> eldobódik, ami a
+<strong>szabályos leállítás</strong>: a kliensek eldobják a
+<code>Sender</code>-eiket, majd a <code>join</code> megvárja a szálat. A
+<code>call</code> segéd egy kérést küld, és megvárja a saját válaszát;
+ha a munkásszál már leállt, <code>Error::Io</code>
+(<code>BrokenPipe</code>) a hiba. A munkásszál soros feldolgozása a
+<code>SharedStore</code> zárát nem teszi fölöslegessé (a többi kód
+közvetlenül is használhatja a tárolót), de a kliensek nem blokkolnak a
+záron.</p>
+<p>A következő diagram a kliens és a munkásszál közötti üzenetváltást
+mutatja:</p>
+<figure>
+<img src="assets/r034-diagram-1.png"
+alt="Csatornás munkásszál-minta az rkv-ban - A kliens a Request-ben a parancsot és a saját válaszcsatornáját küldi; a worker a SharedStore-on végrehajtja, majd a kérés válaszcsatornáján válaszol." />
+<figcaption aria-hidden="true">Csatornás munkásszál-minta az rkv-ban - A
+kliens a Request-ben a parancsot és a saját válaszcsatornáját küldi; a
+worker a SharedStore-on végrehajtja, majd a kérés válaszcsatornáján
+válaszol.</figcaption>
+</figure>
+<p>A hívó oldal használata egy futtatható példaként (a
+<code>Debug</code>-ot a <code>Response</code> deriválja; a
+<code>worker</code> modult a <code>lib.rs</code>
+<code>pub mod worker;</code> sora teszi elérhetővé):</p>
+<p><em>Kódblokk</em> — fájl:
+<code>rkv-core/examples/worker_demo.rs</code> · művelet: új fájl ·
+ellenőrzés: <code>cargo run -p rkv-core --example worker_demo</code></p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">rkv_core::worker::</span><span class="op">{</span>call<span class="op">,</span> spawn<span class="op">};</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">rkv_core::</span><span class="op">{</span>Command<span class="op">,</span> MemStore<span class="op">,</span> Response<span class="op">,</span> SharedStore<span class="op">};</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> (tx<span class="op">,</span> handle) <span class="op">=</span> spawn(<span class="pp">SharedStore::</span>new(<span class="pp">MemStore::</span>new()))<span class="op">;</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> set <span class="op">=</span> call(<span class="op">&amp;</span>tx<span class="op">,</span> <span class="pp">Command::</span>Set(<span class="st">&quot;nev&quot;</span><span class="op">.</span>into()<span class="op">,</span> <span class="st">&quot;ertek&quot;</span><span class="op">.</span>into()))<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;SET -&gt; {set:?}&quot;</span>)<span class="op">;</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="kw">let</span> <span class="pp">Response::</span>Value(bytes) <span class="op">=</span> call(<span class="op">&amp;</span>tx<span class="op">,</span> <span class="pp">Command::</span>Get(<span class="st">&quot;nev&quot;</span><span class="op">.</span>into()))<span class="op">.</span>unwrap() <span class="op">{</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a>        <span class="pp">println!</span>(<span class="st">&quot;GET -&gt; {}&quot;</span><span class="op">,</span> <span class="dt">String</span><span class="pp">::</span>from_utf8_lossy(<span class="op">&amp;</span>bytes))<span class="op">;</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a>    drop(tx)<span class="op">;</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a>    handle<span class="op">.</span>join()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Várt kimenet:</p>
+<pre class="text"><code>SET -&gt; Ok
+GET -&gt; ertek</code></pre>
+<p>A teszt több klienssel ellenőrzi, hogy minden kliens a saját válaszát
+kapja, és hogy egy lezárt csatornán a <code>call</code> hibát ad (a
+teszt a hívó oldali csatornahibát ellenőrzi, nem a munkásszál belső
+állapotát):</p>
+<p><em>Kódblokk</em> — fájl: <code>rkv-core/tests/worker.rs</code> ·
+művelet: új fájl · ellenőrzés:
+<code>cargo test -p rkv-core --test worker</code> → 2 sikeres teszt</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::</span>thread<span class="op">;</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">rkv_core::worker::</span><span class="op">{</span>call<span class="op">,</span> spawn<span class="op">};</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">rkv_core::</span><span class="op">{</span>Command<span class="op">,</span> MemStore<span class="op">,</span> Response<span class="op">,</span> SharedStore<span class="op">};</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> worker_serves_many_clients_without_mixing_replies() <span class="op">{</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> (tx<span class="op">,</span> handle) <span class="op">=</span> spawn(<span class="pp">SharedStore::</span>new(<span class="pp">MemStore::</span>new()))<span class="op">;</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> clients<span class="op">:</span> <span class="dt">Vec</span><span class="op">&lt;</span>_<span class="op">&gt;</span> <span class="op">=</span> (<span class="dv">0</span><span class="op">..</span><span class="dv">4</span>)</span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>map(<span class="op">|</span>i<span class="op">|</span> <span class="op">{</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a>            <span class="kw">let</span> tx <span class="op">=</span> tx<span class="op">.</span>clone()<span class="op">;</span></span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a>            <span class="pp">thread::</span>spawn(<span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a>                <span class="cf">for</span> j <span class="kw">in</span> <span class="dv">0</span><span class="op">..</span><span class="dv">50</span> <span class="op">{</span></span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a>                    <span class="kw">let</span> key <span class="op">=</span> <span class="pp">format!</span>(<span class="st">&quot;worker-{i}-{j}&quot;</span>)<span class="op">;</span></span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a>                    <span class="kw">let</span> reply <span class="op">=</span> call(<span class="op">&amp;</span>tx<span class="op">,</span> <span class="pp">Command::</span>Set(key<span class="op">.</span>clone()<span class="op">,</span> <span class="pp">format!</span>(<span class="st">&quot;v{j}&quot;</span>)))<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a>                    <span class="pp">assert_eq!</span>(reply<span class="op">,</span> <span class="pp">Response::</span><span class="cn">Ok</span>)<span class="op">;</span></span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a>                    <span class="co">// Minden kliens a saját kérésére kapja a saját válaszát.</span></span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a>                    <span class="kw">let</span> reply <span class="op">=</span> call(<span class="op">&amp;</span>tx<span class="op">,</span> <span class="pp">Command::</span>Get(key))<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a>                    <span class="pp">assert_eq!</span>(reply<span class="op">,</span> <span class="pp">Response::</span>Value(<span class="pp">format!</span>(<span class="st">&quot;v{j}&quot;</span>)<span class="op">.</span>into_bytes()))<span class="op">;</span></span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span></span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span>)</span>
+<span id="cb12-23"><a href="#cb12-23" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span>)</span>
+<span id="cb12-24"><a href="#cb12-24" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>collect()<span class="op">;</span></span>
+<span id="cb12-25"><a href="#cb12-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> c <span class="kw">in</span> clients <span class="op">{</span></span>
+<span id="cb12-26"><a href="#cb12-26" aria-hidden="true" tabindex="-1"></a>        c<span class="op">.</span>join()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb12-27"><a href="#cb12-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb12-28"><a href="#cb12-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-29"><a href="#cb12-29" aria-hidden="true" tabindex="-1"></a>    <span class="cf">match</span> call(<span class="op">&amp;</span>tx<span class="op">,</span> <span class="pp">Command::</span>List(<span class="cn">Some</span>(<span class="st">&quot;worker-&quot;</span><span class="op">.</span>into())))<span class="op">.</span>unwrap() <span class="op">{</span></span>
+<span id="cb12-30"><a href="#cb12-30" aria-hidden="true" tabindex="-1"></a>        <span class="pp">Response::</span>Entries(items) <span class="op">=&gt;</span> <span class="pp">assert_eq!</span>(items<span class="op">.</span>len()<span class="op">,</span> <span class="dv">200</span>)<span class="op">,</span></span>
+<span id="cb12-31"><a href="#cb12-31" aria-hidden="true" tabindex="-1"></a>        other <span class="op">=&gt;</span> <span class="pp">panic!</span>(<span class="st">&quot;váratlan válasz: {other:?}&quot;</span>)<span class="op">,</span></span>
+<span id="cb12-32"><a href="#cb12-32" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb12-33"><a href="#cb12-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-34"><a href="#cb12-34" aria-hidden="true" tabindex="-1"></a>    drop(tx)<span class="op">;</span> <span class="co">// az utolsó Sender eldobása leállítja a munkásszálat</span></span>
+<span id="cb12-35"><a href="#cb12-35" aria-hidden="true" tabindex="-1"></a>    handle<span class="op">.</span>join()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb12-36"><a href="#cb12-36" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb12-37"><a href="#cb12-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-38"><a href="#cb12-38" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb12-39"><a href="#cb12-39" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> call_reports_closed_channel_as_broken_pipe() <span class="op">{</span></span>
+<span id="cb12-40"><a href="#cb12-40" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> (tx<span class="op">,</span> handle) <span class="op">=</span> spawn(<span class="pp">SharedStore::</span>new(<span class="pp">MemStore::</span>new()))<span class="op">;</span></span>
+<span id="cb12-41"><a href="#cb12-41" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> tx2 <span class="op">=</span> tx<span class="op">.</span>clone()<span class="op">;</span></span>
+<span id="cb12-42"><a href="#cb12-42" aria-hidden="true" tabindex="-1"></a>    drop(tx)<span class="op">;</span></span>
+<span id="cb12-43"><a href="#cb12-43" aria-hidden="true" tabindex="-1"></a>    drop(tx2)<span class="op">;</span> <span class="co">// minden Sender eldobva: a szál kilép</span></span>
+<span id="cb12-44"><a href="#cb12-44" aria-hidden="true" tabindex="-1"></a>    handle<span class="op">.</span>join()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb12-45"><a href="#cb12-45" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Lezárt csatorna: a fogadó eldobva, a `call` hibát kap.</span></span>
+<span id="cb12-46"><a href="#cb12-46" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> (dead_tx<span class="op">,</span> _rx) <span class="op">=</span> <span class="pp">std::sync::mpsc::</span>channel()<span class="op">;</span></span>
+<span id="cb12-47"><a href="#cb12-47" aria-hidden="true" tabindex="-1"></a>    drop(_rx)<span class="op">;</span></span>
+<span id="cb12-48"><a href="#cb12-48" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> err <span class="op">=</span> call(<span class="op">&amp;</span>dead_tx<span class="op">,</span> <span class="pp">Command::</span>List(<span class="cn">None</span>))<span class="op">.</span>unwrap_err()<span class="op">;</span></span>
+<span id="cb12-49"><a href="#cb12-49" aria-hidden="true" tabindex="-1"></a>    <span class="pp">assert!</span>(err<span class="op">.</span>to_string()<span class="op">.</span>contains(<span class="st">&quot;leállt&quot;</span>))<span class="op">;</span></span>
+<span id="cb12-50"><a href="#cb12-50" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h4 data-number="16.2.5.5" id="lépés-futtatás"><span
+class="header-section-number">16.2.5.5</span> 5. lépés: futtatás</h4>
+<p>A módosítások után ellenőrizzük a teljes workspace-t:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test <span class="at">--workspace</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> clippy <span class="at">--workspace</span> <span class="at">--all-targets</span> <span class="at">--</span> <span class="at">-D</span> warnings</span></code></pre></div>
+<p>Várt kimenet: minden teszt zöld, és nincs figyelmeztetés. (A
+<code>-D warnings</code> mellett is tiszta marad.)</p>
+<p><strong>Ellenőrzési pont.</strong> Az <code>rkv-core</code> a
+<code>SharedStore</code>-t (<code>new</code>, <code>set</code>,
+<code>get</code>, <code>delete</code>, <code>list</code>,
+<code>apply</code>, <code>report</code>) és a <code>worker</code> modult
+(<code>Request</code>, <code>spawn</code>, <code>call</code>)
+exportálja; a <code>MemStore</code> és a <code>FileStore</code> is
+ugyanazzal a többszálú tesztsorral fut; a
+<code>cargo test --workspace</code> és a <code>clippy -D warnings</code>
+hibátlan.</p>
+<p><strong>Továbbvitt eredmény.</strong> A szálbiztos
+<code>SharedStore</code> (<code>rkv-core/src/shared.rs</code>) és a
+<code>worker</code> modul csatornás mintája
+(<code>rkv-core/src/worker.rs</code>: <code>Request</code>,
+<code>spawn</code>, <code>call</code>) alapot ad az <a
+href="r035.html">Atomikus műveletek és memóriarendezés</a> alfejezetnek
+(ott kap a <code>SharedStore</code> statisztikát), a hálózati szervernek
+(<a href="r040.html">Az rkv hálózati szerver: TCP, protokoll, kecses
+leállás</a>) és a <a href="r051.html">Záróprojekt: az rkv teljes
+rendszerként</a> alfejezetnek.</p>
+<h3 data-number="16.2.6" id="tipikus-hibák-és-átállási-csapdák"><span
+class="header-section-number">16.2.6</span> Tipikus hibák és átállási
+csapdák</h3>
+<ol type="1">
+<li><strong>A guard referencia kiengedése a zárból.</strong> Ha a
+<code>MutexGuard</code>-ra hivatkozó referenciát próbálunk kivinni a
+guard hatóköréből, a borrow checker hibázik. Például:</li>
+</ol>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> guard <span class="op">=</span> mutex<span class="op">.</span>lock()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> reference <span class="op">=</span> <span class="op">&amp;</span>guard<span class="op">;</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>drop(guard)<span class="op">;</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="pp">println!</span>(<span class="st">&quot;{}&quot;</span><span class="op">,</span> <span class="op">*</span>reference)<span class="op">;</span> <span class="co">// E0505: cannot move out of guard because it is borrowed</span></span></code></pre></div>
+<p>A hibaüzenet (E0505) arra figyelmeztet, hogy a guard eldobása után a
+referencia érvénytelen. A helyes megoldás, hogy a hozzáférést a guard
+hatókörén belül végezzük, vagy az adatot klónozzuk.</p>
+<ol start="2" type="1">
+<li><strong>Read és write lock keverése ugyanazon a záron.</strong> A
+<code>RwLock</code> read guardja mellett nem lehet ugyanazon a szálon
+write guardot szerezni, mert az holtponthoz vezethet. Például:</li>
+</ol>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> read_guard <span class="op">=</span> rwlock<span class="op">.</span>read()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> write_guard <span class="op">=</span> rwlock<span class="op">.</span>write()<span class="op">.</span>unwrap()<span class="op">;</span> <span class="co">// itt a szál örökre vár</span></span></code></pre></div>
+<p>A megoldás: vagy ne szerezzünk write-ot read alatt, vagy használjunk
+<code>try_write()</code>-ot, és ha kell, engedjük el a read guardot
+előtte.</p>
+<ol start="3" type="1">
+<li><p><strong>Poisoning elrejtése <code>unwrap()</code>-pel.</strong>
+Ha egy szál pánikol a zár alatt, a <code>lock().unwrap()</code> pánikot
+dob, ami könnyen hibás hibakezeléshez vezet. A jobb megoldás a mérgezés
+hibává alakítása (<code>map_err</code>), vagy — ha a védett adat
+invariánsa igazoltan a pánik után is érvényes — a
+<code>unwrap_or_else(PoisonError::into_inner)</code> explicit, indokolt
+használata.</p></li>
+<li><p><strong>Csatorna lezárás nem kezelése.</strong> Ha az összes
+<code>Sender</code> eldobódik, a <code>recv()</code> <code>Err</code>-t
+ad. A <code>for</code> ciklus automatikusan leáll, de a kézi
+<code>recv()</code> hívásoknál a hiba elágazást kezelni kell, különben a
+program pánikolhat.</p></li>
+</ol>
+<h3 data-number="16.2.7" id="feladatok"><span
+class="header-section-number">16.2.7</span> Feladatok</h3>
+<h4 data-number="16.2.7.1" id="a-lefordul-e-és-miért"><span
+class="header-section-number">16.2.7.1</span> (a) Lefordul-e és
+miért?</h4>
+<p>Tekintsük a következő Rust kódot. Lefordul-e? Ha nem, mi a hibakód,
+és mi a baj?</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span><span class="op">{</span>Arc<span class="op">,</span> Mutex<span class="op">};</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> data <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">Mutex::</span>new(<span class="pp">vec!</span>[<span class="dv">1</span><span class="op">,</span> <span class="dv">2</span><span class="op">,</span> <span class="dv">3</span>]))<span class="op">;</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> data_clone <span class="op">=</span> <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>data)<span class="op">;</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> handle <span class="op">=</span> <span class="pp">std::thread::</span>spawn(<span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> guard <span class="op">=</span> data_clone<span class="op">.</span>lock()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a>        <span class="pp">println!</span>(<span class="st">&quot;{:?}&quot;</span><span class="op">,</span> <span class="op">*</span>guard)<span class="op">;</span></span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb16-11"><a href="#cb16-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-12"><a href="#cb16-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> guard <span class="op">=</span> data<span class="op">.</span>lock()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb16-13"><a href="#cb16-13" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;{:?}&quot;</span><span class="op">,</span> <span class="op">*</span>guard)<span class="op">;</span></span>
+<span id="cb16-14"><a href="#cb16-14" aria-hidden="true" tabindex="-1"></a>    handle<span class="op">.</span>join()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb16-15"><a href="#cb16-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h4 data-number="16.2.7.2" id="b-c-kód-átírása-idiomatikus-rustra"><span
+class="header-section-number">16.2.7.2</span> (b) C++ kód átírása
+idiomatikus Rustra</h4>
+<p>Az alábbi C++ osztály egy szálbiztos gyűjtőt valósít meg. Írd át
+Rustra <code>Arc&lt;Mutex&lt;Vec&lt;T&gt;&gt;&gt;</code> használatával
+úgy, hogy a <code>push</code> és a <code>get_all</code> metódusok
+szálbiztosak legyenek, és a típus <code>Clone</code>-olható legyen.</p>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;mutex&gt;</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string&gt;</span></span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> Collector <span class="op">{</span></span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>mutex mtx<span class="op">;</span></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="bu">std::</span>string<span class="op">&gt;</span> items<span class="op">;</span></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> push<span class="op">(</span><span class="bu">std::</span>string item<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>lock_guard<span class="op">&lt;</span><span class="bu">std::</span>mutex<span class="op">&gt;</span> lock<span class="op">(</span>mtx<span class="op">);</span></span>
+<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a>        items<span class="op">.</span>push_back<span class="op">(</span><span class="bu">std::</span>move<span class="op">(</span>item<span class="op">));</span></span>
+<span id="cb17-12"><a href="#cb17-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-13"><a href="#cb17-13" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="bu">std::</span>string<span class="op">&gt;</span> get_all<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb17-14"><a href="#cb17-14" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>lock_guard<span class="op">&lt;</span><span class="bu">std::</span>mutex<span class="op">&gt;</span> lock<span class="op">(</span>mtx<span class="op">);</span></span>
+<span id="cb17-15"><a href="#cb17-15" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> items<span class="op">;</span></span>
+<span id="cb17-16"><a href="#cb17-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-17"><a href="#cb17-17" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<h4 data-number="16.2.7.3"
+id="c-implementációs-feladat-az-rkv-ban"><span
+class="header-section-number">16.2.7.3</span> (c) Implementációs feladat
+az rkv-ban</h4>
+<p>Egészítsd ki az <code>rkv-core/tests/worker.rs</code> tesztet egy
+harmadik esettel: a munkásszál <code>Command::Delete</code> kérésére
+<code>Response::Ok</code>-t, a már nem létező kulcs ismételt törlésére
+<code>Response::NotFound</code>-ot adjon. A teszt több kliens szálat
+indítson, és minden kliens a <em>saját</em> kulcsait törölje; a végén a
+<code>Command::List</code> üres eredményt adjon.</p>
+<h4 data-number="16.2.7.4" id="d-hibajavítás-és-tervezési-döntés"><span
+class="header-section-number">16.2.7.4</span> (d) Hibajavítás és
+tervezési döntés</h4>
+<p>A következő kód holtpontot okozhat két <code>RwLock</code>-kal.
+Magyarázza el, miért, és adjon két lehetséges javítást: (1) zársorrend
+rögzítése, (2) <code>try_write</code> használata visszalépéssel.</p>
+<div class="sourceCode" id="cb18"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span><span class="op">{</span>Arc<span class="op">,</span> RwLock<span class="op">};</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> transfer(from<span class="op">:</span> <span class="op">&amp;</span>RwLock<span class="op">&lt;</span><span class="dt">i32</span><span class="op">&gt;,</span> to<span class="op">:</span> <span class="op">&amp;</span>RwLock<span class="op">&lt;</span><span class="dt">i32</span><span class="op">&gt;</span>) <span class="op">{</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> a <span class="op">=</span> from<span class="op">.</span>write()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> b <span class="op">=</span> to<span class="op">.</span>write()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">*</span>a <span class="op">-=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">*</span>b <span class="op">+=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb18-11"><a href="#cb18-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> a <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">RwLock::</span>new(<span class="dv">10</span>))<span class="op">;</span></span>
+<span id="cb18-12"><a href="#cb18-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> b <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">RwLock::</span>new(<span class="dv">20</span>))<span class="op">;</span></span>
+<span id="cb18-13"><a href="#cb18-13" aria-hidden="true" tabindex="-1"></a>    <span class="co">// két szál: transfer(&amp;a, &amp;b) és transfer(&amp;b, &amp;a)</span></span>
+<span id="cb18-14"><a href="#cb18-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h3 data-number="16.2.8" id="megoldások"><span
+class="header-section-number">16.2.8</span> Megoldások</h3>
+<h4 data-number="16.2.8.1" id="a"><span
+class="header-section-number">16.2.8.1</span> (a)</h4>
+<p>A kód lefordul, de <strong>holtpontba futhat</strong>, tehát nem
+helyes. A főszál <code>guard</code> változója a <code>main</code>
+blokkjának végéig él: egy <code>MutexGuard</code> a hatókör végén
+dobódik el, nem az utolsó használatánál. Az NLL csak a kölcsönzések
+élettartamát rövidíti, a <code>Drop</code>-ot nem hozza előre. A rossz
+ütemezés:</p>
+<ol type="1">
+<li>A főszál előbb szerzi meg a zárat (<code>data.lock()</code>), és
+kiírja a vektort.</li>
+<li>A munkásszál a <code>data_clone.lock()</code> hívásnál blokkol, mert
+a zárat a főszál tartja.</li>
+<li>A főszál a <code>handle.join()</code>-nál a munkásszálra vár,
+miközben a <code>guard</code> még él.</li>
+</ol>
+<p>Mindkét szál a másikra vár: holtpont. Mivel a főszál a
+<code>spawn</code> után azonnal zárol, a munkásszál pedig még csak
+indul, a gyakorlatban szinte mindig a főszál nyer (ellenőrző futás:
+20-ból 20 holtpont, rustc 1.99.1, Linux); a ritka lefutás ütemezésfüggő
+szerencse, nem a kód helyessége. A javítás: a főszál zárját a
+<code>join</code> előtt fel kell szabadítani, külön blokkal vagy
+explicit <code>drop(guard)</code>-dal:</p>
+<div class="sourceCode" id="cb19"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span><span class="op">{</span>Arc<span class="op">,</span> Mutex<span class="op">};</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> data <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">Mutex::</span>new(<span class="pp">vec!</span>[<span class="dv">1</span><span class="op">,</span> <span class="dv">2</span><span class="op">,</span> <span class="dv">3</span>]))<span class="op">;</span></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> data_clone <span class="op">=</span> <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>data)<span class="op">;</span></span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> handle <span class="op">=</span> <span class="pp">std::thread::</span>spawn(<span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb19-8"><a href="#cb19-8" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> guard <span class="op">=</span> data_clone<span class="op">.</span>lock()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb19-9"><a href="#cb19-9" aria-hidden="true" tabindex="-1"></a>        <span class="pp">println!</span>(<span class="st">&quot;{:?}&quot;</span><span class="op">,</span> <span class="op">*</span>guard)<span class="op">;</span></span>
+<span id="cb19-10"><a href="#cb19-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb19-11"><a href="#cb19-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-12"><a href="#cb19-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb19-13"><a href="#cb19-13" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> guard <span class="op">=</span> data<span class="op">.</span>lock()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb19-14"><a href="#cb19-14" aria-hidden="true" tabindex="-1"></a>        <span class="pp">println!</span>(<span class="st">&quot;{:?}&quot;</span><span class="op">,</span> <span class="op">*</span>guard)<span class="op">;</span></span>
+<span id="cb19-15"><a href="#cb19-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="co">// a guard itt dobódik el, a join előtt</span></span>
+<span id="cb19-16"><a href="#cb19-16" aria-hidden="true" tabindex="-1"></a>    handle<span class="op">.</span>join()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb19-17"><a href="#cb19-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A javított változat minden ütemezésben befejeződik; a kimenet
+sorrendje gépfüggő. A <code>Mutex</code> miatt nincs adatverseny. Az
+eredeti változat holtpontja tesztben időkorláttal reprodukálható: a
+<code>main</code> törzsét külön szálon futtatjuk, és a tesztszál
+<code>mpsc::Receiver::recv_timeout</code>-tal vár a befejezésre, így a
+tesztfuttató nem blokkol véglegesen.</p>
+<h4 data-number="16.2.8.2" id="b"><span
+class="header-section-number">16.2.8.2</span> (b)</h4>
+<div class="sourceCode" id="cb20"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span><span class="op">{</span>Arc<span class="op">,</span> Mutex<span class="op">};</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>derive<span class="at">(</span><span class="bu">Clone</span><span class="at">)]</span></span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> Collector <span class="op">{</span></span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a>    items<span class="op">:</span> Arc<span class="op">&lt;</span>Mutex<span class="op">&lt;</span><span class="dt">Vec</span><span class="op">&lt;</span><span class="dt">String</span><span class="op">&gt;&gt;&gt;,</span></span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> Collector <span class="op">{</span></span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> new() <span class="op">-&gt;</span> <span class="dt">Self</span> <span class="op">{</span></span>
+<span id="cb20-10"><a href="#cb20-10" aria-hidden="true" tabindex="-1"></a>        <span class="dt">Self</span> <span class="op">{</span></span>
+<span id="cb20-11"><a href="#cb20-11" aria-hidden="true" tabindex="-1"></a>            items<span class="op">:</span> <span class="pp">Arc::</span>new(<span class="pp">Mutex::</span>new(<span class="dt">Vec</span><span class="pp">::</span>new()))<span class="op">,</span></span>
+<span id="cb20-12"><a href="#cb20-12" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb20-13"><a href="#cb20-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb20-14"><a href="#cb20-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-15"><a href="#cb20-15" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> push(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> item<span class="op">:</span> <span class="dt">String</span>) <span class="op">{</span></span>
+<span id="cb20-16"><a href="#cb20-16" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> <span class="kw">mut</span> guard <span class="op">=</span> <span class="kw">self</span><span class="op">.</span>items<span class="op">.</span>lock()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb20-17"><a href="#cb20-17" aria-hidden="true" tabindex="-1"></a>        guard<span class="op">.</span>push(item)<span class="op">;</span></span>
+<span id="cb20-18"><a href="#cb20-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb20-19"><a href="#cb20-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-20"><a href="#cb20-20" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> get_all(<span class="op">&amp;</span><span class="kw">self</span>) <span class="op">-&gt;</span> <span class="dt">Vec</span><span class="op">&lt;</span><span class="dt">String</span><span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb20-21"><a href="#cb20-21" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> guard <span class="op">=</span> <span class="kw">self</span><span class="op">.</span>items<span class="op">.</span>lock()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb20-22"><a href="#cb20-22" aria-hidden="true" tabindex="-1"></a>        guard<span class="op">.</span>clone()</span>
+<span id="cb20-23"><a href="#cb20-23" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb20-24"><a href="#cb20-24" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>Clone</code> az <code>Arc</code> klónozásával megosztja a
+belső állapotot, így minden klón ugyanazt a gyűjtőt látja.</p>
+<h4 data-number="16.2.8.3" id="c"><span
+class="header-section-number">16.2.8.3</span> (c)</h4>
+<p><em>Kódblokk</em> — fájl: <code>rkv-core/tests/worker.rs</code> ·
+művelet: beillesztés a fájl végére · ellenőrzés:
+<code>cargo test -p rkv-core --test worker</code> → 3 sikeres teszt</p>
+<div class="sourceCode" id="cb21"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> clients_delete_their_own_keys() <span class="op">{</span></span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> (tx<span class="op">,</span> handle) <span class="op">=</span> spawn(<span class="pp">SharedStore::</span>new(<span class="pp">MemStore::</span>new()))<span class="op">;</span></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> clients<span class="op">:</span> <span class="dt">Vec</span><span class="op">&lt;</span>_<span class="op">&gt;</span> <span class="op">=</span> (<span class="dv">0</span><span class="op">..</span><span class="dv">4</span>)</span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>map(<span class="op">|</span>i<span class="op">|</span> <span class="op">{</span></span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a>            <span class="kw">let</span> tx <span class="op">=</span> tx<span class="op">.</span>clone()<span class="op">;</span></span>
+<span id="cb21-8"><a href="#cb21-8" aria-hidden="true" tabindex="-1"></a>            <span class="pp">thread::</span>spawn(<span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb21-9"><a href="#cb21-9" aria-hidden="true" tabindex="-1"></a>                <span class="cf">for</span> j <span class="kw">in</span> <span class="dv">0</span><span class="op">..</span><span class="dv">25</span> <span class="op">{</span></span>
+<span id="cb21-10"><a href="#cb21-10" aria-hidden="true" tabindex="-1"></a>                    <span class="kw">let</span> key <span class="op">=</span> <span class="pp">format!</span>(<span class="st">&quot;own-{i}-{j}&quot;</span>)<span class="op">;</span></span>
+<span id="cb21-11"><a href="#cb21-11" aria-hidden="true" tabindex="-1"></a>                    call(<span class="op">&amp;</span>tx<span class="op">,</span> <span class="pp">Command::</span>Set(key<span class="op">.</span>clone()<span class="op">,</span> <span class="st">&quot;v&quot;</span><span class="op">.</span>into()))<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb21-12"><a href="#cb21-12" aria-hidden="true" tabindex="-1"></a>                    <span class="pp">assert_eq!</span>(call(<span class="op">&amp;</span>tx<span class="op">,</span> <span class="pp">Command::</span>Delete(key<span class="op">.</span>clone()))<span class="op">.</span>unwrap()<span class="op">,</span> <span class="pp">Response::</span><span class="cn">Ok</span>)<span class="op">;</span></span>
+<span id="cb21-13"><a href="#cb21-13" aria-hidden="true" tabindex="-1"></a>                    <span class="co">// A második törlés már nem talál kulcsot.</span></span>
+<span id="cb21-14"><a href="#cb21-14" aria-hidden="true" tabindex="-1"></a>                    <span class="pp">assert_eq!</span>(call(<span class="op">&amp;</span>tx<span class="op">,</span> <span class="pp">Command::</span>Delete(key))<span class="op">.</span>unwrap()<span class="op">,</span> <span class="pp">Response::</span>NotFound)<span class="op">;</span></span>
+<span id="cb21-15"><a href="#cb21-15" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span></span>
+<span id="cb21-16"><a href="#cb21-16" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span>)</span>
+<span id="cb21-17"><a href="#cb21-17" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span>)</span>
+<span id="cb21-18"><a href="#cb21-18" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>collect()<span class="op">;</span></span>
+<span id="cb21-19"><a href="#cb21-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> c <span class="kw">in</span> clients <span class="op">{</span></span>
+<span id="cb21-20"><a href="#cb21-20" aria-hidden="true" tabindex="-1"></a>        c<span class="op">.</span>join()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb21-21"><a href="#cb21-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb21-22"><a href="#cb21-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-23"><a href="#cb21-23" aria-hidden="true" tabindex="-1"></a>    <span class="pp">assert_eq!</span>(</span>
+<span id="cb21-24"><a href="#cb21-24" aria-hidden="true" tabindex="-1"></a>        call(<span class="op">&amp;</span>tx<span class="op">,</span> <span class="pp">Command::</span>List(<span class="cn">None</span>))<span class="op">.</span>unwrap()<span class="op">,</span></span>
+<span id="cb21-25"><a href="#cb21-25" aria-hidden="true" tabindex="-1"></a>        <span class="pp">Response::</span>Entries(<span class="dt">Vec</span><span class="pp">::</span>new())</span>
+<span id="cb21-26"><a href="#cb21-26" aria-hidden="true" tabindex="-1"></a>    )<span class="op">;</span></span>
+<span id="cb21-27"><a href="#cb21-27" aria-hidden="true" tabindex="-1"></a>    drop(tx)<span class="op">;</span></span>
+<span id="cb21-28"><a href="#cb21-28" aria-hidden="true" tabindex="-1"></a>    handle<span class="op">.</span>join()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb21-29"><a href="#cb21-29" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Minden kérés a saját válaszcsatornáján kapja a választ, ezért a
+kliensek párhuzamos futása sem keveri össze a <code>Ok</code> /
+<code>NotFound</code> válaszokat, és a munkásszál sorosan dolgozza fel a
+kéréseket.</p>
+<h4 data-number="16.2.8.4" id="d"><span
+class="header-section-number">16.2.8.4</span> (d)</h4>
+<p>A holtpont oka: ha az egyik szál <code>from</code>-ként
+<code>a</code>-t, <code>to</code>-ként <code>b</code>-t zárol, a másik
+pedig fordítva, mindkettő megkapja az első zárat, és a másodikra vár;
+egyik sem engedi el az elsőt. Megoldás 1: minden szál rögzített
+sorrendben zár, például a <code>RwLock</code> pointerek címe szerint,
+vagy azonos sorrendű paraméterekkel. Megoldás 2:
+<code>try_write()</code> hívás, és ha sikertelen, az első zár eldobása
+után újra próbálkozás.</p>
+<p><em>Kódblokk</em> — önálló példa · ellenőrzés:
+<code>rustc --edition 2024</code>, a kimenet <code>10 20</code>
+(futtatva: rustc 1.99.1)</p>
+<div class="sourceCode" id="cb22"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span><span class="op">{</span>Arc<span class="op">,</span> RwLock<span class="op">};</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> transfer(from<span class="op">:</span> <span class="op">&amp;</span>RwLock<span class="op">&lt;</span><span class="dt">i32</span><span class="op">&gt;,</span> to<span class="op">:</span> <span class="op">&amp;</span>RwLock<span class="op">&lt;</span><span class="dt">i32</span><span class="op">&gt;</span>) <span class="op">{</span></span>
+<span id="cb22-4"><a href="#cb22-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="pp">std::ptr::</span>eq(from<span class="op">,</span> to) <span class="op">{</span></span>
+<span id="cb22-5"><a href="#cb22-5" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span><span class="op">;</span> <span class="co">// ugyanaz a zár: a második write() holtpontot/pánikot okozna</span></span>
+<span id="cb22-6"><a href="#cb22-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb22-7"><a href="#cb22-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Rögzített zársorrend: a cím szerint kisebb zár mindig előbb.</span></span>
+<span id="cb22-8"><a href="#cb22-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> from_first <span class="op">=</span> (from <span class="kw">as</span> <span class="op">*</span><span class="kw">const</span> RwLock<span class="op">&lt;</span><span class="dt">i32</span><span class="op">&gt;</span>) <span class="op">&lt;</span> (to <span class="kw">as</span> <span class="op">*</span><span class="kw">const</span> RwLock<span class="op">&lt;</span><span class="dt">i32</span><span class="op">&gt;</span>)<span class="op">;</span></span>
+<span id="cb22-9"><a href="#cb22-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> (<span class="kw">mut</span> a<span class="op">,</span> <span class="kw">mut</span> b)<span class="op">;</span></span>
+<span id="cb22-10"><a href="#cb22-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> from_first <span class="op">{</span></span>
+<span id="cb22-11"><a href="#cb22-11" aria-hidden="true" tabindex="-1"></a>        a <span class="op">=</span> from<span class="op">.</span>write()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb22-12"><a href="#cb22-12" aria-hidden="true" tabindex="-1"></a>        b <span class="op">=</span> to<span class="op">.</span>write()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb22-13"><a href="#cb22-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb22-14"><a href="#cb22-14" aria-hidden="true" tabindex="-1"></a>        b <span class="op">=</span> to<span class="op">.</span>write()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb22-15"><a href="#cb22-15" aria-hidden="true" tabindex="-1"></a>        a <span class="op">=</span> from<span class="op">.</span>write()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb22-16"><a href="#cb22-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb22-17"><a href="#cb22-17" aria-hidden="true" tabindex="-1"></a>    <span class="op">*</span>a <span class="op">-=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb22-18"><a href="#cb22-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">*</span>b <span class="op">+=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb22-19"><a href="#cb22-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb22-20"><a href="#cb22-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-21"><a href="#cb22-21" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> transfer_try(from<span class="op">:</span> <span class="op">&amp;</span>RwLock<span class="op">&lt;</span><span class="dt">i32</span><span class="op">&gt;,</span> to<span class="op">:</span> <span class="op">&amp;</span>RwLock<span class="op">&lt;</span><span class="dt">i32</span><span class="op">&gt;</span>) <span class="op">{</span></span>
+<span id="cb22-22"><a href="#cb22-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">loop</span> <span class="op">{</span></span>
+<span id="cb22-23"><a href="#cb22-23" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> <span class="kw">mut</span> a <span class="op">=</span> from<span class="op">.</span>write()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb22-24"><a href="#cb22-24" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="kw">let</span> <span class="cn">Ok</span>(<span class="kw">mut</span> b) <span class="op">=</span> to<span class="op">.</span>try_write() <span class="op">{</span></span>
+<span id="cb22-25"><a href="#cb22-25" aria-hidden="true" tabindex="-1"></a>            <span class="op">*</span>a <span class="op">-=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb22-26"><a href="#cb22-26" aria-hidden="true" tabindex="-1"></a>            <span class="op">*</span>b <span class="op">+=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb22-27"><a href="#cb22-27" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb22-28"><a href="#cb22-28" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb22-29"><a href="#cb22-29" aria-hidden="true" tabindex="-1"></a>        drop(a)<span class="op">;</span></span>
+<span id="cb22-30"><a href="#cb22-30" aria-hidden="true" tabindex="-1"></a>        <span class="pp">std::thread::</span>yield_now()<span class="op">;</span></span>
+<span id="cb22-31"><a href="#cb22-31" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb22-32"><a href="#cb22-32" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb22-33"><a href="#cb22-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-34"><a href="#cb22-34" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb22-35"><a href="#cb22-35" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> a <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">RwLock::</span>new(<span class="dv">10</span>))<span class="op">;</span></span>
+<span id="cb22-36"><a href="#cb22-36" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> b <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">RwLock::</span>new(<span class="dv">20</span>))<span class="op">;</span></span>
+<span id="cb22-37"><a href="#cb22-37" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> (a1<span class="op">,</span> b1) <span class="op">=</span> (<span class="pp">Arc::</span>clone(<span class="op">&amp;</span>a)<span class="op">,</span> <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>b))<span class="op">;</span></span>
+<span id="cb22-38"><a href="#cb22-38" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> t1 <span class="op">=</span> <span class="pp">std::thread::</span>spawn(<span class="kw">move</span> <span class="op">||</span> transfer(<span class="op">&amp;</span>a1<span class="op">,</span> <span class="op">&amp;</span>b1))<span class="op">;</span></span>
+<span id="cb22-39"><a href="#cb22-39" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> (a2<span class="op">,</span> b2) <span class="op">=</span> (<span class="pp">Arc::</span>clone(<span class="op">&amp;</span>a)<span class="op">,</span> <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>b))<span class="op">;</span></span>
+<span id="cb22-40"><a href="#cb22-40" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> t2 <span class="op">=</span> <span class="pp">std::thread::</span>spawn(<span class="kw">move</span> <span class="op">||</span> transfer(<span class="op">&amp;</span>b2<span class="op">,</span> <span class="op">&amp;</span>a2))<span class="op">;</span></span>
+<span id="cb22-41"><a href="#cb22-41" aria-hidden="true" tabindex="-1"></a>    t1<span class="op">.</span>join()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb22-42"><a href="#cb22-42" aria-hidden="true" tabindex="-1"></a>    t2<span class="op">.</span>join()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb22-43"><a href="#cb22-43" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A try_write-os változat ugyanígy használható:</span></span>
+<span id="cb22-44"><a href="#cb22-44" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> (a3<span class="op">,</span> b3) <span class="op">=</span> (<span class="pp">Arc::</span>clone(<span class="op">&amp;</span>a)<span class="op">,</span> <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>b))<span class="op">;</span></span>
+<span id="cb22-45"><a href="#cb22-45" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> t3 <span class="op">=</span> <span class="pp">std::thread::</span>spawn(<span class="kw">move</span> <span class="op">||</span> transfer_try(<span class="op">&amp;</span>a3<span class="op">,</span> <span class="op">&amp;</span>b3))<span class="op">;</span></span>
+<span id="cb22-46"><a href="#cb22-46" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> (a4<span class="op">,</span> b4) <span class="op">=</span> (<span class="pp">Arc::</span>clone(<span class="op">&amp;</span>a)<span class="op">,</span> <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>b))<span class="op">;</span></span>
+<span id="cb22-47"><a href="#cb22-47" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> t4 <span class="op">=</span> <span class="pp">std::thread::</span>spawn(<span class="kw">move</span> <span class="op">||</span> transfer_try(<span class="op">&amp;</span>b4<span class="op">,</span> <span class="op">&amp;</span>a4))<span class="op">;</span></span>
+<span id="cb22-48"><a href="#cb22-48" aria-hidden="true" tabindex="-1"></a>    t3<span class="op">.</span>join()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb22-49"><a href="#cb22-49" aria-hidden="true" tabindex="-1"></a>    t4<span class="op">.</span>join()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb22-50"><a href="#cb22-50" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;{} {}&quot;</span><span class="op">,</span> <span class="op">*</span>a<span class="op">.</span>read()<span class="op">.</span>unwrap()<span class="op">,</span> <span class="op">*</span>b<span class="op">.</span>read()<span class="op">.</span>unwrap())<span class="op">;</span></span>
+<span id="cb22-51"><a href="#cb22-51" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>std::ptr::eq</code> ellenőrzés a
+<code>transfer(&amp;a, &amp;a)</code> esetet fedi le: ugyanazon a szálon
+a második <code>write()</code> holtpontot vagy pánikot okozna. A
+<code>try_write</code>-os visszalépés tartós versengésnél livelockot
+okozhat (mindkét szál újra és újra elengedi az első zárat); a rögzített
+zársorrend az elsődleges megoldás. Mivel itt csak írás van,
+<code>Mutex</code> is elég volna.</p>
+<p>Az alábbi ábra a várakozási gráfot mutatja: a rossz ütemezésben (T1,
+T2, T1, T2) T1 tartja <code>a</code>-t és vár <code>b</code>-re, T2
+tartja <code>b</code>-t és vár <code>a</code>-ra, ez kör; a cím szerinti
+rögzített sorrendben mindkét szál <code>a</code>-val kezd, ezért aki nem
+kapja meg, semmit sem tart, és kör nem alakulhat ki (a végén
+<code>a = 10</code>, <code>b = 20</code>).</p>
+<figure id="fig-r034-holtpont">
+<div class="fig-interactive"><iframe src="figures/html/r034-holtpont.html" title="Bal: T1 tartja a-t és vár b-re, T2 tartja b-t és vár a-ra, kör a várakozási gráfban. Jobb: mindkét szál a-val kezd, nincs kör." loading="lazy" style="width:100%;border:0;height:680px"></iframe><noscript><img src="figures/img/r034-holtpont.png" style="width:100.0%"
+alt="Bal: T1 tartja a-t és vár b-re, T2 tartja b-t és vár a-ra, kör a várakozási gráfban. Jobb: mindkét szál a-val kezd, nincs kör." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/r034-holtpont.png" style="width:100.0%"
+alt="Bal: T1 tartja a-t és vár b-re, T2 tartja b-t és vár a-ra, kör a várakozási gráfban. Jobb: mindkét szál a-val kezd, nincs kör." /></details></div>
+<figcaption>Holtpont két zárral és a zársorrend mint
+javítás</figcaption>
+</figure>
+<h3 data-number="16.2.9" id="rövid-összefoglaló"><span
+class="header-section-number">16.2.9</span> Rövid összefoglaló</h3>
+<p>A <code>Mutex&lt;T&gt;</code> és <code>RwLock&lt;T&gt;</code> a Rust
+szálbiztos belső mutabilitás alapjai: a zár birtokolja a védett adatot,
+a guard RAII-ja biztosítja a felszabadítást. A
+<code>Mutex&lt;T&gt;</code> <code>Sync</code>, ha <code>T: Send</code>;
+az <code>RwLock&lt;T&gt;</code> csak ha <code>T: Send + Sync</code>. A
+<code>std::sync::MutexGuard</code> nem <code>Send</code>, a tokio
+guardja <code>Send</code>. Az <code>mpsc</code> csatornák több termelő /
+egy fogyasztó üzenetküldést adnak. A laborban a <a
+href="r033.html">Szálak, Send és Sync: data race fordítási időben
+kizárva</a> alfejezetben bevezetett <code>SharedStore</code>-t
+(<code>rkv-core/src/shared.rs</code>) egészítettük ki
+<code>delete</code>, <code>list</code>, <code>apply</code> metódusokkal
+és a mérgezés kezelésével, és a <code>MemStore</code>-t és a
+<code>FileStore</code>-t egyaránt, közös többszálú tesztsorral
+ellenőriztük. A <code>worker</code> modul (<code>Request</code>,
+<code>spawn</code>, <code>call</code>) csatornás munkásszál-mintát
+valósít meg, kérésenkénti válaszcsatornával. <strong>Továbbvitt
+eredmény:</strong> a <code>SharedStore</code> és a <code>worker</code>
+az <a href="r035.html">Atomikus műveletek és memóriarendezés</a>, <a
+href="r040.html">Az rkv hálózati szerver: TCP, protokoll, kecses
+leállás</a> és a <a href="r051.html">Záróprojekt: az rkv teljes
+rendszerként</a> alfejezetek alapja.</p>
+<h3 data-number="16.2.10" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">16.2.10</span> Források és ellenőrzési
+hiányok</h3>
+<p>A <code>std::sync::Mutex</code>, <code>RwLock</code> és
+<code>mpsc</code> stabil API-ját a <code>std</code> dokumentációja írja
+le (<a href="https://doc.rust-lang.org/std/sync/"
+class="uri">https://doc.rust-lang.org/std/sync/</a>). A
+<code>parking_lot</code> (<code>0.12</code>) és a <code>crossbeam</code>
+(<code>0.8</code>) crate-ek API-ja a docs.rs-en olvasható. A
+<code>RwLock</code> fairness-viselkedése platformfüggő; a
+<code>lock()</code>/<code>read()</code>/<code>write()</code>
+<code>unwrap()</code> mintája a poisoning kezelésére csak akkor
+biztonságos, ha a pánik utáni állapot nem okoz további inkonzisztenciát.
+A <code>Response</code> enum <code>#[derive(Debug)]</code>-ot kapott (<a
+href="r024.html">Trait-ek és generikusok: sablonok és concepts
+helyett</a>), ezért a <code>println!("{:?}")</code> használható. A
+hibaüzenetek szövege (pl. E0505) verziófüggő. A kódot és a kimeneteket a
+könyv rögzített toolchainjével (Rust 1.99.1) ellenőriztük.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="r033.html">← 16.1 Szálak, Send és Sync: data race fordítási időben kizárva</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="r035.html">16.3 Atomikus műveletek és memóriarendezés →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

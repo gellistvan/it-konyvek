@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>14.4 Tiling és pipeline mérése – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz3">III. RÉSZ – Teljesítmény és memória</a> › <a href="index.html#gpuch13">14 Shared memory tiling, async copy és pipelining</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu052.html">← 14.3 Double buffering és pipeline</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu054.html">15.1 L1 és L2 cache →</a></div>
+</nav>
+<h2 data-number="14.4" id="gpu053"><span
+class="header-section-number">14.4</span> Tiling és pipeline mérése</h2>
+<p>A tiling és a pipeline hatásának mérése nem egyszeri
+futásidő-mérésből áll. A memória-hozzáférési minták, az occupancy, a
+bankütközések és a latency hiding együttesen határozzák meg, hogy egy
+optimalizálás valóban csökkenti-e a végrehajtási időt. Ebben az
+alfejezetben egy olyan mérési keretet építünk fel, amely a tiling és a
+double buffering hatását reprodukálhatóan, számszerűen és Nsight-alapú
+metrikákkal vizsgálja. A példa egy mátrix transzponálás lesz; a
+módszertan azonban változtatás nélkül alkalmazható stencil-, konvolúció-
+vagy bármely memória-intenzív tiled kernelre.</p>
+<h3 data-number="14.4.1" id="mérési-keret-és-reprodukálhatóság"><span
+class="header-section-number">14.4.1</span> Mérési keret és
+reprodukálhatóság</h3>
+<p>Mielőtt bármilyen GPU-n futó kísérletet értékelünk, rögzíteni kell a
+környezetet. A könyv mérési szerződése szerint minden állításhoz
+tartoznia kell GPU-modellnek, driververziónak, CUDA-verziónak, compute
+capabilitynek, operációs rendszernek, órajelnek, power limitnek,
+valamint annak, hogy ECC, MIG vagy virtuális GPU aktív-e. Ez nem
+formalitás: ugyanaz a kernel egy A100-on és egy RTX 4090-en más okból
+lehet gyors vagy lassú.</p>
+<p>A mérési protokoll lépései:</p>
+<ol type="1">
+<li><strong>Warm-up.</strong> Az első kernelindítások inicializálják a
+modulokat, a konstans memóriát, a driver belső állapotait. Legalább 10
+bemelegítő iterációt végezzünk (a 14.3 laborral egyezően), mielőtt mérni
+kezdünk.</li>
+<li><strong>Többszöri ismétlés.</strong> Minden konfigurációt legalább
+20-szor mérünk (a könyv mérési protokollja szerint), és a mediánt a
+szórással vagy IQR-rel közöljük, mert a GPU-órajel, a hőmérséklet és a
+háttérterhelés fluktuál.</li>
+<li><strong>Azonos input.</strong> A tiling és pipeline
+összehasonlításánál ugyanazt a bemeneti mátrixot, ugyanazt a
+memóriafoglalást és ugyanazt a kimeneti puffert használjuk.</li>
+<li><strong>Környezetrögzítés.</strong> A mérés előtt és után kérdezzük
+le a <code>nvidia-smi</code>-vel az órajelet, a hőmérsékletet és a power
+limitet. Ha a GPU throttlingol, a mérést meg kell ismételni.</li>
+<li><strong>Hibakezelés.</strong> Fejlesztői (debug) buildben minden
+CUDA-hívást ellenőrizzünk (<code>CUDA_CHECK</code>), és minden
+kernelindítás után hívjunk <code>cudaGetLastError</code>-t. A mérési
+szakaszban viszont ne szinkronizáljunk hívásonként, mert az torzítja az
+időt: az időmérést CUDA-eseményekkel fogjuk körbe, és a mérési ciklus
+végén egyszer ellenőrizzünk (<code>cudaGetLastError</code>,
+<code>cudaDeviceSynchronize</code>).</li>
+</ol>
+<p>A mérési célok három kernelvariánsra:</p>
+<ul>
+<li><strong>Baseline:</strong> naiv globális memóriás
+transzponálás.</li>
+<li><strong>Tiled:</strong> shared memory csempézés, bankütközés
+elkerülése paddinggel.</li>
+<li><strong>Pipelined:</strong> shared memory csempézés és aszinkron
+másolás (<code>cp.async</code>) double bufferinggel.</li>
+</ul>
+<p>A várt hatás iránya ismert: a tiling csökkenti a globális memória
+tranzakciók számát, a pipeline pedig elrejti a globális memória
+késleltetését. A mérés feladata ennek számszerűsítése, nem pedig a
+„gyorsabb” kijelentés bizonyítása.</p>
+<h3 data-number="14.4.2" id="a-példa-fp32-mátrix-transzponálás"><span
+class="header-section-number">14.4.2</span> A példa: FP32 mátrix
+transzponálás</h3>
+<p>A transzponálás azért alkalmas kísérleti terep, mert
+memória-intenzív, és a naiv változat egyik memória-hozzáférése
+szükségképpen nem koaleszkált. A tiled változat mindkét irányban
+koaleszkált olvasást és írást valósít meg; a pipelined változat ezen
+felül a globális betöltést a számítás alá csúsztatja.</p>
+<p>Input: <code>A</code> mátrix <code>M</code> sorral és <code>N</code>
+oszloppal, FP32 elemekkel. Output: <code>B</code> mátrix <code>N</code>
+sorral és <code>M</code> oszloppal, <code>B[n, m] = A[m, n]</code>. A
+teljes adatforgalom pontosan <code>2 * M * N * sizeof(float)</code>
+byte, mert minden elemet egyszer olvasunk és egyszer írunk.</p>
+<p>A kernelváltozatok vázlata CUDA C++-ban (C++17,
+<code>nvcc</code>):</p>
+<pre class="cuda"><code>#include &lt;cuda_runtime.h&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+
+#define CUDA_CHECK(call)                                                       \
+  do {                                                                         \
+    cudaError_t err = (call);                                                  \
+    if (err != cudaSuccess) {                                                  \
+      std::fprintf(stderr, &quot;CUDA error at %s:%d: %s\n&quot;, __FILE__, __LINE__,    \
+                   cudaGetErrorString(err));                                   \
+      std::exit(EXIT_FAILURE);                                                 \
+    }                                                                          \
+  } while (0)
+
+constexpr int TILE_DIM = 32;
+
+// 1. Naive: global memory only
+__global__ void transpose_naive(const float* A, float* B, int M, int N) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x &lt; N &amp;&amp; y &lt; M) {
+        B[x * M + y] = A[y * N + x]; // one side is uncoalesced
+    }
+}
+
+// 2. Tiled: shared memory with padding
+__global__ void transpose_tiled(const float* A, float* B, int M, int N) {
+    __shared__ float tile[TILE_DIM][TILE_DIM + 1]; // padding avoids bank conflicts
+
+    int x = blockIdx.x * TILE_DIM + threadIdx.x;
+    int y = blockIdx.y * TILE_DIM + threadIdx.y;
+
+    if (y &lt; M &amp;&amp; x &lt; N) {
+        tile[threadIdx.y][threadIdx.x] = A[y * N + x];
+    }
+    __syncthreads();
+
+    x = blockIdx.y * TILE_DIM + threadIdx.x;
+    y = blockIdx.x * TILE_DIM + threadIdx.y;
+
+    if (y &lt; N &amp;&amp; x &lt; M) {
+        B[y * M + x] = tile[threadIdx.x][threadIdx.y]; // shared load, transposed
+    }
+}</code></pre>
+<p>A harmadik változat az aszinkron másolás (<code>cp.async</code>)
+primitívjeit használja a <code>&lt;cuda_pipeline.h&gt;</code> fejlécből
+(<code>__pipeline_memcpy_async</code>, <code>__pipeline_commit</code>,
+<code>__pipeline_wait_prior</code>; CUDA 11.0+, compute capability
+8.0+). Ahhoz, hogy a double buffering egyáltalán értelmezhető legyen, a
+blokknak több csempét kell feldolgoznia: ezért a kernel
+persistent/grid-stride jellegű, a blokk a <code>t</code>,
+<code>t + gridDim.x</code>, … sorszámú csempéket dolgozza fel, és amíg
+az aktuális csempét transzponálja, a következő már töltődik. Egy blokk
+egyetlen csempét kezelő változatában nincs „következő csempe”, így ott a
+pipeline semmit sem rejthetne el. Az alábbi kód teljes (CUDA 12.x,
+<code>sm_80</code>; csak statikusan átnézett, nem futtatott vázlat), de
+leegyszerűsítve feltételezi, hogy <code>M</code> és <code>N</code> a
+<code>TILE_DIM</code> többszöröse, a blokk pedig
+<code>dim3(TILE_DIM, TILE_DIM)</code>:</p>
+<pre class="cuda"><code>// Fordítás: nvcc -O3 -std=c++17 -arch=sm_80 (CUDA 12.x); M, N a TILE_DIM többszöröse
+#include &lt;cuda_pipeline.h&gt;
+
+// Egy TILE_DIM x TILE_DIM csempe aszinkron másolása szálanként 4 bájtonként
+__device__ void load_tile(const float* A, float* dst, int tile, int tilesX, int N) {
+    int ty = tile / tilesX, tx = tile % tilesX;
+    const float* src = A + (size_t)(ty * TILE_DIM + threadIdx.y) * N
+                         + tx * TILE_DIM + threadIdx.x;
+    __pipeline_memcpy_async(dst + threadIdx.y * (TILE_DIM + 1) + threadIdx.x,
+                            src, sizeof(float));
+}
+
+// Dinamikus shared memória: 2 * TILE_DIM * (TILE_DIM + 1) * sizeof(float)
+__global__ void transpose_pipelined(const float* A, float* B, int M, int N) {
+    extern __shared__ float smem[];
+    float* buf[2] = { smem, smem + TILE_DIM * (TILE_DIM + 1) };
+
+    const int tilesX   = N / TILE_DIM;
+    const int numTiles = tilesX * (M / TILE_DIM);
+    int cur = 0;
+    int t   = blockIdx.x;
+
+    if (t &lt; numTiles) load_tile(A, buf[0], t, tilesX, N);
+    __pipeline_commit();                       // 0. köteg: az első csempe
+
+    for (; t &lt; numTiles; t += gridDim.x) {
+        int next = t + gridDim.x;
+        if (next &lt; numTiles) load_tile(A, buf[cur ^ 1], next, tilesX, N);
+        __pipeline_commit();                   // a következő csempe (vagy üres köteg)
+        __pipeline_wait_prior(1);              // az aktuális csempe megérkezett
+        __syncthreads();                       // más szálak másolatai is láthatók
+
+        int ty = t / tilesX, tx = t % tilesX;
+        B[(size_t)(tx * TILE_DIM + threadIdx.y) * M + ty * TILE_DIM + threadIdx.x]
+            = buf[cur][threadIdx.x * (TILE_DIM + 1) + threadIdx.y];
+        __syncthreads();                       // mielőtt a puffert újra írjuk
+        cur ^= 1;
+    }
+}</code></pre>
+<p>A host oldali indításnál a grid egydimenziós, például
+<code>min(numTiles, 4 * smCount)</code> blokk, a block
+<code>dim3(TILE_DIM, TILE_DIM)</code>, a dinamikus shared memória pedig
+<code>2 * TILE_DIM * (TILE_DIM + 1) * sizeof(float)</code> = 8448 byte
+(ez 48 KiB alatt van, így <code>cudaFuncSetAttribute</code> nem
+szükséges).</p>
+<p>Itt a lényeg, hogy a <code>__pipeline_memcpy_async</code> a globális
+memóriából a shared memóriába másolást a memória-utasítás szintjén
+aszinkron módon hajtja végre (a szál nem várja meg az adatot), a
+<code>__pipeline_commit</code> lezárja a köteget, a
+<code>__pipeline_wait_prior(N)</code> pedig megvárja, hogy legfeljebb
+<code>N</code> kötegnél több ne legyen folyamatban. A
+<code>cp.async</code> használatához compute capability 8.0 vagy újabb
+szükséges; ezt a <code>cudaDeviceProp::major &gt;= 8</code> feltétellel
+(vagy a <code>cudaDevAttrComputeCapabilityMajor</code> attribútummal)
+kell ellenőrizni. Az <code>asyncEngineCount</code> nem alkalmas erre: az
+a másolómotorok (copy engine) számát adja, amely a
+<code>cudaMemcpyAsync</code>/kernel átfedésre vonatkozik, nem a
+<code>cp.async</code> támogatására.</p>
+<p>A launch konfiguráció mindhárom kernelnél:</p>
+<ul>
+<li>Naiv: <code>dim3 block(32, 32, 1)</code>, grid:
+<code>((N + 31)/32, (M + 31)/32, 1)</code>.</li>
+<li>Tiled: ugyanaz, de a tile méret <code>TILE_DIM</code>; a block
+dimenzió <code>TILE_DIM x TILE_DIM</code> (a <code>TILE_DIM = 32</code>
+mellett 1024 szál; nagyobb csempe csak a lentebb bemutatott, szálanként
+több elemet másoló változattal valósítható meg).</li>
+<li>Pipelined: egydimenziós grid (blokkonként több csempe), block
+<code>TILE_DIM x TILE_DIM</code>, a dinamikus shared memória mérete
+<code>2 * TILE_DIM * (TILE_DIM + 1) * sizeof(float)</code> byte.</li>
+</ul>
+<p>A grid- és blockdimenziót minden mérési jegyzőkönyvben rögzíteni
+kell.</p>
+<h3 data-number="14.4.3"
+id="mérési-protokoll-és-nsight-alapú-vizsgálat"><span
+class="header-section-number">14.4.3</span> Mérési protokoll és
+Nsight-alapú vizsgálat</h3>
+<p>A mérésekhez rögzített környezet:</p>
+<ul>
+<li>GPU: például NVIDIA A100 40 GB (helyőrző; a tényleges modellt a
+laborban kell beírni)</li>
+<li>Driver: 535.xx (helyőrző)</li>
+<li>CUDA Toolkit: 12.2</li>
+<li>Compute capability: 8.0</li>
+<li>Operációs rendszer: Ubuntu 22.04 LTS</li>
+<li>Power limit: 400 W, ECC: bekapcsolva</li>
+<li>MIG: nincs, virtualizáció: nincs</li>
+</ul>
+<p>Ez a konfiguráció illusztratív, és eltér a 14.3 labor környezetétől
+(más GPU és CUDA-verzió); a mérés mindig a saját hardveren készül, és a
+tényleges környezetet kell a naplóba írni.</p>
+<p>A kód build parancsa:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-O3</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-o</span> transpose_lab transpose_lab.cu</span></code></pre></div>
+<p>A futtatás előtt ellenőrizzük a hibákat, majd a mérési kernelt
+hívjuk:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./transpose_lab</span> <span class="at">--m</span> 8192 <span class="at">--n</span> 8192 <span class="at">--repeat</span> 20</span></code></pre></div>
+<p>A Nsight Compute profilozás parancsa egy adott kernelre:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ncu</span> <span class="at">--set</span> full <span class="at">--launch-count</span> 1 <span class="at">--kernel-name</span> transpose_tiled ./transpose_lab <span class="at">--m</span> 8192 <span class="at">--n</span> 8192</span></code></pre></div>
+<p>Célzott metrikák lekérdezése:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ncu</span> <span class="at">--metrics</span> <span class="dt">\</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>  l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,<span class="dt">\</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>  l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum,<span class="dt">\</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>  l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,<span class="dt">\</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>  sm__warps_active.avg.pct_of_peak_sustained_active,<span class="dt">\</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>  dram__bytes.sum <span class="dt">\</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>  ./transpose_lab <span class="at">--m</span> 8192 <span class="at">--n</span> 8192</span></code></pre></div>
+<p>A mérési naplóban külön oszlopban szerepeljen a <strong>várt</strong>
+(elméleti) érték és a <strong>mért</strong> érték. Az <code>ncu</code>
+metrikanevei verziófüggők, ezért a telepített változatban ellenőrizzük
+őket (<code>ncu --query-metrics</code>). A várt értékeket a
+memóriamodellből, a szektorszámításból és az occupancy-előrejelzésből
+becsüljük, a mért értékeket pedig a Nsight-riportból vagy a saját
+timerből nyerjük.</p>
+<p>Példa várt értékek:</p>
+<ul>
+<li><strong>Naiv globális szektorok:</strong> A transzponálásnál az
+egyik oldal nem koaleszkált. A minimális szektorszám <code>M*N/8</code>
+irányonként (32 byte = 8 float). A naiv kernel nem koaleszkált oldalán
+egy warp 32 külön szektort érint a minimális 4 helyett, így ezen az
+oldalon nagyjából 8-szoros szektorszám várható. A pontos érték a
+hozzáférési mintától és a cache-viselkedéstől függ, de a tiled kernelhez
+képest többszörös szektorszám várható.</li>
+<li><strong>Tiled globális szektorok:</strong> Koaleszkált hozzáféréssel
+minden 32 byte-os szektor pontosan egyszer érintett: a load szektorszáma
+(<code>l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum</code>) ≈
+<code>M*N/8</code>, a store szektorszáma (<code>..._op_st.sum</code>) ≈
+<code>N*M/8</code>. (A régi <code>nvprof</code>-os
+<code>gld_transactions</code>/<code>gst_transactions</code> metrikák
+Nsight Compute-ban nem léteznek.)</li>
+<li><strong>Bankütközések:</strong> A <code>TILE_DIM+1</code> padding
+miatt a shared memória olvasásnál a bankütközések száma közel nulla.
+Padding nélkül 32x32-es csempénél a transzponált olvasás 32-way bank
+conflictot okozna.</li>
+<li><strong>DRAM forgalom:</strong> Mindhárom kernelnél várhatóan közel
+<code>2 * M * N * 4</code> byte, mert az alkalmazás minden elemet
+egyszer mozgat; a naiv kernel részleges szektoros írásai az L2-ben
+jellemzően összefésülődnek, de kis L2 vagy kedvezőtlen minta esetén
+többlet-olvasás és read-modify-write jelentkezhet, ezért az eltérés
+mérendő jelenség, nem hiba. A tiling nem csökkenti a teljes DRAM
+forgalmat, csak a szektorok számát és a késleltetést.</li>
+<li><strong>Sávszélesség:</strong>
+<code>sávszélesség = 2 * M * N * 4 / (futásidő * 1e9)</code> GB/s. A
+viszonyítási alap az ugyanazon a GPU-n mért <code>cudaMemcpyDtoD</code>
+sávszélesség (nem a névleges csúcs); a tiled kernel ennek nagy hányadát
+(kitöltendő, mért) várhatóan eléri.</li>
+</ul>
+<p>A mérési napló egy sora például:</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+</colgroup>
+<thead>
+<tr>
+<th>Változat</th>
+<th>Tile</th>
+<th>Block</th>
+<th>Futásidő (µs)</th>
+<th>Szórás</th>
+<th>Sávszélesség (GB/s)</th>
+<th>Load szektor</th>
+<th>Bank conflict</th>
+<th>Occupancy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>naive</td>
+<td>–</td>
+<td>32x32</td>
+<td><em>mérendő</em></td>
+<td><em>mérendő</em></td>
+<td><em>mérendő</em></td>
+<td><em>mérendő</em></td>
+<td>–</td>
+<td><em>mérendő</em></td>
+</tr>
+<tr>
+<td>tiled</td>
+<td>32x32</td>
+<td>32x32</td>
+<td><em>mérendő</em></td>
+<td><em>mérendő</em></td>
+<td><em>mérendő</em></td>
+<td><em>mérendő</em></td>
+<td><em>mérendő</em></td>
+<td><em>mérendő</em></td>
+</tr>
+<tr>
+<td>pipelined</td>
+<td>32x32</td>
+<td>32x32, 1D grid</td>
+<td><em>mérendő</em></td>
+<td><em>mérendő</em></td>
+<td><em>mérendő</em></td>
+<td><em>mérendő</em></td>
+<td><em>mérendő</em></td>
+<td><em>mérendő</em></td>
+</tr>
+</tbody>
+</table>
+<p>A várt értékeket a szövegben a fenti becslések adják, a mért
+értékeket a laborban kell rögzíteni. Fontos, hogy a mérési naplóban a
+várt és mért értékek elkülönüljenek, és a becslés képlete is
+szerepeljen.</p>
+<h3 data-number="14.4.4"
+id="eredmények-értelmezése-nsight-metrikák-és-a-hatásmechanizmus"><span
+class="header-section-number">14.4.4</span> Eredmények értelmezése:
+Nsight-metrikák és a hatásmechanizmus</h3>
+<p>A nyers futásidő önmagában keveset mond. A Nsight Compute metrikái
+megmutatják, miért változott a teljesítmény.</p>
+<h4 data-number="14.4.4.1" id="globális-memória-tranzakciók"><span
+class="header-section-number">14.4.4.1</span> Globális memória
+tranzakciók</h4>
+<p>Az <code>l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum</code> és
+<code>..._op_st.sum</code> metrikák a globális load/store által érintett
+32 byte-os szektorok számát adják (a szektor/kérés arány a
+<code>..._per_request</code> típusú hányadosokból olvasható le). A naiv
+transzponálásnál az egyik oldal nem koaleszkált, ezért egy warp 32
+elemhez a minimális 4 helyett 32 külön szektort érint. A tiled kernelben
+a shared memórián keresztül mindkét oldal koaleszkált: a betöltés
+soronként folyamatos, a kiírás is soronként folyamatos. A várt hatás a
+tranzakciószám drasztikus csökkenése.</p>
+<figure id="fig-gpu053-transpose-access">
+<div class="fig-interactive"><iframe src="figures/html/gpu053-transpose-access.html" title="A naiv transzponálás írása 32 szektort, a csempézett 4-et érint; a padding a csempe oszlopait 32 különböző bankra osztja." loading="lazy" style="width:100%;border:0;height:560px"></iframe><noscript><img src="figures/img/gpu053-transpose-access.png" style="width:100.0%"
+alt="A naiv transzponálás írása 32 szektort, a csempézett 4-et érint; a padding a csempe oszlopait 32 különböző bankra osztja." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu053-transpose-access.png" style="width:100.0%"
+alt="A naiv transzponálás írása 32 szektort, a csempézett 4-et érint; a padding a csempe oszlopait 32 különböző bankra osztja." /></details></div>
+<figcaption>Egy warp (<code>threadIdx.y = 0</code>,
+<code>threadIdx.x = 0..31</code>) globális szektorai a naiv és a
+csempézett transzponálásban, és a shared csempe 0. oszlopának bankjai
+padding nélkül, illetve paddinggel (FP32, 32 B-os szektor, 32 bank × 4
+B). A naiv írás 32 szektort érint, mindegyikből 4 B hasznos; a
+csempézett változat mindkét oldalon 4 szektort. A
+<code>tile[32][32]</code> oszlopa mind a 0. bankba esik (32-utas
+konfliktus), a <code>tile[32][33]</code> oszlopa 32 különböző
+bankba.</figcaption>
+</figure>
+<p>A mérés során a load és store szektorszámot összehasonlítva a tiled
+kernelnek közel a minimális <code>M*N/8</code> értéket kell mutatnia. Ha
+a mért érték magasabb, akkor a hozzáférési minta nem optimális, vagy a
+grid méretezése miatt határfeltételek rontják a koaleszkálást.</p>
+<h4 data-number="14.4.4.2" id="shared-memory-bankütközések"><span
+class="header-section-number">14.4.4.2</span> Shared memory
+bankütközések</h4>
+<p>A tiled kernelnél a
+<code>__shared__ float tile[TILE_DIM][TILE_DIM + 1]</code> deklaráció a
+padding miatt elkerüli a bankütközést. A Nsight-ban a
+<code>l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum</code>
+metrika mutatja a shared memória olvasási bankütközéseit. Padding nélkül
+32x32-es csempénél a transzponált olvasás során a warp mind a 32 szála
+ugyanabba a bankcsoportba ütközne, ami 32-szeres konfliktust jelent. A
+<code>+1</code> oszlop eltolja a sorokat, így a konfliktus
+megszűnik.</p>
+<p>A várt érték: paddinggel a bankütközések száma nulla vagy
+elhanyagolható. Ha a mért érték magas, akkor a paddinget elfelejtettük,
+vagy a tile méret és a bankek száma nem illeszkedik.</p>
+<h4 data-number="14.4.4.3" id="occupancy-és-erőforrás-korlátok"><span
+class="header-section-number">14.4.4.3</span> Occupancy és
+erőforrás-korlátok</h4>
+<p>Az <code>sm__warps_active.avg.pct_of_peak_sustained_active</code>
+metrika az aktív warpek arányát mutatja. A tiled kernel shared memóriát
+foglal: <code>TILE_DIM * (TILE_DIM + 1) * 4</code> byte. 32x32-es tile
+esetén ez 32<em>33</em>4 = 4224 byte blokkonként. A pipelined változat
+két puffert használ, így 8448 byte-ot. Egy A100 SM-en 164 KB shared
+memória áll rendelkezésre, ezért a shared memória nem korlátozza erősen
+az occupancyt. A regiszterhasználat azonban igen: ha a compiler túl sok
+regisztert rendel, az aktív warpek száma csökken.</p>
+<p>A várt hatás: a tiled kernel occupancyje hasonló vagy kissé
+alacsonyabb a naiv kernelhez képest, de a csökkent memória-tranzakciók
+miatt a tényleges teljesítmény nő. A pipelined kernelben a double
+buffering miatt több shared memória kell, de a latency hiding javulhat,
+így a foglaltság csökkenése ellenére is gyorsabb lehet (nem garantált,
+mérendő).</p>
+<p>A mérésnél rögzíteni kell a regiszterhasználatot
+(<code>launch__registers_per_thread</code>) és a shared memória
+foglalást is, mert ezek magyarázzák az occupancyt.</p>
+<h4 data-number="14.4.4.4" id="dram-forgalom-és-sávszélesség"><span
+class="header-section-number">14.4.4.4</span> DRAM forgalom és
+sávszélesség</h4>
+<p>A <code>dram__bytes.sum</code> metrika a tényleges DRAM-forgalmat
+mutatja. A várt érték mindhárom kernelnél közel azonos:
+<code>2 * M * N * 4</code> byte. Ha a mért érték ettől eltér, akkor a
+cache vagy a memória-hozzáférési minta extra forgalmat generál (például
+a határfeltételek miatt, vagy a naiv kernel részleges szektoros írásai
+miatt, ha azok az L2-ben nem fésülődnek össze); az eltérés éppen a mérés
+tárgya. A tiling és pipeline nem csökkenti a teljes forgalmat, csak a
+tranzakciók számát és a késleltetést.</p>
+<p>A sávszélesség számítása a fenti képlettel történik. A naiv kernel
+sávszélessége várhatóan alacsonyabb, mert a nem koaleszkált hozzáférések
+sok részleges szektort és többletforgalmat okoznak az L2/DRAM oldalon. A
+tiled kernel sávszélessége várhatóan megközelíti a mért
+memcpy-sávszélességet. A pipelined kernel javíthat a sávszélességen, ha
+a tiled kernel késleltetése nincs elrejtve; ez nem garantált, és
+mérendő.</p>
+<h4 data-number="14.4.4.5" id="a-pipeline-hatása-latency-hiding"><span
+class="header-section-number">14.4.4.5</span> A pipeline hatása: latency
+hiding</h4>
+<p>A <code>cp.async</code> pipeline lényege, hogy a globális memória
+kéréseket a számítással párhuzamosítja. A Nsight Compute-ben a
+<code>smsp__average_warp_latency_per_inst_issued</code> vagy a
+<code>smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct</code>
+metrika mutatja, mennyi időt töltenek a warpek memória-várakozással. A
+pipelined kernelben ennek az értéknek csökkennie kell a tiled kernelhez
+képest, mert a consumer nem közvetlenül a globális load után vár, hanem
+a már megérkezett shared pufferen dolgozik.</p>
+<p>Várt eredmény (nem garantált): a transzponálásban nincs számítási
+fázis, ezért a pipeline csak akkor gyorsíthat, ha a tiled kernel
+occupancyja alacsony (kevés rezidens warp rejti el a késleltetést). Ha a
+pipelined kernel nem gyorsabb vagy lassabb, az nem a szinkronizáció
+hibájára utal: a többletbarrierek, a 4 B-os <code>cp.async</code> és a
+kisebb rács költsége meghaladhatja a nyereséget. Helyességét a validáció
+és a <code>compute-sanitizer --tool racecheck</code> igazolja, nem a
+futásidő.</p>
+<h3 data-number="14.4.5" id="tileméret-hangolás"><span
+class="header-section-number">14.4.5</span> Tileméret-hangolás</h3>
+<p>A tile méretének megválasztása közvetlenül befolyásolja a shared
+memória foglalást, a bankütközéseket, az occupancyt és a határfeltételek
+kezelését. A hangolást méréssorozattal végezzük, ahol a tile méretet
+változtatjuk, és minden konfigurációra rögzítjük a fenti metrikákat.</p>
+<p>Gyakori tile méretek FP32 transzponálásnál:</p>
+<ul>
+<li><strong>8x8:</strong> kis shared memória, sok kis blokk; a
+szektorszám minimális marad (8 float = 1 szektor), de a blokkonkénti
+overhead és a rövid sorok a kéréshatékonyságot ronthatják.</li>
+<li><strong>16x16:</strong> 16<em>17</em>4 = 1088 byte shared memória
+blokkonként. Jó egyensúly, de a bankütközések elkerülhetők
+paddinggel.</li>
+<li><strong>32x32:</strong> 32<em>33</em>4 = 4224 byte. A legtöbb GPU-n
+ez a standard választás, mert a warp méret (32) illeszkedik a
+sorhosszhoz, és a koaleszkálás optimális.</li>
+<li><strong>64x64:</strong> 64<em>65</em>4 = 16640 byte. Magas shared
+memória igény, alacsonyabb occupancy, de kevesebb blokk és
+határfeltétel. Nagy mátrixoknál előnyös lehet, de a latency hiding
+romolhat.</li>
+</ul>
+<p>A blokk legfeljebb 1024 szálas lehet, ezért a fenti
+<code>TILE_DIM x TILE_DIM</code> blokkal 64x64-es csempe nem indítható
+(4096 szál: érvénytelen launch). Ehhez, és a futásidőben választható
+csempemérethez sablonparaméteres kernel kell, ahol egy szál
+<code>TILE / ROWS</code> elemet másol (<code>ROWS</code> osztja
+<code>TILE</code>-t, <code>TILE * ROWS &lt;= 1024</code>):</p>
+<pre class="cuda"><code>// block = dim3(TILE, ROWS); pl. &lt;8,8&gt;, &lt;16,16&gt;, &lt;32,8&gt;, &lt;64,16&gt; (utóbbi 1024 szál)
+template &lt;int TILE, int ROWS&gt;
+__global__ void transpose_tiled_t(const float* A, float* B, int M, int N) {
+    __shared__ float tile[TILE][TILE + 1];
+    int x = blockIdx.x * TILE + threadIdx.x;
+    int y = blockIdx.y * TILE + threadIdx.y;
+    for (int j = 0; j &lt; TILE; j += ROWS)
+        if (x &lt; N &amp;&amp; y + j &lt; M)
+            tile[threadIdx.y + j][threadIdx.x] = A[(size_t)(y + j) * N + x];
+    __syncthreads();
+    x = blockIdx.y * TILE + threadIdx.x;
+    y = blockIdx.x * TILE + threadIdx.y;
+    for (int j = 0; j &lt; TILE; j += ROWS)
+        if (x &lt; M &amp;&amp; y + j &lt; N)
+            B[(size_t)(y + j) * M + x] = tile[threadIdx.x][threadIdx.y + j];
+}</code></pre>
+<p>A <code>--tile</code> kapcsoló a hoston egy <code>switch</code>,
+amely a megfelelő sablonpéldányt indítja. A mérési sorozat:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> tile <span class="kw">in</span> 8 16 32 64<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    <span class="ex">./transpose_lab</span> <span class="at">--m</span> 8192 <span class="at">--n</span> 8192 <span class="at">--tile</span> <span class="va">$tile</span> <span class="at">--repeat</span> 20</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span></code></pre></div>
+<p>A kapott futásidőket, sávszélességeket és occupancyket táblázatba
+foglaljuk. A várt trend: a különbségek GPU-függők és jellemzően kicsik;
+a mérés dönti el, melyik a legjobb. A 64x64 csempét
+<code>&lt;64,16&gt;</code> (1024 szálas) blokkal indítjuk, ennek
+occupancyját a blokk szálszáma korlátozza
+(<code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code>).</p>
+<p>A pipelined kernelnél a tile méret mellett a shared memória pufferek
+száma is hangolható. A double bufferinghez két puffer kell; ha a tile
+túl nagy, a pufferek kiszoríthatják a blokkokat az SM-ből, így az
+occupancy drasztikusan csökken. A statikusan foglalt shared memória 48
+KiB-nál nem lehet több; ennél nagyobb dinamikus pufferhez a
+<code>cudaFuncSetAttribute(..., cudaFuncAttributeMaxDynamicSharedMemorySize, bytes)</code>
+hívás kell, de figyelni kell a maximális kapacitásra.</p>
+<p>A hangolás eredményét a következő táblázatban rögzítjük (várt és mért
+külön):</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+</colgroup>
+<thead>
+<tr>
+<th>Tile</th>
+<th>Block</th>
+<th>Shared memória/block (byte)</th>
+<th>Regiszter/thread</th>
+<th>Occupancy (várt: kalkulátorból)</th>
+<th>Sávszélesség (mért)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>8x8</td>
+<td>8x8</td>
+<td>8<em>9</em>4=288</td>
+<td><em>mérendő</em></td>
+<td><em>kalkulátorból</em></td>
+<td><em>mérendő</em></td>
+</tr>
+<tr>
+<td>16x16</td>
+<td>16x16</td>
+<td>16<em>17</em>4=1088</td>
+<td><em>mérendő</em></td>
+<td><em>kalkulátorból</em></td>
+<td><em>mérendő</em></td>
+</tr>
+<tr>
+<td>32x32</td>
+<td>32x8</td>
+<td>32<em>33</em>4=4224</td>
+<td><em>mérendő</em></td>
+<td><em>kalkulátorból</em></td>
+<td><em>mérendő</em></td>
+</tr>
+<tr>
+<td>64x64</td>
+<td>64x16</td>
+<td>64<em>65</em>4=16640</td>
+<td><em>mérendő</em></td>
+<td><em>kalkulátorból</em></td>
+<td><em>mérendő</em></td>
+</tr>
+</tbody>
+</table>
+<p>A mért értékeket a Nsight és a saját timer alapján kell kitölteni. A
+várt occupancyt a
+<code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code> API-val előre
+lehet becsülni; a laborban ezt is érdemes lefuttatni.</p>
+<h3 data-number="14.4.6" id="tipikus-hibák-és-elhárításuk"><span
+class="header-section-number">14.4.6</span> Tipikus hibák és
+elhárításuk</h3>
+<h4 data-number="14.4.6.1" id="nem-ellenőrzött-környezet"><span
+class="header-section-number">14.4.6.1</span> Nem ellenőrzött
+környezet</h4>
+<p>Hiba: a mérés közben a GPU órajele változik, thermal throttling lép
+fel, vagy más folyamat terheli a GPU-t. A kapott eredmény nem
+reprodukálható.</p>
+<p>Megoldás: mérés előtt és után
+<code>nvidia-smi --query-gpu=clocks.sm,clocks.mem,power.draw,temperature.gpu --format=csv</code>
+rögzítése. Ha throttlingot látunk, csökkentsük a mérés időtartamát, vagy
+alkalmazzunk hűtési szünetet. Többfelhasználós környezetben használjunk
+MIG-et vagy kérjünk dedikált GPU-időt.</p>
+<h4 data-number="14.4.6.2" id="túl-kicsi-input"><span
+class="header-section-number">14.4.6.2</span> Túl kicsi input</h4>
+<p>Hiba: a mátrix mérete kicsi, a kernelindítási overhead dominál, a
+tiling hatása nem mérhető.</p>
+<p>Megoldás: a bemenet és a kimenet együtt legyen legalább a GPU
+L2-méretének 4–8-szorosa (<code>cudaDevAttrL2CacheSize</code>); a
+8192x8192 FP32 mátrix 256 MiB, ez a mai GPU-kon elegendő. Kisebb
+méretnél az eredmény L2-sávszélesség, és a naplóban így kell
+jelölni.</p>
+<h4 data-number="14.4.6.3" id="csak-egy-mérés"><span
+class="header-section-number">14.4.6.3</span> Csak egy mérés</h4>
+<p>Hiba: egyetlen futásidőt rögzítünk, a zajt nem szűrjük.</p>
+<p>Megoldás: warm-up után legalább 20 ismétlés, medián és szórás (vagy
+IQR) közlése. A szórás nagy értéke (pl. &gt;5%) környezeti problémára
+utal.</p>
+<h4 data-number="14.4.6.4"
+id="bankütközés-figyelmen-kívül-hagyása"><span
+class="header-section-number">14.4.6.4</span> Bankütközés figyelmen
+kívül hagyása</h4>
+<p>Hiba: a tiled kernelben
+<code>__shared__ float tile[TILE_DIM][TILE_DIM]</code> deklarációt
+használunk padding nélkül. A 32x32-es transzponált olvasás 32-way bank
+conflictot okoz, és a tiling előnye elvész.</p>
+<p>Megoldás: mindig <code>TILE_DIM + 1</code> oszlopot használjunk, vagy
+használjunk XOR-swizzle-t a shared memória indexelésében (a
+<code>cudaFuncSetAttribute</code> csak a méretkorlátot állítja, a
+bankleképezést nem befolyásolja). A Nsight bankütközés-metrikájával
+ellenőrizzük.</p>
+<h4 data-number="14.4.6.5"
+id="a-cp.async-pipeline-helytelen-szinkronizációja"><span
+class="header-section-number">14.4.6.5</span> A cp.async pipeline
+helytelen szinkronizációja</h4>
+<p>Hiba: a <code>cuda::pipeline</code> producer és consumer fázisainak
+sorrendje hibás, például a <code>consumer_wait</code> előtt a shared
+puffert olvassuk, vagy a puffert felülírjuk, mielőtt a consumer végzett
+volna. Ez versenyhelyzetet okoz.</p>
+<p>Megoldás: kövessük a pipeline-primitívek szabályait. A producer oldal
+a <code>__pipeline_memcpy_async</code> hívások után
+<code>__pipeline_commit</code>-ot hajt végre; a consumer oldal
+<code>__pipeline_wait_prior(N)</code>-nel vár a megfelelő köteg
+befejezésére, majd <code>__syncthreads()</code>-szel gondoskodik arról,
+hogy a többi szál másolata is látható legyen. A puffert csak akkor írjuk
+újra, ha minden szál végzett az olvasásával (újabb
+<code>__syncthreads</code>). A teljes, működő minta a 2. szakasz
+<code>transpose_pipelined</code> kernelje; itt a hibás minta:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">// HIBÁS: nincs commit/wait, a kernel azonnal olvas</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>__pipeline_memcpy_async<span class="op">(&amp;</span>buffer<span class="op">[</span>threadIdx<span class="op">.</span>x<span class="op">],</span> <span class="op">&amp;</span>source<span class="op">[</span>threadIdx<span class="op">.</span>x<span class="op">],</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">));</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>__syncthreads<span class="op">();</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>use<span class="op">(</span>buffer<span class="op">);</span> <span class="co">// lehet, hogy a másolás még nem fejeződött be</span></span></code></pre></div>
+<p>A helyes minta:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a>__pipeline_memcpy_async<span class="op">(&amp;</span>buffer<span class="op">[</span>threadIdx<span class="op">.</span>x<span class="op">],</span> <span class="op">&amp;</span>source<span class="op">[</span>threadIdx<span class="op">.</span>x<span class="op">],</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">));</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>__pipeline_commit<span class="op">();</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>__pipeline_wait_prior<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>__syncthreads<span class="op">();</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>use<span class="op">(</span>buffer<span class="op">);</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>__syncthreads<span class="op">();</span> <span class="co">// mielőtt a puffert újra írjuk</span></span></code></pre></div>
+<h4 data-number="14.4.6.6" id="túl-nagy-tile-alacsony-occupancy"><span
+class="header-section-number">14.4.6.6</span> Túl nagy tile, alacsony
+occupancy</h4>
+<p>Hiba: a 64x64-es tile csökkenti az aktív blokkok számát, a latency
+hiding romlik, és a kernel lassabb lesz.</p>
+<p>Megoldás: mérjük az occupancyt, és a regiszterhasználatot
+(<code>--maxrregcount</code> vagy launch bounds) hangoljuk. Ha a shared
+memória a korlát, csökkentsük a tile méretet, vagy használjunk kisebb
+puffert a pipeline-ban. A cél az, hogy legalább 2–4 blokk aktív legyen
+SM-enként, hogy a warpütemező elrejthesse a memória-késleltetést.</p>
+<h3 data-number="14.4.7" id="labor-nsight-alapú-elemzés"><span
+class="header-section-number">14.4.7</span> Labor: Nsight-alapú
+elemzés</h3>
+<p>A labor célja, hogy a fenti három kernelváltozatot saját környezetben
+lefuttassa, és a mérési naplót Nsight-metrikákkal töltse ki. A
+<code>transpose_lab.cu</code> programot a hallgató állítja össze a fenti
+kernelvázlatokból (a fejezet nem tartalmazza a teljes forrást); a
+<code>--m</code>, <code>--n</code>, <code>--repeat</code>,
+<code>--tile</code> parancssori kapcsolók feldolgozását is neki kell
+megírnia. A fordítás és futtatás parancsai:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-O3</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-o</span> transpose_lab transpose_lab.cu</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./transpose_lab</span> <span class="at">--m</span> 8192 <span class="at">--n</span> 8192 <span class="at">--repeat</span> 20</span></code></pre></div>
+<p>A Nsight Compute futtatás:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ncu</span> <span class="at">--set</span> full <span class="at">--launch-count</span> 1 <span class="at">--kernel-name</span> transpose_naive ./transpose_lab <span class="at">--m</span> 8192 <span class="at">--n</span> 8192</span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ncu</span> <span class="at">--set</span> full <span class="at">--launch-count</span> 1 <span class="at">--kernel-name</span> transpose_tiled ./transpose_lab <span class="at">--m</span> 8192 <span class="at">--n</span> 8192</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ncu</span> <span class="at">--set</span> full <span class="at">--launch-count</span> 1 <span class="at">--kernel-name</span> transpose_pipelined <span class="dt">\</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>  ./transpose_lab <span class="at">--m</span> 8192 <span class="at">--n</span> 8192</span></code></pre></div>
+<p>A mérési naplóban rögzíteni kell:</p>
+<ul>
+<li>GPU-modell, driver, CUDA-verzió, compute capability, operációs
+rendszer, power limit, ECC/MIG állapot.</li>
+<li>A három kernel futásideje, szórása, sávszélessége.</li>
+<li>A Nsight-ből:
+<code>l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum</code>,
+<code>..._op_st.sum</code>, <code>dram__bytes.sum</code>,
+<code>l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum</code>,
+<code>sm__warps_active.avg.pct_of_peak_sustained_active</code>,
+regiszter/thread, shared memória/block.</li>
+<li>A várt értékeket a fenti becslésekkel, a mért értékeket a
+kísérletből.</li>
+</ul>
+<p>A labor átadandó dokumentuma egy rövid jelentés, amelyben a mért és
+várt értékeket táblázatban összeveti, és legalább egy
+Nsight-képernyőképet vagy riportrészletet mellékel. A jelentésben
+válaszolni kell a kérdésre: <strong>Miért nő a sávszélesség a tiled
+kernelnél, ha a DRAM-forgalom (közel) azonos?</strong> A válasz: a
+koaleszkált hozzáférések miatt a warpok szektorszáma (az LSU/L1 oldali
+kérések) a töredékére csökken, az L2 és a DRAM pedig teljes szektorokat
+és hosszabb, sorban elhelyezkedő hozzáféréseket kap (kevesebb részleges
+írás, kevesebb sor-újraaktiválás); ezek együtt teszik lehetővé, hogy
+ugyanannyi byte mozgatása kevesebb időt vegyen igénybe. A pipelined
+kernel pedig a globális memória késleltetését rejti el, így a
+memória-vezérlő folyamatosan telített.</p>
+<p><strong>Megjegyzés:</strong> A fenti parancsok és a kódvázlat
+szemléltető jellegű; a laborban a tényleges GPU-paramétereket és a
+mérési naplót a hallgatónak kell rögzítenie. A cp.async pipeline
+használatához compute capability 8.0+ szükséges; ha a labor GPU-ja
+régebbi, a pipeline részt ki kell hagyni, és a mérési jegyzőkönyvben ezt
+jelezni kell.</p>
+<h3 data-number="14.4.8" id="összefoglalás-és-önellenőrző-kérdés"><span
+class="header-section-number">14.4.8</span> Összefoglalás és önellenőrző
+kérdés</h3>
+<p>A tiling és a pipeline hatásának mérése akkor értékes, ha a futásidő
+mellett a memória-tranzakciókat, a bankütközéseket, az occupancyt és a
+sávszélességet is vizsgáljuk. A mátrix transzponálás példáján a naiv,
+tiled és pipelined változat összehasonlítása megmutatja: a tiling a
+tranzakciók számát csökkenti, a pipeline a késleltetést rejti el, a
+tileméret pedig az erőforrás-korlátokon keresztül hangolja az optimális
+pontot.</p>
+<p><strong>Önellenőrző kérdés:</strong> Miért csökken a globális memória
+tranzakciók száma a tiled transzponálásnál, és miért nem csökken a
+DRAM-forgalom? Válaszát a Nsight-metrikák alapján indokolja.</p>
+<p>A következő alfejezet (15.1) a cache-ekre, az L2 persistence-re és a
+memóriamodellekre épít; az itt megismert mérési protokoll és a
+Nsight-metrikák ott is alapvető eszköztárként szolgálnak.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu052.html">← 14.3 Double buffering és pipeline</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu054.html">15.1 L1 és L2 cache →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

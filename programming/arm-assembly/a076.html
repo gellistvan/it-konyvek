@@ -1,0 +1,761 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>19.2 Egyszerű UART driver: inicializálás, küldés/vétel
+megszakítással – ARM assembly programozás C-fejlesztőknek:
+AArch64-alkalmazásszinttől Cortex-M bare-metalig</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. RÉSZ – Cortex-M: bare-metal mikrokontroller-programozás</a> › <a href="index.html#ach18">19 Megszakítás-vezérelt I/O és driver minta</a></p>
+<div class="links"><a class="prev" rel="prev" href="a075.html">← 19.1 Polling versus interrupt-vezérelt I/O</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="a077.html">19.3 Timer-alapú időzítés és periodikus feladatok →</a></div>
+</nav>
+<h2 data-number="19.2" id="a076"><span
+class="header-section-number">19.2</span> Egyszerű UART driver:
+inicializálás, küldés/vétel megszakítással</h2>
+<h3 data-number="19.2.1" id="motiváció"><span
+class="header-section-number">19.2.1</span> Motiváció</h3>
+<p>A beágyazott rendszerek többségében a soros kommunikáció az egyik
+legalapvetőbb perifériakezelési feladat. Egy szenzoradatokat fogadó,
+parancsokat értelmező vagy egyszerűen csak konzolüzeneteket naplózó
+firmware gyakran UART-on keresztül kommunikál a külvilággal. Ha a vételt
+pollinggal valósítjuk meg, a CPU aktívan pörög, és nem tud aludni vagy
+más feladatot végezni. Ezzel szemben az interrupt-vezérelt vétel
+lehetővé teszi, hogy a CPU alvó állapotban (<code>WFI</code>) vagy más
+kritikus feladat végrehajtásában legyen, amíg a periféria jelzi, hogy új
+bájt érkezett. Ez a minta nem csak UART-ra, hanem szinte minden bemeneti
+perifériára (SPI, I2C, ADC) adaptálható.</p>
+<p>Ebben az alfejezetben egy minimális, de teljes UART drivert építünk
+fel a QEMU <code>mps2-an385</code> machine CMSDK APB UART perifériájára.
+A fókusz a vételi irányon van: a bejövő karaktereket megszakításban
+fogadjuk, és egy körkörös pufferbe (ring buffer) helyezzük. A küldést
+egyszerű pollingos <code>putc</code>-vel oldjuk meg, hogy a példa ne
+zsúfolódjon el. Az itt bemutatott regiszterkezelés és ISR-szerződés
+közvetlenül használható más ARM Cortex-M alapú driver fejlesztésénél
+is.</p>
+<h3 data-number="19.2.2" id="definíció-uart-regiszterszerződés"><span
+class="header-section-number">19.2.2</span> Definíció: UART
+regiszterszerződés</h3>
+<p>A <strong>UART</strong> (Universal Asynchronous Receiver/Transmitter)
+egy olyan memóriába leképezett periféria, amely párhuzamos adatokat
+soros formában továbbít, illetve soros adatokat párhuzamosít. A CMSDK
+APB UART egy egyszerű, ARM által definiált periféria, amelyet a QEMU
+<code>mps2-an385</code> modellje is implementál. A regisztertérképe öt
+32 bites regiszterből áll, amelyek a periféria báziscíméhez képest fix
+offszeteken érhetők el. Az alábbi táblázat a CMSDK APB UART térképe; a
+<code>0x40004000</code> báziscímet és az IRQ0-t a labor a fő úton (QEMU
+8.2.2) igazolja. Más platformra portolva a címeket és az IRQ-számot a
+célplatform dokumentációjából kell venni.</p>
+<table>
+<colgroup>
+<col style="width: 31%" />
+<col style="width: 25%" />
+<col style="width: 17%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Regiszter</th>
+<th>Offszet</th>
+<th>Írás</th>
+<th>Olvasás</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DATA</code></td>
+<td>0x000</td>
+<td>Küldendő bájt</td>
+<td>Vett bájt</td>
+</tr>
+<tr>
+<td><code>STATE</code></td>
+<td>0x004</td>
+<td>bit2 <code>TXOVERRUN</code>, bit3 <code>RXOVERRUN</code>:
+write-1-to-clear; a többi bit írása hatástalan</td>
+<td>Állapotbitek: TXFULL, RXFULL, TXOVERRUN, RXOVERRUN</td>
+</tr>
+<tr>
+<td><code>CTRL</code></td>
+<td>0x008</td>
+<td>Vezérlés: TXEN, RXEN, TXIE, RXIE</td>
+<td>Vezérlés visszaolvasása</td>
+</tr>
+<tr>
+<td><code>INTSTATUS</code></td>
+<td>0x00C</td>
+<td>Write-1-to-clear: a megfelelő bitre írt 1 törli a jelzőt</td>
+<td>Aktív megszakítások: TXINT, RXINT</td>
+</tr>
+<tr>
+<td><code>BAUDDIV</code></td>
+<td>0x010</td>
+<td>Baud osztó értéke</td>
+<td>Baud osztó visszaolvasása</td>
+</tr>
+</tbody>
+</table>
+<p>A <code>CTRL</code> regiszter bitjei a következők:</p>
+<ul>
+<li>bit 0: <code>TXEN</code> — adó engedélyezése</li>
+<li>bit 1: <code>RXEN</code> — vevő engedélyezése</li>
+<li>bit 2: <code>TXIE</code> — adási megszakítás engedélyezése</li>
+<li>bit 3: <code>RXIE</code> — vételi megszakítás engedélyezése</li>
+</ul>
+<p>A <code>STATE</code> regiszter bitjei:</p>
+<ul>
+<li>bit 0: <code>TXFULL</code> — adó puffer megtelt</li>
+<li>bit 1: <code>RXFULL</code> — vevő puffer megtelt (van olvasható
+adat)</li>
+<li>bit 2: <code>TXOVERRUN</code> — adási túlcsordulás (W1C)</li>
+<li>bit 3: <code>RXOVERRUN</code> — vételi túlcsordulás (W1C)</li>
+</ul>
+<p>Az <code>INTSTATUS</code> regiszter bitjei:</p>
+<ul>
+<li>bit 0: <code>TXINT</code> — adási megszakítás aktív</li>
+<li>bit 1: <code>RXINT</code> — vételi megszakítás aktív</li>
+</ul>
+<p><strong>Fontos szerződés:</strong> a vételi megszakítás
+(<code>RXINT</code>) akkor áll be (latch-elődik), amikor egy bájt
+beérkezik és a <code>RXIE</code> engedélyezve van; az
+<code>RXFULL</code> ettől független pufferállapot. A <code>DATA</code>
+regiszter olvasása törli a <code>STATE.RXFULL</code> bitet — ezzel a
+periféria a következő bájtot fogadhatja —, de <strong>nem törli</strong>
+az <code>INTSTATUS.RXINT</code> jelzőt, amely a hardverben attól a
+pillanattól önálló, “latched” (rögzített) állapotként él. A már
+megállapított <code>RXINT</code>-et külön,
+<strong>write-1-to-clear</strong> móddal kell törölni: az
+<code>INTSTATUS</code> megfelelő bitjébe 1-et kell írni. Az
+<code>INTSTATUS</code> puszta <em>olvasása</em> a jelzőt nem törli. Ha a
+<code>DATA</code> kiolvasása után elmarad az <code>INTSTATUS</code>-ba
+írt törlés, az NVIC a megszakítást továbbra is pendingnek látja, és a
+vezérlés az ISR visszatérésekor azonnal újra belép (tail-chaining)
+ugyanabba az ISR-be: <strong>megszakítási vihart</strong> okozva, amely
+a CPU-t teljesen lefoglalja. Az adási megszakítás (<code>TXINT</code>)
+nem szintvezérelt: akkor áll be (latched), amikor egy bájt elküldése
+után az adópuffer kiürül, és a <code>TXIE</code> engedélyezett. Üres
+pufferrel a <code>TXIE</code> bekapcsolása önmagában nem kér
+megszakítást, ezért a TX-megszakításos küldést az első bájt beírásával
+kell elindítani. Fontos, hogy ennek a fordítottja NEM igaz: a
+<code>DATA</code> regiszter <em>írása</em> a puffert feltölti, és ettől
+a <code>TXFULL</code> jellemzően <strong>beáll</strong>, nem törlődik —
+a <code>TXFULL</code> törlését a hardver tényleges adatküldése végzi,
+amikor a puffer a soros vonalra kiürül, függetlenül attól, hogy a
+szoftver mikor írt utoljára a <code>DATA</code>-ba. A <code>TXINT</code>
+jelzőt ugyanúgy az <code>INTSTATUS</code> megfelelő bitjébe írt 1-gyel
+kell törölni, mint az <code>RXINT</code>-et.</p>
+<p>A <strong>körkörös puffer</strong> (ring buffer) egy olyan
+adatszerkezet, amely fix méretű tömbben tárolja az elemeket, és két
+indexszel (<code>head</code>, <code>tail</code>) jelöli a következő
+írási és olvasási pozíciót. Az egyik indexet a termelő (itt az ISR), a
+másikat a fogyasztó (itt a fő ciklus) módosítja. A puffer akkor üres, ha
+<code>head == tail</code>, és akkor tele, ha
+<code>(head + 1) % méret == tail</code>. A méretet érdemes 2 hatványára
+választani, hogy a modulo helyett bitmaszkolást használhassunk.</p>
+<h3 data-number="19.2.3" id="baud-rate-konfiguráció"><span
+class="header-section-number">19.2.3</span> Baud rate konfiguráció</h3>
+<p>A <code>BAUDDIV</code> regiszter a periféria bemeneti órajelét osztja
+le a kívánt baud rátára. A pontos összefüggés a CMSDK APB UART
+specifikációjában található; tipikusan a következő alakú:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">BAUDDIV</mtext><mo>=</mo><mfrac><msub><mi>f</mi><mtext mathvariant="normal">UARTCLK</mtext></msub><mtext mathvariant="normal">baudrate</mtext></mfrac></mrow><annotation encoding="application/x-tex">
+\text{BAUDDIV} = \frac{f_{\text{UARTCLK}}}{\text{baudrate}}
+</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>f</mi><mtext mathvariant="normal">UARTCLK</mtext></msub><annotation encoding="application/x-tex">f_{\text{UARTCLK}}</annotation></semantics></math>
+a UART periféria számára biztosított rendszeróra frekvenciája. A QEMU
+<code>mps2-an385</code> esetében ez az érték a machine konfigurációjától
+függ, és az AN385 UARTCLK-ja 25 MHz (a 19.3 TIMER1-ablaka ezt méri). A
+QEMU CMSDK UART modellje a baud rátát
+<code>baudrate = UARTCLK / BAUDDIV</code> alakban számítja — nincs
+<code>-1</code> eltolás a képletben. A példában az AN385 25 MHz-es
+UARTCLK-ját használjuk, ami 115200 baud esetén
+<code>BAUDDIV = 25000000 / 115200 ≈ 217</code> értéket ad. Mivel a QEMU
+nem valós idejű emulációt végez, a baud rate pontossága a konzol
+bemenetére nincs hatással, de a regisztert a periféria inicializálásához
+be kell állítani.</p>
+<h3 data-number="19.2.4" id="kidolgozott-példa-uart-driver"><span
+class="header-section-number">19.2.4</span> Kidolgozott példa: UART
+driver</h3>
+<p><strong>Munkakönyvtár:</strong> <code>~/arm-labor/cm/a076/</code> —
+az alfejezet minden laborfájlja ide kerül, és minden parancs innen
+futtatandó (a könyvtárrendet a <a
+href="a006.html">Labor-alapkörnyezet</a> alfejezet írja le).</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> ~/arm-labor/cm/a076</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/arm-labor/cm/a076</span></code></pre></div>
+<p>Az alábbi példa egy teljes, fordítható UART driver vázát mutatja. A
+kód C nyelvű, mert a regiszterelérések és a ring buffer kezelése így
+olvashatóbb; az assembly szerepe a vektortábla és a startup kód, amelyet
+a korábbi fejezetekből ismerünk. A futtatáshoz szükséges teljes
+fájllista: <code>lab-mps2.ld</code>, <code>lab-a076-startup.s</code> (a
+kanonikus startup, az alábbi bővítéssel), <code>lab-uart.h</code>,
+<code>lab-uart.c</code>, <code>lab-main.c</code> és az ellenőrző
+<code>lab-check-vectors.py</code>.</p>
+<p>A linker script és a startup a II. rész kanonikus párja (<a
+href="a065.html">Linker script alapjai</a>, <a href="a066.html">Startup
+kód</a>), a vektortábla ellenőrzője pedig a <a
+href="a064.html">Vektortábla</a> alfejezet
+<code>lab-check-vectors.py</code>-ja. A linker script változatlan; a
+startup másolatának vektortábláját egyetlen, gépileg alkalmazható
+lépéssel bővítjük az UART0 RX (IRQ0) bejegyzésével:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> ~/arm-labor/cm/a065/lab-mps2.ld .</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> ~/arm-labor/cm/a066/lab-startup.s lab-a076-startup.s</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> ~/arm-labor/cm/a064/lab-check-vectors.py .</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="op">&gt;</span> lab-a076-irq.inc <span class="op">&lt;&lt;&#39;EOF&#39;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="st">    /* 16-tól: külső IRQ-k; UART0 RX = IRQ0 = 16. index */</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="st">    .word UART0_Handler           /* 0x40: IRQ0 (UART0 RX)       */</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="op">EOF</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sed</span> <span class="at">-i</span> <span class="st">&#39;/\.word SysTick_Handler/r lab-a076-irq.inc&#39;</span> lab-a076-startup.s   <span class="co"># a SysTick sor után</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="co"># gyenge alias: kezelő nélkül is linkelhető</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&#39;    lab_default_handler UART0_Handler&#39;</span> <span class="op">&gt;&gt;</span> lab-a076-startup.s</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="co"># ellenőrzés: a bővített tábla vége</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="fu">sed</span> <span class="at">-n</span> <span class="st">&#39;/\.word SysTick_Handler/,/^$/p&#39;</span> lab-a076-startup.s</span></code></pre></div>
+<p>A <code>sed</code> mintája csak a vektortábla
+<code>.word SysTick_Handler</code> sorára illeszkedik, a fájl végén lévő
+<code>lab_default_handler SysTick_Handler</code> aliasra nem. A fel nem
+használt IRQ-helyek a kanonikus <code>Default_Handler</code>-re
+mutatnak. Az <code>echo</code> sor a kanonikus
+<code>lab_default_handler</code> makróval a fájl végére egy
+<strong>gyenge</strong>, <code>Default_Handler</code>-re mutató aliast
+fűz a használt kezelőhöz is. A C-fájl erős definíciója ezt felülírja, de
+ha egy build a kezelőt nem tartalmazza, a <code>KEEP</code>-pel
+megtartott vektortábla hivatkozása akkor sem marad feloldatlan. Ezek
+<strong>valódi táblaszavak</strong>, nem megjegyzések, mert csak így
+kerül a használt kezelő a megfelelő indexre
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>16</mn><mo>+</mo><mtext mathvariant="normal">IRQn</mtext></mrow><annotation encoding="application/x-tex">16 + \text{IRQn}</annotation></semantics></math>).</p>
+<h4 data-number="19.2.4.1" id="regiszterdefiníciók-és-ring-buffer"><span
+class="header-section-number">19.2.4.1</span> Regiszterdefiníciók és
+ring buffer</h4>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// lab-uart.h</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#ifndef LAB_UART_H</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define LAB_UART_H</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdint.h&gt;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#define UART0_BASE </span><span class="bn">0x40004000</span><span class="bu">UL</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#define UART0_IRQn </span><span class="dv">0</span><span class="pp">  </span><span class="co">// AN385: UART0 RX = IRQ0, TX = IRQ1 (lásd 18.1 és 20.2)</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">volatile</span> <span class="dt">uint32_t</span> DATA<span class="op">;</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">volatile</span> <span class="dt">uint32_t</span> STATE<span class="op">;</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">volatile</span> <span class="dt">uint32_t</span> CTRL<span class="op">;</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">volatile</span> <span class="dt">uint32_t</span> INTSTATUS<span class="op">;</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">volatile</span> <span class="dt">uint32_t</span> BAUDDIV<span class="op">;</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> CMSDK_UART_TypeDef<span class="op">;</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a><span class="pp">#define UART0 </span><span class="op">((</span><span class="pp">CMSDK_UART_TypeDef </span><span class="op">*)</span><span class="pp"> </span>UART0_BASE<span class="op">)</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a><span class="pp">#define UART_CTRL_TXEN  </span><span class="op">(</span><span class="dv">1</span><span class="bu">U</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a><span class="pp">#define UART_CTRL_RXEN  </span><span class="op">(</span><span class="dv">1</span><span class="bu">U</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="dv">1</span><span class="op">)</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a><span class="pp">#define UART_CTRL_TXIE  </span><span class="op">(</span><span class="dv">1</span><span class="bu">U</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="dv">2</span><span class="op">)</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a><span class="pp">#define UART_CTRL_RXIE  </span><span class="op">(</span><span class="dv">1</span><span class="bu">U</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="dv">3</span><span class="op">)</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a><span class="pp">#define UART_STATE_TXFULL </span><span class="op">(</span><span class="dv">1</span><span class="bu">U</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a><span class="pp">#define UART_STATE_RXFULL </span><span class="op">(</span><span class="dv">1</span><span class="bu">U</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="dv">1</span><span class="op">)</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a><span class="pp">#define UART_INTSTATUS_TXINT </span><span class="op">(</span><span class="dv">1</span><span class="bu">U</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a><span class="pp">#define UART_INTSTATUS_RXINT </span><span class="op">(</span><span class="dv">1</span><span class="bu">U</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="dv">1</span><span class="op">)</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a><span class="co">/* Előfeltétel: uartclk &gt; 0, baudrate &gt; 0, a BAUDDIV = uartclk / baudrate osztó a CMSDK UART</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a><span class="co"> * dokumentált tartományában van (minimum 16 a CMSDK TRM szerint — portoláskor ellenőrizendő;</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a><span class="co"> * a mező 20 bites), és a tényleges baud relatív hibája ≤ 3 %. Hibakód: 0 = OK, -1 = nulla paraméter,</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a><span class="co"> * -2 = osztó a tartományon kívül, -3 = túl nagy baudhiba. (Ez nem általános Cortex-M szabály.) */</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> uart_init<span class="op">(</span><span class="dt">uint32_t</span> uartclk<span class="op">,</span> <span class="dt">uint32_t</span> baudrate<span class="op">);</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> uart_putc<span class="op">(</span><span class="dt">char</span> c<span class="op">);</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span>  uart_getc<span class="op">(</span><span class="dt">void</span><span class="op">);</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span>  uart_available<span class="op">(</span><span class="dt">void</span><span class="op">);</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a><span class="pp">#endif</span></span></code></pre></div>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// lab-uart.c</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;lab-uart.h&quot;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#define RX_BUF_SIZE </span><span class="dv">64</span><span class="pp">  </span><span class="co">// 2 hatványa</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">volatile</span> <span class="dt">char</span>     rx_buf<span class="op">[</span>RX_BUF_SIZE<span class="op">];</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">volatile</span> <span class="dt">uint32_t</span> rx_head <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> <span class="co">// csak az ISR írja</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">volatile</span> <span class="dt">uint32_t</span> rx_tail <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> <span class="co">// csak a fő ciklus írja</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> uart_init<span class="op">(</span><span class="dt">uint32_t</span> uartclk<span class="op">,</span> <span class="dt">uint32_t</span> baudrate<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>uartclk <span class="op">==</span> <span class="dv">0</span> <span class="op">||</span> baudrate <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">return</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> div <span class="op">=</span> uartclk <span class="op">/</span> baudrate<span class="op">;</span>                    <span class="co">// baudrate = UARTCLK / BAUDDIV</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>div <span class="op">&lt;</span> <span class="dv">16</span> <span class="op">||</span> div <span class="op">&gt;</span> <span class="bn">0xFFFFF</span><span class="bu">u</span><span class="op">)</span> <span class="cf">return</span> <span class="op">-</span><span class="dv">2</span><span class="op">;</span>            <span class="co">// 20 bites mező, CMSDK-minimum</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> actual <span class="op">=</span> uartclk <span class="op">/</span> div<span class="op">;</span>                      <span class="co">// tényleges baud</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> diff <span class="op">=</span> actual <span class="op">&gt;</span> baudrate <span class="op">?</span> actual <span class="op">-</span> baudrate <span class="op">:</span> baudrate <span class="op">-</span> actual<span class="op">;</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">((</span><span class="dt">uint64_t</span><span class="op">)</span>diff <span class="op">*</span> <span class="dv">100</span><span class="bu">u</span> <span class="op">&gt;</span> <span class="op">(</span><span class="dt">uint64_t</span><span class="op">)</span>baudrate <span class="op">*</span> <span class="dv">3</span><span class="bu">u</span><span class="op">)</span> <span class="cf">return</span> <span class="op">-</span><span class="dv">3</span><span class="op">;</span>  <span class="co">// &gt; 3 % relatív hiba</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    UART0<span class="op">-&gt;</span>CTRL <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> <span class="co">// kikapcsolás</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>    UART0<span class="op">-&gt;</span>BAUDDIV <span class="op">=</span> div<span class="op">;</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>    UART0<span class="op">-&gt;</span>CTRL <span class="op">=</span> UART_CTRL_TXEN <span class="op">|</span> UART_CTRL_RXEN <span class="op">|</span> UART_CTRL_RXIE<span class="op">;</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> uart_putc<span class="op">(</span><span class="dt">char</span> c<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>UART0<span class="op">-&gt;</span>STATE <span class="op">&amp;</span> UART_STATE_TXFULL<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>        <span class="co">// vár, amíg az adó puffer kiürül</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a>    UART0<span class="op">-&gt;</span>DATA <span class="op">=</span> <span class="op">(</span><span class="dt">uint32_t</span><span class="op">)(</span><span class="dt">uint8_t</span><span class="op">)</span>c<span class="op">;</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> uart_getc<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>rx_head <span class="op">==</span> rx_tail<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span> c <span class="op">=</span> <span class="op">(</span><span class="dt">uint8_t</span><span class="op">)</span>rx_buf<span class="op">[</span>rx_tail<span class="op">];</span></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a>    rx_tail <span class="op">=</span> <span class="op">(</span>rx_tail <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">&amp;</span> <span class="op">(</span>RX_BUF_SIZE <span class="op">-</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">(</span><span class="dt">int</span><span class="op">)</span>c<span class="op">;</span></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> uart_available<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-39"><a href="#cb4-39" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">(</span>rx_head <span class="op">!=</span> rx_tail<span class="op">);</span></span>
+<span id="cb4-40"><a href="#cb4-40" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-41"><a href="#cb4-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-42"><a href="#cb4-42" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> UART0_Handler<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-43"><a href="#cb4-43" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> status <span class="op">=</span> UART0<span class="op">-&gt;</span>INTSTATUS<span class="op">;</span></span>
+<span id="cb4-44"><a href="#cb4-44" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>status <span class="op">&amp;</span> UART_INTSTATUS_RXINT<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-45"><a href="#cb4-45" aria-hidden="true" tabindex="-1"></a>        <span class="co">// write-1-to-clear: torli az INTSTATUS.RXINT-et</span></span>
+<span id="cb4-46"><a href="#cb4-46" aria-hidden="true" tabindex="-1"></a>        UART0<span class="op">-&gt;</span>INTSTATUS <span class="op">=</span> UART_INTSTATUS_RXINT<span class="op">;</span></span>
+<span id="cb4-47"><a href="#cb4-47" aria-hidden="true" tabindex="-1"></a>        <span class="dt">char</span> c <span class="op">=</span> <span class="op">(</span><span class="dt">char</span><span class="op">)(</span>UART0<span class="op">-&gt;</span>DATA <span class="op">&amp;</span> <span class="bn">0xFF</span><span class="op">);</span>     <span class="co">// olvasás törli a STATE.RXFULL-t</span></span>
+<span id="cb4-48"><a href="#cb4-48" aria-hidden="true" tabindex="-1"></a>        <span class="dt">uint32_t</span> next <span class="op">=</span> <span class="op">(</span>rx_head <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">&amp;</span> <span class="op">(</span>RX_BUF_SIZE <span class="op">-</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb4-49"><a href="#cb4-49" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>next <span class="op">!=</span> rx_tail<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-50"><a href="#cb4-50" aria-hidden="true" tabindex="-1"></a>            rx_buf<span class="op">[</span>rx_head<span class="op">]</span> <span class="op">=</span> c<span class="op">;</span></span>
+<span id="cb4-51"><a href="#cb4-51" aria-hidden="true" tabindex="-1"></a>            rx_head <span class="op">=</span> next<span class="op">;</span></span>
+<span id="cb4-52"><a href="#cb4-52" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb4-53"><a href="#cb4-53" aria-hidden="true" tabindex="-1"></a>        <span class="co">// else: a szoftveres ringbe nem fér be, a már kiolvasott bájt elvész (rx_dropped++ a 2. feladatban)</span></span>
+<span id="cb4-54"><a href="#cb4-54" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-55"><a href="#cb4-55" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>status <span class="op">&amp;</span> UART_INTSTATUS_TXINT<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-56"><a href="#cb4-56" aria-hidden="true" tabindex="-1"></a>        UART0<span class="op">-&gt;</span>INTSTATUS <span class="op">=</span> UART_INTSTATUS_TXINT<span class="op">;</span> <span class="co">// write-1-to-clear</span></span>
+<span id="cb4-57"><a href="#cb4-57" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Adási megszakítás kezelése; itt nem használjuk</span></span>
+<span id="cb4-58"><a href="#cb4-58" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-59"><a href="#cb4-59" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Az alábbi ábra a körpuffer négy jellemző állapotát mutatja — üres,
+részben telt, körbefordult, tele. A szemléltetéshez 8 szeletet
+használunk a tényleges 64 helyett, hogy az ábra olvasható maradjon; a
+<code>head</code>/<code>tail</code> logika (és a telítettség feltétele)
+azonban azonos a fenti <code>rx_buf</code>-éval.</p>
+<figure>
+<img src="assets/a076-diagram-1.png"
+alt="Az rx_buf körpuffer állapotai: üres, részben telt, körbefordult, tele - Szemléltetés N=8 szelettel; a valódi rx_buf mérete RX_BUF_SIZE = 64." />
+<figcaption aria-hidden="true">Az rx_buf körpuffer állapotai: üres,
+részben telt, körbefordult, tele - Szemléltetés N=8 szelettel; a valódi
+rx_buf mérete RX_BUF_SIZE = 64.</figcaption>
+</figure>
+<h4 data-number="19.2.4.2" id="fő-program-és-nvic-engedélyezés"><span
+class="header-section-number">19.2.4.2</span> Fő program és NVIC
+engedélyezés</h4>
+<div class="sourceCode" id="cb5"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">// lab-main.c</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;lab-uart.h&quot;</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> nvic_enable_irq<span class="op">(</span><span class="dt">int</span> irqn<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">volatile</span> <span class="dt">uint32_t</span> <span class="op">*</span>nvic_iser <span class="op">=</span> <span class="op">(</span><span class="dt">volatile</span> <span class="dt">uint32_t</span> <span class="op">*)</span><span class="bn">0xE000E100</span><span class="op">;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    nvic_iser<span class="op">[</span>irqn <span class="op">/</span> <span class="dv">32</span><span class="op">]</span> <span class="op">=</span> <span class="op">(</span><span class="dv">1</span><span class="bu">U</span> <span class="op">&lt;&lt;</span> <span class="op">(</span>irqn <span class="op">%</span> <span class="dv">32</span><span class="op">));</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>uart_init<span class="op">(</span><span class="dv">25000000</span><span class="op">,</span> <span class="dv">115200</span><span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span>   <span class="co">// AN385: UARTCLK = 25 MHz; hibás paraméternél nem indulunk</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span> <span class="op">}</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>    nvic_enable_irq<span class="op">(</span>UART0_IRQn<span class="op">);</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>msg <span class="op">=</span> <span class="st">&quot;UART ready</span><span class="sc">\r\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>p <span class="op">=</span> msg<span class="op">;</span> <span class="op">*</span>p<span class="op">;</span> <span class="op">++</span>p<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>        uart_putc<span class="op">(*</span>p<span class="op">);</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span><span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> c <span class="op">=</span> uart_getc<span class="op">();</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>c <span class="op">&gt;=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>            uart_putc<span class="op">((</span><span class="dt">char</span><span class="op">)</span>c<span class="op">);</span> <span class="co">// echo</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Az egyszerűség kedvéért a főciklus itt nem alszik; az alvó változatot
+lásd 19.3.</p>
+<h4 data-number="19.2.4.3" id="build-és-futtatás-qemu-ban"><span
+class="header-section-number">19.2.4.3</span> Build és futtatás
+QEMU-ban</h4>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">arm-none-eabi-gcc</span> <span class="at">-mcpu</span><span class="op">=</span>cortex-m3 <span class="at">-mthumb</span> <span class="at">-ffreestanding</span> <span class="at">-nostdlib</span> <span class="at">-O1</span> <span class="at">-T</span> lab-mps2.ld <span class="dt">\</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-o</span> lab-uart.elf lab-a076-startup.s lab-uart.c lab-main.c</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> lab-check-vectors.py lab-uart.elf 1=Reset_Handler 16=UART0_Handler</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="fu">timeout</span> 10 qemu-system-arm <span class="at">-machine</span> mps2-an385 <span class="at">-cpu</span> cortex-m3 <span class="dt">\</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">-display</span> none <span class="at">-monitor</span> none <span class="at">-serial</span> stdio <span class="at">-kernel</span> lab-uart.elf</span></code></pre></div>
+<p>Kilépés interaktív terminálon: <code>Ctrl-A</code>, majd
+<code>X</code>. Automatikus, megismételhető próba:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">(</span><span class="fu">sleep</span> 1<span class="kw">;</span> <span class="bu">printf</span> <span class="st">&#39;ABCDEFGH&#39;</span><span class="kw">;</span> <span class="fu">sleep</span> 1<span class="kw">)</span> <span class="kw">|</span> <span class="fu">timeout</span> 4 qemu-system-arm <span class="at">-machine</span> mps2-an385 <span class="dt">\</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>    <span class="at">-cpu</span> cortex-m3 <span class="at">-display</span> none <span class="at">-monitor</span> none <span class="at">-serial</span> stdio <span class="at">-kernel</span> lab-uart.elf</span></code></pre></div>
+<p>Várt kimenet: <code>UART ready</code>, majd
+<code>ABCDEFGH</code>.</p>
+<p>A <code>lab-a076-startup.s</code> vektortáblájában a
+<code>UART0_Handler</code> az IRQ0 helyén (16. index, <code>0x40</code>)
+áll; ezt a <code>lab-check-vectors.py</code> utolsó sora gépileg
+igazolja. A <code>-serial stdio</code> a vendég UART0-ját a standard
+bemenetre/kimenetre köti; a <code>-display none -monitor none</code>
+kikapcsolja a grafikus ablakot és a QEMU-monitort, így a stdin nem
+oszlik meg a monitor és a vendég között. A várt kimenet: a konzolon
+megjelenik az <code>UART ready</code> üzenet, majd a beírt karakterek
+visszaíródnak (echo). Mivel a QEMU emuláció nem valós idejű, a beírt
+karakterek megjelenési sorrendje és késleltetése eltérhet a fizikai
+hardveren tapasztalttól; ez nem hiba, hanem az emuláció jellemzője.</p>
+<h3 data-number="19.2.5" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">19.2.5</span> Tipikus hibák és
+ellenpróbák</h3>
+<table>
+<colgroup>
+<col style="width: 17%" />
+<col style="width: 27%" />
+<col style="width: 32%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Tünet</th>
+<th>Hipotézis</th>
+<th>Adatgyűjtés</th>
+<th>Javítás</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Az első karakter után több nem érkezik</td>
+<td>A <code>DATA</code>-t nem olvassuk ki, ezért a
+<code>STATE.RXFULL</code> 1 marad, és a periféria a további bájtokat nem
+fogadja (overrun)</td>
+<td>GDB-vel az ISR után nézzük meg a <code>STATE</code> értékét: ha
+<code>RXFULL</code> 1, ez a hiba</td>
+<td>Az ISR-ben mindenképpen olvassuk ki a <code>DATA</code> regisztert,
+még akkor is, ha a bájtot eldobjuk</td>
+</tr>
+<tr>
+<td>Az ISR azonnal, folytonosan újra belép (megszakítási vihar)</td>
+<td>A <code>DATA</code> olvasása csak a <code>STATE.RXFULL</code>-t
+törli; az <code>INTSTATUS.RXINT</code> jelző „latched”, write-1-to-clear
+nélkül megmarad</td>
+<td>GDB-vel az ISR-ből visszatérés után nézzük meg az
+<code>INTSTATUS</code> értékét: ha <code>RXINT</code> még 1, ez a
+hiba</td>
+<td>Írjunk explicit 1-et az <code>INTSTATUS</code> megfelelő bitjébe az
+ISR-ben, <strong>a <code>DATA</code> kiolvasása előtt</strong>, ahogy a
+driver teszi</td>
+</tr>
+<tr>
+<td>Gyorsan egymás után érkező bájtoknál a vétel elakad, egy bájt
+beragad</td>
+<td>A nyugtázás a <code>DATA</code> olvasása <strong>után</strong> áll:
+a két művelet között érkező új bájt <code>RXINT</code>-jét a késői W1C
+letörli, a bájt <code>RXFULL = 1</code> mellett, megszakítás nélkül
+marad a regiszterben</td>
+<td><code>STATE</code> és <code>INTSTATUS</code> az elakadáskor:
+<code>RXFULL = 1</code>, <code>RXINT = 0</code></td>
+<td>A sorrend cseréje: előbb W1C, utána <code>DATA</code>-olvasás</td>
+</tr>
+<tr>
+<td>A beírt karakterek egyáltalán nem jelennek meg</td>
+<td>A vételi megszakítás nincs engedélyezve (<code>RXIE</code>
+hiányzik), vagy az NVIC-ben nem engedélyeztük az IRQ-t</td>
+<td>Ellenőrizzük a <code>CTRL</code> és az NVIC <code>ISER</code>
+regiszterét GDB-vel</td>
+<td>Állítsuk be a <code>RXIE</code> bitet, és hívjuk meg a
+<code>nvic_enable_irq(UART0_IRQn)</code>-t</td>
+</tr>
+<tr>
+<td>A ring buffer tartalma „elavult”, a fő ciklus nem látja a friss
+adatot</td>
+<td>A <code>rx_head</code> vagy <code>rx_tail</code> változó nem
+<code>volatile</code>, a fordító optimalizálja</td>
+<td>Fordítsuk <code>-O0</code>-val: ha a hiba eltűnik, és
+<code>-O2</code>-vel visszatér, valószínűleg hiányzó
+<code>volatile</code> az ok; igazolás <code>objdump</code>-dal (a
+ciklusban van-e <code>ldr</code>)</td>
+<td>Tegyük <code>volatile</code>-vá a ring buffer indexeit és a
+puffert</td>
+</tr>
+<tr>
+<td>A beírt karakterek minden második esetben jelennek meg</td>
+<td>Az ISR-ben a <code>DATA</code> regisztert kétszer olvassuk (pl. a
+<code>STATE</code> ellenőrzése után is), vagy a <code>rx_head</code>
+növelése hibás</td>
+<td>Szúrjunk be egy számlálót az ISR-be, és figyeljük a
+<code>rx_head</code> értékét</td>
+<td>Egyszer olvassuk a <code>DATA</code>-t, és a <code>rx_head</code>
+növelését egyetlen atomi műveletsorként végezzük</td>
+</tr>
+<tr>
+<td>A QEMU nem indítja el a firmware-t, vagy hibás címen áll meg</td>
+<td>A linker script memóriatérképe nem egyezik a QEMU machine memory
+mapjével</td>
+<td>Ellenőrizzük a <code>readelf -S lab-uart.elf</code> kimenetét, és
+indítsuk a QEMU-t <code>-S -gdb tcp::3333</code>-mal; GDB-ben
+<code>info registers pc sp</code> és <code>x/2xw 0</code></td>
+<td>Igazítsuk a linker scriptet az MPS2 AN385 flash/RAM
+tartományához</td>
+</tr>
+</tbody>
+</table>
+<p>A <strong>sorrend</strong> a perifériától függő eseményprotokoll
+része, nem általános szabály. A CMSDK UART-nál az <code>RXINT</code> a
+bájt érkezésekor beáll, és csak W1C törli; a <code>DATA</code> olvasása
+az <code>RXFULL</code>-t törli, és ezzel engedi a következő bájt
+fogadását. Ha a driver előbb nyugtáz, majd olvas, egy közben érkező bájt
+újra beállítja az <code>RXINT</code>-et, és új megszakítást kér.
+Fordított sorrendnél a <code>DATA</code> olvasása után, de a W1C előtt
+érkező bájt jelzését a W1C letörli: a bájt bent ragad, és mivel
+<code>RXFULL = 1</code>, további bájt sem érkezik. A helyettesítő
+eszközlánccal (<code>tools/cm-run.py</code>, sűrűn érkező
+<code>ABCDEFGH</code> bemenettel) ez kimutatható. A lektor mérése
+szerint (GNU + QEMU 8.2.2) a helyes sorrenddel 36 sűrűn érkező bájt
+mindegyike visszaíródik, a felcserélt sorrenddel viszont csak az első
+bájt (<code>A</code>) jön vissza, utána a vétel elakad; ritkán érkező
+bájtoknál a két változat nem különbözött.</p>
+<figure id="fig-a076-ack-sorrend">
+<div class="fig-interactive"><iframe src="figures/html/a076-ack-sorrend.html" title="A helyes sorrendben a második bájt új megszakítást kér; a felcserélt sorrendben a W1C a második bájt jelzését is törli, és a vétel RXFULL=1, RXINT=0 állapotban elakad." loading="lazy" style="width:100%;border:0;height:640px"></iframe><noscript><img src="figures/img/a076-ack-sorrend.png" style="width:95.0%"
+alt="A helyes sorrendben a második bájt új megszakítást kér; a felcserélt sorrendben a W1C a második bájt jelzését is törli, és a vétel RXFULL=1, RXINT=0 állapotban elakad." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/a076-ack-sorrend.png" style="width:95.0%"
+alt="A helyes sorrendben a második bájt új megszakítást kér; a felcserélt sorrendben a W1C a második bájt jelzését is törli, és a vétel RXFULL=1, RXINT=0 állapotban elakad." /></details></div>
+<figcaption>UART RX nyugtázási sorrend: W1C → DATA (helyes) és DATA →
+W1C (elakad); a B bájt a két ISR-utasítás között áll készen
+(állapotgép-modell)</figcaption>
+</figure>
+<p>A felcserélt sorrend futtatható ellenpróbája:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> lab-uart.c lab-uart-swapped.c</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="op">&gt;</span> swap.sed <span class="op">&lt;&lt;&#39;EOF&#39;</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="st">s|UART0-&gt;INTSTATUS = UART_INTSTATUS_RXINT;|@@RXINT@@|</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="st">s|char c = (char)(UART0-&gt;DATA \&amp; 0xFF);.*|UART0-&gt;INTSTATUS = UART_INTSTATUS_RXINT;|</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="st">s|@@RXINT@@|char c = (char)(UART0-&gt;DATA \&amp; 0xFF);|</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="op">EOF</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sed</span> <span class="at">-i</span> <span class="at">-f</span> swap.sed lab-uart-swapped.c</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="ex">arm-none-eabi-gcc</span> <span class="at">-mcpu</span><span class="op">=</span>cortex-m3 <span class="at">-mthumb</span> <span class="at">-ffreestanding</span> <span class="at">-nostdlib</span> <span class="at">-O1</span> <span class="dt">\</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">-T</span> lab-mps2.ld <span class="at">-o</span> lab-uart-swapped.elf <span class="dt">\</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>  lab-a076-startup.s lab-uart-swapped.c lab-main.c</span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="kw">(</span><span class="fu">sleep</span> 1<span class="kw">;</span> <span class="bu">printf</span> <span class="st">&#39;ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789&#39;</span><span class="kw">;</span> <span class="fu">sleep</span> 1<span class="kw">)</span> <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>  <span class="fu">timeout</span> 4 qemu-system-arm <span class="at">-machine</span> mps2-an385 <span class="at">-cpu</span> cortex-m3 <span class="dt">\</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>  <span class="at">-display</span> none <span class="at">-monitor</span> none <span class="at">-serial</span> stdio <span class="at">-kernel</span> lab-uart-swapped.elf</span></code></pre></div>
+<p>A lektor mérése szerint a kimenet ekkor <code>UART ready</code>, majd
+csak <code>A</code>; a helyes sorrendű változattal mind a 36 bájt
+visszaíródik. A timer más eset: ott nincs kiolvasandó adat, a törlésnek
+csak a visszatérés előtt kell megtörténnie (<a href="a070.html">ISR
+írása: C és assembly vegyesen</a>).</p>
+<h3 data-number="19.2.6" id="feladatok"><span
+class="header-section-number">19.2.6</span> Feladatok</h3>
+<p><strong>1. (magyarázó, alapszint — cél: megértés-ellenőrzés)</strong>
+Ismertesd a CMSDK UART <code>STATE</code> és <code>INTSTATUS</code>
+regisztereinek bitjeit! Magyarázd el, hogyan törlődik az RX és a TX
+megszakítás, és miért nem elegendő az <code>INTSTATUS</code> regiszter
+olvasása a megszakítás törléséhez!</p>
+<p><strong>2. (implementációs, középszint — cél: ring buffer és
+overrun-számlálás)</strong> Egészítsd ki a ring buffert egy
+<code>volatile uint32_t rx_dropped</code> számlálóval, amely a
+<strong>szoftveres ringbe nem fért, már kiolvasott</strong> bájtokat
+számolja! Ez nem teljes végponti veszteségszám: a hardveres overrun (a
+<code>DATA</code> időben ki nem olvasása miatt elvesző bájt,
+<code>STATE.RXOVERRUN</code>) külön eseményként jelentendő (és W1C-vel
+törlendő), mert azt a szoftveres számláló nem látja; teljes
+veszteségszámhoz a protokollnak sorszámot kell hordoznia. Készíts egy
+<code>uart_get_dropped(void)</code> és egy
+<code>uart_get_hw_overrun(void)</code> függvényt, és külön teszteld a
+ring-full és a periféria-overrun esetet! Ügyelj arra, hogy a számláló
+írása az ISR-ben, olvasása a fő ciklusban történik, és a 32 bites
+írás/olvasás atomi a Cortex-M3-on.</p>
+<p><strong>3. (hibakeresési/mérési, középszint — cél: determinisztikus
+hiba és ellenpróba)</strong> A <code>lab-main.c</code> alábbi hibás
+változatában a fő ciklus a <code>uart_getc()</code>-et kétszer hívja:
+<code>if (uart_getc() &gt;= 0) uart_putc(uart_getc());</code>. Emiatt
+minden iteráció két bájtot fogyaszt: üres pufferre a második hívás −1-et
+ad, és a <code>uart_putc</code> 0xFF-et küld. Azonosítsd a hibát,
+készíts ellenpróbát (számláló az ISR-ben és a visszaírt karakterek
+számlálója a fő ciklusban), javítsd a kódot, és QEMU-ban mérd meg a
+javított és a hibás változat különbségét!</p>
+<h3 data-number="19.2.7" id="megoldások"><span
+class="header-section-number">19.2.7</span> Megoldások</h3>
+<p><strong>1. megoldás — Segítség.</strong> Gondold végig, melyik
+regiszter melyik állapotot tükrözi, és melyik művelet (olvasás vagy
+írás) törli a jelzőt. Külön figyelj a <code>STATE</code> és az
+<code>INTSTATUS</code> szerepére.</p>
+<p><strong>1. megoldás — Teljes megoldás.</strong> A <code>STATE</code>
+regiszter bit 0 a <code>TXFULL</code>, bit 1 az <code>RXFULL</code>. Az
+<code>INTSTATUS</code> bit 0 a <code>TXINT</code>, bit 1 az
+<code>RXINT</code>. Az <code>RXINT</code> akkor áll be (latch-elt),
+amikor egy bájt beérkezik és <code>RXIE</code> = 1; az
+<code>RXFULL</code> ettől független pufferállapot. A <code>DATA</code>
+regiszter olvasása törli a <code>STATE.RXFULL</code>-t, és ezzel engedi
+a következő bájt fogadását — de az <code>INTSTATUS.RXINT</code> jelző
+ettől önállóan, “latched” módon megmarad, mert az <code>INTSTATUS</code>
+<strong>puszta olvasása</strong> csak visszajelzi az állapotot, nem
+módosítja azt. A már bekövetkezett <code>RXINT</code>-et (és
+<code>TXINT</code>-et) ezért külön, <strong>write-1-to-clear</strong>
+móddal kell törölni: 1-et kell írni az <code>INTSTATUS</code> megfelelő
+bitjébe. A TX megszakítás latched: akkor áll be, amikor egy bájt
+elküldése után a puffer kiürül, és a <code>TXIE</code> engedélyezett;
+üres pufferrel a <code>TXIE</code> önmagában nem kér megszakítást. A
+<code>TXFULL</code>-t a hardver tényleges adatküldése törli, nem a
+<code>DATA</code>-ba írás — a <code>DATA</code> írása feltölti a
+puffert, és ettől a <code>TXFULL</code> jellemzően beáll. A
+<code>TXINT</code> jelzőt emellett ugyanúgy explicit kell törölni az
+<code>INTSTATUS</code>-ba írt 1-gyel. Ha ez elmarad, az NVIC a
+megszakítást pendingnek látja, és az ISR azonnal újra belép —
+megszakítási vihart okozva.</p>
+<p><strong>2. megoldás — Segítség.</strong> A ring buffer telítettségét
+a <code>next == rx_tail</code> feltétel jelzi, a hardveres overrun pedig
+a <code>STATE.RXOVERRUN</code> bitjéhez kapcsolódik. A számláló 32
+bites, ezért a Cortex-M3 egyetlen <code>LDR</code>/<code>STR</code>
+utasítással atomian éri el.</p>
+<p><strong>2. megoldás — Teljes megoldás.</strong></p>
+<div class="sourceCode" id="cb9"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">// lab-uart.c kiegészítés</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">volatile</span> <span class="dt">uint32_t</span> rx_dropped <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">volatile</span> <span class="dt">uint32_t</span> rx_hw_overrun <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> UART0_Handler<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> status <span class="op">=</span> UART0<span class="op">-&gt;</span>INTSTATUS<span class="op">;</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>status <span class="op">&amp;</span> UART_INTSTATUS_RXINT<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>        UART0<span class="op">-&gt;</span>INTSTATUS <span class="op">=</span> UART_INTSTATUS_RXINT<span class="op">;</span> <span class="co">// write-1-to-clear</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>        <span class="dt">char</span> c <span class="op">=</span> <span class="op">(</span><span class="dt">char</span><span class="op">)(</span>UART0<span class="op">-&gt;</span>DATA <span class="op">&amp;</span> <span class="bn">0xFF</span><span class="op">);</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>        <span class="dt">uint32_t</span> next <span class="op">=</span> <span class="op">(</span>rx_head <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">&amp;</span> <span class="op">(</span>RX_BUF_SIZE <span class="op">-</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>next <span class="op">!=</span> rx_tail<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>            rx_buf<span class="op">[</span>rx_head<span class="op">]</span> <span class="op">=</span> c<span class="op">;</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>            rx_head <span class="op">=</span> next<span class="op">;</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a>            rx_dropped<span class="op">++;</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>UART0<span class="op">-&gt;</span>STATE <span class="op">&amp;</span> <span class="op">(</span><span class="dv">1</span><span class="bu">u</span> <span class="op">&lt;&lt;</span> <span class="dv">3</span><span class="op">))</span> <span class="op">{</span>        <span class="co">/* RXOVERRUN, lekérdezéssel */</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a>        UART0<span class="op">-&gt;</span>STATE <span class="op">=</span> <span class="dv">1</span><span class="bu">u</span> <span class="op">&lt;&lt;</span> <span class="dv">3</span><span class="op">;</span>            <span class="co">/* W1C */</span></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a>        rx_hw_overrun<span class="op">++;</span></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ...</span></span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a><span class="dt">uint32_t</span> uart_get_dropped<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-26"><a href="#cb9-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> rx_dropped<span class="op">;</span></span>
+<span id="cb9-27"><a href="#cb9-27" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb9-28"><a href="#cb9-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-29"><a href="#cb9-29" aria-hidden="true" tabindex="-1"></a><span class="dt">uint32_t</span> uart_get_hw_overrun<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-30"><a href="#cb9-30" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> rx_hw_overrun<span class="op">;</span></span>
+<span id="cb9-31"><a href="#cb9-31" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>rx_dropped</code> 32 bites, aligned változó; a Cortex-M3
+egyetlen <code>LDR</code>/<code>STR</code> utasítással éri el, ezért az
+írás és olvasás atomi. Nem kell kritikus szakasz. A hardveres overrun a
+fenti kódban lekérdezéssel (RXORIE nélkül) kezelt, az RX-blokkon kívül.
+Ha megszakítással kezelnénk: <code>CTRL.RXORIE</code> (bit5) és külön
+<code>UARTOVF_Handler</code> kell az összevont túlcsordulási vonalon
+(IRQ12, vektorindex 16 + 12 = 28,
+<code>NVIC_ISER0 = 1u &lt;&lt; 12</code>), benne
+<code>INTSTATUS = 1u &lt;&lt; 3</code> és
+<code>STATE = 1u &lt;&lt; 3</code> W1C (az IRQ-hozzárendelés
+<strong>ellenőrizendő</strong>; a 17.3 1. feladata IRQ12-t nevezi így).
+Ring-full teszt: a főciklus az első 100 ms-ban ne olvasson, közben 100
+bájt érkezik csövön át; a várt <code>rx_dropped</code> = 100 − 63 = 37.
+Hardveres overrun QEMU-n nem idézhető elő, mert a modell nem fogad új
+bájtot, amíg az <code>RXFULL</code> be van állítva.</p>
+<p><strong>3. megoldás — Segítség.</strong> A hiba a
+<code>uart_getc()</code> kétszeri hívásában van; gondold végig, melyik
+hívás melyik bájtot fogyasztja el, és hogyan lehet egyetlen olvasással
+helyettesíteni.</p>
+<p><strong>3. megoldás — Teljes megoldás.</strong> A hiba
+determinisztikus: az <code>if (uart_getc() &gt;= 0)</code> feltétel
+kiértékelése már kiolvassa és eldobja az első karaktert, majd a
+<code>uart_putc(uart_getc())</code> a <em>következő</em> karaktert
+olvassa ki és küldi vissza. A kimenet a bemenet ütemezésétől függ: ha a
+második <code>uart_getc()</code> hívásakor a puffer üres, −1-et kap, és
+a <code>uart_putc</code> 0xFF-et küld; bájtonként érkező bemenetnél így
+egyetlen beírt karakter sem jön vissza, csak 0xFF-ek. Ha két bájt már a
+pufferben van, a második jön vissza. Ellenpróba: az ISR növel egy
+<code>rx_events</code> számlálót, a fő ciklus <code>tx_chars</code>
+számlálót (csak a 0..255 közötti visszaküldött értékekre) és
+<code>tx_ff</code> számlálót a −1-ből lett küldésekre; a hibásban
+<code>tx_chars &lt; rx_events</code> és <code>tx_ff &gt; 0</code>
+(bájtonként érkező bemenetnél <code>tx_chars == 0</code>), a javítottban
+<code>tx_chars == rx_events</code>, <code>tx_ff == 0</code>. A javítás:
+egyetlen olvasás, eltárolt értékkel:</p>
+<div class="sourceCode" id="cb10"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> c <span class="op">=</span> uart_getc<span class="op">();</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>c <span class="op">&gt;=</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>    uart_putc<span class="op">((</span><span class="dt">uint8_t</span><span class="op">)</span>c<span class="op">);</span></span></code></pre></div>
+<p>A tényleges arány a QEMU-beli érkezési időzítéstől függ, ezért itt
+nem közlünk mért arányt; a számlálók GDB-vel nézhetők:
+<code>p rx_events</code>, <code>p tx_chars</code>,
+<code>p tx_ff</code>.</p>
+<h3 data-number="19.2.8" id="rövid-összefoglaló"><span
+class="header-section-number">19.2.8</span> Rövid összefoglaló</h3>
+<p><strong>Mi vihető át más Cortex-M UART-ra?</strong> Átvihető a
+<em>módszer</em>: szerződésből induló MMIO-driver, egyírós/egyolvasós
+(SPSC) ring buffer és ISR, az ISR rövidsége. A CMSDK-specifikus
+állítások (regiszterek címei és bitmezői, a
+<code>STATE</code>/<code>INTSTATUS</code> szemantika, az ACK-sorrend, a
+BAUDDIV-minimum) portoláskor újra ellenőrizendők a célperiféria
+dokumentációjából. Portolási lista: (1) regisztertérkép és
+hozzáférés-típusok, (2) az interrupt-forrás jellege (szint vagy latch)
+és a nyugtázás sorrendje, (3) a baudosztó képlete és tartománya, (4) az
+IRQ-szám és a prioritás, (5) az overrun-jelzés helye. Az UART driver
+inicializálása a <code>CTRL</code>, <code>BAUDDIV</code> és
+<code>INTSTATUS</code> regiszterek konfigurációjából áll. A vételi
+megszakítás kezelése az ISR-ben két lépés, ebben a sorrendben: előbb az
+<code>INTSTATUS</code> RX bitjének W1C-törlése (enélkül megszakítási
+vihar), utána a <code>DATA</code> olvasása (enélkül az
+<code>RXFULL</code> 1 marad, és a periféria több bájtot nem fogad). A
+karaktert ezután egy körkörös pufferbe írjuk. A ring bufferben az ISR
+előbb a puffert írja, és csak utána lépteti a <code>head</code>-et; a
+főciklus előbb olvas, és csak utána lépteti a <code>tail</code>-t.
+Mindkét index <code>volatile</code>, 32 bites, egy író – így nincs
+szükség kritikus szakaszra. A küldés polling-alapú egyszerűsítéssel
+történik. Más platformra portolva a címeket és az IRQ-számot a
+célplatform dokumentációjából kell venni.</p>
+<p><strong>Továbbhasznált definíciók:</strong></p>
+<ul>
+<li><strong>UART:</strong> univerzális aszinkron adó-vevő, memóriába
+leképezett periféria.</li>
+<li><strong>ring buffer:</strong> fix méretű körkörös puffer
+<code>head</code> és <code>tail</code> indexszel.</li>
+<li><strong>ISR:</strong> hardveresen meghívott megszakításkezelő rutin,
+amely az eseményt törli és feldolgozza.</li>
+</ul>
+<h3 data-number="19.2.9" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">19.2.9</span> Források és ellenőrzési
+hiányok</h3>
+<p>Az alábbiak <strong>dokumentációs kiindulópontok</strong>
+(forrásállapot: lásd az <a href="guide.html#a000">Olvasói útmutató</a>
+tábláját):</p>
+<ul>
+<li><a href="https://developer.arm.com/documentation/ddi0403/">Armv7-M
+Architecture Reference Manual, DDI0403E</a> — a kivételmodell, az NVIC
+és a memóriába leképezett perifériák általános szerződése.</li>
+<li><a
+href="https://developer.arm.com/architectures/cpu-architecture/m-profile/docs">Arm
+M-profile architektúra dokumentáció</a> — az NVIC prioritáskezelése, a
+megszakítások engedélyezése.</li>
+<li><a href="https://www.qemu.org/docs/master/">QEMU System
+Emulation</a> — a <code>mps2-an385</code> machine és a CMSDK perifériák
+memóriatérképe; a <code>-nographic</code> és <code>-kernel</code>
+kapcsolók viselkedése.</li>
+<li>Arm Cortex-M System Design Kit Technical Reference Manual (DDI0479),
+APB UART fejezet — a <code>DATA</code>, <code>STATE</code>,
+<code>CTRL</code>, <code>INTSTATUS</code>, <code>BAUDDIV</code>
+regiszterek bitmezői és a baud osztó képlete.</li>
+</ul>
+<p>A laborkönyvtár összeállítását a helyettesítő eszközlánccal (Clang +
+<code>ld.lld</code>) ellenőriztük: egy üres könyvtárban, kizárólag a <a
+href="a064.html">Vektortábla</a>, a <a href="a065.html">Linker script
+alapjai</a>, a <a href="a066.html">Startup kód</a> és ennek az
+alfejezetnek a fájljaiból, a fenti
+<code>cp</code>/<code>cat</code>/<code>sed</code> lépésekkel a labor
+fordul és linkelődik, és a <code>lab-check-vectors.py</code> a Reset- és
+a használt IRQ-bejegyzést is a várt szimbólumra mutatónak találja. A
+<code>tools/cm-run.py</code> UART0-modelljében
+(<code>--uart-stdin</code>) a program kiírta az <code>UART ready</code>
+sort, és a bemenetet visszaírta. <strong>Mérési állapot:</strong> a
+lektor mérése szerint (GNU + QEMU 8.2.2) a könyv
+<code>cp</code>/<code>cat</code>/<code>sed</code>/<code>echo</code>
+lépéseivel a labor fordul, a
+<code>lab-check-vectors.py … 16=UART0_Handler</code> minden sora OK, a
+UART0 <code>0x40004000</code> báziscíme és az IRQ0 a fő úton igazolt
+(vektorellenőrzés + echo), és a 36 bájtos sűrű bemenet mind a 36 bájtja
+visszaíródik. A <code>BAUDDIV</code> képlete és az UARTCLK frekvenciája
+a QEMU <code>mps2-an385</code> modelljére érvényes, más QEMU-verzión
+<code>info mtree</code>-vel ellenőrizendő.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="a075.html">← 19.1 Polling versus interrupt-vezérelt I/O</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="a077.html">19.3 Timer-alapú időzítés és periodikus feladatok →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

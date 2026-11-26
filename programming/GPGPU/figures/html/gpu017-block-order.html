@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blokksorrend: spinlock-holtpont és atomi egyesítés</title>
+<style>
+:root{--fg:#111;--bg:#fff;--muted:#666;--hl:#1f4e79;--hl2:#c55a11;--cell:#fff;--cellhl:#d9d9d9;--line:#000;--code:#f3f3f3}
+@media (prefers-color-scheme:dark){:root{--fg:#eee;--bg:#1b1b1b;--muted:#aaa;--hl:#8fb8e8;--hl2:#f0a060;--cell:#262626;--cellhl:#4a4a4a;--line:#ddd;--code:#2a2a2a}}
+*{box-sizing:border-box}
+body{margin:0;padding:10px;font:14px/1.45 system-ui,sans-serif;color:var(--fg);background:var(--bg)}
+.ctl{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:6px}
+button{font:inherit;padding:3px 10px;cursor:pointer}
+input[type=range]{flex:1;min-width:120px}
+#status{margin:4px 0 6px;min-height:2.9em}
+/* A pszeudokód a rajz ALATT, teljes szélességben (hosszú sorok ne görgessenek oldalra) */
+.wrap{display:flex;flex-direction:column;gap:10px;align-items:stretch}
+svg{width:100%;height:auto;display:block}
+pre#code{width:100%;margin:0;padding:6px 8px;background:var(--code);font:12.5px/1.5 ui-monospace,monospace;white-space:pre;overflow-x:auto}
+pre#code span{display:block;padding:0 4px}
+pre#code span.on{outline:2px solid var(--hl);font-weight:bold}
+svg text:not([fill]){fill:var(--fg);}
+svg text{font-family:system-ui,sans-serif}
+.small{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="ctl" role="group" aria-label="Lejátszás vezérlői">
+  <button id="first" title="Első lépés">⏮</button>
+  <button id="prev" title="Előző lépés">◀ Lépés</button>
+  <button id="play" title="Lejátszás / szünet">▶ Lejátszás</button>
+  <button id="next" title="Következő lépés">Lépés ▶</button>
+  <input id="pos" type="range" min="0" max="0" value="0" aria-label="Lépés kiválasztása">
+  <span id="cnt" class="small"></span>
+</div>
+<div class="ctl"><label>mód <select id="mode"><option value="spin" selected>spinlock (bad_ordered_kernel)</option><option value="good">helyes minta (atomicAdd)</option></select></label><label>ütemezési sorrend <select id="ord"><option value="asc">növekvő</option><option value="desc" selected>csökkenő</option><option value="rnd">véletlen</option></select></label><label>mag <input type="number" id="seed" value="1" min="0" max="9999" style="width:5em"></label><label>rezidens helyek <input type="range" id="slots" min="1" max="8" value="4" style="width:110px"></label><span id="ordv" class="small" aria-live="polite">sorrend: 5, 4, 3, 2, 1, 0</span><svg width="0" height="0" style="position:absolute"><defs><pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" stroke="currentColor" stroke-width="1.5"/></pattern></defs></svg></div>
+<div id="status" aria-live="polite"></div>
+<div class="wrap">
+  <svg id="v" viewBox="0 0 560 300" role="img" aria-label="Csökkenő ütemezésnél a négy rezidens hely mind várakozó blokkal telik meg, a 0. blokk nem indulhat; a helyes mintában a blokkok bármely sorrendje 210-et ad"></svg>
+  <pre id="code" aria-label="Pszeudokód"></pre>
+</div>
+<p class="small">Játékmodell: rezidens helyek száma állítható (alapérték 2 SM × 2 hely), grid = 6. Valós GPU-n több SM és rezidens hely van, de ugyanez a mechanizmus: nem rezidens blokkra nincs forward progress.</p>
+<script>
+// ---- Adat: lépések (a Python-szkript számolja ki és illeszti be, a könyv példájával egyezően) ----
+// Minden lépés: {msg: "állapotsor szövege", line: kiemelt pszeudokódsor indexe vagy -1, ...saját mezők}
+let STEPS = [{"msg": "az 5. blokk rezidens lesz. rezidens: {5}, várakozik: {5}, sorban: {4, 3, 2, 1, 0}, flags: 000000", "line": 2, "res": [5], "wait": [5], "queue": [4, 3, 2, 1, 0], "flags": [0, 0, 0, 0, 0, 0], "dead": false, "mode": "spin"}, {"msg": "a 4. blokk rezidens lesz. rezidens: {5, 4}, várakozik: {5, 4}, sorban: {3, 2, 1, 0}, flags: 000000", "line": 2, "res": [5, 4], "wait": [5, 4], "queue": [3, 2, 1, 0], "flags": [0, 0, 0, 0, 0, 0], "dead": false, "mode": "spin"}, {"msg": "a 3. blokk rezidens lesz. rezidens: {5, 4, 3}, várakozik: {5, 4, 3}, sorban: {2, 1, 0}, flags: 000000", "line": 2, "res": [5, 4, 3], "wait": [5, 4, 3], "queue": [2, 1, 0], "flags": [0, 0, 0, 0, 0, 0], "dead": false, "mode": "spin"}, {"msg": "a 2. blokk rezidens lesz. rezidens: {5, 4, 3, 2}, várakozik: {5, 4, 3, 2}, sorban: {1, 0}, flags: 000000", "line": 2, "res": [5, 4, 3, 2], "wait": [5, 4, 3, 2], "queue": [1, 0], "flags": [0, 0, 0, 0, 0, 0], "dead": false, "mode": "spin"}, {"msg": "HOLTPONT: minden rezidens blokk a flags[bid-1]-re vár, a szükséges blokk nem kap helyet (nincs forward progress a nem rezidens blokkokra). rezidens: {5, 4, 3, 2}, várakozik: {5, 4, 3, 2}, sorban: {1, 0}, flags: 000000", "line": 4, "res": [5, 4, 3, 2], "wait": [5, 4, 3, 2], "queue": [1, 0], "flags": [0, 0, 0, 0, 0, 0], "dead": true, "mode": "spin"}];
+const CODE = ["// bad_ordered_kernel (HIBÁS, sorrendfüggő)", "int bid = blockIdx.x;", "if (bid > 0) {", "    while (atomicAdd(&flags[bid - 1], 0) == 0) { }   // spin", "    // HOLTPONT, ha bid-1 nem rezidens", "}", "// a blokk munkája", "data[bid] = bid * bid;", "__threadfence();", "", "atomicExch(&flags[bid], 1);", "", "// sum_of_squares_kernel (HELYES, sorrendfüggetlen)", "sdata[tid] = local_sum; __syncthreads();", "for (s = blockDim.x / 2; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid + s]; __syncthreads(); }", "", "", "if (tid == 0) atomicAdd(result, sdata[0]);"];          // pszeudokód sorai (üres lista: a panel elrejtve)
+
+// ---- Rajzolás: ezt a függvényt kell az ábrához igazítani ----
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, text){const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);if(text!==undefined)e.textContent=text;svg.appendChild(e);return e;}
+const svg = document.getElementById("v");
+function css(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim();}
+function render(s){
+  // Példa: tömb cellákként, s.a = értékek, s.hl = kiemelt indexek
+  svg.innerHTML = "";
+  const a = s.a || [], w = 48, x0 = (560 - a.length * w) / 2, y0 = 110;
+  a.forEach((v, i) => {
+    const on = (s.hl || []).includes(i);
+    el("rect", {x: x0 + i * w, y: y0, width: w, height: w, fill: on ? css("--cellhl") : css("--cell"), stroke: css("--line"), "stroke-width": on ? 3 : 1.2});
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w / 2 + 6, "text-anchor": "middle", "font-size": 18}, String(v));
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w + 18, "text-anchor": "middle", "font-size": 12, fill: css("--muted")}, String(i));
+  });
+}
+
+const VALS = {"0": [1, 2, 1, 2, 1, 1, 1, 1], "1": [2, 4, 2, 4, 2, 2, 2, 2], "2": [3, 6, 3, 6, 3, 3, 3, 3], "3": [4, 8, 4, 8, 4, 4, 4, 4], "4": [5, 10, 5, 10, 5, 5, 5, 5], "5": [6, 12, 6, 12, 6, 6, 6, 6]}, G = 6, az = b => (b === 1 || b === 5 ? "az " : "a ");
+function rng(seed){ let a = seed >>> 0; return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+function order(){
+  const o = document.getElementById("ord").value, base = [0,1,2,3,4,5];
+  if (o === "asc") return base; if (o === "desc") return base.slice().reverse();
+  const r = rng(+document.getElementById("seed").value), a = base.slice();
+  for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
+  return a;
+}
+function stat(s){ return s.msg + ". rezidens: {" + s.res.join(", ") + "}, várakozik: {" + s.wait.join(", ") + "}, sorban: {" + s.queue.join(", ") + "}, flags: " + s.flags.join(""); }
+function spinJS(ord, slots){
+  const queue = ord.slice(), res = [], flags = new Array(G).fill(0), st = [];
+  const snap = (msg, line) => { const wait = res.filter(b => b > 0 && !flags[b - 1]); const s = {msg: msg, line: line, res: res.slice(), wait: wait, queue: queue.slice(), flags: flags.slice(), dead: false, mode: "spin"}; s.msg = stat(s); st.push(s); };
+  while (queue.length || res.length) {
+    while (queue.length && res.length < slots) { const b = queue.shift(); res.push(b); snap(az(b) + b + ". blokk rezidens lesz", b > 0 ? 2 : 7); }
+    const ready = res.filter(b => b === 0 || flags[b - 1]);
+    if (!ready.length) { const l = st[st.length - 1]; const s = Object.assign({}, l, {dead: true, line: 4, msg: "HOLTPONT: minden rezidens blokk a flags[bid-1]-re vár, a szükséges blokk nem kap helyet (nincs forward progress a nem rezidens blokkokra)"}); s.msg = stat(s); st.push(s); return st; }
+    const b = ready[0]; res.splice(res.indexOf(b), 1); flags[b] = 1;
+    snap(az(b) + b + ". blokk lefut: data[" + b + "] = " + (b * b) + ", flags[" + b + "] = 1, a helye felszabadul", 10);
+  }
+  st[st.length - 1].msg = st[st.length - 1].msg.replace(". rezidens", "; minden blokk lefutott. rezidens");
+  return st;
+}
+function goodJS(ord){
+  const st = []; let result = 0; const done = [];
+  ord.forEach(b => {
+    let cur = VALS[b].slice(); st.push({msg: az(b) + b + ". blokk: sdata betöltve (" + cur.join(", ") + ")", line: 13, block: b, sdata: cur.slice(), result: result, done: done.slice(), mode: "good"});
+    for (let s = 4; s > 0; s >>= 1) { cur = cur.map((v, i) => i < s ? cur[i] + cur[i + s] : null).slice(0, 8); for (let i = s; i < 8; i++) cur[i] = null; st.push({msg: az(b) + b + ". blokk: fa-redukció s = " + s, line: 14, block: b, sdata: cur.slice(), result: result, done: done.slice(), mode: "good"}); }
+    result += cur[0]; done.push(b);
+    st.push({msg: az(b) + b + ". blokk: atomicAdd(result, " + cur[0] + ") → result = " + result, line: 17, block: b, sdata: cur.slice(), result: result, done: done.slice(), mode: "good"});
+  });
+  st[st.length - 1].msg += " (minden sorrendben 210)";
+  return st;
+}
+function render(s){
+  svg.setAttribute("viewBox", "0 0 640 300");
+  svg.innerHTML = "";
+  if (s.mode === "spin") {
+    const slots = s.res.length > +document.getElementById("slots").value ? s.res.length : +document.getElementById("slots").value;
+    el("text", {x: 10, y: 22, "font-size": 13, "font-weight": "bold"}, "rezidens helyek (" + slots + ")");
+    for (let i = 0; i < slots; i++) {
+      const b = i < s.res.length ? s.res[i] : null, x = 10 + i * 76, waiting = b !== null && s.wait.includes(b);
+      el("rect", {x: x, y: 34, width: 68, height: 68, rx: 6, fill: b === null ? css("--cell") : (waiting ? "url(#hatch)" : css("--hl")), stroke: css("--line"), "stroke-width": 1.5});
+      if (b !== null) { el("rect", {x: x + 20, y: 52, width: 28, height: 28, fill: css("--bg")}); el("text", {x: x + 34, y: 73, "text-anchor": "middle", "font-size": 18, "font-weight": "bold"}, String(b)); }
+      if (waiting) el("text", {x: x + 34, y: 118, "text-anchor": "middle", "font-size": 11}, "vár (spin)");
+    }
+    el("text", {x: 10, y: 150, "font-size": 13}, "sorban:");
+    s.queue.forEach((b, i) => { el("rect", {x: 80 + i * 44, y: 132, width: 36, height: 28, fill: "none", stroke: css("--line"), "stroke-dasharray": "4 3"}); el("text", {x: 98 + i * 44, y: 151, "text-anchor": "middle", "font-size": 13}, String(b)); });
+    el("text", {x: 10, y: 200, "font-size": 13}, "flags:");
+    s.flags.forEach((f, i) => { el("rect", {x: 80 + i * 44, y: 182, width: 30, height: 30, fill: f ? css("--fg") : css("--cell"), stroke: css("--line")}); el("text", {x: 95 + i * 44, y: 228, "text-anchor": "middle", "font-size": 11, fill: css("--muted")}, String(i)); });
+    if (s.dead) el("text", {x: 320, y: 280, "text-anchor": "middle", "font-size": 30, "font-weight": "bold"}, "HOLTPONT");
+    else if (!s.queue.length && !s.res.length) el("text", {x: 320, y: 280, "text-anchor": "middle", "font-size": 22, "font-weight": "bold"}, "minden blokk lefutott");
+  } else {
+    el("text", {x: 10, y: 22, "font-size": 13, "font-weight": "bold"}, az(s.block) + s.block + ". blokk sdata tömbje (8 szálas mini-blokk)");
+    s.sdata.forEach((v, i) => { el("rect", {x: 10 + i * 60, y: 34, width: 54, height: 40, fill: v === null ? css("--cell") : css("--cellhl"), stroke: css("--line"), "stroke-dasharray": v === null ? "3 3" : "none"}); el("text", {x: 37 + i * 60, y: 60, "text-anchor": "middle", "font-size": 15}, v === null ? "" : String(v)); });
+    el("text", {x: 10, y: 120, "font-size": 13}, "lefutott blokkok (sorrendben): " + (s.done.length ? s.done.join(", ") : "–"));
+    el("text", {x: 10, y: 170, "font-size": 22, "font-weight": "bold"}, "result = " + s.result);
+    el("text", {x: 10, y: 200, "font-size": 12, fill: css("--muted")}, "részösszegek blokkonként: 10, 20, 30, 40, 50, 60 → összesen 210, sorrendtől függetlenül");
+  }
+}
+function recompute(){
+  const o = order(); document.getElementById("ordv").textContent = "sorrend: " + o.join(", ");
+  setSteps(document.getElementById("mode").value === "spin" ? spinJS(o, +document.getElementById("slots").value) : goodJS(o));
+}
+["mode", "ord"].forEach(id => document.getElementById(id).addEventListener("change", recompute));
+["slots", "seed"].forEach(id => document.getElementById(id).addEventListener("input", recompute));
+
+
+// ---- Vezérlés (általában nem kell módosítani) ----
+let k = 0, timer = null;
+const pos = document.getElementById("pos"), status = document.getElementById("status");
+const codeEl = document.getElementById("code");
+if (!CODE.length) codeEl.style.display = "none";
+else codeEl.innerHTML = CODE.map((l, i) => `<span id="L${i}">${l.replace(/&/g,"&amp;").replace(/</g,"&lt;")}</span>`).join("");
+pos.max = STEPS.length - 1;
+// Új lépéssor betöltése (pl. saját bemenetből számolva): setSteps(lista)
+function setSteps(list){ stop(); STEPS = list; pos.max = STEPS.length - 1; show(0); }
+function show(i){
+  k = Math.max(0, Math.min(STEPS.length - 1, i));
+  const s = STEPS[k];
+  pos.value = k;
+  document.getElementById("cnt").textContent = `${k + 1}/${STEPS.length}`;
+  status.textContent = s.msg || "";
+  codeEl.querySelectorAll("span").forEach(x => x.classList.remove("on"));
+  if (s.line !== undefined && s.line >= 0) { const L = document.getElementById("L" + s.line); if (L) L.classList.add("on"); }
+  render(s);
+}
+function stop(){ if (timer) { clearInterval(timer); timer = null; } document.getElementById("play").textContent = "▶ Lejátszás"; }
+document.getElementById("first").onclick = () => { stop(); show(0); };
+document.getElementById("prev").onclick = () => { stop(); show(k - 1); };
+document.getElementById("next").onclick = () => { stop(); show(k + 1); };
+document.getElementById("play").onclick = () => {
+  if (timer) { stop(); return; }
+  if (k >= STEPS.length - 1) show(0);
+  document.getElementById("play").textContent = "⏸ Szünet";
+  timer = setInterval(() => { if (k >= STEPS.length - 1) stop(); else show(k + 1); }, 1000);
+};
+pos.oninput = () => { stop(); show(+pos.value); };
+document.addEventListener("keydown", e => { if (e.key === "ArrowRight") { stop(); show(k + 1); } if (e.key === "ArrowLeft") { stop(); show(k - 1); } });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => show(k));
+show(0);
+</script>
+<script>(function(){function s(){var b=document.body;parent.postMessage({figResize:Math.ceil(b.getBoundingClientRect().height)},"*")}addEventListener("load",s);addEventListener("resize",s);if(window.ResizeObserver)new ResizeObserver(s).observe(document.body);s()})()</script></body>
+</html>

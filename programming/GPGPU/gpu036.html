@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>10.3 Compute-sanitizer: memcheck és racecheck – GPGPU –
+általános célú számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. RÉSZ – CUDA programozási modell</a> › <a href="index.html#gpuch09">10 Hibakezelés, debugging és compute-sanitizer</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu035.html">← 10.2 cuda-gdb és kernel-debugging</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu037.html">10.4 Tipikus CUDA-hibák és megelőzésük →</a></div>
+</nav>
+<h2 data-number="10.3" id="gpu036"><span
+class="header-section-number">10.3</span> Compute-sanitizer: memcheck és
+racecheck</h2>
+<p>A compute-sanitizer az NVIDIA eszközkészletének egyik legfontosabb
+tagja a CUDA-alkalmazások futás közbeni memóriahibáinak és
+versenyhelyzeteinek feltárására. A hagyományos CPU-oldali
+memóriaellenőrző eszközökhöz képest a GPU-nál különösen nagy a
+jelentősége, mert a hibás globális memóriahozzáférések, a nem
+inicializált memóriaterületek és a szinkronizálatlan olvasások/írások
+gyakran nem vezetnek azonnali programleálláshoz. A CUDA hardver számos
+esetben nem ad hardveres kivételt egy túlindexelt globális
+memóriaolvasásnál, hanem csendben visszaad egy más memóriacím tartalmát,
+vagy egy out-of-bounds írás a szomszédos adatot rontja meg anélkül, hogy
+a hibát azonnal észlelnénk. A következmény gyakran csak később, egy
+másik kernelben vagy egy host-oldali feldolgozás során jelentkezik, ami
+a hibakeresést rendkívül megnehezíti.</p>
+<p>A <code>compute-sanitizer</code> ezt a problémát instrumentációval
+oldja meg: a futó kódot a futtatókörnyezetbe beépülve figyeli. Négy fő
+eszköze van, amelyeket a <code>--tool</code> kapcsolóval választunk:</p>
+<ul>
+<li><code>memcheck</code>: az érvénytelen (kívül eső vagy
+felszabadított) memóriahozzáféréseket, a hibás device pointer
+használatát és a memóriaszivárgást keresi;</li>
+<li><code>racecheck</code>: a <strong>shared memória</strong>
+adatversenyeit (hazardjait) detektálja;</li>
+<li><code>initcheck</code>: a <strong>nem inicializált globális
+memória</strong> olvasását jelzi;</li>
+<li><code>synccheck</code>: a szinkronizációs primitívek hibás
+használatát (például divergens <code>__syncthreads()</code>)
+keresi.</li>
+</ul>
+<p>A kimenetek formátuma és a pontos opciók verziófüggők; a könyv ezért
+nem ad „valódi” riportmintát, csak a hibák várt jellegét írja le, és
+minden ellenőrzéshez a használt toolkit
+<code>compute-sanitizer --help</code> kimenetét és a Compute Sanitizer
+User Manualt kell követni. A régi <code>cuda-memcheck</code> eszköz
+elavult, a CUDA 12 toolkitekben már nem szerepel; helyette a
+<code>compute-sanitizer --tool memcheck</code> használandó.</p>
+<p>A négy eszköz egymást kiegészíti, de külön-külön kell futtatni őket,
+mert egy futásban egyszerre egy eszköz aktív, és a kimenetek jellege
+eltérő. A fejezetben először a memchecket, majd a racechecket, az
+initchecket és a synccheck-et mutatjuk be, végül egy izolált laborban
+mindegyiket egy szándékosan hibás kernelen futtatjuk.</p>
+<p>A laborkódokban közös hibaellenőrző makrót használunk, amelyet egy
+<code>cuda_check.h</code> fejlécbe teszünk (a CUDA-hibakódokról szóló
+alfejezet makrójának egyszerűsített változata):</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// cuda_check.h</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#pragma once</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUDA_CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp">                                                     </span><span class="op">\</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                                                     </span><span class="op">\</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="dt">cudaError_t</span><span class="pp"> </span><span class="va">cuda_check_err_</span><span class="pp"> </span><span class="op">=</span><span class="pp"> </span><span class="op">(</span>call<span class="op">);</span><span class="pp">                                </span><span class="op">\</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span><span class="va">cuda_check_err_</span><span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                </span><span class="op">\</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="bu">std::</span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA error at </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp">      </span><span class="op">\</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="pp">                         </span><span class="ot">__LINE__</span><span class="op">,</span><span class="pp"> </span>cudaGetErrorString<span class="op">(</span><span class="va">cuda_check_err_</span><span class="op">));</span><span class="pp">     </span><span class="op">\</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="bu">std::</span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                         </span><span class="op">\</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="op">}</span><span class="pp">                                                                    </span><span class="op">\</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span></code></pre></div>
+<h3 data-number="10.3.1" id="a-memcheck-eszköz"><span
+class="header-section-number">10.3.1</span> A memcheck eszköz</h3>
+<p>A <code>memcheck</code> a leghasználtabb compute-sanitizer eszköz. A
+CUDA-rendszerben a globális memóriahozzáférések általában nem
+ellenőrzöttek: a hardver nem tudja minden tranzakciónál eldönteni, hogy
+az adott cím a lefoglalt memóriaterületen belül van-e. Ezért egy olyan
+kernel, amely egy vektor utolsó elemén túl ír, nem feltétlenül okoz
+azonnali hibát, hanem a memória egy másik részét rontja meg. A
+<code>memcheck</code> a device-oldali memóriaallokációkat és
+memóriahozzáféréseket instrumentálva megállapítja, hogy minden globális,
+shared és local memóriaolvasás/írás érvényes tartományon belül
+történik-e. A <code>memcheck</code> bármely, már lefordított binárison
+fut.</p>
+<p>A tipikus hibák, amelyeket a <code>memcheck</code> detektál:</p>
+<ul>
+<li><strong>Érvénytelen globális memóriaolvasás vagy -írás</strong>
+(<code>Invalid __global__ read/write</code>): a kernel olyan címre
+hivatkozik, amely nem tartozik a lefoglalt memóriaterülethez. Ennek
+leggyakoribb oka a túlindexelés: a szál indexe legfeljebb
+<code>n-1</code> lehet, de a kód <code>a[i+1]</code>-et ér el, amikor
+<code>i == n-1</code>.</li>
+<li><strong>Felszabadítás utáni hozzáférés</strong>: a host oldalon
+<code>cudaFree</code> után a device pointer még mindig használatban van.
+A riport az érvénytelen hozzáférés helyét adja meg (a kernelben), nem
+azt, hogy hol szabadították fel a memóriát; ehhez a host-oldali
+backtrace és a kód átnézése kell.</li>
+<li><strong>Out-of-bounds hozzáférés shared memóriában</strong>: a
+<code>__shared__</code> tömb indexelése is túlcsordulhat, ha a
+szálazonosító nagyobb a tömb méreténél.</li>
+<li><strong>Memóriaszivárgás</strong>: a <code>--leak-check full</code>
+opcióval a nem felszabadított device allokációk jelezhetők.</li>
+</ul>
+<p>A forrássorokra való visszavezetéshez elég a <code>-lineinfo</code>
+kapcsoló; a <code>-G</code> nem szükséges, sőt megváltoztatja a kód
+viselkedését (kikapcsolja a device-optimalizációt, lassít), ezért csak
+akkor használd, ha a változók részletes vizsgálata is kell. A
+<code>-lineinfo</code> az optimalizált kódot nem módosítja.</p>
+<p>A parancssori forma:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-lineinfo</span> <span class="at">-o</span> sanitizer_lab sanitizer_lab.cu</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">compute-sanitizer</span> <span class="at">--tool</span> memcheck ./sanitizer_lab oob</span></code></pre></div>
+<p>A <code>--show-backtrace yes</code> opció részletes hívási láncot ad,
+ami segít megtalálni a hibás kernelt és a hívó host-kódot.</p>
+<p>Példaként tekintsünk egy szándékos túlindexelést. A kernel célja,
+hogy minden szál a saját indexénél eggyel nagyobb indexre írjon. A grid
+1 blokkból, a blokk 64 szálból áll, a tömb mérete pedig 64. Az utolsó
+szál <code>i+1 = 64</code>-et ír, ami már a lefoglalt memóriaterületen
+kívül van.</p>
+<pre class="cuda"><code>// lab_memcheck.cu
+#include &quot;cuda_check.h&quot;
+
+__global__ void oob_write(int *a, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n) {
+        // Hiba: az utolsó szál i = n-1 esetén a[n]-t ír.
+        a[i + 1] = i;
+    }
+}
+
+int main() {
+    constexpr int n = 64;
+    int *d_a;
+    CUDA_CHECK(cudaMalloc(&amp;d_a, n * sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_a, 0, n * sizeof(int)));
+
+    oob_write&lt;&lt;&lt;1, 64&gt;&gt;&gt;(d_a, n);   // 1 blokk, 64 szál
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaFree(d_a));
+    return 0;
+}</code></pre>
+<p>A fenti kernel futtatása normál körülmények között lehet, hogy
+hibátlanul lefut, mert a hardver nem feltétlenül ellenőrzi az írási
+címet (a lefoglalt blokk mögötti terület gyakran a lefoglalási
+granularitás miatt még érvényes). A
+<code>compute-sanitizer --tool memcheck</code> ezzel szemben az
+érvénytelen írást várhatóan jelzi: a riportban
+<code>Invalid __global__ write of size 4 bytes</code> jellegű sor, a
+hibás szál azonosítója (<code>thread (63,0,0) in block (0,0,0)</code>)
+és a kernel neve szerepel, az <code>ERROR SUMMARY</code> sorban pedig a
+hibák száma. A pontos szöveg verziófüggő.</p>
+<p>A hiba oka egyértelmű: a tömb mérete 64, tehát az érvényes indexek
+0–63, de a 63-as szál a 64-es indexre ír. A memcheck a hibás hozzáférést
+shared memóriánál is kimutatja: ha például egy
+<code>__shared__ int sdata[32];</code> tömböt egy 63-as indexű szál
+<code>sdata[63]</code>-ként ér el, az hibaként jelenik meg (a riportban
+<code>__shared__</code> szerepel).</p>
+<p>A használat utáni felszabadítás tipikus példája, amikor a host kód
+<code>cudaFree</code>-t hív, majd egy későbbi kernel mégis hivatkozik a
+pointerre:</p>
+<pre class="cuda"><code>// HIBÁS MINTA: használat felszabadítás után (csak a memcheck bemutatására)
+__global__ void use_after_free(int *ptr, float *out) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    // A ptr már felszabadított, ezért érvénytelen olvasás.
+    out[i] = ptr[i] * 2.0f;
+}
+
+int main() {
+    int *d_ptr;
+    float *d_out;
+    CUDA_CHECK(cudaMalloc(&amp;d_ptr, 64 * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&amp;d_out, 64 * sizeof(float)));
+    CUDA_CHECK(cudaFree(d_ptr));   // korai felszabadítás
+
+    use_after_free&lt;&lt;&lt;1, 64&gt;&gt;&gt;(d_ptr, d_out);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaFree(d_out));
+    return 0;
+}</code></pre>
+<p>Itt a kernelben a <code>ptr</code> már felszabadított, így a
+<code>memcheck</code> várhatóan érvénytelen globális olvasást jelez a
+<code>use_after_free</code> kernelben. A riport a hozzáférés helyét
+mutatja, a <code>cudaFree</code> helyét nem. Normál futtatásnál a hiba
+gyakran nem okoz azonnali hibát, mert a címtartomány még leképezett
+lehet, de a tartalma érvénytelen.</p>
+<h3 data-number="10.3.2" id="a-racecheck-eszköz"><span
+class="header-section-number">10.3.2</span> A racecheck eszköz</h3>
+<p>A <code>racecheck</code> a <strong>shared memória</strong>
+adatversenyeit (hazardjait) detektálja: ha két szál ugyanazt a
+<code>__shared__</code> címet éri el, legalább az egyik hozzáférés írás,
+és a hozzáférések között nincs szinkronizáció
+(<code>__syncthreads()</code> vagy más megfelelő szinkronizáció). A
+<code>racecheck</code> <strong>nem</strong> vizsgálja a globális memória
+versenyeit: egy globális <code>counter[0] += 1</code> nem atomi növelést
+a <code>racecheck</code> nem jelez. A hazardot attól függetlenül jelzi,
+hogy az adott futásban az eredmény ténylegesen hibás-e: a hiányzó
+szinkronizáció maga a hiba, a ténylegesen bekövetkező ütközés nem
+feltétel.</p>
+<p>A racecheck riportjában a hazard típusa
+<code>Write-After-Read</code>, <code>Read-After-Write</code> vagy
+<code>Write-After-Write</code> jellegű (pl.
+<code>Error: Race reported between Write access at ... and Read access at ...</code>),
+a riport végén pedig <code>RACECHECK SUMMARY: N hazards displayed</code>
+szerepel; a pontos szöveg verziófüggő.</p>
+<p>A <code>racecheck</code> futtatása hasonló a memcheckhez:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">compute-sanitizer</span> <span class="at">--tool</span> racecheck ./sanitizer_lab race</span></code></pre></div>
+<p>Tekintsük a következő szándékosan hibás kernelt, amelyben két warp
+egy shared tömbbe ír, majd a szomszéd elemet olvassa
+<code>__syncthreads()</code> nélkül:</p>
+<pre class="cuda"><code>// HIBÁS MINTA: shared memória hazard (a racecheck bemutatására)
+__global__ void shared_race(int *out) {
+    __shared__ int s[64];
+    int t = threadIdx.x;
+    s[t] = t;
+    // HIBA: ide __syncthreads() kellene.
+    out[t] = s[(t + 1) % 64];   // a szomszéd szál által írt elemet olvassa (t = 31, 63: a másik warpét)
+}</code></pre>
+<p>A 64 szálas blokk két warpból áll. A <code>t</code> szál a
+<code>t + 1</code> indexű elemet olvassa: a 31. szál a második warp
+által írt <code>s[32]</code>-t, a 63. szál az első warp által írt
+<code>s[0]</code>-t, a többi szál a saját warpja egy másik lane-jének
+írását. A barrier hiánya miatt mindegyik olvasás Read-After-Write
+hazard; a warpon belüli esetekben is, mert Volta óta a warp lane-jei nem
+garantáltan lépésben haladnak. A <code>racecheck</code> várhatóan
+Read-After-Write hazardot jelez. A javítás:
+<code>__syncthreads();</code> az írás és az olvasás közé.</p>
+<figure id="fig-gpu036-shared-race">
+<div class="fig-interactive"><iframe src="figures/html/gpu036-shared-race.html" title="Minden szál a jobb szomszédja által írt elemet olvassa; a 31. és 63. szál a másik warp elemét. Barrier nélkül ez hazard, __syncthreads()-szel helyes." loading="lazy" style="width:100%;border:0;height:560px"></iframe><noscript><img src="figures/img/gpu036-shared-race.png" style="width:100.0%"
+alt="Minden szál a jobb szomszédja által írt elemet olvassa; a 31. és 63. szál a másik warp elemét. Barrier nélkül ez hazard, __syncthreads()-szel helyes." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu036-shared-race.png" style="width:100.0%"
+alt="Minden szál a jobb szomszédja által írt elemet olvassa; a 31. és 63. szál a másik warp elemét. Barrier nélkül ez hazard, __syncthreads()-szel helyes." /></details></div>
+<figcaption>Shared memória RAW-hazard a <code>shared_race</code>
+kernelben: minden szál a jobb szomszédja által írt elemet olvassa;
+warphatárt csak a 31. (<code>s[32]</code>) és a 63. szál
+(<code>s[0]</code>) olvasása lép át, de barrier nélkül mindegyik olvasás
+hazard</figcaption>
+</figure>
+<p>Globális memória versenyére (pl. <code>counter[0] += 1</code> 256
+szállal) a racecheck nem alkalmas. Ennek a kimenete nem determinisztikus
+(a végeredmény nem 256, de konkrét számot nem állítunk), a javítás
+<code>atomicAdd</code>, a detektálás pedig tervezéssel, kódáttekintéssel
+és teszteléssel történik; a sanitizer eszközei közül ezt a hibát a
+<code>racecheck</code> nem találja meg.</p>
+<h3 data-number="10.3.3" id="az-initcheck-eszköz"><span
+class="header-section-number">10.3.3</span> Az initcheck eszköz</h3>
+<p>Az <code>initcheck</code> a <strong>nem inicializált globális
+memória</strong> olvasását jelzi: például egy <code>cudaMalloc</code>
+után, <code>cudaMemset</code>, <code>cudaMemcpy</code> vagy kernelbeli
+írás nélkül olvasott területet. A regiszterekben vagy lokális
+változókban lévő inicializálatlan értéket az <code>initcheck</code> nem
+találja meg; azt a fordító figyelmeztetései (<code>-Wall</code>,
+<code>-Wuninitialized</code>) és a statikus elemzés tudja jelezni.</p>
+<p>Az initcheck futtatása:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">compute-sanitizer</span> <span class="at">--tool</span> initcheck ./sanitizer_lab init</span></code></pre></div>
+<p>Példaként vegyünk egy kernelt, amely egy nem inicializált bemeneti
+tömböt olvas:</p>
+<pre class="cuda"><code>// HIBÁS MINTA: nem inicializált globális memória olvasása
+__global__ void uninit_read(const int *in, int *out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n) {
+        out[i] = in[i] + 1;   // az in tartalma nem definiált (nincs cudaMemset/cudaMemcpy)
+    }
+}</code></pre>
+<p>A hívó oldalon az <code>in</code> tömb <code>cudaMalloc</code>-kal
+készül, <code>cudaMemset</code>/<code>cudaMemcpy</code> nélkül. Az
+initcheck várhatóan
+<code>Uninitialized __global__ memory read of size 4 bytes</code>
+jellegű hibát jelez a kernelben (a pontos szöveg verziófüggő). A
+javítás: az <code>in</code> tömb inicializálása (<code>cudaMemset</code>
+vagy host→device másolás) a kernel indítása előtt.</p>
+<h3 data-number="10.3.4" id="a-synccheck-eszköz"><span
+class="header-section-number">10.3.4</span> A synccheck eszköz</h3>
+<p>A <code>synccheck</code> a szinkronizációs primitívek hibás
+használatát találja meg, például azt, amikor egy
+<code>__syncthreads()</code> nem éri el a blokk minden szála (divergens
+barrier), vagy érvénytelen maszkú warp-szintű szinkronizációt
+(<code>__syncwarp</code>, <code>__shfl_sync</code>). Ez az az eszköz,
+amely a blokkszintű barrier divergens használatát jelzi; a
+<code>racecheck</code> nem erre való.</p>
+<pre class="cuda"><code>// HIBÁS MINTA: divergens barrier (definiálatlan viselkedés, holtpontot is okozhat!)
+__global__ void bad_barrier(int *out) {
+    if (threadIdx.x &lt; 16) {
+        __syncthreads();      // a blokk többi szála nem éri el
+    }
+    out[threadIdx.x] = 1;
+}</code></pre>
+<p>Futtatás:
+<code>compute-sanitizer --tool synccheck ./sanitizer_lab sync</code>. A
+synccheck várhatóan érvénytelen barrier-használatot jelez. A kernel
+viselkedése definiálatlan, a program akár le is állhat, ezért csak
+izolált környezetben, timeouttal futtasd.</p>
+<h3 data-number="10.3.5"
+id="labor-sanitizer-futtatás-és-riportértelmezés"><span
+class="header-section-number">10.3.5</span> Labor: sanitizer-futtatás és
+riportértelmezés</h3>
+<p>A labor célja, hogy a négy eszközt egy-egy szándékosan hibás kernelen
+használjuk, és a riportokból azonosítsuk a hibákat. A laborban a hibás
+kódot izolált környezetben futtatjuk, mert a túlindexelés, a divergens
+barrier és a versenyhelyzet a futást megállíthatja. A
+<code>nvidia-smi</code> figyelése és a futtatás timeouttal
+(<code>timeout 60</code>) biztosítja, hogy egy hibás kernel ne blokkolja
+a gépet.</p>
+<p><strong>Környezet</strong> (a saját környezetedből töltendő ki; a
+példa nem futtatott):</p>
+<ul>
+<li>GPU: <code>[modell, compute capability]</code></li>
+<li>Driver: <code>[kitöltendő]</code></li>
+<li>CUDA Toolkit: <code>[kitöltendő]</code></li>
+<li>OS: <code>[kitöltendő]</code></li>
+<li>Compute-sanitizer verzió:
+<code>[a compute-sanitizer --version kimenete]</code></li>
+<li>Build:
+<code>nvcc -lineinfo -o sanitizer_lab sanitizer_lab.cu</code></li>
+<li>Futtatási parancsok (egy futás egy hibát vizsgál):
+<code>compute-sanitizer --tool memcheck ./sanitizer_lab oob</code>,
+<code>--tool racecheck ... race</code>,
+<code>--tool initcheck ... init</code>,
+<code>--tool synccheck ... sync</code></li>
+</ul>
+<p>A laborhoz használt <code>sanitizer_lab.cu</code> négy szándékos
+hibát tartalmaz, külön kernelekben; a futtatandó hibát a parancssori
+argumentum választja ki, így a riportok egyértelműen az adott hibához
+köthetők.</p>
+<pre class="cuda"><code>// sanitizer_lab.cu  (nem futtatott példa; a cuda_check.h a fent bemutatott fejléc)
+#include &lt;cstring&gt;
+#include &quot;cuda_check.h&quot;
+
+// 1. hiba: túlindexelés a memcheck számára
+__global__ void oob_write(int *a, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n) {
+        a[i + 1] = i;                  // az utolsó szál a[n]-t ír
+    }
+}
+
+// 2. hiba: shared memória hazard a racecheck számára
+__global__ void shared_race(int *out) {
+    __shared__ int s[64];
+    int t = threadIdx.x;
+    s[t] = t;
+    // HIBA: hiányzó __syncthreads()
+    out[t] = s[(t + 1) % 64];
+}
+
+// 3. hiba: nem inicializált globális memória az initcheck számára
+__global__ void uninit_read(const int *in, int *out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n) out[i] = in[i] + 1;
+}
+
+// 4. hiba: divergens barrier a synccheck számára
+__global__ void bad_barrier(int *out) {
+    if (threadIdx.x &lt; 16) {
+        __syncthreads();
+    }
+    out[threadIdx.x] = 1;
+}
+
+int main(int argc, char **argv) {
+    const char *mode = (argc &gt; 1) ? argv[1] : &quot;oob&quot;;
+    constexpr int n = 64;
+    int *d_a = nullptr, *d_b = nullptr;
+
+    if (std::strcmp(mode, &quot;oob&quot;) == 0) {
+        CUDA_CHECK(cudaMalloc(&amp;d_a, n * sizeof(int)));   // pontosan n elem
+        CUDA_CHECK(cudaMemset(d_a, 0, n * sizeof(int)));
+        oob_write&lt;&lt;&lt;1, 64&gt;&gt;&gt;(d_a, n);
+    } else if (std::strcmp(mode, &quot;race&quot;) == 0) {
+        CUDA_CHECK(cudaMalloc(&amp;d_b, n * sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_b, 0, n * sizeof(int)));
+        shared_race&lt;&lt;&lt;1, 64&gt;&gt;&gt;(d_b);
+    } else if (std::strcmp(mode, &quot;init&quot;) == 0) {
+        CUDA_CHECK(cudaMalloc(&amp;d_a, n * sizeof(int)));   // szándékosan nincs inicializálás
+        CUDA_CHECK(cudaMalloc(&amp;d_b, n * sizeof(int)));
+        uninit_read&lt;&lt;&lt;1, 64&gt;&gt;&gt;(d_a, d_b, n);
+    } else if (std::strcmp(mode, &quot;sync&quot;) == 0) {
+        CUDA_CHECK(cudaMalloc(&amp;d_b, 32 * sizeof(int)));
+        bad_barrier&lt;&lt;&lt;1, 32&gt;&gt;&gt;(d_b);                       // csak timeouttal futtasd
+    } else {
+        std::fprintf(stderr, &quot;Használat: %s oob|race|init|sync\n&quot;, argv[0]);
+        return EXIT_FAILURE;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (d_a) CUDA_CHECK(cudaFree(d_a));
+    if (d_b) CUDA_CHECK(cudaFree(d_b));
+    return 0;
+}</code></pre>
+<p>A labor során a négy sanitizer futtatás külön-külön történik. A
+mérési naplóban minden futtatáshoz rögzítsd a parancsot, a teljes
+kimenetet és a hibák számát; a kimenetet a saját környezetben kell
+gyűjteni.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Futtatás</th>
+<th>Várt (dokumentáció szerint)</th>
+<th>Mért</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>memcheck ... oob</code></td>
+<td>érvénytelen 4 bájtos globális írás, a 63-as szál</td>
+<td><code>[kitöltendő]</code></td>
+</tr>
+<tr>
+<td><code>racecheck ... race</code></td>
+<td>Read-After-Write hazard a shared tömbön</td>
+<td><code>[kitöltendő]</code></td>
+</tr>
+<tr>
+<td><code>initcheck ... init</code></td>
+<td>nem inicializált globális olvasás</td>
+<td><code>[kitöltendő]</code></td>
+</tr>
+<tr>
+<td><code>synccheck ... sync</code></td>
+<td>érvénytelen/divergens barrier</td>
+<td><code>[kitöltendő]</code></td>
+</tr>
+</tbody>
+</table>
+<p>A „mért” oszlopot csak tényleges futtatás után szabad kitölteni; ha
+eltér a várttól, a riport szövegét és a toolkit verzióját is rögzítsd. A
+sanitizer alatt a kernelek futása a normálnál sokszor lassabb; a
+laborban ezért kis méreteket használunk, és a futásidő nem mérési célú.
+A fordítás várt módja figyelmeztetés nélküli, de ezt a konkrét
+<code>nvcc</code> verzióval ellenőrizni kell.</p>
+<h3 data-number="10.3.6"
+id="a-hibák-értelmezése-és-gyakori-csapdák"><span
+class="header-section-number">10.3.6</span> A hibák értelmezése és
+gyakori csapdák</h3>
+<p>A compute-sanitizer riportjainak értelmezéséhez fontos megérteni a
+hibaüzenetek szerkezetét. A riportok <code>ERROR SUMMARY</code>
+(memcheck, initcheck, synccheck) vagy <code>RACECHECK SUMMARY</code>
+sorral zárulnak, amely megadja a találatok számát. A hiba típusa jelzi a
+hozzáférés jellegét (érvénytelen globális/shared olvasás vagy írás, nem
+inicializált olvasás, hazard). A <code>by thread ... in block ...</code>
+azonosítja a hibát okozó szálat, ami segít a forráskódban a feltétel
+vagy indexszámítás ellenőrzésében. A <code>Saved host backtrace</code> a
+host oldali hívási láncot mutatja a kernelindítás pontjáról.</p>
+<p>A gyakori csapda a hibaattribúció téves értelmezése. A memcheck az
+<strong>érvénytelen</strong> hozzáférést a hozzáférés helyén (a
+kernelben) jelzi. Ha egy kernel egy másik kernel által korábban
+elrontott, de még érvényes memóriát olvas, a memcheck ezt nem jelzi,
+mert a hozzáférés érvényes; az ilyen hibák (érvényes, de rossz tartalmú
+memória) más módszerrel (az előző kernel túlindexelésének
+<code>memcheck</code>-futtatásával, köztes ellenőrző tesztekkel, a kód
+átnézésével) keresendők; az <code>initcheck</code> csak a sosem írt
+globális memória olvasását jelzi. A <code>--launch-count N</code> opció
+a vizsgált kernelindítások számát korlátozza (nem reprodukciós eszköz),
+a <code>--launch-skip</code> az első N indítást kihagyja.</p>
+<p>A másik fontos szempont, hogy a compute-sanitizer instrumentációja
+jelentősen lassítja a futást, és a kernel erőforrás-igényét is
+növelheti; ezért a sanitizerrel történő futtatás nem a teljesítmény
+mérésére szolgál, az eredmények csak a hibadetektálásra vonatkoznak. Ha
+egy kernel sanitizer alatt nem indul el, a lehetséges okokat a toolkit
+dokumentációjában kell keresni (pl. csökkenthető a blokkméret).</p>
+<p>A racecheck eredményét nem szabad a „nincs hazard” szó szerint
+értelmezni globális memóriára: a racecheck csak a shared memóriát
+vizsgálja. Globális memóriás versenyre atomikus műveletek, blokkok
+közötti szinkronizáció és alapos tesztelés szükséges.</p>
+<p>Az initcheck a nem inicializált <strong>globális</strong> memóriát
+jelzi (pl. <code>cudaMalloc</code> után inicializálás nélkül olvasott
+területet), a regiszterekben vagy lokális változókban lévő
+inicializálatlan értéket nem. Ha a program globális memóriát használ
+inicializálás nélkül, az a memcheck számára sem hiba (a memória
+érvényes), ezért az initcheck külön futtatása szükséges. A
+determinisztikus inicializálás a megelőzés módja.</p>
+<h3 data-number="10.3.7" id="összefoglalás-és-önellenőrző-kérdés"><span
+class="header-section-number">10.3.7</span> Összefoglalás és önellenőrző
+kérdés</h3>
+<p>A compute-sanitizer a CUDA fejlesztő egyik elsődleges eszköze a
+rejtett memóriahibák és versenyhelyzetek felderítésére. A
+<code>memcheck</code> a túlindexelést, a felszabadítás utáni hozzáférést
+és az érvénytelen pointereket találja meg; a <code>racecheck</code> a
+shared memória szinkronizálatlan konkurens hozzáféréseit; az
+<code>initcheck</code> a nem inicializált globális memória olvasását; a
+<code>synccheck</code> a hibás szinkronizációt. Az eszközök külön
+futtathatók, és a riportok együttesen adnak képet a kernel
+memória-viselkedéséről.</p>
+<p>A laborban bemutatott szándékos hibák az egyes eszközök várt jellegét
+szemléltetik; a tényleges riportokat az olvasónak kell gyűjtenie. A
+következő alfejezet a tipikus CUDA-hibák rendszerezett tárgyalásával és
+azok megelőzésével foglalkozik; az itt bemutatott eszközök a hibák
+azonosításának alapját képezik.</p>
+<p><strong>Önellenőrző kérdés:</strong> Adott egy kernel, amely időnként
+rossz eredményt ad, és a <code>compute-sanitizer --tool memcheck</code>
+nem talál érvénytelen memóriahozzáférést, de az eredmény nem
+determinisztikus. Melyik sanitizer eszköz futtatását érdemes
+megpróbálni, és milyen hibatípust várunk? Indokold a versenyhelyzetek
+természetével.</p>
+<p><em>Válasz vázlat:</em> A <code>racecheck</code> eszközt, ha a hiba a
+shared memóriában lévő szinkronizálatlan írás/olvasásban rejlik; ha a
+hiba globális memóriabeli verseny, a racecheck nem találja meg, ilyenkor
+atomikus műveletek és kódáttekintés kell. A memcheck nem talál hibát,
+mert a hozzáférések érvényes memóriatartományon belül vannak, csak a
+sorrendjük nincs szinkronban. A racecheck a hazardot
+<code>Read-After-Write</code>, <code>Write-After-Read</code> vagy
+<code>Write-After-Write</code> típusként jelzi. A javítás
+<code>__syncthreads()</code> (shared memória) vagy atomi művelet. Ha az
+eltérés nem inicializált memóriából ered, az <code>initcheck</code> is
+megpróbálandó.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu035.html">← 10.2 cuda-gdb és kernel-debugging</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu037.html">10.4 Tipikus CUDA-hibák és megelőzésük →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

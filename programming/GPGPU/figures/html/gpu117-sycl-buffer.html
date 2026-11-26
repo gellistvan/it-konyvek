@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SYCL buffer és accessor életciklusa</title>
+<style>
+:root{--fg:#111;--bg:#fff;--muted:#666;--hl:#1f4e79;--hl2:#c55a11;--cell:#fff;--cellhl:#d9d9d9;--line:#000;--code:#f3f3f3}
+@media (prefers-color-scheme:dark){:root{--fg:#eee;--bg:#1b1b1b;--muted:#aaa;--hl:#8fb8e8;--hl2:#f0a060;--cell:#262626;--cellhl:#4a4a4a;--line:#ddd;--code:#2a2a2a}}
+*{box-sizing:border-box}
+body{margin:0;padding:10px;font:14px/1.45 system-ui,sans-serif;color:var(--fg);background:var(--bg)}
+.ctl{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:6px}
+button{font:inherit;padding:3px 10px;cursor:pointer}
+input[type=range]{flex:1;min-width:120px}
+#status{margin:4px 0 6px;min-height:2.9em}
+/* A pszeudokód a rajz ALATT, teljes szélességben (hosszú sorok ne görgessenek oldalra) */
+.wrap{display:flex;flex-direction:column;gap:10px;align-items:stretch}
+svg{width:100%;height:auto;display:block}
+pre#code{width:100%;margin:0;padding:6px 8px;background:var(--code);font:12.5px/1.5 ui-monospace,monospace;white-space:pre;overflow-x:auto}
+pre#code span{display:block;padding:0 4px}
+pre#code span.on{outline:2px solid var(--hl);font-weight:bold}
+svg text:not([fill]){fill:var(--fg);}
+svg text{font-family:system-ui,sans-serif}
+.small{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="ctl" role="group" aria-label="Lejátszás vezérlői">
+  <button id="first" title="Első lépés">⏮</button>
+  <button id="prev" title="Előző lépés">◀ Lépés</button>
+  <button id="play" title="Lejátszás / szünet">▶ Lejátszás</button>
+  <button id="next" title="Következő lépés">Lépés ▶</button>
+  <input id="pos" type="range" min="0" max="0" value="0" aria-label="Lépés kiválasztása">
+  <span id="cnt" class="small"></span>
+</div>
+<div class="ctl"><button onclick="readY()">közvetlen y.data() olvasás</button> <span id="warn" aria-live="polite" style="font-weight:bold"></span></div>
+<div id="status" aria-live="polite"></div>
+<div class="wrap">
+  <svg id="v" viewBox="0 0 560 300" role="img" aria-label="A buffer hatókörének végén a destruktor megvárja a kernelt és visszaírja az y-t; a host_accessor blokkolja a következő kernelt, amíg él."></svg>
+  <pre id="code" aria-label="Pszeudokód"></pre>
+</div>
+<p class="small">Feltétel: SYCL 2020, buffer write-back a host-pointerre; USM esetén nincs implicit függőség. Sematikus, nem időarányos. Pontozott: a buffer birtokolja a vektort; csíkozott: várakozás.</p>
+<script>
+// ---- Adat: lépések (a Python-szkript számolja ki és illeszti be, a könyv példájával egyezően) ----
+// Minden lépés: {msg: "állapotsor szövege", line: kiemelt pszeudokódsor indexe vagy -1, ...saját mezők}
+let STEPS = [{"ph": 1, "p": 1, "line": 3, "ok": false, "msg": "(1) buf_x, buf_y létrehozása x.data() / y.data() fölött: a vektorok mostantól a buffer birtokában vannak."}, {"ph": 2, "p": 1, "line": 6, "ok": false, "msg": "(2) q.submit: az accessorok (read x, read_write y) alapján a futtatórendszer függőségi élt rögzít; a submit azonnal visszatér."}, {"ph": 3, "p": 1, "line": 7, "ok": false, "msg": "(3) H→D másolás és kernel: y = 2·1 + 2 = 4 az eszközön. A host közben továbbfut a blokk végéig."}, {"ph": 4, "p": 1, "line": 9, "ok": false, "msg": "(4) A blokk vége: a buffer destruktora megvárja a kernelt, majd D→H write-back a y.data()-ra."}, {"ph": 5, "p": 1, "line": 10, "ok": true, "msg": "(5) A vektor újra a hosté: az ellenőrzés y[i] == 4 teljesül."}, {"ph": 1, "p": 2, "line": 12, "ok": false, "msg": "(6) host_accessor létrehozása: blokkol, amíg a buf_y-t író kernel 1 fut."}, {"ph": 2, "p": 2, "line": 13, "ok": false, "msg": "(7) A host_accessor él; a buf_y-t használó kernel 2 submitja várakozik."}, {"ph": 3, "p": 2, "line": 14, "ok": false, "msg": "(8) A host_accessor megszűnik → kernel 2 elindul. Tanulság: a host_accessort szűk blokkban hozzuk létre."}];
+const CODE = ["std::vector<float> x(N, 1.0f), y(N, 2.0f);  const float alpha = 2.0f;", "{", "    sycl::buffer<float, 1> buf_x{x.data(), sycl::range<1>{N}};", "    sycl::buffer<float, 1> buf_y{y.data(), sycl::range<1>{N}};", "    q.submit([&](sycl::handler& h) {", "        auto acc_x = buf_x.get_access<sycl::access::mode::read>(h);", "        auto acc_y = buf_y.get_access<sycl::access::mode::read_write>(h);", "        h.parallel_for(sycl::range<1>{N}, [=](sycl::id<1> i) { acc_y[i] = alpha * acc_x[i] + acc_y[i]; });", "    });", "}   // ~buffer: megvárja a kernelt, majd visszaírja y-t", "// ellenőrzés a hoston: y[i] == 4", "// --- 30.4.7, 7. hiba ---", "{ sycl::host_accessor ha{buf_y};      // blokkol, amíg a buf_y-t író kernel fut", "  q.submit(/* buf_y-t használó kernel 2 */);   // nem indul, amíg ha él", "}                                     // ha megszűnik → kernel 2 indulhat"];          // pszeudokód sorai (üres lista: a panel elrejtve)
+
+// ---- Rajzolás: ezt a függvényt kell az ábrához igazítani ----
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, text){const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);if(text!==undefined)e.textContent=text;svg.appendChild(e);return e;}
+const svg = document.getElementById("v");
+function css(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim();}
+function render(s){
+  // Példa: tömb cellákként, s.a = értékek, s.hl = kiemelt indexek
+  svg.innerHTML = "";
+  const a = s.a || [], w = 48, x0 = (560 - a.length * w) / 2, y0 = 110;
+  a.forEach((v, i) => {
+    const on = (s.hl || []).includes(i);
+    el("rect", {x: x0 + i * w, y: y0, width: w, height: w, fill: on ? css("--cellhl") : css("--cell"), stroke: css("--line"), "stroke-width": on ? 3 : 1.2});
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w / 2 + 6, "text-anchor": "middle", "font-size": 18}, String(v));
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w + 18, "text-anchor": "middle", "font-size": 12, fill: css("--muted")}, String(i));
+  });
+}
+
+let READ = false;
+function readY(){ READ = true; show(k); }
+function bar(x, y, w, h, lab, kind){
+  const fill = kind === "own" ? "url(#dots)" : kind === "wait" ? "url(#hatch)" : kind === "copy" ? css("--cellhl") : css("--cell");
+  el("rect", {x: x, y: y, width: w, height: h, fill: fill, stroke: css("--line")});
+  const lines = lab.split("\n");
+  lines.forEach((t, i) => { el("rect", {x: x + w / 2 - t.length * 3.4, y: y + h / 2 - 8 + (i - (lines.length - 1) / 2) * 15, width: t.length * 6.8, height: 15, fill: css("--bg"), opacity: 0.85});
+    el("text", {x: x + w / 2, y: y + h / 2 + 4 + (i - (lines.length - 1) / 2) * 15, "text-anchor": "middle", "font-size": 12}, t); });
+}
+function render(s){
+  svg.setAttribute("viewBox", "0 0 560 250");
+  const L = css("--line");
+  svg.innerHTML = '<defs><pattern id="hatch" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="7" stroke="' + L + '" stroke-width="1"/></pattern>' +
+    '<pattern id="dots" width="5" height="5" patternUnits="userSpaceOnUse"><circle cx="2.5" cy="2.5" r="1" fill="' + css("--muted") + '"/></pattern>' +
+    '<marker id="ah" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="' + L + '"/></marker></defs>';
+  const X = t => 110 + t * 72;
+  if (s.p === 1) {
+    const rows = {"Host": 30, "buffer-tulajdon": 95, "Device": 160};
+    Object.entries(rows).forEach(([r, y]) => el("text", {x: 4, y: y + 28, "font-size": 12}, r));
+    const P = [[0, 1, "Host", "(1) buf\nlétrehozása", "op", 1], [1, 2, "Host", "(2) submit\n+ accessor", "op", 2], [2, 4, "Host", "(4) ~buffer vár", "wait", 4],
+      [4.6, 6, "Host", "(5) y[i] == 4", "op", 5], [0, 4.6, "buffer-tulajdon", "x, y a buffer birtokában", "own", 1],
+      [2, 2.6, "Device", "H→D", "copy", 3], [2.6, 4, "Device", "kernel: y = 4", "op", 3], [4, 4.6, "Device", "D→H", "copy", 4]];
+    P.filter(p => p[5] <= s.ph).forEach(([a, b, r, lab, kind, ph]) => {
+      let bb = b; if (r === "buffer-tulajdon" && s.ph < 5) bb = Math.min(b, s.ph === 4 ? 4.6 : 2 + (s.ph - 1));
+      bar(X(a), rows[r], X(bb) - X(a), 44, lab, kind);
+    });
+    if (s.ph >= 2) el("line", {x1: X(1.5), y1: 74, x2: X(2.6), y2: 160, stroke: L, "stroke-width": 1.5, "stroke-dasharray": "6 4", "marker-end": "url(#ah)"});
+    if (s.ph >= 4) el("line", {x1: X(4.3), y1: 160, x2: X(4.75), y2: 74, stroke: L, "stroke-width": 2.5, "marker-end": "url(#ah)"});
+  } else {
+    const rows = {"Host": 50, "Device": 140};
+    Object.entries(rows).forEach(([r, y]) => el("text", {x: 4, y: y + 28, "font-size": 12}, r));
+    el("text", {x: 4, y: 24, "font-size": 13, "font-weight": "bold"}, "7. hiba: a host_accessor élettartama");
+    const P = [[0, 1, "Host", "submit\n(kernel 1)", "op", 1], [1, 2.5, "Host", "host_accessor:\nblokkol", "wait", 1], [0.6, 2.5, "Device", "kernel 1", "op", 1],
+      [2.5, 4.5, "Host", "host_accessor él", "own", 2], [3, 4.5, "Device", "kernel 2\nvárakozik", "wait", 2], [4.5, 5.8, "Device", "kernel 2", "op", 3]];
+    P.filter(p => p[5] <= s.ph).forEach(([a, b, r, lab, kind]) => bar(X(a), rows[r], X(b) - X(a), 44, lab, kind));
+    if (s.ph >= 3) el("line", {x1: X(4.5), y1: 94, x2: X(4.5), y2: 140, stroke: L, "stroke-width": 1.5, "stroke-dasharray": "6 4", "marker-end": "url(#ah)"});
+  }
+  const w = document.getElementById("warn");
+  if (READ && s.p === 1) { w.textContent = s.ok ? "y.data()[0] = 4 – a write-back megtörtént, az olvasás helyes." : "Figyelem: a buffer birtokolja a memóriát – a közvetlen y.data() olvasás értéke itt nem definiált!"; w.style.color = s.ok ? "#2e7d32" : "#c62828"; }
+  else { w.textContent = ""; }
+}
+
+
+// ---- Vezérlés (általában nem kell módosítani) ----
+let k = 0, timer = null;
+const pos = document.getElementById("pos"), status = document.getElementById("status");
+const codeEl = document.getElementById("code");
+if (!CODE.length) codeEl.style.display = "none";
+else codeEl.innerHTML = CODE.map((l, i) => `<span id="L${i}">${l.replace(/&/g,"&amp;").replace(/</g,"&lt;")}</span>`).join("");
+pos.max = STEPS.length - 1;
+// Új lépéssor betöltése (pl. saját bemenetből számolva): setSteps(lista)
+function setSteps(list){ stop(); STEPS = list; pos.max = STEPS.length - 1; show(0); }
+function show(i){
+  k = Math.max(0, Math.min(STEPS.length - 1, i));
+  const s = STEPS[k];
+  pos.value = k;
+  document.getElementById("cnt").textContent = `${k + 1}/${STEPS.length}`;
+  status.textContent = s.msg || "";
+  codeEl.querySelectorAll("span").forEach(x => x.classList.remove("on"));
+  if (s.line !== undefined && s.line >= 0) { const L = document.getElementById("L" + s.line); if (L) L.classList.add("on"); }
+  render(s);
+}
+function stop(){ if (timer) { clearInterval(timer); timer = null; } document.getElementById("play").textContent = "▶ Lejátszás"; }
+document.getElementById("first").onclick = () => { stop(); show(0); };
+document.getElementById("prev").onclick = () => { stop(); show(k - 1); };
+document.getElementById("next").onclick = () => { stop(); show(k + 1); };
+document.getElementById("play").onclick = () => {
+  if (timer) { stop(); return; }
+  if (k >= STEPS.length - 1) show(0);
+  document.getElementById("play").textContent = "⏸ Szünet";
+  timer = setInterval(() => { if (k >= STEPS.length - 1) stop(); else show(k + 1); }, 1800);
+};
+pos.oninput = () => { stop(); show(+pos.value); };
+document.addEventListener("keydown", e => { if (e.key === "ArrowRight") { stop(); show(k + 1); } if (e.key === "ArrowLeft") { stop(); show(k - 1); } });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => show(k));
+show(0);
+</script>
+<script>(function(){function s(){var b=document.body;parent.postMessage({figResize:Math.ceil(b.getBoundingClientRect().height)},"*")}addEventListener("load",s);addEventListener("resize",s);if(window.ResizeObserver)new ResizeObserver(s).observe(document.body);s()})()</script></body>
+</html>

@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>28.3 TPU-n futó JAX – GPGPU – általános célú számítások
+GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz6">VI. RÉSZ – TPU, OpenCL és más modellek</a> › <a href="index.html#gpuch27">28 JAX és TPU programozás</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu107.html">← 28.2 Vmap, pmap és sharding</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu109.html">28.4 JAX teljesítmény és korlátok →</a></div>
+</nav>
+<h2 data-number="28.3" id="gpu108"><span
+class="header-section-number">28.3</span> TPU-n futó JAX</h2>
+<p>A JAX TPU-n való futtatása a gyakorlatban azt jelenti, hogy ugyanazt
+a funkcionális, NumPy-szerű API-t használjuk, mint CPU-n vagy GPU-n, de
+a háttérben az XLA compiler TPU-ra optimalizált végrehajtható kódot
+állít elő, a JAX pedig a többszörösen összetett TPU-topológiát sharding
+segítségével képes egyetlen logikai programból kihasználni. Ebben a
+fejezetben a TPU mint JAX-backend működését, az XLA fordítási láncot és
+a profilozás alapjait mutatjuk be egy olyan laborral, amelyik
+mátrixszorzást futtat TPU-n, rögzíti a környezetet, és elválasztja a
+várt elméleti értékeket a ténylegesen mért eredményektől.</p>
+<p>Az alfejezet feltételezi a <code>jax.jit</code>, a <code>vmap</code>,
+a <code>pmap</code> és a sharding alapjainak ismeretét a 28.2.
+alfejezetből. Itt arra koncentrálunk, hogyan viselkednek ezek az
+eszközök kifejezetten TPU-n, és milyen többletinformációt ad az
+XLA-alapú eszközlánc.</p>
+<h3 data-number="28.3.1" id="a-tpu-mint-jax-backend"><span
+class="header-section-number">28.3.1</span> A TPU mint JAX backend</h3>
+<p>A JAX a TPU-t elsődleges gyorsítóként kezeli. Amikor egy JAX-program
+elindul, a <code>jax.devices()</code> hívás listázza az elérhető
+eszközöket. TPU-környezetben ezek <code>TpuDevice</code> típusú
+objektumok, és jellemzően több eszközt látunk: a
+<code>jax.devices()</code> listájának hossza a TPU-generációtól függ:
+egy TPU v3-8 nyolc eszközt (8 TensorCore), egy v4-8 négyet (4 chip,
+megacore), egy v4-32 tizenhatot (16 chip) ad. A pontos szám a konkrét
+környezetben <code>len(jax.devices())</code>-szel ellenőrizendő. A JAX
+automatikusan kiválasztja a TPU-backendet, ha van elérhető TPU; ha
+nincs, CPU-ra vagy GPU-ra esik vissza. Ezt mindig ellenőrizni kell a
+következő hívással:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(jax.default_backend())  <span class="co"># &#39;tpu&#39; TPU-n</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(jax.devices())          <span class="co"># TPU eszközök listája</span></span></code></pre></div>
+<p>A tipikus hibák egyike, hogy a fejlesztő azt hiszi, TPU-n fut, de a
+<code>default_backend()</code> értéke <code>'cpu'</code>, mert a
+TPU-erőforrás nem volt elérhető, vagy a JAX telepítés nem tartalmazta a
+TPU-támogatást. A JAX TPU-hoz a <code>libtpu</code> könyvtárat és a
+megfelelő <code>jaxlib</code> verziót kell telepíteni; a pontos
+telepítési parancsok gyorsan változnak, ezért a fejezet írásakor
+érvényes verziókat a hivatalos JAX-dokumentációban kell ellenőrizni. Itt
+az a fontos, hogy a futtatókörnyezetben a <code>jax.devices()</code>
+legalább egy TPU-eszközt mutasson, és a
+<code>jax.default_backend()</code> eredménye <code>'tpu'</code>
+legyen.</p>
+<p>A TPU-n a JAX tömbök alapértelmezés szerint a TPU memóriájában jönnek
+létre, ha a műveletet TPU-backenden hajtjuk végre. A host memóriából
+való átvitel implicit, de a méréshez és a determinisztikus viselkedéshez
+érdemes explicit <code>jax.device_put</code>-ot használni. A JAX
+<strong>aszinkron dispatch</strong>-t használ (nem lusta kiértékelést):
+a számítás azonnal elindul, a hívás azonban nem várja meg a végét; az
+eredmény a <code>block_until_ready()</code>-ig vagy az adat eléréséig
+(pl. kiírás) nem biztos, hogy kész. Ez a TPU-n is így van (lásd
+28.1).</p>
+<h3 data-number="28.3.2"
+id="xla-compilation-a-jax-tól-a-tpu-executable-ig"><span
+class="header-section-number">28.3.2</span> XLA compilation: a JAX-tól a
+TPU-executable-ig</h3>
+<p>A JAX egyik legfontosabb tulajdonsága, hogy a
+<code>jax.jit</code>-tel transzformált függvényeket a rendszer először
+Jaxpr-re, majd XLA HLO-ra, végül TPU-ra optimalizált gépi kódra fordítja
+(Python → jaxpr → StableHLO/HLO → TPU-bináris). Ezt a láncot érdemes
+tudatosan látni, mert a TPU teljesítménye és a hibakeresés is ezen a
+szinten dől el.</p>
+<p>A fordítási folyamat lépései:</p>
+<ol type="1">
+<li><p><strong>Jaxpr</strong> – A JAX a Python-függvényt trace-eli, és
+egy köztes reprezentációt, Jaxpr-t állít elő. Ez a reprezentáció
+explicit módon tartalmazza az összes műveletet, a változókat és a
+kontrollfolyamot, de már független a Python-keretrendszertől. A
+<code>jax.make_jaxpr</code> segítségével megnézhetjük ezt a
+reprezentációt.</p></li>
+<li><p><strong>XLA HLO</strong> – A Jaxpr-ből a JAX StableHLO-t állít
+elő, amelyből az XLA HLO-gráfot épít (a HLO az XLA magas szintű műveleti
+reprezentációja). A HLO már egy statikus, gráf-alapú reprezentáció,
+amelyen az XLA elvégzi az operátorfúziót, a memóriatervezést, a mátrix-
+és konvolúciós műveletek átírását, valamint a TPU-specifikus
+optimalizációkat. A szöveges forma:
+<code>jax.jit(fun).lower(*args).as_text()</code> (StableHLO), illetve
+<code>.compile().as_text()</code> (az optimalizált HLO); a korábbi
+<code>jax.xla_computation</code> a 0.4.30-ban megszűnt.</p></li>
+<li><p><strong>TPU executable</strong> – A HLO-ból a TPU backend (az XLA
+TPU-driverén keresztül) a TPU TensorCore-jaira (MXU, vektor- és
+skaláregységek) optimalizált gépi kódot generál. Ez a lépés történhet a
+futtatás előtt (JIT) vagy előre (AOT). A JAX legtöbbször JIT-et használ:
+az első hívás lefordítja a függvényt, a későbbi hívások a cache-ből
+töltik be az executable-t.</p></li>
+</ol>
+<p>A JIT fordítási overheadje TPU-n jelentős lehet: egy összetett
+modellnél akár több másodperc is lehet, ezért minden mérés előtt
+kötelező a warm-up. A fordítási idő mérésére külön kísérletet is
+végezhetünk:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax.numpy <span class="im">as</span> jnp</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>N <span class="op">=</span> <span class="dv">4096</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>key <span class="op">=</span> jax.random.PRNGKey(<span class="dv">0</span>)</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>kA, kB <span class="op">=</span> jax.random.split(key)</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>A <span class="op">=</span> jax.random.normal(kA, (N, N), dtype<span class="op">=</span>jnp.float32)</span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>B <span class="op">=</span> jax.random.normal(kB, (N, N), dtype<span class="op">=</span>jnp.float32)</span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> matmul(A, B):</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> A <span class="op">@</span> B</span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="co"># JIT fordítás időmérése</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>start <span class="op">=</span> time.perf_counter()</span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>C <span class="op">=</span> jax.jit(matmul)(A, B).block_until_ready()</span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>compile_and_run_time <span class="op">=</span> time.perf_counter() <span class="op">-</span> start</span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;Első hívás (fordítás + futtatás): </span><span class="sc">{</span>compile_and_run_time<span class="sc">:.3f}</span><span class="ss"> s&quot;</span>)</span></code></pre></div>
+<p>A generált műveletek ellenőrzéséhez a
+<code>jax.jit(matmul).lower(A, B).as_text()</code> (StableHLO) és a
+<code>.compile().as_text()</code> (optimalizált HLO) használható. A
+fenti mátrixszorzásra egy <code>dot</code> műveletet fogunk látni,
+amelyet az XLA a TPU-n az MXU-ra képez le. A HLO szövegében a
+TPU-specifikus csomagolás (például a layout-ok és a sharding annotációk)
+is megjelenik, ha a JAX-ben megadtuk a shardingot.</p>
+<p>Az XLA fordítási cache-t a JAX folyamaton belül tartja. Ugyanazon
+függvény és bemeneti alakzatok esetén a fordítás csak egyszer történik.
+Ezért a mérési protokollban mindig ugyanazt a függvényt és alakzatot
+használjuk, és a mérés előtt egy üres hívással „bemelegítjük” a
+rendszert.</p>
+<h3 data-number="28.3.3" id="tpu-sharding-a-8-mag-kihasználása"><span
+class="header-section-number">28.3.3</span> TPU sharding: a 8 mag
+kihasználása</h3>
+<p>A TPU-k több magból (TensorCore) állnak, és a JAX-ben ezeket a
+magokat egy logikai mesh-be szervezve oszthatjuk el a számítást. A 28.2.
+alfejezetben bevezetett <code>jax.sharding.Mesh</code>,
+<code>NamedSharding</code> és <code>PartitionSpec</code> eszközök TPU-n
+ugyanúgy működnek, de itt a mesh dimenzióit a fizikai TPU-topológiához
+kell igazítani. Egy TPU v3-8 esetén a 8 magot általában 2×4-es vagy
+4×2-es rácsba szervezhetjük, mert a TPU magok között gyors, 2D-s torus
+összeköttetés van. A rosszul választott mesh-topológia kommunikációs
+többletköltséget okoz, és ronthatja a teljesítményt.</p>
+<p>A sharding megadása a <code>jax.jit</code> hívásban történik az
+<code>in_shardings</code> és <code>out_shardings</code> paraméterekkel.
+Például egy mátrixszorzásnál, ahol az <code>A</code> mátrix sorait az
+<code>x</code> tengelyre, a <code>B</code> mátrix oszlopait az
+<code>y</code> tengelyre, a kimeneti <code>C</code> mátrixot pedig
+mindkét tengelyre shardoljuk, a következőket írjuk:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> functools <span class="im">import</span> partial</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> numpy <span class="im">as</span> np</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax.numpy <span class="im">as</span> jnp</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> jax.sharding <span class="im">import</span> Mesh, NamedSharding, PartitionSpec</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="co"># TPU eszközök lekérése</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>devices <span class="op">=</span> np.array(jax.devices()).reshape(<span class="dv">2</span>, <span class="dv">4</span>)  <span class="co"># TPU v3-8: 2x4 mesh</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>mesh <span class="op">=</span> Mesh(devices, (<span class="st">&#39;x&#39;</span>, <span class="st">&#39;y&#39;</span>))</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="co"># Sharding specifikáció: A sorai az x tengelyre, B oszlopai az y tengelyre</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>pspec_A <span class="op">=</span> PartitionSpec(<span class="st">&#39;x&#39;</span>, <span class="va">None</span>)   <span class="co"># A[..., x, ...] sorok shardolva</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>pspec_B <span class="op">=</span> PartitionSpec(<span class="va">None</span>, <span class="st">&#39;y&#39;</span>)   <span class="co"># B[..., ..., y] oszlopok shardolva</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>pspec_C <span class="op">=</span> PartitionSpec(<span class="st">&#39;x&#39;</span>, <span class="st">&#39;y&#39;</span>)    <span class="co"># C mindkét dimenzióban shardolva</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>A_sharding <span class="op">=</span> NamedSharding(mesh, pspec_A)</span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>B_sharding <span class="op">=</span> NamedSharding(mesh, pspec_B)</span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>C_sharding <span class="op">=</span> NamedSharding(mesh, pspec_C)</span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a><span class="at">@partial</span>(jax.jit, in_shardings<span class="op">=</span>(A_sharding, B_sharding), out_shardings<span class="op">=</span>C_sharding)</span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> matmul(A, B):</span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> A <span class="op">@</span> B</span></code></pre></div>
+<figure id="fig-gpu108-matmul-sharding">
+<div class="fig-interactive"><iframe src="figures/html/gpu108-matmul-sharding.html" title="Felül a 2×4-es mesh, x = 0, 1 sorok, y = 0–3 oszlopok, D0–D7 eszközök. A két vízszintes sávra osztva: A0 a D0–D3, A1 a D4–D7 eszközökön replikálva. B négy függőleges sávra: B_j a D_j és D_(j+4) eszközön. C 2×4 blokk: C_ij a D(i, j) eszközön. N = 8192-nél A_i 4096 × 8192 (128 MiB), B_j 8192 × 2048 (64 MiB), C_ij 4096 × 2048 (32 MiB). A D(1, 2) = D6 eszköz A1-et, B2-t és C12-t tartja; nincs kommunikáció." loading="lazy" style="width:100%;border:0;height:560px"></iframe><noscript><img src="figures/img/gpu108-matmul-sharding.png" style="width:100.0%"
+alt="Felül a 2×4-es mesh, x = 0, 1 sorok, y = 0–3 oszlopok, D0–D7 eszközök. A két vízszintes sávra osztva: A0 a D0–D3, A1 a D4–D7 eszközökön replikálva. B négy függőleges sávra: B_j a D_j és D_(j+4) eszközön. C 2×4 blokk: C_ij a D(i, j) eszközön. N = 8192-nél A_i 4096 × 8192 (128 MiB), B_j 8192 × 2048 (64 MiB), C_ij 4096 × 2048 (32 MiB). A D(1, 2) = D6 eszköz A1-et, B2-t és C12-t tartja; nincs kommunikáció." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu108-matmul-sharding.png" style="width:100.0%"
+alt="Felül a 2×4-es mesh, x = 0, 1 sorok, y = 0–3 oszlopok, D0–D7 eszközök. A két vízszintes sávra osztva: A0 a D0–D3, A1 a D4–D7 eszközökön replikálva. B négy függőleges sávra: B_j a D_j és D_(j+4) eszközön. C 2×4 blokk: C_ij a D(i, j) eszközön. N = 8192-nél A_i 4096 × 8192 (128 MiB), B_j 8192 × 2048 (64 MiB), C_ij 4096 × 2048 (32 MiB). A D(1, 2) = D6 eszköz A1-et, B2-t és C12-t tartja; nincs kommunikáció." /></details></div>
+<figcaption><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>A</mi><mo>⋅</mo><mi>B</mi></mrow><annotation encoding="application/x-tex">A \cdot B</annotation></semantics></math>
+shardolva 2 × 4-es mesh-en: <code>P('x', None)</code> ×
+<code>P(None, 'y')</code> → <code>P('x', 'y')</code>. Minden eszköz a
+teljes kontrakciós dimenziót látja, ezért kollektíva nélkül számolja a
+saját
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>C</mi><mrow><mi>i</mi><mi>j</mi></mrow></msub><annotation encoding="application/x-tex">C_{ij}</annotation></semantics></math>
+blokkját</figcaption>
+</figure>
+<p>Fontos: a <code>PartitionSpec</code> argumentumai a tömb dimenzióinak
+felelnek meg. A <code>None</code> azt jelenti, hogy az adott dimenziót
+nem shardoljuk, hanem minden magra replikáljuk. A mátrixszorzásnál az
+<code>A</code> mátrix sorait (az első dimenzió) az <code>x</code>
+tengely mentén osztjuk el, a <code>B</code> oszlopait (a második
+dimenzió) az <code>y</code> tengely mentén. A kimeneti <code>C</code>
+mátrix mindkét dimenzióban shardolt lesz, ami természetes, mert a
+mátrixszorzás során a kimenet egyes blokkjai a megfelelő bemeneti
+blokkokból számíthatók.</p>
+<p>Ha sem a bemenetek nincsenek shardolva, sem a <code>jit</code> nem
+kap shardingot, a JAX a számítást az alapértelmezett eszközön (egy
+magon) hajtja végre, a többi mag tétlen marad. Ezt a hibát a profilban a
+többi mag tétlensége, a TPU-kihasználtság alacsony értéke jelzi.</p>
+<p>A TPU-n a sharding nem csak a számítást osztja el, hanem a memóriát
+is: minden mag a saját HBM-szeletében tárolja a rá eső adatot. Ezért a
+nagy mátrixok esetén a sharding elengedhetetlen a memóriakorlát
+elkerüléséhez.</p>
+<h3 data-number="28.3.4" id="profilozás-tpu-n"><span
+class="header-section-number">28.3.4</span> Profilozás TPU-n</h3>
+<p>A TPU-n futó JAX-programok profilozására a <code>jax.profiler</code>
+modul szolgál. A profilozás segítségével láthatjuk, mennyi időt töltenek
+az egyes XLA-műveletek a TPU-n, mennyi idő megy el adatmozgatásra és
+kommunikációra, valamint mennyire van kihasználva a TPU. A profilozás
+alapvető lépései:</p>
+<ol type="1">
+<li>Indítsuk el a trace-t a
+<code>jax.profiler.start_trace(log_dir)</code> hívással, ahol a
+<code>log_dir</code> egy könyvtár, ahová a profilfájlok kerülnek.</li>
+<li>Futtassuk a mérendő kódot, és mindenképpen hívjuk meg a
+<code>block_until_ready()</code>-t, hogy a TPU-műveletek valóban
+befejeződjenek, mielőtt a trace-t leállítjuk.</li>
+<li>Állítsuk le a trace-t a <code>jax.profiler.stop_trace()</code>
+hívással.</li>
+<li>Nyissuk meg a profilfájlokat TensorBoard-ban:
+<code>tensorboard --logdir=&lt;log_dir&gt;</code> (a Profile laphoz a
+<code>tensorboard_plugin_profile</code> csomag szükséges).</li>
+</ol>
+<p>Példa a profilozásra:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax.numpy <span class="im">as</span> jnp</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Előfeltétel: a mesh, a sharding és a matmul definíciója a 28.3.3 szerint,</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="co"># A és B pedig már a TPU-ra helyezett (device_put) bemenet.</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>_ <span class="op">=</span> matmul(A, B).block_until_ready()   <span class="co"># warm-up a trace előtt</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="co"># Profilozás indítása</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>log_dir <span class="op">=</span> <span class="st">&quot;/tmp/jax_tpu_profile&quot;</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>jax.profiler.start_trace(log_dir)</span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="co"># Mérendő művelet</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>C <span class="op">=</span> matmul(A, B).block_until_ready()</span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="co"># Profilozás leállítása</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>jax.profiler.stop_trace()</span></code></pre></div>
+<p>A TensorBoard Profile lapján a következőket érdemes megvizsgálni:</p>
+<ul>
+<li><strong>Op timeline</strong>: az egyes XLA-műveletek (pl.
+<code>dot</code>, <code>transpose</code>, <code>copy</code>) időtartama.
+A TPU-n a <code>dot</code> műveletnek dominálnia kell egy jól
+optimalizált mátrixszorzásban.</li>
+<li><strong>Memory bandwidth</strong>: a TPU HBM-sávszélességének
+kihasználtsága. Magas kihasználtság memóriakorlátosságra utal; alacsony
+érték esetén a szűk keresztmetszet máshol van (pl. számítás,
+kommunikáció, várakozás).</li>
+<li><strong>TPU utilization</strong>: az MXU (mátrixegység)
+kihasználtsága. A nagyobb érték jobb, de általános küszöböt (pl.
+&gt;70%) nem adunk; a Profile lapon megjelenő pontos metrikaneveket a
+használt profilcsomag adja.</li>
+<li><strong>Communication</strong>: a TPU magok közötti adatcsere. Ha a
+sharding nem illeszkedik a topológiához, itt nagy időt fogunk
+látni.</li>
+</ul>
+<p>A profilozásnál figyeljünk arra, hogy a trace indítása és leállítása
+közé ne kerüljön a JIT fordítás, mert az torzítja a képet. A warm-up
+után indítsuk a trace-t.</p>
+<h3 data-number="28.3.5" id="labor-tpu-jax-kísérlet"><span
+class="header-section-number">28.3.5</span> Labor: TPU JAX kísérlet</h3>
+<p>A labor célja, hogy a fenti eszközöket egy ellenőrizhető
+mátrixszorzáson alkalmazzuk. Az alábbi kód TPU-n futtatható
+(<strong>ebben a könyvben nem futtattuk</strong>, nincs saját
+TPU-mérés), és méri a mátrixszorzás idejét shardinggal. A környezetet és
+a mérési naplót a kísérlet után rögzítjük.</p>
+<h3 data-number="28.3.6"
+id="labor-környezet-a-fejezet-írásakor-érvényes-ellenőrizd-a-legfrissebb-verziókat"><span
+class="header-section-number">28.3.6</span> Labor környezet (a fejezet
+írásakor érvényes; ellenőrizd a legfrissebb verziókat)</h3>
+<table>
+<colgroup>
+<col style="width: 29%" />
+<col style="width: 37%" />
+<col style="width: 32%" />
+</colgroup>
+<thead>
+<tr>
+<th>Összetevő</th>
+<th>Specifikáció</th>
+<th>Megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TPU típus</td>
+<td>TPU v3-8</td>
+<td>8 mag, magonként 16 GiB HBM (összesen 128 GiB); gyártói adat,
+ellenőrizendő</td>
+</tr>
+<tr>
+<td>JAX verzió</td>
+<td>0.4.38</td>
+<td>Ellenőrizd a legfrissebb stabil verziót</td>
+</tr>
+<tr>
+<td>jaxlib verzió</td>
+<td>0.4.38</td>
+<td>TPU-támogatással</td>
+</tr>
+<tr>
+<td>libtpu</td>
+<td>TPU v3-hoz illeszkedő</td>
+<td>A pontos verziót a JAX-dokumentáció adja</td>
+</tr>
+<tr>
+<td>Operációs rendszer</td>
+<td>a Cloud TPU VM runtime image szerinti (ellenőrizendő)</td>
+<td>a TPU VM szoftververziójától függ</td>
+</tr>
+<tr>
+<td>Python</td>
+<td>3.11</td>
+<td></td>
+</tr>
+<tr>
+<td>NumPy</td>
+<td>1.26.4</td>
+<td></td>
+</tr>
+<tr>
+<td>Mérési módszer</td>
+<td><code>perf_counter</code>, 5 warm-up, 20 ismétlés; medián és
+IQR</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p>A labor kódja:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Nyelv: Python 3.11 + JAX</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Fájl: gpu108_tpu_matmul.py</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="co"># Leírás: Mátrixszorzás TPU-n, shardinggal, mérés.</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> functools <span class="im">import</span> partial</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> numpy <span class="im">as</span> np</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax.numpy <span class="im">as</span> jnp</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> jax.sharding <span class="im">import</span> Mesh, NamedSharding, PartitionSpec</span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> main():</span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 1. TPU backend ellenőrzése</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Backend: </span><span class="sc">{</span>jax<span class="sc">.</span>default_backend()<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Eszközök: </span><span class="sc">{</span>jax<span class="sc">.</span>devices()<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">assert</span> jax.default_backend() <span class="op">==</span> <span class="st">&quot;tpu&quot;</span>, <span class="st">&quot;A kód TPU-t igényel.&quot;</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">assert</span> <span class="bu">len</span>(jax.devices()) <span class="op">==</span> <span class="dv">8</span>, <span class="st">&quot;Pontosan 8 eszköz szükséges (a reshape(2, 4) miatt).&quot;</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 2. Mesh és sharding beállítása</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>    devices <span class="op">=</span> np.array(jax.devices()).reshape(<span class="dv">2</span>, <span class="dv">4</span>)  <span class="co"># TPU v3-8: 2x4</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>    mesh <span class="op">=</span> Mesh(devices, (<span class="st">&#39;x&#39;</span>, <span class="st">&#39;y&#39;</span>))</span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>    pspec_A <span class="op">=</span> PartitionSpec(<span class="st">&#39;x&#39;</span>, <span class="va">None</span>)</span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a>    pspec_B <span class="op">=</span> PartitionSpec(<span class="va">None</span>, <span class="st">&#39;y&#39;</span>)</span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a>    pspec_C <span class="op">=</span> PartitionSpec(<span class="st">&#39;x&#39;</span>, <span class="st">&#39;y&#39;</span>)</span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a>    A_sharding <span class="op">=</span> NamedSharding(mesh, pspec_A)</span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a>    B_sharding <span class="op">=</span> NamedSharding(mesh, pspec_B)</span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a>    C_sharding <span class="op">=</span> NamedSharding(mesh, pspec_C)</span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 3. Mátrixok létrehozása (az alapértelmezett eszközön; a device_put helyezi el shardolva)</span></span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true" tabindex="-1"></a>    N <span class="op">=</span> <span class="dv">8192</span></span>
+<span id="cb5-33"><a href="#cb5-33" aria-hidden="true" tabindex="-1"></a>    dtype <span class="op">=</span> jnp.float32</span>
+<span id="cb5-34"><a href="#cb5-34" aria-hidden="true" tabindex="-1"></a>    key <span class="op">=</span> jax.random.PRNGKey(<span class="dv">0</span>)</span>
+<span id="cb5-35"><a href="#cb5-35" aria-hidden="true" tabindex="-1"></a>    kA, kB, kAs, kBs <span class="op">=</span> jax.random.split(key, <span class="dv">4</span>)</span>
+<span id="cb5-36"><a href="#cb5-36" aria-hidden="true" tabindex="-1"></a>    A_host <span class="op">=</span> jax.random.normal(kA, (N, N), dtype<span class="op">=</span>dtype)</span>
+<span id="cb5-37"><a href="#cb5-37" aria-hidden="true" tabindex="-1"></a>    B_host <span class="op">=</span> jax.random.normal(kB, (N, N), dtype<span class="op">=</span>dtype)</span>
+<span id="cb5-38"><a href="#cb5-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-39"><a href="#cb5-39" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 4. Mátrixok átvitele TPU-ra explicit shardinggal</span></span>
+<span id="cb5-40"><a href="#cb5-40" aria-hidden="true" tabindex="-1"></a>    A <span class="op">=</span> jax.device_put(A_host, A_sharding)</span>
+<span id="cb5-41"><a href="#cb5-41" aria-hidden="true" tabindex="-1"></a>    B <span class="op">=</span> jax.device_put(B_host, B_sharding)</span>
+<span id="cb5-42"><a href="#cb5-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-43"><a href="#cb5-43" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 5. JIT-elt mátrixszorzás shardinggal</span></span>
+<span id="cb5-44"><a href="#cb5-44" aria-hidden="true" tabindex="-1"></a>    <span class="at">@partial</span>(jax.jit, in_shardings<span class="op">=</span>(A_sharding, B_sharding), out_shardings<span class="op">=</span>C_sharding)</span>
+<span id="cb5-45"><a href="#cb5-45" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> matmul(A, B):</span>
+<span id="cb5-46"><a href="#cb5-46" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> A <span class="op">@</span> B</span>
+<span id="cb5-47"><a href="#cb5-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-48"><a href="#cb5-48" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 6. Warm-up (JIT fordítás + 5 futtatás)</span></span>
+<span id="cb5-49"><a href="#cb5-49" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">5</span>):</span>
+<span id="cb5-50"><a href="#cb5-50" aria-hidden="true" tabindex="-1"></a>        matmul(A, B).block_until_ready()</span>
+<span id="cb5-51"><a href="#cb5-51" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-52"><a href="#cb5-52" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 7. Mérés</span></span>
+<span id="cb5-53"><a href="#cb5-53" aria-hidden="true" tabindex="-1"></a>    num_reps <span class="op">=</span> <span class="dv">20</span></span>
+<span id="cb5-54"><a href="#cb5-54" aria-hidden="true" tabindex="-1"></a>    times <span class="op">=</span> []</span>
+<span id="cb5-55"><a href="#cb5-55" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(num_reps):</span>
+<span id="cb5-56"><a href="#cb5-56" aria-hidden="true" tabindex="-1"></a>        start <span class="op">=</span> time.perf_counter()</span>
+<span id="cb5-57"><a href="#cb5-57" aria-hidden="true" tabindex="-1"></a>        C <span class="op">=</span> matmul(A, B).block_until_ready()</span>
+<span id="cb5-58"><a href="#cb5-58" aria-hidden="true" tabindex="-1"></a>        end <span class="op">=</span> time.perf_counter()</span>
+<span id="cb5-59"><a href="#cb5-59" aria-hidden="true" tabindex="-1"></a>        times.append(end <span class="op">-</span> start)</span>
+<span id="cb5-60"><a href="#cb5-60" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-61"><a href="#cb5-61" aria-hidden="true" tabindex="-1"></a>    med <span class="op">=</span> np.median(times)</span>
+<span id="cb5-62"><a href="#cb5-62" aria-hidden="true" tabindex="-1"></a>    iqr <span class="op">=</span> np.percentile(times, <span class="dv">75</span>) <span class="op">-</span> np.percentile(times, <span class="dv">25</span>)</span>
+<span id="cb5-63"><a href="#cb5-63" aria-hidden="true" tabindex="-1"></a>    flops <span class="op">=</span> <span class="dv">2</span> <span class="op">*</span> N<span class="op">**</span><span class="dv">3</span>  <span class="co"># mátrixszorzás műveletigénye</span></span>
+<span id="cb5-64"><a href="#cb5-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-65"><a href="#cb5-65" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;N = </span><span class="sc">{</span>N<span class="sc">}</span><span class="ss">, dtype = </span><span class="sc">{</span>dtype<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb5-66"><a href="#cb5-66" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Medián futásidő: </span><span class="sc">{</span>med<span class="sc">:.6f}</span><span class="ss"> s&quot;</span>)</span>
+<span id="cb5-67"><a href="#cb5-67" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;IQR: </span><span class="sc">{</span>iqr<span class="sc">:.6f}</span><span class="ss"> s&quot;</span>)</span>
+<span id="cb5-68"><a href="#cb5-68" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Teljesítmény: </span><span class="sc">{</span>flops <span class="op">/</span> med <span class="op">/</span> <span class="fl">1e12</span><span class="sc">:.2f}</span><span class="ss"> TFLOPS&quot;</span>)</span>
+<span id="cb5-69"><a href="#cb5-69" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Elméleti FLOP: </span><span class="sc">{</span>flops <span class="op">/</span> <span class="fl">1e12</span><span class="sc">:.2f}</span><span class="ss"> TFLOP&quot;</span>)</span>
+<span id="cb5-70"><a href="#cb5-70" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-71"><a href="#cb5-71" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 8. Helyesség: shardolt TPU-eredmény összevetése host (NumPy) referenciával</span></span>
+<span id="cb5-72"><a href="#cb5-72" aria-hidden="true" tabindex="-1"></a>    N_small <span class="op">=</span> <span class="dv">1024</span></span>
+<span id="cb5-73"><a href="#cb5-73" aria-hidden="true" tabindex="-1"></a>    A_s <span class="op">=</span> jax.random.normal(kAs, (N_small, N_small), dtype<span class="op">=</span>dtype)</span>
+<span id="cb5-74"><a href="#cb5-74" aria-hidden="true" tabindex="-1"></a>    B_s <span class="op">=</span> jax.random.normal(kBs, (N_small, N_small), dtype<span class="op">=</span>dtype)</span>
+<span id="cb5-75"><a href="#cb5-75" aria-hidden="true" tabindex="-1"></a>    small_mm <span class="op">=</span> jax.jit(<span class="kw">lambda</span> a, b: a <span class="op">@</span> b,</span>
+<span id="cb5-76"><a href="#cb5-76" aria-hidden="true" tabindex="-1"></a>                       in_shardings<span class="op">=</span>(A_sharding, B_sharding),</span>
+<span id="cb5-77"><a href="#cb5-77" aria-hidden="true" tabindex="-1"></a>                       out_shardings<span class="op">=</span>C_sharding)</span>
+<span id="cb5-78"><a href="#cb5-78" aria-hidden="true" tabindex="-1"></a>    small_hi <span class="op">=</span> jax.jit(<span class="kw">lambda</span> a, b: jnp.matmul(a, b, precision<span class="op">=</span>jax.lax.Precision.HIGHEST),</span>
+<span id="cb5-79"><a href="#cb5-79" aria-hidden="true" tabindex="-1"></a>                       in_shardings<span class="op">=</span>(A_sharding, B_sharding),</span>
+<span id="cb5-80"><a href="#cb5-80" aria-hidden="true" tabindex="-1"></a>                       out_shardings<span class="op">=</span>C_sharding)</span>
+<span id="cb5-81"><a href="#cb5-81" aria-hidden="true" tabindex="-1"></a>    ref <span class="op">=</span> np.asarray(A_s, dtype<span class="op">=</span>np.float64) <span class="op">@</span> np.asarray(B_s, dtype<span class="op">=</span>np.float64)</span>
+<span id="cb5-82"><a href="#cb5-82" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> name, fn <span class="kw">in</span> ((<span class="st">&quot;alapértelmezett precision&quot;</span>, small_mm),</span>
+<span id="cb5-83"><a href="#cb5-83" aria-hidden="true" tabindex="-1"></a>                     (<span class="st">&quot;HIGHEST&quot;</span>, small_hi)):</span>
+<span id="cb5-84"><a href="#cb5-84" aria-hidden="true" tabindex="-1"></a>        C_s <span class="op">=</span> np.asarray(fn(jax.device_put(A_s, A_sharding),</span>
+<span id="cb5-85"><a href="#cb5-85" aria-hidden="true" tabindex="-1"></a>                            jax.device_put(B_s, B_sharding)))</span>
+<span id="cb5-86"><a href="#cb5-86" aria-hidden="true" tabindex="-1"></a>        rel <span class="op">=</span> np.linalg.norm(C_s <span class="op">-</span> ref) <span class="op">/</span> np.linalg.norm(ref)</span>
+<span id="cb5-87"><a href="#cb5-87" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;Relatív hiba (Frobenius), </span><span class="sc">{</span>name<span class="sc">}</span><span class="ss">: </span><span class="sc">{</span>rel<span class="sc">:.3e}</span><span class="ss">&quot;</span>)</span>
+<span id="cb5-88"><a href="#cb5-88" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-89"><a href="#cb5-89" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="va">__name__</span> <span class="op">==</span> <span class="st">&quot;__main__&quot;</span>:</span>
+<span id="cb5-90"><a href="#cb5-90" aria-hidden="true" tabindex="-1"></a>    main()</span></code></pre></div>
+<h3 data-number="28.3.7" id="mérési-napló-sablon"><span
+class="header-section-number">28.3.7</span> Mérési napló (sablon)</h3>
+<p>A mérési naplóban a ténylegesen mért értékeket a laboratóriumi
+futtatás után kell beírni. Az alábbi táblázat a <strong>várt</strong>
+eredményeket és a <strong>mért</strong> eredmények helyét mutatja; a
+mért oszlop üres, mert a labor nem futott.</p>
+<table>
+<colgroup>
+<col style="width: 14%" />
+<col style="width: 42%" />
+<col style="width: 21%" />
+<col style="width: 21%" />
+</colgroup>
+<thead>
+<tr>
+<th>Mutató</th>
+<th>Várt érték / tartomány</th>
+<th>Mért érték</th>
+<th>Megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Backend</td>
+<td><code>tpu</code></td>
+<td></td>
+<td>Ellenőrzés</td>
+</tr>
+<tr>
+<td>Eszközök száma</td>
+<td>8</td>
+<td></td>
+<td>TPU v3-8</td>
+</tr>
+<tr>
+<td>Medián futásidő (N=8192, f32)</td>
+<td>analitikus alsó korlát: 2·N³ ≈ 1,10 TFLOP osztva a hardvercsúccsal
+(az adatlap szerinti BF16-csúcs egy v3-8-on kb. 420 TFLOPS,
+ellenőrizendő → legalább kb. 2,6 ms); a tényleges érték nem becsülhető
+megbízhatóan</td>
+<td></td>
+<td>Az f32 dot alapértelmezett precisionnel TPU-n egyetlen bf16 menetben
+fut; <code>precision=HIGHEST</code> esetén több menet, lassabb.</td>
+</tr>
+<tr>
+<td>IQR</td>
+<td>a mediánhoz képest kicsi (a küszöb a mérésből rögzítendő)</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>TFLOPS (mért)</td>
+<td>a futásidőből: 1,10 TFLOP / idő; a csúcs fölötti érték mérési hibát
+jelez</td>
+<td></td>
+<td>A mérés a <code>block_until_ready</code> miatt a számítási időt
+méri.</td>
+</tr>
+<tr>
+<td>Helyesség</td>
+<td>a kis méretű (1024) shardolt eredmény relatív hibája a float64
+NumPy-referenciához képest: alapértelmezett precisionnel nagyságrendileg
+1e-3–1e-2 (bf16 bemenet), <code>HIGHEST</code>-nél jóval kisebb; a
+küszöböt a mérés alapján kell rögzíteni</td>
+<td></td>
+<td>A fő eltérés oka az f32 matmul alapértelmezett bf16 menete, nem
+csupán a műveleti sorrend.</td>
+</tr>
+</tbody>
+</table>
+<p>A <strong>várt</strong> értékek indoklása: a JAX az f32
+mátrixszorzást TPU-n alapértelmezett precisionnel egyetlen bf16 menetben
+végzi (gyorsabb, de ~1e-3–1e-2 relatív hibával);
+<code>precision=HIGHEST</code> esetén több menet kell, ami lassabb.
+Konkrét TFLOPS-értéket forrás és mérés híján nem közlünk. A mért érték
+alacsonyabb is lehet, ha a sharding kommunikációs overheadet okoz, vagy
+ha a mátrixméret nem optimális a TPU számára. A mérési eredményt mindig
+az adott TPU-generációra és a JAX-verzióra vonatkoztatva kell
+értelmezni.</p>
+<h3 data-number="28.3.8" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">28.3.8</span> Tipikus hibák és helyes
+megoldások</h3>
+<p>A TPU-n futó JAX-programoknál a következő hibák fordulnak elő
+leggyakrabban, és a megoldásuk tanulságos:</p>
+<ol type="1">
+<li><p><strong>Hiba: a backend CPU.</strong><br />
+A <code>jax.default_backend()</code> értéke <code>'cpu'</code>, mert a
+TPU nem elérhető, vagy a JAX nem TPU-támogatással lett telepítve.<br />
+<strong>Megoldás:</strong> ellenőrizzük a <code>jax.devices()</code>
+kimenetét, és győződjünk meg arról, hogy a környezetben van TPU. Ha
+nincs, indítsunk TPU-VM-et, vagy használjunk Colab/Kaggle TPU-t. A
+telepítéshez a hivatalos JAX-dokumentációban szereplő
+<code>pip install jax[tpu]</code> parancsot használjuk (a pontos csomag
+neve változhat).</p></li>
+<li><p><strong>Hiba: a sharding hiánya.</strong><br />
+A bemenetek az alapértelmezett eszközön vannak (nincs
+<code>device_put</code> shardinggal), és a <code>jax.jit</code> sem kap
+<code>in_shardings</code>-et, így a számítás egy magon fut.<br />
+<strong>Megoldás:</strong> vagy shardolt bemeneteket adjunk át (a
+<code>jit</code> a bemenetek shardingját követi), vagy írjuk elő a
+<code>jit</code>-nek az
+<code>in_shardings</code>/<code>out_shardings</code> paramétert;
+ellenőrzés: <code>C.sharding</code> és
+<code>len(C.sharding.device_set)</code>. Hozzunk létre
+<code>Mesh</code>-t és <code>NamedSharding</code>-ot. Ellenőrizzük, hogy
+a <code>mesh</code> dimenziói illeszkednek a TPU-topológiához.</p></li>
+<li><p><strong>Hiba: a mérésnél nincs warm-up.</strong><br />
+Az első hívás tartalmazza a JIT fordítási időt, ami több másodperc is
+lehet, és így a mért idő torz lesz.<br />
+<strong>Megoldás:</strong> a mérés előtt legalább egyszer hívjuk meg a
+függvényt <code>block_until_ready()</code>-vel, és csak utána kezdjük el
+az időmérést.</p></li>
+<li><p><strong>Hiba: a <code>block_until_ready</code>
+elhagyása.</strong><br />
+A JAX aszinkron módon hajtja végre a műveleteket; ha nem blokkolunk, a
+<code>time.perf_counter</code> csak a dispatch idejét méri, nem a
+tényleges számítást.<br />
+<strong>Megoldás:</strong> minden mért hívás után hívjuk meg a
+<code>block_until_ready()</code>-t, mielőtt a stopperórát
+leállítjuk.</p></li>
+<li><p><strong>Hiba: a profilozás nem rögzít
+TPU-műveleteket.</strong><br />
+A <code>jax.profiler.start_trace</code> és <code>stop_trace</code>
+között nem szinkronizálunk, ezért a trace üres vagy hiányos lesz.<br />
+<strong>Megoldás:</strong> a <code>stop_trace()</code> előtt mindig
+hívjuk meg a <code>block_until_ready()</code>-t, és a trace indítása
+előtt végezzük el a warm-up-ot.</p></li>
+<li><p><strong>Hiba: a mátrixméret nem fér a TPU
+memóriájába.</strong><br />
+A TPU HBM-mérete korlátozott (pl. v3-8 esetén magonként 16 GiB, összesen
+128 GiB). Ha a mátrixok túl nagyok, a futtatás memóriahiánnyal
+leáll.<br />
+<strong>Megoldás:</strong> a sharding csökkenti az egyes magokra jutó
+memóriát, de a teljes mátrix mérete így is korlátos. A laborban N=8192
+f32 esetén a két bemeneti mátrix egyenként 256 MiB, a kimenet 256 MiB,
+ami belefér. Nagyobb N esetén bfloat16-ot vagy másik TPU-típust kell
+választani.</p></li>
+<li><p><strong>Hiba: a pontosság összehasonlításakor a TPU és a CPU
+eltérő eredményt ad.</strong><br />
+Az f32 matmul alapértelmezésben bf16 bemenettel számol (relatív hiba
+~1e-3–1e-2), a műveleti sorrend pedig szintén eltérhet.<br />
+<strong>Megoldás:</strong> a numerikus összehasonlítást tűréshatárral
+végezzük (pl. relatív norma-hiba vagy <code>jnp.allclose</code>
+megfelelő <code>rtol</code>-lal), vagy <code>precision=HIGHEST</code>
+mellett hasonlítunk, és rögzítjük a használt precisiont.</p></li>
+</ol>
+<h3 data-number="28.3.9" id="összefoglalás-és-további-lépések"><span
+class="header-section-number">28.3.9</span> Összefoglalás és további
+lépések</h3>
+<p>Ebben a fejezetben megvizsgáltuk, hogyan futtatható a JAX
+TPU-n. Láttuk, hogy a JAX backend kiválasztása automatikus, de
+ellenőrizni kell. Az XLA fordítási lánc (Jaxpr → HLO → TPU executable)
+meghatározza a teljesítményt és a hibakeresés lehetőségeit. A sharding a
+TPU magok kihasználásának kulcsa, a profilozás pedig megmutatja, hol van
+szűk keresztmetszet. A labor egy shardolt mátrixszorzás mérési eljárását
+és naplósablonját adja meg; a várt értékeket levezettük, a mért
+értékeket a saját TPU-futás után kell kitölteni.</p>
+<p>A következő alfejezet (28.4) ezekre az alapokra épít, és mélyebben
+elemzi a JAX teljesítményét és korlátait TPU-n: a memória-sávszélesség,
+a kommunikáció és a precision szerepét.</p>
+<h3 data-number="28.3.10" id="önellenőrző-kérdés"><span
+class="header-section-number">28.3.10</span> Önellenőrző kérdés</h3>
+<p>Miért fontos a TPU-n a <code>Mesh</code> és a
+<code>NamedSharding</code> megadása, és mi történik, ha elhagyjuk?
+Magyarázd el, miért nem elegendő pusztán a <code>jax.jit</code>
+használata a TPU teljesítményének kihasználásához.</p>
+<p><strong>Válasz vázlat:</strong> A <code>Mesh</code> és a
+<code>NamedSharding</code> mondja meg, hogyan oszlik el a tömb a
+TPU-magokon. Ha sem a bemenetek nincsenek shardolva, sem a
+<code>jit</code> nem kap shardingot, a számítás az alapértelmezett
+eszközön (egy magon) fut, a többi mag tétlen marad, és a labor
+teljesítménye egy mag teljesítményére korlátozódik; a shardolás emellett
+a memóriát is elosztja. A <code>jax.jit</code> önmagában csak a
+fordítást és az operátorfúziót adja, az adatelosztást nem.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu107.html">← 28.2 Vmap, pmap és sharding</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu109.html">28.4 JAX teljesítmény és korlátok →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

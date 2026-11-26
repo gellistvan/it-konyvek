@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>27.2 XLA és a gráffordítás – GPGPU – általános célú számítások
+GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz6">VI. RÉSZ – TPU, OpenCL és más modellek</a> › <a href="index.html#gpuch26">27 TPU architektúra és XLA</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu102.html">← 27.1 TPU-architektúra</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu104.html">27.3 TPU programozási modell →</a></div>
+</nav>
+<h2 data-number="27.2" id="gpu103"><span
+class="header-section-number">27.2</span> XLA és a gráffordítás</h2>
+<p>Az XLA (Accelerated Linear Algebra) nem könyvtár, hanem egy
+optimalizáló compiler, amely a JAX, a TensorFlow és más keretrendszerek
+által előállított magas szintű gráfot hardver-specifikus végrehajtható
+kóddá alakítja. A 27.1. alfejezetben láttuk, hogy a TPU szisztolikus
+tömbje csak akkor hatékony, ha az adatfolyamot és a memóriaelérést
+pontosan illesztjük a hardverhez. Az XLA ezt a feladatot végzi el:
+bemenetként kap egy HLO-gráfot (High Level Optimizer), majd fúzióval,
+csempézéssel, elrendezés-hozzárendeléssel és egyéb átalakításokkal olyan
+kódot állít elő, amely a TPU-n, GPU-n vagy CPU-n a lehető legkevesebb
+memóriamozgatással és a lehető legnagyobb számítási átfedéssel fut.</p>
+<p>A fejezetben az XLA-t elsősorban a JAX felől vizsgáljuk, mert a JAX a
+legközvetlenebbül teszi láthatóvá a gráffordítás fázisait. A 27.1 az XLA
+programozási modelljét röviden bemutatta; itt a fordítás fázisaira, a
+fúzióra és az elrendezésre koncentrálunk, és nem ismételjük az ott leírt
+jit→HLO áttekintést. A tanult fogalmak azonban ugyanúgy érvényesek a
+CUDA C++ oldalán is: ha korábban saját kerneleket optimalizáltunk,
+érdemes felismerni, hogy az XLA által végzett fúzió, csempézés és
+elrendezés-választás ugyanazokat a hardveres elveket követi, mint
+amelyeket a CUDA fejezetekben a shared memory tilingnél, a coalescingnál
+és a latency hidingnál megismertünk.</p>
+<h3 data-number="27.2.1" id="a-hlo-mint-köztes-nyelv"><span
+class="header-section-number">27.2.1</span> A HLO mint köztes nyelv</h3>
+<p>A HLO az XLA köztes reprezentációja. A JAX <code>jax.jit</code>
+hívása során a Python-kód először egy úgynevezett jaxpr reprezentációvá
+alakul; a JAX ezt StableHLO-ra (MLIR) fordítja, az XLA pedig ezt HLO-vá
+alakítja, és ezen futtatja az optimalizáló passzokat. A HLO szöveges
+formája hasonlít egy statikus típusú, funkcionális programnyelvre:
+minden műveletnek explicit bemenete és kimenete van, a dimenziók és
+típusok rögzítettek, és nincs Python-szintű vezérlési szerkezet.</p>
+<p>Egy egyszerű HLO-részlet így nézhet ki:</p>
+<pre class="text"><code>HloModule jit_f, entry_computation_layout={(f32[1024,128]{1,0})-&gt;f32[1024]{0}}
+
+%add (p0: f32[], p1: f32[]) -&gt; f32[] {
+  %p0 = f32[] parameter(0)
+  %p1 = f32[] parameter(1)
+  ROOT %s = f32[] add(%p0, %p1)
+}
+
+%max (q0: f32[], q1: f32[]) -&gt; f32[] {
+  %q0 = f32[] parameter(0)
+  %q1 = f32[] parameter(1)
+  ROOT %t = f32[] maximum(%q0, %q1)
+}
+
+ENTRY %main (x: f32[1024,128]) -&gt; f32[1024] {
+  %x = f32[1024,128] parameter(0)
+  %y = f32[1024,128] sine(%x)
+  %z = f32[1024,128] multiply(%y, %x)
+  %zero = f32[] constant(0)
+  %w = f32[1024] reduce(%z, %zero), dimensions={1}, to_apply=%add
+  %ninf = f32[] constant(-inf)
+  %m = f32[] reduce(%x, %ninf), dimensions={0,1}, to_apply=%max
+  %b = f32[1024] broadcast(%m), dimensions={}
+  ROOT %result = f32[1024] add(%w, %b)
+}</code></pre>
+<p>A fenti kimenet egyszerűsített illusztráció (nem valós dump); a
+pontos forma a JAX/XLA verziótól függ. A fontos megfigyelés az, hogy a
+HLO-ból már eltűnt a Python dinamizmusa: a <code>jnp.sin</code>, a
+szorzás, a redukció és a maximum mind külön HLO-utasítás, amelyek a
+compiler számára matematikai műveletekként értelmezhetők.</p>
+<p>A HLO előnye, hogy a gráf minden csomópontja statikus alakkal és
+típussal rendelkezik. Ez lehetővé teszi az algebrai egyszerűsítést, a
+közös részkifejezések kiküszöbölését (CSE), a konstansok beágyazását és
+a memóriaallokáció tervezését. A HLO nem tartalmaz olyan
+Python-vezérlést, mint az <code>if</code> vagy a <code>for</code>;
+ezeket a JAX transzformációi már korábban feloldották, vagy explicit
+HLO-vezérlési műveletekké alakították (például <code>conditional</code>,
+<code>while</code>).</p>
+<h3 data-number="27.2.2" id="a-gráffordítás-fázisai"><span
+class="header-section-number">27.2.2</span> A gráffordítás fázisai</h3>
+<p>Az XLA fordítócsővezeték több, jól elkülöníthető fázisból áll. A
+<code>jax.jit</code> hívásakor a JAX a függvényt tracerek segítségével
+absztrakt módon végrehajtja, és előállít egy jaxpr-t. Ezt követően az
+XLA az alábbi lépéseket végzi:</p>
+<ol type="1">
+<li><strong>HLO előállítása</strong>: a jaxpr-ből a JAX StableHLO-t
+készít, ezt az XLA HLO-vá alakítja.</li>
+<li><strong>Inliner és egyszerűsítés</strong>: a beágyazott
+HLO-modulokat beolvasztja, a konstansokat kiértékeli, a felesleges
+átalakításokat eltávolítja.</li>
+<li><strong>Algebrai egyszerűsítés</strong>: például <code>x * 1</code>
+→ <code>x</code>, <code>x + 0</code> → <code>x</code>, vagy a redundáns
+transzpozíciók kiiktatása.</li>
+<li><strong>Elrendezés-hozzárendelés (layout assignment)</strong>:
+minden tenzorhoz memóriaelrendezést rendel.</li>
+<li><strong>Fúzió (fusion)</strong>: összevonható műveletcsoportokat
+egyetlen kernelbe von össze.</li>
+<li><strong>Csempézés (tiling)</strong>: nagy műveleteket kisebb
+blokkokra bont.</li>
+<li><strong>Kódgenerálás</strong>: a HLO-ból hardver-specifikus LLVM IR,
+GPU/TPU kernel vagy egyéb célkód készül.</li>
+</ol>
+<figure id="fig-gpu103-lanc">
+<div class="fig-interactive"><iframe src="figures/html/gpu103-lanc.html" title="Folyamatábra: Python-függvény, jaxpr, StableHLO (MLIR), HLO before_optimizations, passzok (egyszerűsítés, algebrai egyszerűsítés, layout assignment, fúzió, csempézés), HLO after_optimizations, célkód. A jaxpr-hez a jax.make_jaxpr, a StableHLO-hoz a jax.jit(f).lower(x).as_text(), a before_optimizations HLO-hoz az XLA_FLAGS dump, az after_optimizations HLO-hoz a lower(x).compile().as_text() tartozik. A jaxpr dobozon hurok: grad és vmap, jaxpr-ből jaxpr. A JAX-oldali dobozok vékony, az XLA-oldaliak vastag kerettel." loading="lazy" style="width:100%;border:0;height:430px"></iframe><noscript><img src="figures/img/gpu103-lanc.png" style="width:90.0%"
+alt="Folyamatábra: Python-függvény, jaxpr, StableHLO (MLIR), HLO before_optimizations, passzok (egyszerűsítés, algebrai egyszerűsítés, layout assignment, fúzió, csempézés), HLO after_optimizations, célkód. A jaxpr-hez a jax.make_jaxpr, a StableHLO-hoz a jax.jit(f).lower(x).as_text(), a before_optimizations HLO-hoz az XLA_FLAGS dump, az after_optimizations HLO-hoz a lower(x).compile().as_text() tartozik. A jaxpr dobozon hurok: grad és vmap, jaxpr-ből jaxpr. A JAX-oldali dobozok vékony, az XLA-oldaliak vastag kerettel." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu103-lanc.png" style="width:90.0%"
+alt="Folyamatábra: Python-függvény, jaxpr, StableHLO (MLIR), HLO before_optimizations, passzok (egyszerűsítés, algebrai egyszerűsítés, layout assignment, fúzió, csempézés), HLO after_optimizations, célkód. A jaxpr-hez a jax.make_jaxpr, a StableHLO-hoz a jax.jit(f).lower(x).as_text(), a before_optimizations HLO-hoz az XLA_FLAGS dump, az after_optimizations HLO-hoz a lower(x).compile().as_text() tartozik. A jaxpr dobozon hurok: grad és vmap, jaxpr-ből jaxpr. A JAX-oldali dobozok vékony, az XLA-oldaliak vastag kerettel." /></details></div>
+<figcaption>A JAX/XLA fordítási lánca és a vizsgálati pontok: a
+<code>grad</code>/<code>vmap</code> a jaxpr szintjén dolgozik, a
+StableHLO a JAX és az XLA közötti csereformátum, a négy lekérdező API a
+megfelelő szinthez tartozik</figcaption>
+</figure>
+<p>A fúzió és a csempézés a legfontosabb teljesítményoptimalizáló
+lépések. A 27.1. alfejezetben láttuk, hogy a szisztolikus tömb csak
+akkor teljesít jól, ha a mátrixblokkok folyamatosan rendelkezésre állnak
+– a TPU v1-et éppen a memória-sávszélesség korlátozta. A fúzió csökkenti
+a köztes eredmények globális memóriába (GPU-n HBM-be) írásából és
+visszaolvasásából adódó forgalmat, a csempézés pedig a blokkméretet a
+gyors helyi memóriához igazítja.</p>
+<p>A HLO-gráfot az <code>XLA_FLAGS=--xla_dump_to=&lt;könyvtár&gt;</code>
+környezeti változóval ki lehet íratni; a szöveges HLO-hoz elég a
+<code>--xla_dump_hlo_as_text</code> kapcsoló. A
+<code>--xla_dump_hlo_pass_re</code> kapcsolóval megadható, hogy mely
+optimalizáló passzok után készüljön dump; az <code>.*</code> minta az
+összes passzra mentést kér, ami több száz fájlt eredményez, ezért
+általában nem ajánlott. Például:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab_xla_hlo.py</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="va">XLA_FLAGS</span><span class="op">=</span><span class="st">&quot;--xla_dump_to=/tmp/hlo_dump --xla_dump_hlo_as_text&quot;</span> <span class="ex">python</span> lab_xla_hlo.py</span></code></pre></div>
+<p>A dump könyvtárban
+<code>module_NNNN.jit_f.*before_optimizations.txt</code> és
+<code>module_NNNN.jit_f.*after_optimizations.txt</code> jellegű fájlok
+jelennek meg (a modul sorszáma és a GPU-s fájlnevek, például
+<code>sm_8.0_gpu_after_optimizations</code>, verziófüggők). Az
+<code>after_optimizations</code> fájlban a kiválasztott műveletek
+<code>fusion</code> régiókba kerülnek. A lefordított, optimalizált HLO a
+kódból is lekérdezhető:
+<code>jax.jit(f).lower(x).compile().as_text()</code>.</p>
+<h3 data-number="27.2.3"
+id="fúzió-kevesebb-memóriamozgatás-jobb-adatújrafelhasználás"><span
+class="header-section-number">27.2.3</span> Fúzió: kevesebb
+memóriamozgatás, jobb adatújrafelhasználás</h3>
+<p>A fúzió (fusion) során az XLA több HLO-műveletet egyetlen kernelbe
+von össze. Például a <code>sin(x) * x + 1</code> lánc három külön
+HLO-utasítás, de fúzió után egyetlen kernel hajtja végre mindhárom
+műveletet. Ez azért előnyös, mert a köztes eredményeket nem kell a
+globális memóriába kiírni, majd onnan visszaolvasni; a kernel a
+regiszterekben vagy a shared memóriában tartja az adatokat, amíg a
+következő műveletnek szüksége van rájuk.</p>
+<figure id="fig-gpu103-fuzio">
+<div class="fig-interactive"><iframe src="figures/html/gpu103-fuzio.html" title="Három panel. A: fúzió nélkül a sin, a multiply és az add külön kernel; a HBM-ben x, y, z és out tenzor; hét számozott átvitel: x olvasása, y írása, y és x olvasása, z írása, z olvasása, out írása. B: egyetlen fúzionált kernel, y és z regiszterben, két átvitel: x olvasása és out írása. C: a labor f(x) függvénye, x f32[1024,128]; fusion.row_sum régió (sine, multiply, reduce dim 1, eredmény f32[1024]) és fusion.global_max régió (reduce dims 0 és 1, eredmény skalár), majd broadcast és add, kimenet f32[1024]." loading="lazy" style="width:100%;border:0;height:640px"></iframe><noscript><img src="figures/img/gpu103-fuzio.png" style="width:100.0%"
+alt="Három panel. A: fúzió nélkül a sin, a multiply és az add külön kernel; a HBM-ben x, y, z és out tenzor; hét számozott átvitel: x olvasása, y írása, y és x olvasása, z írása, z olvasása, out írása. B: egyetlen fúzionált kernel, y és z regiszterben, két átvitel: x olvasása és out írása. C: a labor f(x) függvénye, x f32[1024,128]; fusion.row_sum régió (sine, multiply, reduce dim 1, eredmény f32[1024]) és fusion.global_max régió (reduce dims 0 és 1, eredmény skalár), majd broadcast és add, kimenet f32[1024]." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu103-fuzio.png" style="width:100.0%"
+alt="Három panel. A: fúzió nélkül a sin, a multiply és az add külön kernel; a HBM-ben x, y, z és out tenzor; hét számozott átvitel: x olvasása, y írása, y és x olvasása, z írása, z olvasása, out írása. B: egyetlen fúzionált kernel, y és z regiszterben, két átvitel: x olvasása és out írása. C: a labor f(x) függvénye, x f32[1024,128]; fusion.row_sum régió (sine, multiply, reduce dim 1, eredmény f32[1024]) és fusion.global_max régió (reduce dims 0 és 1, eredmény skalár), majd broadcast és add, kimenet f32[1024]." /></details></div>
+<figcaption>Fúzió nélküli és fúzionált végrehajtás; a labor függvényének
+fúziós régiói. A <code>sin(x) * x + 1</code> láncban a szorzás
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>x</mi><annotation encoding="application/x-tex">x</annotation></semantics></math>-et
+újra beolvassa, ezért fúzió nélkül 7 HBM-átvitel (4 olvasás, 3 írás)
+kell, fúzióval 2; sematikus ábra, a valós felosztás a dumpból
+ellenőrizendő</figcaption>
+</figure>
+<p>A fúzió hatása különösen a memóriakötött feladatoknál drámai. Ha egy
+elemenkénti lánc három egyoperandusú műveletből áll, fúzió nélkül minden
+művelet külön kernel, amely a teljes tenzort beolvassa és kiírja a
+globális memóriába. Ez 6 tenzorátvitel (3 olvasás és 3 írás). A fenti
+<code>sin(x) * x + 1</code> példában a szorzás <code>x</code>-et újra
+beolvassa, így fúzió nélkül 7 átvitel (4 olvasás, 3 írás) adódik.
+Fúzióval a globális memóriából egyszer olvasunk, egyszer írunk, a köztes
+értékek regiszterben maradnak, azaz 2 átvitel. A forgalom így a fúzió
+nélkül a szükséges többszöröse: a tisztán egyoperandusú láncnál 6
+helyett 2 átvitel (háromszoros), a <code>sin(x) * x + 1</code> példában
+7 helyett 2 (3,5-szeres).</p>
+<p>Az XLA többféle fúziós típust ismer:</p>
+<ul>
+<li><strong>kLoop</strong>: elemenkénti műveleteket von össze, amelyek
+azonos indexeléssel dolgoznak. Például <code>sin</code>,
+<code>multiply</code>, <code>add</code> egy kifejezésben.</li>
+<li><strong>kInput</strong>: egy redukció bemenetét előállító
+elemenkénti műveleteket olvasztja a redukcióba (például
+<code>sin(x) * x</code> közvetlenül a sorösszegzés bemenetén), így a
+köztes tenzor nem kerül a memóriába.</li>
+<li><strong>kOutput</strong>: egy elemenkénti fogyasztót (például
+bias-add, aktivációs függvény) olvaszt egy <code>dot</code> vagy
+konvolúció kimenetébe.</li>
+<li><strong>Multi-output (sibling) fúzió</strong>: közös bemenetet
+olvasó, egymástól független műveleteket (például ugyanazon az adaton
+számolt összeg és maximum) egy kernelbe von több kimenettel.</li>
+</ul>
+<p>A fúziós típusok pontos elnevezése és viselkedése verziófüggő; az XLA
+dokumentációja és a valós dump a mérvadó.</p>
+<p>A fúzió nem mindig előnyös. Ha egy művelet nagyon nagy számítási
+igényű, és a fúzió miatt a kernel regiszternyomása túl magas lesz, az
+occupancy csökkenhet, és a futásidő romolhat. Az XLA költségmodellt
+használ annak eldöntésére, hogy a fúzió megéri-e. A döntés a hardver
+jellemzőitől is függ: TPU-n más a fúziós stratégia, mint GPU-n.</p>
+<p>A HLO dumpban a fúziós régiók jól láthatók. A fenti példafüggvény
+optimalizálás utáni alakja sematikusan így nézhet ki (illusztráció, nem
+valós dump; a pontos felosztás verzió- és célhardver-függő):</p>
+<pre class="text"><code>%fusion.row_sum (x: f32[1024,128]) -&gt; f32[1024] {
+  %y = f32[1024,128] sine(%x)
+  %z = f32[1024,128] multiply(%y, %x)
+  ROOT %w = f32[1024] reduce(%z, %zero), dimensions={1}, to_apply=%add
+}
+%fusion.global_max (x: f32[1024,128]) -&gt; f32[] {
+  ROOT %m = f32[] reduce(%x, %ninf), dimensions={0,1}, to_apply=%max
+}
+// broadcast + add:
+ROOT %fusion.out = f32[1024] fusion(%fusion.row_sum, %fusion.global_max),
+    kind=kLoop</code></pre>
+<p>A sematikus kivonat két redukciós régiót mutat: a sorösszegzést a
+bemenetét előállító <code>sine</code> és <code>multiply</code>
+műveletekkel (kInput jellegű fúzió), a globális maximumot külön
+régióban, mert az minden elemtől függ, és az eredménye csak a teljes
+futás után áll rendelkezésre. A <code>broadcast</code> és az
+<code>add</code> ezután egy elemenkénti fúzióba kerülhet. A valós XLA
+ennél más felosztást is választhat.</p>
+<h3 data-number="27.2.4"
+id="csempézés-a-nagy-tenzorok-felosztása-a-memóriahierarchiához"><span
+class="header-section-number">27.2.4</span> Csempézés: a nagy tenzorok
+felosztása a memóriahierarchiához</h3>
+<p>A csempézés (tiling) a nagy tenzorokat kisebb blokkokra osztja, hogy
+azok a gyorsabb memóriaszinteken férjenek el. A TPU v2–v5 szisztolikus
+tömbje 128×128-as, a v1 és a v6e tömbje 256×256-os mátrixblokkokat tud
+egyszerre feldolgozni, ezért (generációtól függően) a compiler olyan
+tile-méreteket választ, amelyek ehhez illeszkednek. A GPU-n a csempézés
+a shared memory méretéhez igazodik; ugyanaz az elv, mint amit a CUDA
+<code>tiling</code> fejezetben láttunk.</p>
+<p>A HLO szintjén a csempézés nem mindig látható közvetlenül, mert az
+XLA a kódgenerálás fázisában hajtja végre. Például egy mátrixszorzás
+HLO-szinten:</p>
+<pre class="text"><code>%dot = f32[1024,1024] dot(%lhs, %rhs), lhs_contracting_dims={1},
+    rhs_contracting_dims={0}</code></pre>
+<p>A GPU-n az XLA a <code>dot</code> műveletet jellemzően
+cuBLAS/cuBLASLt hívással vagy Triton-alapú GEMM-fúzióval valósítja meg,
+a csempézést ezek (vagy a generált kernel) végzik. A TPU backend zárt
+forrású, ezért a belső lépései nem ellenőrizhetők ebből a leírásból; a
+tile-méret kiválasztása automatikus, és a compiler belső
+költségmodelljén alapul, felhasználói kapcsolóval nem szabályozható
+megbízhatóan. A <code>donate_argnums</code> paraméter nem tile-méretet,
+hanem a bemeneti pufferek átadását (újrahasznosítását) szabályozza.</p>
+<p>A csempézés és a fúzió együtt dolgozik. Először a fúzió csökkenti a
+memóriaműveletek számát, majd a csempézés biztosítja, hogy a fúzionált
+kernel adatai a gyors memóriában férjenek el. Ha a fúzió túl nagy, a
+csempézés felbonthatja a fúzionált régiót, hogy a blokkméret ne haladja
+meg a rendelkezésre álló shared memóriát.</p>
+<h3 data-number="27.2.5"
+id="elrendezés-a-memória-sorrendje-és-a-hardver-illesztése"><span
+class="header-section-number">27.2.5</span> Elrendezés: a memória
+sorrendje és a hardver illesztése</h3>
+<p>Az elrendezés (layout) azt határozza meg, hogy a logikai tenzor
+elemei milyen sorrendben helyezkednek el a memóriában. A leggyakoribb a
+soronkénti (row-major) és az oszloponkénti (column-major) elrendezés, de
+a TPU esetén ennél bonyolultabb, úgynevezett tiled layout is használatos
+(a dumpban pl. <code>{1,0:T(8,128)}</code>), amely a tenzort a
+vektorregiszterekhez illő, f32-re jellemzően 8 × 128-as csempékre
+bontja; ez független az MXU 128 × 128-as méretétől (a pontos csempeméret
+hardver- és típusfüggő, ellenőrzendő).</p>
+<p>A HLO-ban minden tenzorhoz tartozik egy layout. A fenti példában a
+<code>{1,0}</code> a dimenziók fizikai sorrendjét jelenti: a 0. dimenzió
+a leglassabban változó, az 1. dimenzió a leggyorsabban változó. Ez a
+soronkénti elrendezés. Ha a layout <code>{0,1}</code>, az oszloponkénti
+elrendezést jelent, ahol a 0. dimenzió a leggyorsabban változó.</p>
+<p>A layout-választás kritikus a teljesítmény szempontjából. A TPU
+szisztolikus tömbje úgy van kialakítva, hogy a mátrixblokkokat
+meghatározott sorrendben várja. Ha a bemeneti tenzor elrendezése nem
+egyezik a hardver elvárásával, a compilernek transzponálást kell
+beillesztenie, ami extra memóriamozgatást és futásidőt jelent. Az XLA
+layout assignment passzja megpróbálja minimalizálni ezeket a
+transzponálásokat, vagy teljesen elkerülni őket.</p>
+<p>A JAX-ban a layoutot ritkán kell kézzel beállítani, mert az XLA
+választ: a JAX-tömbnek nincs felhasználó által megadható fizikai
+(eszközoldali) elrendezése. A <code>jax.numpy.array</code>
+<code>order</code> paramétere csak NumPy-kompatibilitásból létezik: a
+JAX csak az <code>order='K'</code> értéket fogadja el, más értékre
+<code>NotImplementedError</code>-t ad (JAX-verzió szerint ellenőrzendő);
+a <code>jax.lax.transpose</code> pedig logikai dimenziókat permutál, nem
+layoutot állít. Explicit layout csak az experimentális
+<code>jax.experimental.layout</code> API-val adható meg. A HLO dumpban a
+layout az <code>entry_computation_layout</code> részben és az egyes
+műveletek kimeneténél látható.</p>
+<p>Például, ha a bemeneti layout <code>{1,0}</code> (row-major), de a
+szisztolikus tömb <code>{0,1}</code> (column-major) elrendezést vár, az
+XLA egy transzponálást illeszt be. Ez látható a HLO dumpban:</p>
+<pre class="text"><code>%transpose = f32[128,1024] transpose(%x), dimensions={1,0}</code></pre>
+<p>A felesleges transzponálás elkerülése JAX-ból a logikai műveletek
+átrendezésével lehetséges (például a <code>dot_general</code>
+<code>dimension_numbers</code> paraméterével kifejezett szorzás, ahol
+nem kell előbb transzponálni), és a dumpban ellenőrizhető, hogy az
+<code>after_optimizations</code> HLO-ban maradt-e <code>transpose</code>
+vagy <code>copy</code> utasítás.</p>
+<h3 data-number="27.2.6"
+id="xla-és-jax-a-funkcionális-transzformációk-és-a-gráffordítás"><span
+class="header-section-number">27.2.6</span> XLA és JAX: a funkcionális
+transzformációk és a gráffordítás</h3>
+<p>A JAX a funkcionális programozási modellre épül: a
+<code>jax.jit</code>, <code>jax.grad</code>, <code>jax.vmap</code> és a
+többi transzformáció a jaxpr szintjén dolgozik (a <code>jax.pmap</code>
+régebbi eszköz, az új kód általában <code>jax.jit</code>-et használ
+sharding-gal), majd az XLA végzi a hardver-specifikus fordítást. Ez a
+rétegződés az oka annak, hogy a JAX egyszerre nyújt magas szintű,
+Pythonbarát felületet és alacsony szintű, optimalizált végrehajtást.</p>
+<p>Amikor egy függvényt <code>jax.jit</code>-tel lefordítunk, a JAX a
+Python-kódot tracerek segítségével absztrakt módon végrehajtja. A
+tracerek a tenzorok helyett csak az alakot és a típust hordozzák, így a
+függvény tényleges értékei nem befolyásolják a gráf felépítését. Az így
+kapott jaxpr-t a JAX StableHLO-ra fordítja, az XLA ezt HLO-vá alakítja,
+majd futtatja az optimalizáló passzokat.</p>
+<p>A JAX <code>jax.make_jaxpr</code> eszközzel megtekinthetjük a
+jaxpr-t, még mielőtt az XLA-hoz érne:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax.numpy <span class="im">as</span> jnp</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> f(x):</span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    y <span class="op">=</span> jnp.sin(x)</span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    z <span class="op">=</span> y <span class="op">*</span> x</span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> jnp.<span class="bu">sum</span>(z, axis<span class="op">=</span><span class="dv">1</span>)</span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(jax.make_jaxpr(f)(jnp.ones((<span class="dv">4</span>, <span class="dv">3</span>))))</span></code></pre></div>
+<p>A kimenet egy jaxpr, amely a HLO előtti állapotot mutatja. A
+<code>jax.jit(f).lower(x).as_text()</code> a StableHLO-t, a
+<code>jax.jit(f).lower(x).compile().as_text()</code> az optimalizált
+HLO-t adja; az <code>XLA_FLAGS</code> dump is használható. (A korábbi
+<code>jax.xla_computation</code> API elavult, újabb JAX-verziókban
+eltávolították.)</p>
+<p>A JAX és az XLA kapcsolatában fontos megérteni, hogy a
+<code>jax.grad</code> és a <code>jax.vmap</code> transzformációk a jaxpr
+szintjén hajtódnak végre, még az XLA-fordítás előtt. Ez azt jelenti,
+hogy a gradiensszámítás és a vektorizálás nem igényel külön
+XLA-támogatást; a JAX a jaxpr-t transzformálja, majd az XLA a
+transzformált gráfot fordítja le.</p>
+<p>A JAX AOT (ahead-of-time) módban is képes XLA-gráfot generálni,
+például a <code>jax.export</code> modul segítségével (a korábbi
+<code>jax.experimental.export</code> átkerült oda). Ez lehetővé teszi a
+gráf exportálását és későbbi, Python nélküli futtatását. A részletek a
+JAX verziójától függenek, ezért az API használata előtt a friss
+dokumentációt ellenőrizni kell.</p>
+<h3 data-number="27.2.7" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">27.2.7</span> Tipikus hibák és helyes
+megoldások</h3>
+<p>Az XLA-val és a JAX-szal dolgozó mérnökök leggyakoribb hibái a
+gráffordítás félreértéséből fakadnak. Az alábbiakban öt tipikus hibát és
+a helyes megoldást ismertetjük.</p>
+<p><strong>1. Python-vezérlés a JIT-ben</strong></p>
+<p>Ha egy JIT-tel ellátott függvényben <code>if</code> vagy
+<code>for</code> ciklus feltétele a bemenet értékétől függ, a JAX nem
+tudja lefordítani. Például:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="at">@jax.jit</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> f_hibas(x):</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> x[<span class="dv">0</span>] <span class="op">&gt;</span> <span class="dv">0</span>:        <span class="co"># Hibás: értékfüggő Python-feltétel (TracerBoolConversionError)</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> x <span class="op">*</span> <span class="dv">2</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> x <span class="op">*</span> <span class="dv">3</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="at">@jax.jit</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> f_helyes(x):</span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> jnp.where(x[<span class="dv">0</span>] <span class="op">&gt;</span> <span class="dv">0</span>, x <span class="op">*</span> <span class="dv">2</span>, x <span class="op">*</span> <span class="dv">3</span>)   <span class="co"># vagy jax.lax.cond</span></span></code></pre></div>
+<p>Az <code>x[0] &gt; 0</code> értéke a JIT alatt tracer, a Python
+<code>if</code> pedig konkrét <code>bool</code>-t kér, ezért a
+<code>f_hibas</code> híváskor kivétel keletkezik. A megoldás:
+<code>jnp.where</code> vagy <code>jax.lax.cond</code> az értékfüggő
+vezérléshez. Az alakfüggő feltétel (például
+<code>if x.shape[0] &gt; 10:</code>) viszont helyes JAX-kód: az
+<code>x.shape[0]</code> statikus, a feltétel Python-időben
+kiértékelődik, és csak az egyik ág kerül a HLO-ba; a Python-vezérlést
+érdemes kizárólag az ilyen statikus döntésekre használni.</p>
+<p><strong>2. Nem JIT-elt kód</strong></p>
+<p>A JAX-ban a <code>jax.jit</code> nélküli kód minden egyes műveletet
+külön dispatch-el a Python interpreteren keresztül. Ez különösen sok kis
+művelet esetén hatalmas overheadet jelent. A megoldás egyszerű: a
+számítási magot mindig <code>jax.jit</code>-tel fordítsuk le, és csak a
+legkülső hívásnál használjunk Python-vezérlést.</p>
+<p><strong>3. Felesleges transzponálás</strong></p>
+<p>Ha a mátrixszorzás operandusainak sorrendje nem illeszkedik a hardver
+elvárásához, az XLA transzponálást illeszt be, ami lassítja a futást. A
+JAX-ban a fizikai layout nem állítható közvetlenül (az
+<code>order='F'</code> a JAX-ban nem támogatott). A megoldás: a logikai
+műveleteket úgy kell megfogalmazni, hogy ne kelljen transzponálni
+(például <code>dot_general</code> <code>dimension_numbers</code>-szel),
+és a HLO dumpban ellenőrizni kell az
+<code>entry_computation_layout</code>-ot, valamint a
+<code>transpose</code> és <code>copy</code> utasításokat.</p>
+<p><strong>4. A fúzió megakadályozása</strong></p>
+<p>Bizonyos műveletek fúziós határt képeznek vagy akadályozzák a fúziót:
+a <code>jax.debug.print</code>, a host
+callback/<code>io_callback</code>, az átlátszatlan
+<code>custom_call</code> műveletek, a nagy beágyazott konstansok. A
+vezérlési szerkezetek (<code>while_loop</code>, <code>cond</code>) külön
+számítási egységekbe kerülnek, így a fúzió a törzsükön belül működik, a
+határukon át nem. A hiba akkor látható, ha a HLO dumpban sok kis, nem
+fúzionált művelet van. A megoldás: kerüljük az ilyen műveleteket a hot
+path-ben, és a nagy konstansokat argumentumként adjuk át.</p>
+<p><strong>5. A HLO dump félreértelmezése</strong></p>
+<p>A HLO dump nem a végső gépi kód. A <code>before_optimizations</code>
+fájl a fúzió és a layout-hozzárendelés előtti állapotot mutatja, a
+<code>after_optimizations</code> pedig a fúzió utáni, de a kódgenerálás
+előtti állapotot. A tényleges kernelkód az LLVM IR vagy a PTX/TPU
+assembly szintjén jelenik meg. A hiba akkor fordul elő, ha valaki a
+nyers HLO-ból próbál teljesítményt jósolni anélkül, hogy a fúzió és a
+csempézés hatását figyelembe venné. A megoldás: mindig az
+<code>after_optimizations</code> fájlt és a kódgenerált kimenetet
+elemezzük együtt.</p>
+<h3 data-number="27.2.8" id="labor-xla-hlo-gráf-elemzése"><span
+class="header-section-number">27.2.8</span> Labor: XLA HLO gráf
+elemzése</h3>
+<p>A labor célja: egy kis JAX-függvény HLO-gráfjának elemzése, a fúzió
+hatásának megfigyelése és a futásidő mérése. A példa GPU-n fut, de a HLO
+elemzés ugyanúgy működik TPU-n is. A labor a JAX/XLA eszközláncot
+használja; a környezeti paramétereket a mérés előtt rögzíteni kell.</p>
+<p><strong>Környezet (ellenőrizni a friss verziókat)</strong></p>
+<table>
+<thead>
+<tr>
+<th>Paraméter</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU</td>
+<td>NVIDIA A100-SXM4-40GB</td>
+</tr>
+<tr>
+<td>Driver</td>
+<td>550.54.15</td>
+</tr>
+<tr>
+<td>CUDA</td>
+<td>12.6</td>
+</tr>
+<tr>
+<td>JAX</td>
+<td>0.4.38 (ellenőrizni)</td>
+</tr>
+<tr>
+<td>jaxlib</td>
+<td>0.4.38 (ellenőrizni)</td>
+</tr>
+<tr>
+<td>XLA</td>
+<td>a jaxlib beépített XLA-ja</td>
+</tr>
+<tr>
+<td>Precision</td>
+<td>FP32</td>
+</tr>
+<tr>
+<td>Input</td>
+<td>(1024, 128)</td>
+</tr>
+</tbody>
+</table>
+<p>A fenti verziók a példa rögzítésére szolgálnak; a futtatáshoz
+használt pontos verziókat a labor előtt ellenőrizni kell. A labor
+kódja:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># JAX / XLA</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax.numpy <span class="im">as</span> jnp</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Rögzített méret és adat</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> numpy <span class="im">as</span> np</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>N <span class="op">=</span> <span class="dv">1024</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>M <span class="op">=</span> <span class="dv">128</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>key <span class="op">=</span> jax.random.PRNGKey(<span class="dv">0</span>)</span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>x <span class="op">=</span> jax.random.normal(key, (N, M), dtype<span class="op">=</span>jnp.float32)</span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> f(x):</span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;Elemenkénti lánc és redukció.&quot;&quot;&quot;</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>    y <span class="op">=</span> jnp.sin(x)</span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>    z <span class="op">=</span> y <span class="op">*</span> x</span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>    w <span class="op">=</span> jnp.<span class="bu">sum</span>(z, axis<span class="op">=</span><span class="dv">1</span>)      <span class="co"># redukció az 1. dimenzió mentén</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>    m <span class="op">=</span> jnp.<span class="bu">max</span>(x)              <span class="co"># globális maximum</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> w <span class="op">+</span> m</span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>f_jit <span class="op">=</span> jax.jit(f)</span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a><span class="co"># Helyesség-ellenőrzés NumPy referenciával</span></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a>ref <span class="op">=</span> np.<span class="bu">sum</span>(np.sin(np.asarray(x)) <span class="op">*</span> np.asarray(x), axis<span class="op">=</span><span class="dv">1</span>) <span class="op">+</span> np.<span class="bu">max</span>(np.asarray(x))</span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a>result <span class="op">=</span> f_jit(x).block_until_ready()</span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a>np.testing.assert_allclose(np.asarray(result), ref, rtol<span class="op">=</span><span class="fl">1e-4</span>, atol<span class="op">=</span><span class="fl">1e-4</span>)</span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;Result shape: </span><span class="sc">{</span>result<span class="sc">.</span>shape<span class="sc">}</span><span class="ss">, dtype: </span><span class="sc">{</span>result<span class="sc">.</span>dtype<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> bench(fn, warmup<span class="op">=</span><span class="dv">5</span>, repeats<span class="op">=</span><span class="dv">20</span>):</span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Aszinkron dispatch: block_until_ready nélkül csak a dispatch idejét mérnénk.</span></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(warmup):</span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a>        fn(x).block_until_ready()</span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a>    ts <span class="op">=</span> []</span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(repeats):</span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a>        t0 <span class="op">=</span> time.perf_counter()</span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a>        fn(x).block_until_ready()</span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a>        ts.append((time.perf_counter() <span class="op">-</span> t0) <span class="op">*</span> <span class="fl">1000.0</span>)</span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a>    q1, med, q3 <span class="op">=</span> np.percentile(ts, [<span class="dv">25</span>, <span class="dv">50</span>, <span class="dv">75</span>])</span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="bu">float</span>(med), <span class="bu">float</span>(q3 <span class="op">-</span> q1)  <span class="co"># medián, IQR</span></span>
+<span id="cb8-40"><a href="#cb8-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-41"><a href="#cb8-41" aria-hidden="true" tabindex="-1"></a>med_jit, iqr_jit <span class="op">=</span> bench(f_jit)</span>
+<span id="cb8-42"><a href="#cb8-42" aria-hidden="true" tabindex="-1"></a><span class="cf">with</span> jax.disable_jit():</span>
+<span id="cb8-43"><a href="#cb8-43" aria-hidden="true" tabindex="-1"></a>    med_nojit, iqr_nojit <span class="op">=</span> bench(f)  <span class="co"># nem JIT-elt baseline, azonos protokoll</span></span>
+<span id="cb8-44"><a href="#cb8-44" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;JIT:     medián </span><span class="sc">{</span>med_jit<span class="sc">:.4f}</span><span class="ss"> ms, IQR </span><span class="sc">{</span>iqr_jit<span class="sc">:.4f}</span><span class="ss"> ms&quot;</span>)</span>
+<span id="cb8-45"><a href="#cb8-45" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;Nem JIT: medián </span><span class="sc">{</span>med_nojit<span class="sc">:.4f}</span><span class="ss"> ms, IQR </span><span class="sc">{</span>iqr_nojit<span class="sc">:.4f}</span><span class="ss"> ms&quot;</span>)</span>
+<span id="cb8-46"><a href="#cb8-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-47"><a href="#cb8-47" aria-hidden="true" tabindex="-1"></a><span class="co"># Várt eredmény: a JIT-elt verzió várhatóan gyorsabb (a Python-dispatch overhead</span></span>
+<span id="cb8-48"><a href="#cb8-48" aria-hidden="true" tabindex="-1"></a><span class="co"># eltűnik, a műveletek fúzionálnak); a mértéket mérés adja, nem jósoljuk meg.</span></span></code></pre></div>
+<p>A HLO dump kiíratásához futtassuk a szkriptet az alábbi
+parancsokkal:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab_xla_hlo.py</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">XLA_FLAGS</span><span class="op">=</span><span class="st">&quot;--xla_dump_to=/tmp/hlo_dump --xla_dump_hlo_as_text&quot;</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="ex">python</span> lab_xla_hlo.py</span></code></pre></div>
+<p>A dump könyvtárban keressük meg a
+<code>module_*.jit_f*after_optimizations.txt</code> fájlt
+(<code>ls /tmp/hlo_dump</code>; a pontos név verzió- és
+célhardver-függő). Az elemenkénti <code>sine</code> és
+<code>multiply</code> műveletek várhatóan a sorösszegző redukcióval
+közös fúziós régióba kerülnek, a globális maximum pedig külön régióba,
+mert az a teljes bemenettől függ; a végső <code>add</code> (a
+<code>broadcast</code>-tal) a redukciók után következik. A
+<code>reduce</code> művelet dimenziói és a layout mezők mutatják a
+compiler döntéseit. A fúziós régiók tényleges számát a dumpból kell
+megszámolni.</p>
+<p><strong>Mérési napló</strong></p>
+<p>A mérési naplóban a következő adatokat kell rögzíteni:</p>
+<table>
+<colgroup>
+<col style="width: 72%" />
+<col style="width: 28%" />
+</colgroup>
+<thead>
+<tr>
+<th>Mérési paraméter</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU</td>
+<td>NVIDIA A100-SXM4-40GB</td>
+</tr>
+<tr>
+<td>Driver</td>
+<td>550.54.15 (példa; a driver és a CUDA párosítását
+<code>nvidia-smi</code> kimenetével kell ellenőrizni)</td>
+</tr>
+<tr>
+<td>CUDA</td>
+<td>12.6 (példa)</td>
+</tr>
+<tr>
+<td>JAX</td>
+<td>0.4.38 (ellenőrizni)</td>
+</tr>
+<tr>
+<td>Precision</td>
+<td>FP32</td>
+</tr>
+<tr>
+<td>Input</td>
+<td>(1024, 128)</td>
+</tr>
+<tr>
+<td>Warm-up</td>
+<td>5 iteráció</td>
+</tr>
+<tr>
+<td>Ismétlés</td>
+<td>20 iteráció</td>
+</tr>
+<tr>
+<td>Medián futásidő, JIT</td>
+<td>&lt;mért – kitöltendő&gt; ms</td>
+</tr>
+<tr>
+<td>IQR, JIT</td>
+<td>&lt;mért – kitöltendő&gt; ms</td>
+</tr>
+<tr>
+<td>Medián futásidő, nem JIT</td>
+<td>&lt;mért – kitöltendő&gt; ms</td>
+</tr>
+<tr>
+<td>IQR, nem JIT</td>
+<td>&lt;mért – kitöltendő&gt; ms</td>
+</tr>
+<tr>
+<td>Fúziós régiók a HLO dumpban</td>
+<td>&lt;a dumpból megszámlálandó&gt;</td>
+</tr>
+</tbody>
+</table>
+<p>A mért és a várt eredményt külön kell választani. A várt eredmény: a
+JIT-elt verzió futásideje kisebb, mint a nem JIT-elt
+Python-végrehajtásé, mert a Python-dispatch overhead eltűnik; a
+különbség mértékét mérés adja meg. A HLO dumpban az elemkénti lánc
+legalább egy fúzióban jelenik meg. A kódot nem futtattuk, a táblázat
+értékei kitöltendők. A mért eredmény a laborban kapott medián és IQR,
+valamint a dump tényleges fúziós régiói. Ha a mért érték jelentősen
+eltér, ellenőrizni kell a verziókat, a háttérterhelést és a GPU
+órajelét.</p>
+<p>A labor átadandó eredményei:</p>
+<ol type="1">
+<li>A fenti JAX-kód és a HLO dump kivonata.</li>
+<li>A mérési napló a fenti táblázat formátumában.</li>
+<li>Egy rövid elemzés, amely leírja, hogy a fúzió hogyan csökkentette a
+memóriaműveletek számát.</li>
+</ol>
+<h3 data-number="27.2.9" id="önellenőrző-kérdés"><span
+class="header-section-number">27.2.9</span> Önellenőrző kérdés</h3>
+<p>Miért csökkenti a fúzió a globális memóriaforgalmat?</p>
+<p><strong>Válasz:</strong> mert a köztes eredményeket a kernel
+regisztereiben vagy a shared memóriában tartja, nem írja ki a globális
+memóriába, így a globális memóriából csak egyszer olvas, és egyszer
+ír.</p>
+<h3 data-number="27.2.10" id="kitekintés"><span
+class="header-section-number">27.2.10</span> Kitekintés</h3>
+<p>A következő alfejezet (27.3) a TPU programozási modellt mutatja be,
+ahol a HLO-ból származó parancsok és a szisztolikus tömb kapcsolata
+kerül részletezésre. A 27.2-ban megismert fúzió, csempézés és
+layout-hozzárendelés ott válik kézzelfoghatóvá a TPU hardveres
+végrehajtásában.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu102.html">← 27.1 TPU-architektúra</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu104.html">27.3 TPU programozási modell →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

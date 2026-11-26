@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>14.2 Aszinkron másolás (cp.async) – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz3">III. RÉSZ – Teljesítmény és memória</a> › <a href="index.html#gpuch13">14 Shared memory tiling, async copy és pipelining</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu050.html">← 14.1 Shared memory tiling</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu052.html">14.3 Double buffering és pipeline →</a></div>
+</nav>
+<h2 data-number="14.2" id="gpu051"><span
+class="header-section-number">14.2</span> Aszinkron másolás
+(cp.async)</h2>
+<p>A globális memória és a shared memory közötti adatmozgás hagyományos
+útja a CUDA programozási modellben a regisztereken keresztül vezet.
+Amikor a 14.1 alfejezetben a tiling (csempézés) technikáját bemutattuk,
+a kernelünkben a betöltés tipikusan a következő lépésekből állt:</p>
+<ol type="1">
+<li>A globális memóriából egy skalár (pl. <code>float</code>) beolvasása
+egy regiszterbe.</li>
+<li>A regiszter tartalmának kiírása a shared memory megfelelő
+pozíciójába.</li>
+<li><code>__syncthreads()</code> hívás a blokk számára.</li>
+</ol>
+<p>Ez a szinkron minta működik, de két jelentős hatékonysági problémát
+vet fel. Egyrészt a betöltés végrehajtása közben a szál foglal egy
+regisztert az adat számára, ami növeli a regiszternyomást és
+csökkentheti az occupancy-t. Másrészt, és ami ennél fontosabb, a
+betöltés és a tárolás közötti függőség miatt a hardver nem tudja igazán
+elrejteni a globális memória latenciáját a shared memory-ba való írás
+előtt. Az NVIDIA az Ampere architektúrával (Compute Capability 8.0 és
+újabb) bevezetett egy hardveres megoldást erre a problémára: az
+aszinkron másolást, röviden <code>cp.async</code>.</p>
+<p>Ez a fejezet a <code>cp.async</code> alapvető működését, a hozzá
+tartozó commit/wait szinkronizációs modellt, valamint a gyakorlati
+alkalmazását mutatja be egy laborpéldán keresztül.</p>
+<figure>
+<img src="assets/gpu051-diagram-1.png"
+alt="cp.async adatút - A cp.async közvetlenül a globális memóriából a shared memóriába másol; a commit és wait után a shared adat a számító szálak számára látható." />
+<figcaption aria-hidden="true">cp.async adatút - A cp.async közvetlenül
+a globális memóriából a shared memóriába másol; a commit és wait után a
+shared adat a számító szálak számára látható.</figcaption>
+</figure>
+<h3 data-number="14.2.1"
+id="hardvertámogatás-és-a-közvetlen-adatút"><span
+class="header-section-number">14.2.1</span> Hardvertámogatás és a
+közvetlen adatút</h3>
+<p>A <code>cp.async</code> utasítás (melyet a PTX ISA dokumentáció
+<code>cp.async.ca</code> és <code>cp.async.cg</code> formában ismer, a
+hardverben pedig <code>LDGSTS</code> utasításként valósul meg) lehetővé
+teszi a szálak számára, hogy a globális memóriából közvetlenül a shared
+memory-ba másoljanak adatot anélkül, hogy az adat átmenetileg a
+regiszterfájlban tárolódna. Ezzel az adatút lerövidül: az adat a
+globális memóriából a memóriarendszeren (L2 cache, illetve opcionálisan
+L1) keresztül az SM-en belüli shared memory-ba kerül, kikerülve a
+regiszterfájlt (a <code>.cg</code> változat az L1-et sem tölti fel); az
+utasítás a load-store egységen és az L1TEX egységen keresztül fut.</p>
+<p>A hardvertámogatás kulcsfontosságú itt. A <code>cp.async</code> nem
+egy szoftveres trükk, hanem egy valódi aszinkron memóriaművelet. A PTX
+ISA-ban két fő változata van:</p>
+<ul>
+<li><strong><code>cp.async.ca</code> (Cache All):</strong> Az adatot az
+L1 és L2 cache-en keresztül mozgatja. Ez akkor hasznos, ha a globális
+memóriabeli adatot más szálak vagy blokkok is használják, és szeretnénk
+kihasználni a cache-lokalitást.</li>
+<li><strong><code>cp.async.cg</code> (Cache Global):</strong> Az adat
+csak az L2 cache-be kerül, az L1-et megkerüli. Ez 16 bájtos másolásnál
+tipikus választás a tiling műveletekhez, ahol a globális memóriából
+származó adatot a blokk csak egyszer olvassa be a shared memory-ba, és
+az L1 cache-ben tartása felesleges szennyezést okozna, kiszorítva onnan
+más, hasznos adatokat.</li>
+</ul>
+<p>A hardveres támogatásnak köszönhetően a <code>cp.async</code>
+műveletek képesek a háttérben folytatódni, miközben a szálak más, nem
+függő utasításokat hajtanak végre. Ez az alapja a következő alfejezetben
+(14.3) tárgyalt double buffering és pipeline technikáknak, ahol a
+számítás és a memóriamásolás átfedésbe kerül. Jelen alfejezetben azonban
+az alapvető mechanizmusra és a helyes szinkronizációra
+koncentrálunk.</p>
+<h3 data-number="14.2.2"
+id="a-cuda-c-api-__pipeline_memcpy_async-commit-és-wait"><span
+class="header-section-number">14.2.2</span> A CUDA C++ API:
+<code>__pipeline_memcpy_async</code>, commit és wait</h3>
+<p>A <code>cp.async</code> használatához a CUDA C++ nyelvben a
+<code>&lt;cuda_pipeline.h&gt;</code> fejlécfájlban deklarált
+<em>pipeline primitíveket</em> (<code>__pipeline_memcpy_async</code>,
+<code>__pipeline_commit</code>, <code>__pipeline_wait_prior</code>)
+használhatjuk. (A libcu++ <code>&lt;cuda/pipeline&gt;</code> fejléce a
+magasabb szintű <code>cuda::pipeline</code> osztályt adja, amely más
+API; a primitívekhez a <code>&lt;cuda_pipeline.h&gt;</code> kell.) A
+primitívek közvetlenebb kontrollt adnak, és jól szemléltetik a hardveres
+működést.</p>
+<p>A legalapvetőbb belső függvény a következő:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>__pipeline_memcpy_async<span class="op">(</span><span class="dt">void</span><span class="op">*</span> <span class="ex">__restrict__</span> dst_shared<span class="op">,</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>                        <span class="at">const</span> <span class="dt">void</span><span class="op">*</span> <span class="ex">__restrict__</span> src_global<span class="op">,</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>                        <span class="dt">size_t</span> size_and_align<span class="op">);</span></span></code></pre></div>
+<p>Itt <code>dst_shared</code> a shared memory célcím,
+<code>src_global</code> a globális memória forráscím,
+<code>size_and_align</code> pedig a másolandó bájtok száma, amely egyben
+a cím igazítási követelménye is: értéke csak 4, 8 vagy 16 lehet, és a
+forrás- és célcímnek ugyanekkora igazításúnak kell lennie. Az
+<code>.ca</code> változat mindhárom méretet támogatja, a
+<code>.cg</code> csak a 16 bájtosat; a 4 és 8 bájtos másolás tehát
+<code>.ca</code>-ként valósul meg. A leggyakoribb esetekben
+<code>float</code> (4 bájt), <code>int2</code>/<code>float2</code> (8
+bájt) vagy <code>int4</code>/<code>float4</code> (16 bájt) típusokat
+másolunk. A 16 bájtos vektorizált másolás a leghatékonyabb, mert ez
+felel meg egy teljes 128 bites memóriatranzakciónak.</p>
+<p>Fontos, hogy a <code>__pipeline_memcpy_async</code> hívása önmagában
+nem garantálja az adat azonnali elérhetőségét a shared memory-ban. Az
+aszinkron műveletek befejeződésének kezelésére szolgál a commit és a
+wait mechanizmus.</p>
+<p><strong>A commit/wait modell:</strong></p>
+<p>A <code>cp.async</code> utasítások egy aszinkron „csoportokba”
+(pipeline stage-ekbe) rendeződnek. A szálak a
+<code>__pipeline_commit()</code> hívással lezárják az összes addig
+kiadott, befejezetlen <code>cp.async</code> műveletet egy csoportba. Ezt
+követően a <code>__pipeline_wait_prior(N)</code> hívással a szál
+megvárja, amíg az általa commitált csoportok közül legfeljebb a
+legutóbbi <code>N</code> van még folyamatban, azaz a legutóbbi
+<code>N</code> kivételével minden korábbi csoport befejeződött.
+<code>N = 0</code>: minden csoport kész; <code>N = 1</code>: a legutolsó
+commitált csoport még futhat (ez a double buffering alapja, 14.3).</p>
+<figure id="fig-gpu051-commit-wait">
+<div class="fig-interactive"><iframe src="figures/html/gpu051-commit-wait.html" title="Idővonal: három commitált csoport; wait_prior(1) után a két régebbi kész, a legújabb még fut; alatta két szál, a másik szál adatához __syncthreads kell." loading="lazy" style="width:100%;border:0;height:560px"></iframe><noscript><img src="figures/img/gpu051-commit-wait.png" style="width:100.0%"
+alt="Idővonal: három commitált csoport; wait_prior(1) után a két régebbi kész, a legújabb még fut; alatta két szál, a másik szál adatához __syncthreads kell." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu051-commit-wait.png" style="width:100.0%"
+alt="Idővonal: három commitált csoport; wait_prior(1) után a két régebbi kész, a legújabb még fut; alatta két szál, a másik szál adatához __syncthreads kell." /></details></div>
+<figcaption>A <code>cp.async</code> csoportok, a
+<code>__pipeline_wait_prior(N)</code> és a blokkszintű szinkron
+(sematikus, nem mért időzítés;
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>c</mi><mi>c</mi><mo>≥</mo><mn>8</mn><mo>,</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">cc \ge 8{,}0</annotation></semantics></math>).
+(a) Egy szál három csoportot commitál; a <code>wait_prior(1)</code>
+akkor tér vissza, amikor a legutóbbi egy csoport (G2) kivételével minden
+korábbi csoport kész, a <code>wait_prior(0)</code> akkor, amikor mind.
+(b) A wait csak a hívó szál saját másolataira vonatkozik: a B szál a
+<code>__syncthreads()</code> nélkül az A szál még meg nem érkezett
+elemét olvashatja.</figcaption>
+</figure>
+<p>A legegyszerűbb helyes minta a következő:</p>
+<ol type="1">
+<li>Kiadjuk az összes szükséges <code>__pipeline_memcpy_async</code>
+utasítást.</li>
+<li>Meghívjuk a <code>__pipeline_commit()</code>-et, létrehozva ezzel
+egy csoportot.</li>
+<li>Meghívjuk a <code>__pipeline_wait_prior(0)</code>-t, ami megvárja,
+amíg az összes, a commit előtt kiadott művelet befejeződik.</li>
+</ol>
+<h3 data-number="14.2.3"
+id="gyakorlati-minta-tiled-másolás-cp.async-kel"><span
+class="header-section-number">14.2.3</span> Gyakorlati minta: Tiled
+másolás <code>cp.async</code>-kel</h3>
+<p>Nézzük meg, hogyan alakul át a 14.1 alfejezetben megismert tiled
+betöltés <code>cp.async</code> használatával. Tegyük fel, hogy egy
+<code>M x N</code> méretű mátrixot töltünk be csempékbe. A hagyományos
+(szinkron) betöltés így nézett ki:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Szinkron betöltés: global -&gt; register -&gt; shared</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> TILE_DIM<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> row <span class="op">=</span> by <span class="op">*</span> TILE_DIM <span class="op">+</span> i<span class="op">;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> col <span class="op">=</span> bx <span class="op">*</span> TILE_DIM <span class="op">+</span> tx<span class="op">;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> val <span class="op">=</span> global_in<span class="op">[</span>row <span class="op">*</span> N <span class="op">+</span> col<span class="op">];</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    tile<span class="op">[</span>i<span class="op">][</span>tx<span class="op">]</span> <span class="op">=</span> val<span class="op">;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>cp.async</code>-kel ugyanez a művelet közvetlenné válik:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_pipeline.h&gt;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co">// Aszinkron betöltés: global -&gt; shared (a `__align__(16)` tile miatt 4 B-os másolás is</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co">// igazított)</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> TILE_DIM<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> row <span class="op">=</span> by <span class="op">*</span> TILE_DIM <span class="op">+</span> i<span class="op">;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> col <span class="op">=</span> bx <span class="op">*</span> TILE_DIM <span class="op">+</span> tx<span class="op">;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> dst <span class="op">=</span> <span class="op">&amp;</span>tile<span class="op">[</span>i<span class="op">][</span>tx<span class="op">];</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">float</span><span class="op">*</span> src <span class="op">=</span> <span class="op">&amp;</span>global_in<span class="op">[</span>row <span class="op">*</span> N <span class="op">+</span> col<span class="op">];</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    __pipeline_memcpy_async<span class="op">(</span>dst<span class="op">,</span> src<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">));</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>__pipeline_commit<span class="op">();</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>__pipeline_wait_prior<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span></code></pre></div>
+<p>Ebben a példában a <code>sizeof(float)</code> 4 bájtot jelent, ami
+megfelel a minimális <code>cp.async</code> méretnek. Ennél hatékonyabb,
+ha vektorizáljuk a betöltést. Például <code>float4</code> típus
+használatával 16 bájtot másolunk egyszerre:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_pipeline.h&gt;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="co">// Feltételezve, hogy N osztható 4-gyel, a tile `__align__(16)`, és a bemenet 16 B-ra igazított</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> col <span class="op">=</span> bx <span class="op">*</span> TILE_DIM <span class="op">+</span> tx <span class="op">*</span> <span class="dv">4</span><span class="op">;</span>   <span class="co">// blokk-eltolással</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="co">// blokk: (TILE_DIM/4) x TILE_DIM szál; egy szál egy sor 4 elemét tölti</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> row <span class="op">=</span> by <span class="op">*</span> TILE_DIM <span class="op">+</span> ty<span class="op">;</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>float4<span class="op">*</span> dst4 <span class="op">=</span> <span class="kw">reinterpret_cast</span><span class="op">&lt;</span>float4<span class="op">*&gt;(&amp;</span>tile<span class="op">[</span>ty<span class="op">][</span>tx <span class="op">*</span> <span class="dv">4</span><span class="op">]);</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="at">const</span> float4<span class="op">*</span> src4 <span class="op">=</span> <span class="kw">reinterpret_cast</span><span class="op">&lt;</span><span class="at">const</span> float4<span class="op">*&gt;(&amp;</span>global_in<span class="op">[</span>row <span class="op">*</span> N <span class="op">+</span> col<span class="op">]);</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>__pipeline_memcpy_async<span class="op">(</span>dst4<span class="op">,</span> src4<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>float4<span class="op">));</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>__pipeline_commit<span class="op">();</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>__pipeline_wait_prior<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span></code></pre></div>
+<p>A <code>sizeof(float4)</code> értéke 16, így ez egyetlen 16 bájtos,
+maximális hatékonyságú aszinkron másolást eredményez. Fontos
+megjegyezni, hogy a cél- és forráscímeknek ebben az esetben 16 bájtra
+igazítottnak kell lenniük.</p>
+<h3 data-number="14.2.4"
+id="labor-cp.async-alapú-pipeline-ellenőrzése"><span
+class="header-section-number">14.2.4</span> Labor:
+<code>cp.async</code>-alapú pipeline ellenőrzése</h3>
+<p>A következő labor célja, hogy egy izolált környezetben,
+reprodukálható mérésekkel hasonlítsa össze a hagyományos szinkron
+betöltés és a <code>cp.async</code>-alapú betöltés teljesítményét és
+viselkedését.</p>
+<h4 data-number="14.2.4.1" id="laborfeladat"><span
+class="header-section-number">14.2.4.1</span> Laborfeladat</h4>
+<p>Írjon egy CUDA C++ kernelt, amely egy 4096x4096 méretű
+<code>float</code> mátrixot tölt be 32x32-es csempékbe a shared
+memory-ba, majd kiszámítja a csempe összegét, és kiírja egy kimeneti
+vektorba. Valósítsa meg a betöltést kétféleképpen:</p>
+<ol type="1">
+<li><strong>Baseline:</strong> hagyományos szinkron betöltéssel (global
+-&gt; register -&gt; shared).</li>
+<li><strong>Optimalizált:</strong> <code>cp.async</code> használatával,
+<code>float4</code> vektorizált betöltéssel.</li>
+</ol>
+<h4 data-number="14.2.4.2" id="mérési-környezet-kitöltendő"><span
+class="header-section-number">14.2.4.2</span> Mérési környezet
+(kitöltendő)</h4>
+<p>Minden méréshez rögzíteni kell a hardver- és szoftverkörnyezetet. Az
+alábbi táblázat egy sablon; a második oszlopban a ténylegesen használt
+laboratóriumi értékeket kell feltüntetni.</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th style="text-align: left;">Paraméter</th>
+<th style="text-align: left;">Érték (helyőrző / kitöltendő)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><strong>GPU modell</strong></td>
+<td
+style="text-align: left;"><code>NVIDIA RTX 0000 (Placeholder)</code></td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Compute Capability</strong></td>
+<td
+style="text-align: left;"><code>&lt;kitöltendő, pl. 8.9&gt;</code></td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>CUDA Toolkit verzió</strong></td>
+<td
+style="text-align: left;"><code>&lt;nvcc --version alapján kitöltendő&gt;</code></td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>GPU Driver verzió</strong></td>
+<td
+style="text-align: left;"><code>&lt;nvidia-smi alapján kitöltendő&gt;</code></td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Operációs rendszer</strong></td>
+<td
+style="text-align: left;"><code>Linux (Ubuntu 22.04 LTS izolált konténer)</code></td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Power limit</strong></td>
+<td style="text-align: left;"><code>Alapértelmezett</code></td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>MIG / Virtualizáció</strong></td>
+<td style="text-align: left;"><code>Kikapcsolva</code></td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Fordítóparancs</strong></td>
+<td
+style="text-align: left;"><code>nvcc -arch=sm_&lt;CC&gt; -O3 -std=c++17 -o cp_async_lab cp_async_lab.cu</code>
+(CC ≥ 80; pl. sm_89)</td>
+</tr>
+</tbody>
+</table>
+<h4 data-number="14.2.4.3" id="forráskód-cp_async_lab.cu"><span
+class="header-section-number">14.2.4.3</span> Forráskód
+(<code>cp_async_lab.cu</code>)</h4>
+<pre class="cuda"><code>// cp_async_lab.cu (nem futtatott kód; fordítsd és mérd a saját GPU-don)
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cuda_pipeline.h&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;cmath&gt;
+#include &lt;vector&gt;
+#include &lt;algorithm&gt;
+
+#define CUDA_CHECK(call)                                                     \
+    do {                                                                     \
+        cudaError_t err_ = (call);                                           \
+        if (err_ != cudaSuccess) {                                           \
+            std::fprintf(stderr, &quot;CUDA hiba %s:%d: %s\n&quot;, __FILE__, __LINE__, \
+                         cudaGetErrorString(err_));                          \
+            std::exit(EXIT_FAILURE);                                         \
+        }                                                                    \
+    } while (0)
+
+constexpr int TILE_DIM = 32;
+constexpr int MATRIX_DIM = 4096;
+constexpr int BX = TILE_DIM / 4;   // 8 szál/sor (egy szál 4 float-ot kezel)
+constexpr int BY = TILE_DIM;       // 32 sor -&gt; 256 szál/blokk
+
+// Blokkszintű összeg: warp shuffle + 8 warp részösszegének összegzése.
+// Minden szál meghívja; az eredmény csak a 0. szálnál érvényes.
+__device__ float block_sum(float v) {
+    __shared__ float warp_sums[BX * BY / 32];
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    for (int o = 16; o &gt; 0; o &gt;&gt;= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+    if ((tid &amp; 31) == 0) warp_sums[tid &gt;&gt; 5] = v;
+    __syncthreads();
+    float r = 0.0f;
+    if (tid == 0)
+        for (int w = 0; w &lt; BX * BY / 32; ++w) r += warp_sums[w];
+    return r;
+}
+
+// Egy szál feldolgozása: tile[ty][tx*4 .. tx*4+3] részösszege.
+__device__ float thread_partial(const float (*tile)[TILE_DIM], int tx, int ty) {
+    return (tile[ty][tx * 4] + tile[ty][tx * 4 + 1]) +
+           (tile[ty][tx * 4 + 2] + tile[ty][tx * 4 + 3]);
+}
+
+// --- Baseline: global -&gt; regiszter -&gt; shared, minden szál 4 elemet tölt ---
+__global__ void sync_tile_sum_kernel(const float* __restrict__ input,
+                                     float* __restrict__ output, int width) {
+    __shared__ __align__(16) float tile[TILE_DIM][TILE_DIM];
+    int tx = threadIdx.x, ty = threadIdx.y;
+    size_t row = (size_t)blockIdx.y * TILE_DIM + ty;
+    for (int j = 0; j &lt; 4; ++j) {
+        int c = tx + BX * j;                        // koaleszkált: egymás utáni oszlopok
+        tile[ty][c] = input[row * width + (size_t)blockIdx.x * TILE_DIM + c];
+    }
+    __syncthreads();
+    float total = block_sum(thread_partial(tile, tx, ty));
+    if (tx == 0 &amp;&amp; ty == 0) output[blockIdx.y * gridDim.x + blockIdx.x] = total;
+}
+
+// --- Optimalizált: cp.async, minden szál egyetlen 16 B-os (float4) másolást ad ki ---
+__global__ void async_tile_sum_kernel(const float* __restrict__ input,
+                                      float* __restrict__ output, int width) {
+    __shared__ __align__(16) float tile[TILE_DIM][TILE_DIM];
+    int tx = threadIdx.x, ty = threadIdx.y;
+    size_t row = (size_t)blockIdx.y * TILE_DIM + ty;
+    size_t col = (size_t)blockIdx.x * TILE_DIM + tx * 4;   // blokk-eltolással
+    __pipeline_memcpy_async(&amp;tile[ty][tx * 4], &amp;input[row * width + col], sizeof(float4));
+    __pipeline_commit();
+    __pipeline_wait_prior(0);   // csak a hívó szál saját másolataira vonatkozik
+    __syncthreads();            // a többi szál másolatainak láthatóságához kell
+    float total = block_sum(thread_partial(tile, tx, ty));
+    if (tx == 0 &amp;&amp; ty == 0) output[blockIdx.y * gridDim.x + blockIdx.x] = total;
+}
+
+template &lt;typename Launch&gt;
+void measure(const char* name, Launch&amp;&amp; launch, int warmup, int reps) {
+    cudaEvent_t a, b;
+    CUDA_CHECK(cudaEventCreate(&amp;a));
+    CUDA_CHECK(cudaEventCreate(&amp;b));
+    for (int i = 0; i &lt; warmup; ++i) launch();
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector&lt;double&gt; t(reps);
+    for (int i = 0; i &lt; reps; ++i) {
+        CUDA_CHECK(cudaEventRecord(a));
+        launch();
+        CUDA_CHECK(cudaEventRecord(b));
+        CUDA_CHECK(cudaEventSynchronize(b));
+        CUDA_CHECK(cudaGetLastError());
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&amp;ms, a, b));
+        t[i] = ms;
+    }
+    double mean = 0.0, var = 0.0;
+    for (double x : t) mean += x;
+    mean /= reps;
+    for (double x : t) var += (x - mean) * (x - mean);
+    std::vector&lt;double&gt; s = t;
+    std::sort(s.begin(), s.end());
+    double med = (reps % 2) ? s[reps / 2] : 0.5 * (s[reps / 2 - 1] + s[reps / 2]);
+    std::printf(&quot;%-6s: median = %.4f ms, mean = %.4f ms, std = %.4f ms (n = %d)\n&quot;,
+                name, med, mean, std::sqrt(var / (reps - 1)), reps);
+    CUDA_CHECK(cudaEventDestroy(a));
+    CUDA_CHECK(cudaEventDestroy(b));
+}
+
+int main() {
+    const int tiles = MATRIX_DIM / TILE_DIM;
+    const size_t n = (size_t)MATRIX_DIM * MATRIX_DIM;
+    std::vector&lt;float&gt; h_in(n), h_sync((size_t)tiles * tiles), h_async((size_t)tiles * tiles);
+    unsigned seed = 12345u;                       // determinisztikus, rand() nélkül
+    for (size_t i = 0; i &lt; n; ++i) {
+        seed = seed * 1664525u + 1013904223u;
+        h_in[i] = (float)(seed &gt;&gt; 8) / 16777216.0f;
+    }
+    float *d_in, *d_sync, *d_async;
+    CUDA_CHECK(cudaMalloc(&amp;d_in, n * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;d_sync, h_sync.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;d_async, h_async.size() * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_in, h_in.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+
+    dim3 block(BX, BY);
+    dim3 grid(tiles, tiles);
+    measure(&quot;sync&quot;,  [&amp;]() { sync_tile_sum_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_in, d_sync,
+        MATRIX_DIM); }, 5, 20);
+    measure(&quot;async&quot;, [&amp;]() { async_tile_sum_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_in, d_async,
+        MATRIX_DIM); }, 5, 20);
+
+    CUDA_CHECK(cudaMemcpy(h_sync.data(), d_sync, h_sync.size() * sizeof(float),
+        cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_async.data(), d_async, h_async.size() * sizeof(float),
+        cudaMemcpyDeviceToHost));
+
+    // CPU-referencia (double): minden csempe összege
+    double max_rel = 0.0;
+    for (int by = 0; by &lt; tiles; ++by)
+        for (int bx = 0; bx &lt; tiles; ++bx) {
+            double ref = 0.0;
+            for (int r = 0; r &lt; TILE_DIM; ++r)
+                for (int c = 0; c &lt; TILE_DIM; ++c)
+                    ref += h_in[(size_t)(by * TILE_DIM + r) * MATRIX_DIM + bx * TILE_DIM + c];
+            size_t k = (size_t)by * tiles + bx;
+            max_rel = std::max({max_rel, std::fabs(h_sync[k] - ref) / ref,
+                std::fabs(h_async[k] - ref) / ref});
+        }
+    std::printf(&quot;Validáció: max relatív hiba a CPU-referenciához képest = %.3e &quot;
+                &quot;(küszöb 1e-4)\n&quot;, max_rel);
+    const bool ok = max_rel &lt; 1e-4;
+    std::printf(&quot;Eredmény: %s\n&quot;, ok ? &quot;OK&quot; : &quot;HIBA&quot;);
+
+    CUDA_CHECK(cudaFree(d_in));
+    CUDA_CHECK(cudaFree(d_sync));
+    CUDA_CHECK(cudaFree(d_async));
+    return ok ? 0 : EXIT_FAILURE;
+}</code></pre>
+<h4 data-number="14.2.4.4" id="várt-és-mért-eredmények"><span
+class="header-section-number">14.2.4.4</span> Várt és mért
+eredmények</h4>
+<p>A <code>cp.async</code> használatától itt nem várunk drámai
+gyorsulást, mivel a kernel nem tartalmaz számítási fázist, amivel az
+adatmozgást átfedhetnénk (ez a 14.3 alfejezet témája). A lehetséges
+nyereség forrása a regiszternyomás csökkenése és a kevesebb
+load-utasítás; ennek mértékét a mérés dönti el, nem a becslés.</p>
+<p>A kernel 4096×4096 FP32 elemet (64 MiB) olvas, és csak 16 384
+<code>float</code>-ot (64 KiB) ír, ezért a futásidő alsó korlátja a
+DRAM-sávszélességből számolható:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>t</mi><mi>min</mi></msub><mo>≈</mo><mn>64</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">MiB</mtext><mi>/</mi><msub><mi>B</mi><mtext mathvariant="normal">peak</mtext></msub></mrow><annotation encoding="application/x-tex">t_{\min} \approx 64\ \text{MiB} / B_{\text{peak}}</annotation></semantics></math>.
+Példa (adatlapi érték, nem mért): egy ~504 GB/s sávszélességű GPU-n
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>t</mi><mi>min</mi></msub><mo>≈</mo><mn>0</mn><mo>,</mo><mn>13</mn></mrow><annotation encoding="application/x-tex">t_{\min} \approx 0{,}13</annotation></semantics></math>
+ms; ennél gyorsabb mért idő L2-találatra vagy mérési hibára utal.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th style="text-align: left;">Metrika</th>
+<th style="text-align: left;">Várt (modellből)</th>
+<th style="text-align: left;">Mért (kitöltendő)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><strong>Baseline futásidő (medián ±
+szórás)</strong></td>
+<td
+style="text-align: left;"><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>≥</mo><msub><mi>t</mi><mi>min</mi></msub></mrow><annotation encoding="application/x-tex">\geq t_{\min}</annotation></semantics></math></td>
+<td
+style="text-align: left;"><code>&lt;mért – kitöltendő&gt;</code></td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong><code>cp.async</code> futásidő
+(medián ± szórás)</strong></td>
+<td
+style="text-align: left;"><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>≥</mo><msub><mi>t</mi><mi>min</mi></msub></mrow><annotation encoding="application/x-tex">\geq t_{\min}</annotation></semantics></math>,
+a baseline-hoz hasonló vagy kissé jobb</td>
+<td
+style="text-align: left;"><code>&lt;mért – kitöltendő&gt;</code></td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Gyorsulás</strong></td>
+<td style="text-align: left;">nem garantált; kicsi, ha a kernel
+DRAM-korlátos</td>
+<td
+style="text-align: left;"><code>&lt;számolt – kitöltendő&gt;</code></td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Helyesség</strong></td>
+<td style="text-align: left;">a két kernel kimenete a CPU-referenciával
+egyezik (relatív hiba &lt; 1e-4)</td>
+<td
+style="text-align: left;"><code>&lt;a program kimenete&gt;</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Fontos:</strong> a „Mért” oszlop üres sablon; a könyv
+írásakor a programot nem futtattuk. Csak a saját környezetben végzett
+futtatás eredménye írható be (a környezet adataival együtt).</p>
+<h3 data-number="14.2.5" id="tipikus-hibák-és-a-helyes-megoldások"><span
+class="header-section-number">14.2.5</span> Tipikus hibák és a helyes
+megoldások</h3>
+<p>A <code>cp.async</code> használata során több gyakori hibával
+találkozhatunk, amelyek a kernel nem determinisztikus viselkedéséhez
+vagy teljesítményromláshoz vezethetnek.</p>
+<ol type="1">
+<li><strong>Hiányzó <code>__pipeline_commit()</code> hívás.</strong>
+<ul>
+<li><strong>Hiba:</strong> A felhasználó kiadja a
+<code>__pipeline_memcpy_async</code> utasításokat, de elfelejti a
+<code>__pipeline_commit()</code>-et. Ebben az esetben a
+<code>__pipeline_wait_prior(0)</code> nem tudja, mely műveletekre kell
+várnia, és a szálak a shared memory érvénytelen tartalmát
+olvashatják.</li>
+<li><strong>Megoldás:</strong> Minden olyan logikai betöltési fázis
+után, ahol a <code>wait</code> hívás következik, kötelező a
+<code>commit</code> meghívása.</li>
+</ul></li>
+<li><strong>A <code>__syncthreads()</code> elhagyása a várakozás
+után.</strong>
+<ul>
+<li><strong>Hiba:</strong> A <code>__pipeline_wait_prior(0)</code> csak
+a hívó szálra vonatkozóan garantálja a saját maga által kiadott
+<code>cp.async</code> műveletek befejeződését. Ha a szál a blokk egy
+másik szálja által írt shared memory területről olvas, a blokk-szintű
+láthatóság nem garantált a <code>__syncthreads()</code> nélkül.</li>
+<li><strong>Megoldás:</strong> A <code>__pipeline_wait_prior(0)</code>
+hívás után, ha a szálak egymás adatait olvassák a shared memory-ból, meg
+kell hívni a <code>__syncthreads()</code>-et a blokk-szintű
+konzisztencia biztosításához. (A magasabb szintű
+<code>cuda::pipeline</code> API-nál a szinkronizáció hatóköre a pipeline
+objektum thread scope-jától függ; a pontos szabályokat a CUDA
+Programming Guide „Asynchronous Data Copies” szakasza adja.)</li>
+</ul></li>
+<li><strong>Helytelen méret vagy igazítás.</strong>
+<ul>
+<li><strong>Hiba:</strong> A <code>__pipeline_memcpy_async</code> méret
+paramétere nem 4, 8 vagy 16 bájt. Például <code>sizeof(float3)</code>
+használata (ami 12 bájt) nem támogatott méret: fordítási hiba vagy nem
+definiált viselkedés. Hasonlóképpen, a 16 bájtos másolásnál a forrás- és
+célcímeknek 16 bájtra igazítottnak kell lenniük (a shared tömbre
+<code>__align__(16)</code> kell).</li>
+<li><strong>Megoldás:</strong> Mindig <code>sizeof(float)</code>,
+<code>sizeof(float2)</code>, vagy <code>sizeof(float4)</code> típusú
+méreteket használjunk, és győződjünk meg a memória igazításáról. Az
+<code>int4</code>, <code>long2</code> stb. típusok szintén 8 vagy 16
+bájtosak.</li>
+</ul></li>
+<li><strong>Nem megfelelő architektúra.</strong>
+<ul>
+<li><p><strong>Hiba:</strong> A kódot <code>sm_80</code> alatti Compute
+Capability-re fordítják, és hardveres gyorsítást várnak. A
+<code>cuda_pipeline.h</code> primitívek sm_80 alatt is lefordulnak, de
+szinkron másolásra esnek vissza, ezért ott a másolás-számítás átfedés
+nem jön létre. A nyers PTX <code>cp.async</code> utasítás viszont sm_80
+alatt nem fordul le.</p></li>
+<li><p><strong>Megoldás:</strong> Ha a hordozhatóság számít, a
+primitíveket használjuk (fallback-kel), nyers PTX esetén pedig
+feltételes fordítást:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#if __CUDA_ARCH__ &gt;= 800</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">// nyers PTX cp.async vagy __pipeline_* hívások</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#else</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// szinkron betöltés</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#endif</span></span></code></pre></div></li>
+</ul></li>
+</ol>
+<h3 data-number="14.2.6" id="összefoglalás-és-továbblépés"><span
+class="header-section-number">14.2.6</span> Összefoglalás és
+továbblépés</h3>
+<p>Ebben az alfejezetben bemutattuk a <code>cp.async</code> hardveres
+alapjait, a globális memóriából a shared memory-ba történő közvetlen,
+regisztereket elkerülő aszinkron másolást. Részleteztük a commit és wait
+mechanizmust, amely elengedhetetlen a műveletek helyes
+szinkronizálásához. A laborfeladat a hagyományos szinkron betöltés és a
+<code>cp.async</code>-alapú megoldás összehasonlítását készíti elő; a
+mérést az olvasó végzi el a saját GPU-ján.</p>
+<p>Az itt bemutatott minta még nem használja ki az aszinkronitásban
+rejlő legnagyobb lehetőséget, a memóriaműveletek és a számítások
+átfedését. A <code>__pipeline_wait_prior(0)</code> hívás ugyanis
+megvárja az összes másolás befejeződését, ami a szálakat továbbra is
+blokkolja. A következő alfejezetben (14.3) ezt a korlátot oldjuk fel a
+double buffering és a pipeline technikák bevezetésével, ahol a kernel az
+egyik csempe adatának betöltése közben már egy másik, korábban betöltött
+csempén végez számítást.</p>
+<h4 data-number="14.2.6.1" id="modern-api-k-és-kitekintés"><span
+class="header-section-number">14.2.6.1</span> Modern API-k és
+kitekintés</h4>
+<p>A <code>__pipeline_*</code> primitíveken túl a CUDA magasabb szintű
+aszinkron-másolási API-kat is kínál: a libcu++
+<code>cuda::memcpy_async</code> és a
+<code>cooperative_groups::memcpy_async</code> függvényeket
+(csoportszintű, kooperatív másolás a <code>cuda::pipeline</code> vagy
+<code>cuda::barrier</code> objektumokkal). Hopper (cc 9.0) architektúrán
+a hardver külön, tenzor-szintű aszinkron másolást (TMA,
+<code>cp.async.bulk</code>) is támogat; ezek részleteit a CUDA
+Programming Guide tárgyalja, a következő alfejezet pipeline-mintái
+ezekre is épülhetnek.</p>
+<h4 data-number="14.2.6.2" id="önellenőrző-kérdések"><span
+class="header-section-number">14.2.6.2</span> Önellenőrző kérdések</h4>
+<ol type="1">
+<li>Miért kell <code>__syncthreads()</code> a
+<code>__pipeline_wait_prior(0)</code> után, ha a szálak egymás által
+másolt adatot olvassák?</li>
+<li>Mi történik, ha a <code>__pipeline_commit()</code> hívást
+elhagyjuk?</li>
+<li>Miért nem várható nagy gyorsulás a laborban a
+<code>cp.async</code>-tól?</li>
+</ol>
+<p><strong>Megoldások.</strong> (1) A wait csak a hívó szál saját
+másolataira vonatkozik; a többi szál másolatainak láthatóságát a
+blokk-szintű barrier biztosítja. (2) A <code>wait_prior</code> csak a
+már commitált csoportokra vonatkozik, így a le nem zárt másolások
+befejezése nem garantált, és a szál inicializálatlan vagy félig írt
+shared memóriát olvashat. (3) A kernelben nincs számítási fázis,
+amellyel a másolás átfedhető volna, és a futásidőt várhatóan a
+DRAM-sávszélesség korlátozza.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu050.html">← 14.1 Shared memory tiling</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu052.html">14.3 Double buffering és pipeline →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

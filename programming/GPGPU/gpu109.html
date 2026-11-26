@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>28.4 JAX teljesítmény és korlátok – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz6">VI. RÉSZ – TPU, OpenCL és más modellek</a> › <a href="index.html#gpuch27">28 JAX és TPU programozás</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu108.html">← 28.3 TPU-n futó JAX</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu110.html">29.1 OpenCL platform és device modell →</a></div>
+</nav>
+<h2 data-number="28.4" id="gpu109"><span
+class="header-section-number">28.4</span> JAX teljesítmény és
+korlátok</h2>
+<p>A JAX által generált XLA-gráf végrehajtása a TPU-n vagy a GPU-n
+alapvetően más teljesítménymodellt követ, mint a korábban tárgyalt
+közvetlen CUDA- vagy OpenCL-kernelek. A JAX a programot először egy
+tisztán funkcionális, statikus alakú gráffá alakítja, majd az XLA
+fordító optimalizálja és leképezi a célhardverre. Ez a fordítási lépés
+teszi lehetővé, hogy a TPU systolic array-jei, a nagy kapacitású
+HBM-memória és a csökkentett utasítás-ütemezési overhead mellett nagyon
+magas átbocsátóképességet érjünk el, ugyanakkor újfajta korlátokat is
+bevezet: a shape-ek rögzítettek, a recompiláció költséges, és a
+memória-méretezés logikája eltér a hagyományos CUDA-folyamattól.</p>
+<p>Ebben a fejezetben a JAX/TPU teljesítményjellemzőit járjuk körbe. A
+célunk az, hogy a JAX-et ne puszta Python-könyvtárként, hanem egy saját
+végrehajtási modellel rendelkező akcelerátor-programozási eszközként
+értsük. Megvizsgáljuk, miért kulcsfontosságú a shape-stabilitás, hogyan
+kerülhetjük el a felesleges újrafordítást, és milyen memória- és
+eszközkorlátokkal kell számolnunk a gyakorlatban. A fejezet laborja egy
+valós, reprodukálható benchmarkot mutat be, amelyben a várt és a mért
+teljesítményt elkülönítjük, és az eredményeket a szokásos konvencióknak
+megfelelően rögzítjük.</p>
+<h3 data-number="28.4.1"
+id="miért-más-a-jaxtpu-teljesítménymodellje"><span
+class="header-section-number">28.4.1</span> Miért más a JAX/TPU
+teljesítménymodellje?</h3>
+<p>A CUDA esetén a fejlesztő explicit módon kezeli a kernelindítást, a
+szálak és blokkok számát, a memóriatereket és a szinkronizációt. A JAX
+ezzel szemben a <code>jit</code>, a <code>vmap</code> és a
+<code>pmap</code> transzformációk révén automatikusan építi fel a
+végrehajtási gráfot. A teljesítményt ezért elsősorban nem a kézzel írt
+kernel minősége határozza meg, hanem az, hogy az XLA mennyire tudja a
+teljes számítást optimalizálni a rendelkezésre álló hardverre.</p>
+<p>A TPU esetében ez a modell még hangsúlyosabb. A TPU egy olyan
+akcelerátor, amelyet kifejezetten mátrixműveletek és tömbfüggvények nagy
+átbocsátóképességű feldolgozására terveztek. Az általános célú
+regiszterek, a warp-ütemező és a bonyolult elágazáskezelés helyett a TPU
+szívét a MXU (Matrix Multiply Unit) alkotja, amely a 128×128-as vagy
+256×256-os systolic array-ben hajtja végre a dense mátrixszorzást. Ez a
+kialakítás rendkívül hatékony a dominánsan lineáris algebrai
+műveleteknél, de kevésbé rugalmas a szabálytalan, erősen adatfüggő
+vezérlésű kódoknál. A JAX/TPU teljesítmény tehát akkor optimális, ha a
+számítás nagy része sűrű tenzorműveletekben fejezhető ki, és a
+bemeneti-kimeneti adatok alakja ismert és rögzített.</p>
+<h3 data-number="28.4.2" id="recompilation-és-shape-stabilitás"><span
+class="header-section-number">28.4.2</span> Recompilation és
+shape-stabilitás</h3>
+<p>A JAX <code>jit</code> dekorátora az első hívás alkalmával lefordítja
+a függvényt a bemeneti argumentumok konkrét típusára és alakjára. Ha
+ugyanazt a függvényt ugyanolyan shape-ű és dtype-ú bemenettel hívjuk, a
+gyorsítótárazott XLA-beli végrehajtható binárist használja fel, és a
+hívás Python-oldali overheadje kis függvénynél jellemzően
+tízmikroszekundumos nagyságrendű. Ha azonban a shape megváltozik, a
+teljes gráfot újra kell fordítani. Ez a <strong>recompilation</strong>
+költsége, amely jellemzően másodpercekben mérhető, ezért a forró
+útvonalon elkerülendő.</p>
+<p>A következő kód ezt a jelenséget mutatja meg. (A kód JAX, Python; a
+JAX verzióját és a futtató hardvert a laborban rögzítjük.)</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># nyelv: Python, JAX</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax.numpy <span class="im">as</span> jnp</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="at">@jax.jit</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> add_bias(x, bias):</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> x <span class="op">+</span> bias</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="co"># Először egy (128, 128)-es bemenettel hívjuk.</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>x1 <span class="op">=</span> jnp.ones((<span class="dv">128</span>, <span class="dv">128</span>), dtype<span class="op">=</span>jnp.float32)</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>bias <span class="op">=</span> jnp.ones((<span class="dv">128</span>,), dtype<span class="op">=</span>jnp.float32)</span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>add_bias(x1, bias)  <span class="co"># itt történik a fordítás</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="co"># Másodszor ugyanolyan shape-vel – nincs recompilation.</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>x2 <span class="op">=</span> jnp.zeros((<span class="dv">128</span>, <span class="dv">128</span>), dtype<span class="op">=</span>jnp.float32)</span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>add_bias(x2, bias)  <span class="co"># gyorsítótárazott</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="co"># Harmadszor eltérő shape-vel – recompilation.</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>x3 <span class="op">=</span> jnp.ones((<span class="dv">256</span>, <span class="dv">128</span>), dtype<span class="op">=</span>jnp.float32)</span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>add_bias(x3, bias)  <span class="co"># újrafordítás, lassú</span></span></code></pre></div>
+<p>A gyakorlatban a recompiláció elkerülésére több stratégia áll
+rendelkezésre:</p>
+<ol type="1">
+<li><p><strong>Fix shape-ek használata.</strong> Ha a modell vagy a
+szimuláció mindig ugyanakkora tenzorokkal dolgozik, a JAX csak egyszer
+fordít. Ez a mélytanulásban a leggyakoribb megközelítés, mert a batch
+méretet és a bemeneti dimenziókat gyakran rögzítik.</p></li>
+<li><p><strong>Padding.</strong> Változó hosszúságú sorozatoknál (pl.
+szöveg vagy idősor) a bemeneteket nullával töltjük fel egy maximális
+hosszra. Így a shape állandó marad, a recompiláció megszűnik. A padding
+hátránya a felesleges számítás, de ezt a TPU nagy átbocsátóképessége
+gyakran elnyeli.</p></li>
+<li><p><strong><code>static_argnums</code> vagy
+<code>static_argnames</code> a <code>jit</code>-ben.</strong> Ha a
+függvénynek olyan argumentuma van, amely nem tenzor, hanem például egy
+shape-paraméter vagy egy flag, akkor ezt statikus argumentumként kell
+megjelölni. A JAX ekkor ezt az értéket a fordítás során beégeti a
+gráfba, és a változása újrafordítást vált ki. Ezt akkor használjuk, ha a
+shape ritkán változik, de a dinamikus tenzoradat gyakran
+frissül.</p></li>
+</ol>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># nyelv: Python, JAX</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="co"># HIBÁS: a sima @jax.jit minden argumentumot trace-el, így a transpose_y</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="co"># trace-elt érték lesz, és az `if` TracerBoolConversionError-t dob.</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="at">@jax.jit</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> matmul_bad(x, y, transpose_y):</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> transpose_y:</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> x <span class="op">@</span> y.T</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> x <span class="op">@</span> y</span></code></pre></div>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># nyelv: Python, JAX</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co"># HELYES: a transpose_y statikus argumentum (Python bool).</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> functools <span class="im">import</span> partial</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="at">@partial</span>(jax.jit, static_argnums<span class="op">=</span><span class="dv">2</span>)</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> matmul_static(x, y, transpose_y):</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> transpose_y:</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> x <span class="op">@</span> y.T</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> x <span class="op">@</span> y</span></code></pre></div>
+<ol start="4" type="1">
+<li><strong>Bucketing, padding és maszkolás dinamikus shape
+esetén.</strong> Ha a bemeneti méret időben változik, a hosszakat néhány
+előre rögzített méretre (bucket, pl. 128, 256, 512) kerekítjük fel, és a
+kitöltött elemeket maszkoljuk. Így csak bucketenként egyszer fordít a
+JAX. A <code>jax.lax.map</code> ezt nem helyettesíti: a bemeneti shape
+változása vele is új trace-t és fordítást jelent. Az újrafordítások
+száma a <code>JAX_LOG_COMPILES=1</code> beállítással ellenőrizhető.</li>
+</ol>
+<figure id="fig-gpu109-bucketing">
+<div class="fig-interactive"><iframe src="figures/html/gpu109-bucketing.html" title="Két oszlopdiagram a tíz bemenettel (100, 130, 200, 260, 300, 120, 500, 140, 210, 480). A: bucket nélkül minden oszlop fölött fordítás jel, összesen 10 fordítás, nincs padding. B: a hosszak 128, 256 vagy 512-re kerekítve; a valódi rész szürke, a padding vonalkázott; fordítás csak az első 128-as, 256-os és 512-es előfordulásnál (100, 130, 260), a többi cache-találat; 3 fordítás, kihasználtság 2440/3328, kb. 73%." loading="lazy" style="width:100%;border:0;height:560px"></iframe><noscript><img src="figures/img/gpu109-bucketing.png" style="width:95.0%"
+alt="Két oszlopdiagram a tíz bemenettel (100, 130, 200, 260, 300, 120, 500, 140, 210, 480). A: bucket nélkül minden oszlop fölött fordítás jel, összesen 10 fordítás, nincs padding. B: a hosszak 128, 256 vagy 512-re kerekítve; a valódi rész szürke, a padding vonalkázott; fordítás csak az első 128-as, 256-os és 512-es előfordulásnál (100, 130, 260), a többi cache-találat; 3 fordítás, kihasználtság 2440/3328, kb. 73%." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu109-bucketing.png" style="width:95.0%"
+alt="Két oszlopdiagram a tíz bemenettel (100, 130, 200, 260, 300, 120, 500, 140, 210, 480). A: bucket nélkül minden oszlop fölött fordítás jel, összesen 10 fordítás, nincs padding. B: a hosszak 128, 256 vagy 512-re kerekítve; a valódi rész szürke, a padding vonalkázott; fordítás csak az első 128-as, 256-os és 512-es előfordulásnál (100, 130, 260), a többi cache-találat; 3 fordítás, kihasználtság 2440/3328, kb. 73%." /></details></div>
+<figcaption>Recompiláció bucket nélkül és 128/256/512-es bucketekkel:
+tíz különböző hosszú bemenetnél bucket nélkül 10, bucketekkel 3 fordítás
+kell, cserébe a feldolgozott elemek kb. 27%-a padding (kihasználtság
+2440 / 3328); szemléltető hosszak</figcaption>
+</figure>
+<p>A JAX a recompilációt a hívások során naplózza, ha a
+<code>JAX_LOG_COMPILES=1</code> környezeti változót beállítjuk. Ez
+hasznos diagnosztikai eszköz. A túl gyakori újrafordítás a teljesítményt
+drámaian lerontja, ezért a fejlesztés során érdemes rögtön a végleges
+shape-ekkel dolgozni.</p>
+<h3 data-number="28.4.3" id="memória-és-eszközkorlátok"><span
+class="header-section-number">28.4.3</span> Memória és
+eszközkorlátok</h3>
+<p>A TPU-n a következő memóriaréteg-hierarchiát különböztetjük meg
+(Cloud TPU architektúra-dokumentáció alapján): HBM (High Bandwidth
+Memory), chipen belüli vektormemória (VMEM, lásd 27.4), skaláris memória
+(SMEM), majd a vektor-regiszterek és az MXU belső pufferei (HBM → VMEM →
+regiszterek/MXU). A HBM kapacitása jellemzően tíz-száz gigabájt
+nagyságrendű, de a gyakorlati hozzáférhető kapacitást csökkenti a
+rendszerrezervált terület, az XLA-layout, valamint a többszörös
+pufferelés. A TPU memória-modellje eltér a CUDA-étól: nincs a CUDA
+shared memory-jának megfelelő, szálblokkok által címezhető memória, a
+chipen belüli VMEM-et pedig a fordító (XLA, illetve Pallas-kernel esetén
+a programozó) kezeli; az adatmozgást a HBM és a VMEM között is az XLA
+ütemezi. Az MXU hatékony kihasználásához az adatoknak megfelelő
+layoutban kell a HBM-ben lenniük, különben az átpárnázás és az átmásolás
+többletköltséget okoz.</p>
+<p>A <strong>memória- és eszközkorlátok</strong> két fő formában
+jelentkeznek:</p>
+<ul>
+<li><p><strong>Kapacitáskorlát:</strong> Ha a tenzorok együttes mérete
+meghaladja a rendelkezésre álló HBM-et, a JAX/TPU futás kifogytával
+meghiúsul. A TPU általában nem támogatja az automatikus host-memóriából
+való kicserélést, ezért a fejlesztő felelőssége a memóriahasználat
+tervezése. A gyakorlatban ez azt jelenti, hogy nagy modelleknél a
+paramétereket shardingolni kell, vagy a számítást kisebb darabokra kell
+bontani.</p></li>
+<li><p><strong>Sávszélesség-korlát:</strong> A TPU HBM sávszélessége
+nagy, de a MXU által kínált számítási csúcs még ennél is nagyobb. A
+roofline-modell alapján számos művelet memória-korlátos: az adatmozgatás
+ideje dominál, nem a lebegőpontos műveletek. A dense mátrixszorzás
+azonban tipikusan számítási korlátos, mert a MXU nagyon magas FLOPs-ot
+ér el, és a mátrixméretek növelésével a compute intensity (FLOP per
+byte) rohamosan nő.</p></li>
+</ul>
+<figure id="fig-gpu109-roofline">
+<div class="fig-interactive"><iframe src="figures/html/gpu109-roofline.html" title="Log-log grafikon, vízszintesen az aritmetikai intenzitás 0,01-től 10 000 FLOP/bájtig, függőlegesen a teljesítmény 0,01-től 100 TFLOPS-ig. A ferde memóriatető 0,936 TB/s szorozva az intenzitással, a vízszintes számítási tető 35,6 TFLOPS, a gerincpont kb. 38 FLOP/bájtnál. Az add_bias kör jelölője kb. 0,125 intenzitásnál, kb. 0,12 TFLOPS-nál a ferde szakaszon; a GEMM 4096³ négyzet jelölője kb. 683 intenzitásnál a vízszintes tetőn." loading="lazy" style="width:100%;border:0;height:640px"></iframe><noscript><img src="figures/img/gpu109-roofline.png" style="width:80.0%"
+alt="Log-log grafikon, vízszintesen az aritmetikai intenzitás 0,01-től 10 000 FLOP/bájtig, függőlegesen a teljesítmény 0,01-től 100 TFLOPS-ig. A ferde memóriatető 0,936 TB/s szorozva az intenzitással, a vízszintes számítási tető 35,6 TFLOPS, a gerincpont kb. 38 FLOP/bájtnál. Az add_bias kör jelölője kb. 0,125 intenzitásnál, kb. 0,12 TFLOPS-nál a ferde szakaszon; a GEMM 4096³ négyzet jelölője kb. 683 intenzitásnál a vízszintes tetőn." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu109-roofline.png" style="width:80.0%"
+alt="Log-log grafikon, vízszintesen az aritmetikai intenzitás 0,01-től 10 000 FLOP/bájtig, függőlegesen a teljesítmény 0,01-től 100 TFLOPS-ig. A ferde memóriatető 0,936 TB/s szorozva az intenzitással, a vízszintes számítási tető 35,6 TFLOPS, a gerincpont kb. 38 FLOP/bájtnál. Az add_bias kör jelölője kb. 0,125 intenzitásnál, kb. 0,12 TFLOPS-nál a ferde szakaszon; a GEMM 4096³ négyzet jelölője kb. 683 intenzitásnál a vízszintes tetőn." /></details></div>
+<figcaption>Roofline az RTX 3090 adatlapi csúcsaival (FP32: 35,6 TFLOPS,
+936 GB/s; a gerincpont kb. 38 FLOP/bájt): az <code>add_bias</code> (AI
+kb. 0,125) memóriakorlátos, a 4096³-os GEMM (AI kb. 683)
+számításkorlátos. Névleges értékek, nem mérés; a valós SGEMM a tető
+alatt marad</figcaption>
+</figure>
+<p>A TPU-n az XLA a tenzorokat a HBM-ben egy <strong>tiled
+layout</strong> szerint tárolja. Ez a tiling illeszkedik az MXU systolic
+array-jének bemeneti pufferéhez. Ha egy művelet kimenetét a következő
+művelet közvetlenül felhasználja, az XLA megpróbálja a köztes tenzort a
+HBM helyett a VMEM-ben/vektorregiszterekben tartani, elkerülve a
+redundáns memóriaírást és -olvasást. Ez a <strong>fusion</strong>
+folyamata: a JAX az elemi műveleteket egyetlen XLA-kernelbe olvasztja
+össze, ami drámaian csökkenti az adatmozgást. A fúzió azonban nem mindig
+lehetséges; például a nagy, nem elemi számítások vagy a megosztott
+köztes értékek akadályozhatják.</p>
+<p>A memóriakorlátok kezelésére a következő stratégiákat
+alkalmazzuk:</p>
+<ul>
+<li><p><strong>Batch méret csökkentése.</strong> A legtöbb esetben a
+memória fogyasztás lineárisan nő a batch mérettel. Ha a modell nem fér
+el, a mini-batch méretet kell csökkenteni.</p></li>
+<li><p><strong>Gradient checkpointing (rematerializáció).</strong> A
+backpropagation során a forward aktivációk tárolása jelentős memóriát
+igényel. A checkpointing feláldozza a számítási sebességet a
+memóriamegtakarításért: bizonyos aktivációkat nem tárolunk, hanem a
+backward menetben újraszámítjuk. A JAX-ben ez a
+<code>jax.checkpoint</code> segítségével érhető el.</p></li>
+<li><p><strong>Sharding és data parallelism.</strong> Ha több TPU chip
+áll rendelkezésre, a tenzorokat a <code>pmap</code> vagy a
+<code>jax.sharding</code> segítségével szétoszthatjuk. A paramétereket
+is több részre oszthatjuk, így minden eszköz csak egy szeletet
+tárol.</p></li>
+<li><p><strong>Sharding tudatos tervezése.</strong> A JAX-ben az adatok
+eszközök közötti elosztását a <code>jax.sharding.NamedSharding</code> és
+a <code>jax.sharding.Mesh</code> (vagy <code>jax.make_mesh</code>) adjuk
+meg; ez nem a memórián belüli layout (azt az XLA választja, kísérletileg
+a <code>jax.experimental.layout</code> állítja). A <code>Mesh</code> az
+eszközök logikai rácsa, a <code>PartitionSpec</code> pedig azt adja meg,
+hogy a tömb mely dimenziója melyik mesh-tengelyen oszlik el. A
+<code>DeviceMesh</code> a PyTorch fogalma, a JAX-ben nincs ilyen
+osztály. Ez akkor lényeges, ha a TPU-n belüli adatpárhuzamos vagy
+modellpárhuzamos mintát akarunk kialakítani. A sharding finomhangolása
+összetett, de a teljesítmény szempontjából meghatározó lehet; az API a
+JAX verzióról verzióra változhat, ezért a használt verzió
+dokumentációját kell követni.</p></li>
+</ul>
+<h3 data-number="28.4.4" id="labor-benchmark-és-elemzés"><span
+class="header-section-number">28.4.4</span> Labor: benchmark és
+elemzés</h3>
+<p>A labor célja, hogy a fenti fogalmakat egy konkrét, reprodukálható
+mérésen keresztül megértsük. A laborban JAX-et használunk, de a teljes
+környezetet a könyv konvenciói szerint rögzítjük. Mivel a fejezet a
+JAX/TPU-ról szól, de a legtöbb olvasó CPU/GPU-val rendelkezik, a mérést
+GPU-n (vagy CPU-n) végezd, a TPU-specifikus viselkedést pedig a várt
+eredmények szekcióban külön jelöljük; a TPU-ra vonatkozó állítások csak
+dokumentáción alapulnak, TPU-n nem futtattunk semmit.</p>
+<p><strong>Környezet (mérési napló):</strong></p>
+<ul>
+<li>Szoftver: JAX és jaxlib verziója: <code>&lt;kitöltendő&gt;</code>
+(rögzítsd a <code>jax.__version__</code> kimenetéből), Python
+<code>&lt;kitöltendő&gt;</code>.</li>
+<li>Hardver: NVIDIA RTX 3090 (compute capability 8.6), 24 GB GDDR6X;
+CUDA- és driververzió: <code>&lt;kitöltendő&gt;</code>.</li>
+<li>OS: <code>&lt;kitöltendő&gt;</code>, izolált konténerben (pl.
+Docker, <code>--gpus all</code>).</li>
+<li>Precision: FP32 bemenet; a JAX/XLA alapértelmezett mátrixszorzási
+precisionje (TF32 használata) a verziótól függ, ezért rögzítendő (pl.
+<code>jax.default_matmul_precision</code>).</li>
+<li>TPU esetén: a laborban nem használtunk TPU-t; a TPU-ra vonatkozó
+elvárásokat az XLA/Cloud TPU dokumentáció alapján adjuk meg, és ezt
+külön jelöljük.</li>
+</ul>
+<p><strong>A benchmark feladat:</strong> egy nagy mátrixszorzás
+többszöri végrehajtása. Ez a művelet ideális a TPU/GPU számítási
+korlátjának tesztelésére.</p>
+<p><strong>Kód (JAX):</strong></p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># nyelv: Python, JAX</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax.numpy <span class="im">as</span> jnp</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Ellenőrizzük a JAX által használt eszközt</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(jax.devices())</span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="co"># A kimenet a verziótól függ (pl. egy CUDA-eszköz listája)</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="co"># Fix shape-ű mátrixok</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>A <span class="op">=</span> jnp.ones((<span class="dv">4096</span>, <span class="dv">4096</span>), dtype<span class="op">=</span>jnp.float32)</span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>B <span class="op">=</span> jnp.ones((<span class="dv">4096</span>, <span class="dv">4096</span>), dtype<span class="op">=</span>jnp.float32)</span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="at">@jax.jit</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> matmul(x, y):</span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> x <span class="op">@</span> y</span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a><span class="co"># Warm-up: fordítás + szinkron futás. A warm-upot is szinkronizálni kell,</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a><span class="co"># különben az aszinkron dispatch miatt az első mért ismétlésbe csúszik.</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">5</span>):</span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>    matmul(A, B).block_until_ready()</span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a><span class="co"># Mérés: 20 ismétlés</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>times <span class="op">=</span> []</span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">20</span>):</span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a>    start <span class="op">=</span> time.perf_counter()</span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a>    C <span class="op">=</span> matmul(A, B)</span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a>    C.block_until_ready()  <span class="co"># szinkronizálás a GPU-val</span></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a>    end <span class="op">=</span> time.perf_counter()</span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a>    times.append(end <span class="op">-</span> start)</span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> statistics</span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a>med <span class="op">=</span> statistics.median(times)</span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a>q1, _, q3 <span class="op">=</span> statistics.quantiles(times, n<span class="op">=</span><span class="dv">4</span>)</span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;Medián idő: </span><span class="sc">{</span>med<span class="op">*</span><span class="dv">1000</span><span class="sc">:.2f}</span><span class="ss"> ms, IQR: </span><span class="sc">{</span>(q3 <span class="op">-</span> q1)<span class="op">*</span><span class="dv">1000</span><span class="sc">:.2f}</span><span class="ss"> ms&quot;</span>)</span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;Számítás: </span><span class="sc">{</span><span class="dv">2</span> <span class="op">*</span> <span class="dv">4096</span><span class="op">**</span><span class="dv">3</span><span class="sc">:.2e}</span><span class="ss"> FLOP&quot;</span>)</span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;Teljesítmény: </span><span class="sc">{</span><span class="dv">2</span> <span class="op">*</span> <span class="dv">4096</span><span class="op">**</span><span class="dv">3</span> <span class="op">/</span> med<span class="sc">:.2e}</span><span class="ss"> FLOPS&quot;</span>)</span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-39"><a href="#cb4-39" aria-hidden="true" tabindex="-1"></a><span class="co"># Recompiláció tesztelése: változó shape-ű bemenet. A fordítás egyszeri</span></span>
+<span id="cb4-40"><a href="#cb4-40" aria-hidden="true" tabindex="-1"></a><span class="co"># esemény, ezért itt egyetlen mérés van; több mintához a</span></span>
+<span id="cb4-41"><a href="#cb4-41" aria-hidden="true" tabindex="-1"></a><span class="co"># jax.clear_caches() utáni ismételt hívás használható.</span></span>
+<span id="cb4-42"><a href="#cb4-42" aria-hidden="true" tabindex="-1"></a>A_dyn <span class="op">=</span> jnp.ones((<span class="dv">4096</span>, <span class="dv">2048</span>), dtype<span class="op">=</span>jnp.float32)</span>
+<span id="cb4-43"><a href="#cb4-43" aria-hidden="true" tabindex="-1"></a>B_dyn <span class="op">=</span> jnp.ones((<span class="dv">2048</span>, <span class="dv">4096</span>), dtype<span class="op">=</span>jnp.float32)</span>
+<span id="cb4-44"><a href="#cb4-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-45"><a href="#cb4-45" aria-hidden="true" tabindex="-1"></a>start <span class="op">=</span> time.perf_counter()</span>
+<span id="cb4-46"><a href="#cb4-46" aria-hidden="true" tabindex="-1"></a>C_dyn <span class="op">=</span> matmul(A_dyn, B_dyn)  <span class="co"># újrafordítás történik</span></span>
+<span id="cb4-47"><a href="#cb4-47" aria-hidden="true" tabindex="-1"></a>C_dyn.block_until_ready()</span>
+<span id="cb4-48"><a href="#cb4-48" aria-hidden="true" tabindex="-1"></a>end <span class="op">=</span> time.perf_counter()</span>
+<span id="cb4-49"><a href="#cb4-49" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;Recompilált hívás ideje: </span><span class="sc">{</span>(end<span class="op">-</span>start)<span class="op">*</span><span class="dv">1000</span><span class="sc">:.2f}</span><span class="ss"> ms&quot;</span>)</span></code></pre></div>
+<p><strong>Várt eredmények:</strong></p>
+<ul>
+<li>A művelet 2 · 4096³ ≈ 1,37 · 10¹¹ FLOP. Az RTX 3090 FP32 csúcsa az
+adatlap szerint kb. 35,6 TFLOPS; ennek 70–85%-át (kb. 25–30 TFLOPS)
+feltételezve a várt idő kb. 4,6–5,5 ms. Ez analitikus becslés, nem
+mérés; a tényleges érték a precisiontől (FP32 vagy TF32), az órajeltől
+és az XLA-verziótól függ. Összehasonlító alapként célszerű cuBLAS
+SGEMM-et (27.4 <code>gemm_bench</code>) is mérni.</li>
+<li>A recompilált hívás ideje jóval nagyobb lesz a normál hívásénál,
+mert a JAX az új shape-re újrafordítja a gráfot: a fordítási költség
+jellemzően a ms–s tartományban mozog, miközben a fix shape-ű hívás ms
+nagyságrendű.</li>
+</ul>
+<p><strong>Mért eredmények (illesztendő a saját
+futtatáskor):</strong></p>
+<p>Ebben a kiadásban a kódot nem futtattuk, ezért nincs mért adat. A
+saját futtatás után töltsd ki (a mediánt és az IQR-t a
+<code>times</code> listából számold):</p>
+<ul>
+<li>Medián idő fix shape mellett: <code>&lt;mért – kitöltendő&gt;</code>
+ms (IQR: <code>&lt;mért – kitöltendő&gt;</code> ms).</li>
+<li>Elért teljesítmény: 2 · 4096³ / mediánidő =
+<code>&lt;mért – kitöltendő&gt;</code> TFLOPS.</li>
+<li>Recompilált hívás ideje: <code>&lt;mért – kitöltendő&gt;</code> ms
+(a teljes XLA-fordítással).</li>
+</ul>
+<p><strong>Elemzés:</strong></p>
+<p>Az eredmény értékelése a saját mérés után lehetséges. Egy 4096³-as
+SGEMM ms nagyságrendű, ezért a Python- és launch-overhead (tíz–száz
+mikroszekundum) nem magyarázhat jelentős elmaradást a csúcstól; ha a
+mért érték a várt tartomány alatt marad, először a precisiont, az
+órajelet/hőmérsékletet és a cuBLAS-referenciát kell ellenőrizni. A
+recompiláció a normál híváshoz képest nagyságrendekkel lassabb, ezért a
+forró útvonalon kerülendő.</p>
+<p>A TPU esetén a várható teljesítmény más képet mutat: a TPU-k MXU-ra
+épülő felépítése a nagy, sűrű mátrixszorzásokra optimalizált; hogy ez a
+gyakorlatban mennyivel közelebb visz a csúcshoz, hipotézis. A pontos
+értékeket a Cloud TPU dokumentációjából és saját TPU-mérésből kell
+venni, mert ebben a laborban nem futtattunk TPU-t.</p>
+<h3 data-number="28.4.5" id="gyakori-hibák-és-helyes-megoldás"><span
+class="header-section-number">28.4.5</span> Gyakori hibák és helyes
+megoldás</h3>
+<p>A JAX/TPU teljesítményt érintő leggyakoribb hibák a következők:</p>
+<ol type="1">
+<li><p><strong>Nem szinkronizált mérés.</strong> A JAX aszinkron módon
+hajtja végre a műveleteket, ezért ha a <code>block_until_ready()</code>
+hívást kihagyjuk, az időmérés csupán a kernelindítási overheadet fogja
+mérni, nem a tényleges futásidőt. <strong>Helyes megoldás:</strong>
+minden egyes mérési pont után hívjuk a <code>block_until_ready()</code>
+metódust, vagy használjunk <code>jax.profiler</code>
+időbélyegeket.</p></li>
+<li><p><strong>Recompiláció a forró útvonalon.</strong> Ha egy
+<code>jit</code>-elt függvény bemeneti shape-je minden iterációban
+változik, az újrafordítás többször is lefut, és a teljesítmény
+összeomlik. <strong>Helyes megoldás:</strong> fix shape-ek használata,
+padding, vagy <code>static_argnums</code> alkalmazása a ritkán változó
+paraméterekre.</p></li>
+<li><p><strong>Túl nagy batch méret.</strong> A nagy batch egyszerre
+növeli a memóriahasználatot és a számítási időt, de a GPU/TPU memóriája
+véges. Ha túl nagy, a futtatás kifogyott memóriával meghiúsul.
+<strong>Helyes megoldás:</strong> batch méret csökkentése, gradient
+checkpointing, vagy sharding.</p></li>
+<li><p><strong>Nem megfelelő sharding layout.</strong> Több eszköz
+esetén az alapértelmezett adatpárhuzamos elosztás nem mindig optimális.
+A nem kontinuus vagy rosszul illeszkedő shardok a HBM-ben felesleges
+adatmozgást okoznak. <strong>Helyes megoldás:</strong> a
+<code>Mesh</code> és a <code>NamedSharding</code> segítségével tudatosan
+megtervezni az adatok elhelyezését, és profilozással ellenőrizni a
+tényleges forgalmat.</p></li>
+<li><p><strong>Figyelmen kívül hagyni a JAX dispatch
+overheadjét.</strong> A JAX Python felületén a tenzorműveletek láncolata
+egy Python-overheadet jelent, ami kis méretű műveleteknél domináns
+lehet. <strong>Helyes megoldás:</strong> a kis műveleteket összefűzni,
+vagy <code>jax.jit</code>-tel egyetlen XLA-gráfba olvasztani; ha a méret
+nagyon kicsi, a JAX nem hatékony, és érdemesebb más eszközt
+használni.</p></li>
+</ol>
+<h3 data-number="28.4.6" id="összefoglalás"><span
+class="header-section-number">28.4.6</span> Összefoglalás</h3>
+<p>A JAX/TPU teljesítményét három fő tényező határozza meg: az XLA által
+létrehozott gráf minősége, a shape-ek stabilitása és a
+memória-elrendezés. A recompiláció elkerülése a gyakorlati munka
+alapfeltétele, mert a felesleges újrafordítás másodperceket is
+felemészthet. A memória- és eszközkorlátok — különösen a HBM kapacitása
+és a sharding mikéntje — meghatározzák, hogy egy modell vagy szimuláció
+egyáltalán elfér-e az adott hardveren, és hogy milyen hatékonysággal
+fut. A labor mérései (a kitöltés után) mutatják meg, hogyan teljesít a
+JAX GPU-n; a TPU-ra vonatkozó összehasonlítás csak hipotézis, TPU-n nem
+mértünk. A következő fejezet az OpenCL programozási modellre tér át,
+ahol a hasonlóságok és a különbségek tovább árnyalják a képet.</p>
+<p><strong>Önellenőrző kérdés:</strong> Magyarázd el, miért okoz a
+shape-változás teljesítménycsökkenést a JAX <code>jit</code>
+használatakor, és adj meg két stratégiát a recompiláció
+elkerülésére.</p>
+<p><em>Válaszvázlat:</em> a <code>jit</code> a bemenet shape-je és
+dtype-ja szerint trace-el és fordít, és ezt a (shape, dtype) kulcs alatt
+gyorsítótárazza; új shape új trace-t és XLA-fordítást jelent, ami ms–s
+nagyságrendű költség. Stratégiák: fix shape-ek, padding/bucketing
+maszkolással, <code>static_argnums</code> ritkán változó
+paraméterekre.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu108.html">← 28.3 TPU-n futó JAX</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu110.html">29.1 OpenCL platform és device modell →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

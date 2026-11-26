@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>17.1 Future-ök és async/await: mi történik a motorháztető alatt
+– Rust programozás C++-fejlesztőknek – a nulláról a
+mesterszintig</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – Párhuzamosság és aszinkronitás</a> › <a href="index.html#rch16">17 Aszinkron Rust</a></p>
+<div class="links"><a class="prev" rel="prev" href="r036.html">← 16.4 Adatpárhuzamosság rayonnal</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="r038.html">17.2 Pin, Unpin, async trait-ek és a Send-határok →</a></div>
+</nav>
+<h2 data-number="17.1" id="r037"><span
+class="header-section-number">17.1</span> Future-ök és async/await: mi
+történik a motorháztető alatt</h2>
+<h3 data-number="17.1.1" id="motiváció"><span
+class="header-section-number">17.1.1</span> Motiváció</h3>
+<p>Ha C++-ban tíz TCP-kapcsolatot akarunk egyszerre kiszolgálni, a
+hagyományos megoldás gyakran tíz szál. Minden szál saját veremmel, saját
+ütemezési állapottal rendelkezik, és a kernel egy-egy blokkoló
+<code>read</code> hívás közben felfüggeszti. Ez tíz szál esetén még
+elfogadható; százezer kapcsolatnál már memória- és ütemezési
+katasztrófa. A C++20 bevezette a korutinokat, a Rust pedig a
+<code>Future</code>-alapú async/await modellt: a cél mindkét nyelvben
+az, hogy egy feladat felfüggesztéséhez ne kelljen külön szál, hanem egy
+kisméretű állapotgép tárolja, hol tart a művelet.</p>
+<p>A Rust megközelítés lényege: az <code>async fn</code> hívása
+<strong>nem hajtja végre</strong> a függvény törzsét. Ehelyett egy olyan
+értéket ad vissza, amelyet egy úgynevezett <strong>executor</strong>
+polloz. Ez a fejezet azt mutatja meg, mi történik a motorháztető alatt:
+mit tartalmaz a <code>Future</code>, mi a <code>poll</code>, mi a
+<code>Waker</code>, és miért van szükség <code>Pin</code>-re.</p>
+<h3 data-number="17.1.2" id="fogalmak-és-szabályok"><span
+class="header-section-number">17.1.2</span> Fogalmak és szabályok</h3>
+<p><strong>Definíció.</strong> A <code>Future</code> trait egy olyan
+értéket ír le, amely egy később rendelkezésre álló eredményt képvisel. A
+szabványos definíció leegyszerűsítve:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> <span class="bu">Future</span> <span class="op">{</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">type</span> Output<span class="op">;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> poll(<span class="kw">self</span><span class="op">:</span> Pin<span class="op">&lt;&amp;</span><span class="kw">mut</span> <span class="dt">Self</span><span class="op">&gt;,</span> cx<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> Context<span class="op">&lt;</span><span class="ot">&#39;_</span><span class="op">&gt;</span>) <span class="op">-&gt;</span> Poll<span class="op">&lt;</span><span class="dt">Self</span><span class="pp">::</span>Output<span class="op">&gt;;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">enum</span> Poll<span class="op">&lt;</span>T<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    Ready(T)<span class="op">,</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    Pending<span class="op">,</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>poll</code> hívás az egyetlen mód, ahogy a future haladást
+érhet el. A <code>Ready(value)</code> azt jelenti, hogy az eredmény
+elkészült, a <code>Pending</code> pedig azt, hogy a future még nem tud
+befejeződni; az executor később újra fogja hívni a
+<code>poll</code>-t.</p>
+<p><strong>Szabály.</strong> Az <code>async fn</code> hívása nem fut le
+azonnal: a hívás egy <code>impl Future&lt;Output = T&gt;</code> értéket
+hoz létre, amely a függvény állapotgépét tartalmazza. A függvény törzse
+csak akkor kezd el futni, amikor valaki meghívja a <code>poll</code>
+metódust.</p>
+<p>A <code>Waker</code> szerepe: amikor egy future <code>Pending</code>
+értéket ad vissza, gondoskodnia kell arról, hogy valaki később értesítse
+az executort. Három modellt kell megkülönböztetni:</p>
+<ul>
+<li><strong>Levél-future</strong> (például egy socket olvasása): a
+<code>poll</code> a <code>Context</code>-ből kapott <code>Waker</code>-t
+eltárolja az eseményforrásnál; amikor az esemény bekövetkezik (a socket
+olvashatóvá válik), a forrás meghívja a <code>Waker::wake()</code>-et,
+és az executor újra ütemezi a taskot. Minden <code>poll</code>-nál a
+<em>legutóbbi</em> wakert kell tárolni (a régit lecserélve, szükség
+esetén a <code>will_wake</code> összehasonlítással), mert az executor a
+taskot közben másik wakerrel is pollozhatja.</li>
+<li><strong>Összetett future</strong> (az <code>async fn</code>
+állapotgépe): nem tárol saját wakert. A <code>.await</code> pontokon a
+generált <code>poll</code> ugyanazt a <code>cx</code>-et adja tovább a
+belső (child) future-nek, így a wakerfelelősség a levélig
+<em>delegálódik</em>; az executor ezért az összetett future mellé sem
+tárol külön wakert, csak a task <code>Waker</code>-ét adja át a
+<code>poll</code>-nak.</li>
+<li><strong>Már elindított task</strong> (<code>tokio::spawn</code>): a
+runtime a taskot magától futtatja, az <code>await</code>-elt
+<code>JoinHandle</code> pedig egy külön future, amely akkor lesz kész,
+amikor a task befejeződik; a <code>JoinHandle</code> eldobása a taskot
+nem szakítja meg (leválasztja róla).</li>
+</ul>
+<p>A <code>poll</code> szerződése: egy <code>Ready(v)</code> után a
+future-t többé nem szabad pollozni (az <code>async fn</code> állapotgépe
+ekkor pánikol: <code>async fn resumed after completion</code>), egy
+<code>Pending</code> után pedig csak akkor érdemes újrapollozni, ha a
+waker jelzett. A <code>Waker</code> tehát az a csatorna, amely lehetővé
+teszi, hogy a future ne pörögjön folyamatosan, hanem várjon.</p>
+<p><strong>Szabály.</strong> A Rust standard könyvtár
+<strong>nem</strong> tartalmaz beépített async runtime-et. Az
+<code>async fn</code> és a <code>Future</code> csak a nyelvi és
+könyvtári alapszint; az executor és a reaktor — az I/O eseményeket
+figyelő komponens — külső crate-ekből, jellemzően a Tokio-ról
+származik.</p>
+<h3 data-number="17.1.3" id="c-és-rust-összevetés"><span
+class="header-section-number">17.1.3</span> C++ és Rust összevetés</h3>
+<p>C++20-ban egy korutin vázlata:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;coroutine&gt;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Task <span class="op">{</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> <span class="dt">promise_type</span> <span class="op">{</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>        Task get_return_object<span class="op">()</span> <span class="op">{</span> <span class="cf">return</span> <span class="op">{};</span> <span class="op">}</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>suspend_never initial_suspend<span class="op">()</span> <span class="op">{</span> <span class="cf">return</span> <span class="op">{};</span> <span class="op">}</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>suspend_never final_suspend<span class="op">()</span> <span class="kw">noexcept</span> <span class="op">{</span> <span class="cf">return</span> <span class="op">{};</span> <span class="op">}</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>        <span class="dt">void</span> return_void<span class="op">()</span> <span class="op">{}</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>        <span class="dt">void</span> unhandled_exception<span class="op">()</span> <span class="op">{}</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">};</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>Task compute<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">co_await</span> <span class="bu">std::</span>suspend_never<span class="op">{};</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;hello from coroutine</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A Rust megfelelő gondolati párja:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> compute() <span class="op">{</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;hello from async fn&quot;</span>)<span class="op">;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A látszólagos hasonlóság mögött fontos különbségek vannak. A C++
+korutinoknál a visszatérési típus <code>promise_type</code>-ja határozza
+meg a korutin viselkedését, és a felfüggesztés a <code>co_await</code>
+kifejezéssel történik. A Rust-ban az <code>async fn</code> egy
+<code>Future</code> értéket ad, és a felfüggesztési pont a
+<code>.await</code> posztfix művelet. A C++ korutin frame-je gyakran
+dinamikusan allokálódik, bár a fordító elideálhatja; a Rust async fn
+állapotgépe általában inline tárolódik a future értékben, és akár nulla
+allokációval is használható. A legfontosabb különbség a végrehajtási
+modell: a Rust future passzív, az executor húzza a <code>poll</code>-on
+keresztül; a C++-ban a <code>promise_type::initial_suspend</code> dönti
+el, hogy a korutin a hívásakor azonnal fut-e (a fenti példában
+<code>suspend_never</code>: igen, a szöveg rögtön kiíródik) vagy
+felfüggesztve indul; a Rust <code>async fn</code> mindig lusta: a hívás
+csak létrehozza a future-t, a törzs az első <code>poll</code>-ig nem
+fut. A C++ nyelv emellett szabadabban engedi a
+<code>coroutine_handle</code> közvetlen folytatását, és a
+<code>co_await</code> általánosabb felfüggesztési mechanizmust
+takar.</p>
+<h3 data-number="17.1.4"
+id="kidolgozott-példa-kézzel-pollozott-future"><span
+class="header-section-number">17.1.4</span> Kidolgozott példa: kézzel
+pollozott Future</h3>
+<p>Először nézzük a leggyakoribb kezdő hibát:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> greet() <span class="op">-&gt;</span> <span class="dt">String</span> <span class="op">{</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;hello&quot;</span><span class="op">.</span>into()</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> s <span class="op">=</span> greet()<span class="op">;</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;{s}&quot;</span>)<span class="op">;</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ez a változat szándékosan nem fordul le: a <code>greet()</code> hívás
+eredménye <code>impl Future&lt;Output = String&gt;</code>, nem
+<code>String</code>, ezért a <code>println!</code> nem tudja formázni. A
+hiba <code>E0277</code>, lényege:
+<code>impl Future&lt;Output = String&gt;</code> doesn’t implement
+<code>Display</code> (a pontos szöveg verziófüggő). A javítás egy
+executor és egy <code>.await</code> hozzáadása:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="pp">tokio::</span>main<span class="at">]</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> s <span class="op">=</span> greet()<span class="op">.</span><span class="kw">await</span><span class="op">;</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;{s}&quot;</span>)<span class="op">;</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ahhoz, hogy lássuk, mit csinál az executor, implementáljunk egy
+nagyon egyszerű future-t. A következő <code>Remind</code> az első
+pollozásnál még <code>Pending</code>, a másodiknál <code>Ready</code>
+lesz, és közben értesíti a wakert:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::future::</span><span class="bu">Future</span><span class="op">;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::pin::</span>Pin<span class="op">;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::task::</span><span class="op">{</span>Context<span class="op">,</span> Poll<span class="op">,</span> Waker<span class="op">};</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Remind <span class="op">{</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    ready<span class="op">:</span> <span class="dt">bool</span><span class="op">,</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> <span class="bu">Future</span> <span class="cf">for</span> Remind <span class="op">{</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">type</span> Output <span class="op">=</span> <span class="op">&amp;</span><span class="ot">&#39;static</span> <span class="dt">str</span><span class="op">;</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> poll(<span class="kw">mut</span> <span class="kw">self</span><span class="op">:</span> Pin<span class="op">&lt;&amp;</span><span class="kw">mut</span> <span class="dt">Self</span><span class="op">&gt;,</span> cx<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> Context<span class="op">&lt;</span><span class="ot">&#39;_</span><span class="op">&gt;</span>) <span class="op">-&gt;</span> Poll<span class="op">&lt;&amp;</span><span class="ot">&#39;static</span> <span class="dt">str</span><span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="kw">self</span><span class="op">.</span>ready <span class="op">{</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>            <span class="pp">Poll::</span>Ready(<span class="st">&quot;megvan!&quot;</span>)</span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>            <span class="kw">self</span><span class="op">.</span>ready <span class="op">=</span> <span class="cn">true</span><span class="op">;</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>            <span class="co">// Értesítsük az executort, hogy érdemes újra pollozni.</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>            cx<span class="op">.</span>waker()<span class="op">.</span>wake_by_ref()<span class="op">;</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>            <span class="pp">Poll::</span>Pending</span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> future <span class="op">=</span> Remind <span class="op">{</span> ready<span class="op">:</span> <span class="cn">false</span> <span class="op">};</span></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> waker <span class="op">=</span> <span class="pp">Waker::</span>noop()<span class="op">;</span></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> cx <span class="op">=</span> <span class="pp">Context::</span>from_waker(<span class="op">&amp;</span>waker)<span class="op">;</span></span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> pinned <span class="op">=</span> <span class="dt">Box</span><span class="pp">::</span>pin(future)<span class="op">;</span></span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a>    <span class="cf">match</span> pinned<span class="op">.</span>as_mut()<span class="op">.</span>poll(<span class="op">&amp;</span><span class="kw">mut</span> cx) <span class="op">{</span></span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a>        <span class="pp">Poll::</span>Pending <span class="op">=&gt;</span> <span class="pp">println!</span>(<span class="st">&quot;első poll: Pending&quot;</span>)<span class="op">,</span></span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a>        <span class="pp">Poll::</span>Ready(s) <span class="op">=&gt;</span> <span class="pp">println!</span>(<span class="st">&quot;első poll: Ready({s})&quot;</span>)<span class="op">,</span></span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a>    <span class="cf">match</span> pinned<span class="op">.</span>as_mut()<span class="op">.</span>poll(<span class="op">&amp;</span><span class="kw">mut</span> cx) <span class="op">{</span></span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a>        <span class="pp">Poll::</span>Pending <span class="op">=&gt;</span> <span class="pp">println!</span>(<span class="st">&quot;második poll: Pending&quot;</span>)<span class="op">,</span></span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a>        <span class="pp">Poll::</span>Ready(s) <span class="op">=&gt;</span> <span class="pp">println!</span>(<span class="st">&quot;második poll: Ready({s})&quot;</span>)<span class="op">,</span></span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>Waker::noop()</code> a standard könyvtárban stabil (a
+rögzített Rust 1.99.1-ben elérhető). A <code>poll</code>
+<code>Pin&lt;&amp;mut Self&gt;</code> paramétert vár, de ehhez a
+<code>Box::pin</code> <strong>nem szükséges</strong>: a
+<code>Remind</code> csak egy <code>bool</code>-t tartalmaz, tehát
+<code>Unpin</code>, ezért a <code>Pin::new(&amp;mut future)</code> is
+megfelel (lásd a következő szakaszt). A példa a <code>Box::pin</code>-t
+a kupacon tartott, könnyen továbbadható
+<code>Pin&lt;Box&lt;F&gt;&gt;</code> miatt használja. Várt kimenet:</p>
+<pre class="text"><code>első poll: Pending
+második poll: Ready(megvan!)</code></pre>
+<p>A <code>Remind</code> példa megmutatja a modell lényegét: a future
+nem fut, amíg pollozva nincs; <code>Pending</code> esetén a wakerrel
+jelzi az újrapollozási igényét; a <code>Ready</code> pedig a
+végeredményt tartalmazza.</p>
+<h3 data-number="17.1.5" id="mi-van-egy-async-fn-állapotgépében"><span
+class="header-section-number">17.1.5</span> Mi van egy async fn
+állapotgépében?</h3>
+<p>Egy <code>async fn</code> lefordításakor a Rust fordító egy olyan
+struktúrát generál, amely a függvény lokális változóit tárolja, és egy
+<code>Future</code> implementációt ad hozzá. A <code>.await</code>
+pontoknál a generált <code>poll</code> meghívja a belső future
+<code>poll</code> metódusát; ha az <code>Pending</code>, akkor a külső
+future is <code>Pending</code>-et ad vissza. Ha a belső
+<code>Ready</code>, akkor a külső folytatja a következő utasítással.</p>
+<p>Tekintsük ezt a vázlatot:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> example(a<span class="op">:</span> <span class="dt">u32</span>) <span class="op">-&gt;</span> <span class="dt">u32</span> <span class="op">{</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> x <span class="op">=</span> a <span class="op">+</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> y <span class="op">=</span> read_value()<span class="op">.</span><span class="kw">await</span><span class="op">;</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    x <span class="op">+</span> y</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A generált állapotgép nagyjából így gondolkodik:</p>
+<ol type="1">
+<li><strong>Állapot 0:</strong> <code>x = a + 1</code>, hívja
+<code>read_value().poll(...)</code>.</li>
+<li>Ha <code>read_value</code> <code>Ready(y)</code>, <strong>állapot
+1:</strong> visszaadja <code>Ready(x + y)</code>.</li>
+<li>Ha <code>read_value</code> <code>Pending</code>, a külső future is
+<code>Pending</code>-et ad vissza; a wakert nem ő tárolja: ugyanazt a
+<code>cx</code>-et adta tovább, így a belső (levél) future
+regisztrálta.</li>
+</ol>
+<p>Az állapotgép tehát a <code>.await</code> pontokon felfüggeszti
+magát, és a <code>poll</code> legközelebbi hívásakor ott folytatja, ahol
+abbahagyta.</p>
+<p><strong>Miért nincs beépített runtime?</strong> A Rust standard
+könyvtár csak a <code>Future</code>, a <code>poll</code> és a
+<code>Waker</code> alapfogalmát definiálja. A valódi ütemezés — mikor,
+melyik szálon, hány future-t pollozzon az executor — tudatosan a
+felhasználóra van bízva. Ez lehetővé teszi, hogy különböző környezetben
+különböző executor fusson: operációs rendszeren (szerveren, asztali
+gépen) a Tokio, mikrovezérlőn pedig <code>no_std</code> executor,
+például az Embassy (lásd <a href="r050.html">no_std, embedded-hal és
+Embassy: Rust mikrovezérlőn</a>). A Tokio operációs rendszert (szálakat,
+I/O-eseménykezelőt) feltételez, ezért nem mikrovezérlő-runtime. A
+C++-hoz hasonlóan a Rustban sincs „egyetlen igaz” async futtató, de a
+Tokio a de facto standard.</p>
+<h3 data-number="17.1.6"
+id="pin-az-önhivatkozó-állapotgép-problémája"><span
+class="header-section-number">17.1.6</span> Pin: az önhivatkozó
+állapotgép problémája</h3>
+<p>Az <code>async fn</code>-ek egyik elsőre meglepő tulajdonsága, hogy
+miért kell <code>Pin</code>-t használni. A C++-ban megszokott mozgatási
+szemantikából tudjuk: egy objektum memóriabeli mozgatása után a rá
+mutató nyers címek érvénytelenné válnak. Ha egy <code>async fn</code>
+törzse egy <code>.await</code> pont felett a <em>saját</em> lokális
+változójára mutató kölcsönzést tart életben, például:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> fill() <span class="op">-&gt;</span> <span class="pp">std::io::</span><span class="dt">Result</span><span class="op">&lt;</span><span class="dt">usize</span><span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> buf <span class="op">=</span> [<span class="dv">0u8</span><span class="op">;</span> <span class="dv">1024</span>]<span class="op">;</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> n <span class="op">=</span> reader()<span class="op">.</span>read(<span class="op">&amp;</span><span class="kw">mut</span> buf)<span class="op">.</span><span class="kw">await</span><span class="op">?;</span> <span class="co">// a `buf` kölcsönzése átível az `.await`-en</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(n)</span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>a <code>buf</code> az állapotgép mezője, a <code>read</code> future
+pedig erre a mezőre mutató <code>&amp;mut</code>-ot tárol: ez
+önhivatkozás. Ha csak a hívó által birtokolt <code>self</code>-re mutat
+a kölcsönzés (például <code>&amp;mut self.buf</code>), a future nem
+önhivatkozó, mert a kölcsönzés a future-ön kívüli objektumra mutat.</p>
+<p>akkor a generált állapotgép önhivatkozóvá válhat: az egyik mezője
+referencia egy másik mezőjére mutat. Ha a future-t ezután megmozgatjuk,
+a referencia érvénytelen lesz. A <code>Pin&lt;&amp;mut Self&gt;</code>
+azt garantálja, hogy a future nem mozdul el a pollozás során. A
+<code>Future::poll</code> ezért vesz
+<code>Pin&lt;&amp;mut Self&gt;</code>-et, és a tipikus használat
+<code>Box::pin</code> vagy a <code>tokio::pin!</code> makró.</p>
+<p>A <code>Pin</code> tehát nem misztikum: típusrendszerbeli garancia
+arra, hogy egy önhivatkozó értéket ne lehessen biztonságos kódból
+elmozdítani, miután pinelték. A pontos szerződés négy részből áll:</p>
+<ul>
+<li><strong>Pinelés előtt és után.</strong> Pinelés előtt az érték
+szabadon mozgatható (átadható, <code>Vec</code>-be tehető). A
+<code>Pin&lt;P&gt;</code> létrehozása után az, amire a pointer mutat (a
+<em>pointee</em>), a drop-ig nem mozdulhat el, és a memóriája nem
+szabadítható fel, nem használható fel újra.</li>
+<li><strong>Pointer és pointee.</strong> A <code>Pin</code> a
+<em>pointee</em> címét rögzíti, nem a pointerét. Egy
+<code>Pin&lt;Box&lt;F&gt;&gt;</code> ezért szabadon mozgatható (csak a
+<code>Box</code> pointer költözik), miközben a benne lévő <code>F</code>
+címe állandó. Egy <code>Pin&lt;&amp;mut F&gt;</code> esetén az
+<code>F</code>-nek kell helyben maradnia.</li>
+<li><strong>Drop guarantee.</strong> A pinelt pointee memóriája a
+<code>Drop::drop</code> lefutásáig érvényes marad, ezért az önhivatkozó
+mutatók a <code>drop</code>-ban is használhatók.</li>
+<li><strong>Safe és unsafe határ.</strong> Az <code>Unpin</code>
+típusoknál (a legtöbb szokásos típus) a pinelés semmit nem korlátoz: a
+<code>Pin::new</code> biztonságosan hívható, és a
+<code>Pin&lt;&amp;mut T&gt;</code>-ből <code>&amp;mut T</code> nyerhető.
+<code>!Unpin</code> típust (például az <code>async fn</code>
+állapotgépét, vagy egy <code>PhantomPinned</code> mezőt tartalmazó
+structot) biztonságos kódból <code>Box::pin</code>-nel,
+<code>Rc::pin</code>/<code>Arc::pin</code>-nel vagy a <code>pin!</code>
+makróval lehet pinelni; a mezőkhöz való hozzáférés (<em>projekció</em>)
+a std-ben mindig <code>unsafe</code>
+(<code>Pin::get_unchecked_mut</code>, <code>map_unchecked_mut</code>): a
+szerkezetileg nem pinelt mezőre adott <code>&amp;mut</code> helyes, a
+pinelt mezőre csak <code>Pin&lt;&amp;mut Field&gt;</code> adható. Ezt a
+<code>pin-project</code> crate fedi el biztonságos felülettel.</li>
+</ul>
+<p>Az alábbi program az öt tipikus esetet mutatja egymás mellett
+(kimenete: <code>ok</code>):</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::future::</span><span class="bu">Future</span><span class="op">;</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::marker::</span>PhantomPinned<span class="op">;</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::pin::</span><span class="op">{</span>pin<span class="op">,</span> Pin<span class="op">};</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::task::</span><span class="op">{</span>Context<span class="op">,</span> Poll<span class="op">,</span> Waker<span class="op">};</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="co">/// Unpin: egyetlen bool mező, a Pin::new elég.</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Remind <span class="op">{</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>    ready<span class="op">:</span> <span class="dt">bool</span><span class="op">,</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> <span class="bu">Future</span> <span class="cf">for</span> Remind <span class="op">{</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">type</span> Output <span class="op">=</span> <span class="op">&amp;</span><span class="ot">&#39;static</span> <span class="dt">str</span><span class="op">;</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> poll(<span class="kw">mut</span> <span class="kw">self</span><span class="op">:</span> Pin<span class="op">&lt;&amp;</span><span class="kw">mut</span> <span class="dt">Self</span><span class="op">&gt;,</span> cx<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> Context<span class="op">&lt;</span><span class="ot">&#39;_</span><span class="op">&gt;</span>) <span class="op">-&gt;</span> Poll<span class="op">&lt;&amp;</span><span class="ot">&#39;static</span> <span class="dt">str</span><span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="kw">self</span><span class="op">.</span>ready <span class="op">{</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a>            <span class="pp">Poll::</span>Ready(<span class="st">&quot;megvan!&quot;</span>)</span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>            <span class="kw">self</span><span class="op">.</span>ready <span class="op">=</span> <span class="cn">true</span><span class="op">;</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a>            cx<span class="op">.</span>waker()<span class="op">.</span>wake_by_ref()<span class="op">;</span></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a>            <span class="pp">Poll::</span>Pending</span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a><span class="co">/// !Unpin: a PhantomPinned jelzi, hogy a pinelt érték címe nem változhat.</span></span>
+<span id="cb10-25"><a href="#cb10-25" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Fixed(PhantomPinned)<span class="op">;</span></span>
+<span id="cb10-26"><a href="#cb10-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-27"><a href="#cb10-27" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb10-28"><a href="#cb10-28" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> cx <span class="op">=</span> <span class="pp">Context::</span>from_waker(<span class="pp">Waker::</span>noop())<span class="op">;</span></span>
+<span id="cb10-29"><a href="#cb10-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-30"><a href="#cb10-30" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. Unpin future: a Pin::new elég, nincs szükség kupacra.</span></span>
+<span id="cb10-31"><a href="#cb10-31" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> remind <span class="op">=</span> Remind <span class="op">{</span> ready<span class="op">:</span> <span class="cn">false</span> <span class="op">};</span></span>
+<span id="cb10-32"><a href="#cb10-32" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> pinned <span class="op">=</span> <span class="pp">Pin::</span>new(<span class="op">&amp;</span><span class="kw">mut</span> remind)<span class="op">;</span></span>
+<span id="cb10-33"><a href="#cb10-33" aria-hidden="true" tabindex="-1"></a>    <span class="pp">assert!</span>(pinned<span class="op">.</span>as_mut()<span class="op">.</span>poll(<span class="op">&amp;</span><span class="kw">mut</span> cx)<span class="op">.</span>is_pending())<span class="op">;</span></span>
+<span id="cb10-34"><a href="#cb10-34" aria-hidden="true" tabindex="-1"></a>    <span class="pp">assert!</span>(pinned<span class="op">.</span>as_mut()<span class="op">.</span>poll(<span class="op">&amp;</span><span class="kw">mut</span> cx)<span class="op">.</span>is_ready())<span class="op">;</span></span>
+<span id="cb10-35"><a href="#cb10-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-36"><a href="#cb10-36" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. A pinelés *előtt* a future szabadon mozgatható.</span></span>
+<span id="cb10-37"><a href="#cb10-37" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> fut <span class="op">=</span> Remind <span class="op">{</span> ready<span class="op">:</span> <span class="cn">false</span> <span class="op">};</span></span>
+<span id="cb10-38"><a href="#cb10-38" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> moved <span class="op">=</span> fut<span class="op">;</span></span>
+<span id="cb10-39"><a href="#cb10-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-40"><a href="#cb10-40" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. Pin&lt;Box&lt;F&gt;&gt;: a Box mozgatható, a benne lévő F címe állandó.</span></span>
+<span id="cb10-41"><a href="#cb10-41" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> boxed<span class="op">:</span> Pin<span class="op">&lt;</span><span class="dt">Box</span><span class="op">&lt;</span>Remind<span class="op">&gt;&gt;</span> <span class="op">=</span> <span class="dt">Box</span><span class="pp">::</span>pin(moved)<span class="op">;</span></span>
+<span id="cb10-42"><a href="#cb10-42" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> address_before <span class="op">=</span> <span class="op">&amp;*</span>boxed <span class="kw">as</span> <span class="op">*</span><span class="kw">const</span> Remind<span class="op">;</span></span>
+<span id="cb10-43"><a href="#cb10-43" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> moved_box <span class="op">=</span> boxed<span class="op">;</span> <span class="co">// csak a pointer költözik</span></span>
+<span id="cb10-44"><a href="#cb10-44" aria-hidden="true" tabindex="-1"></a>    <span class="pp">assert_eq!</span>(address_before<span class="op">,</span> <span class="op">&amp;*</span>moved_box <span class="kw">as</span> <span class="op">*</span><span class="kw">const</span> Remind)<span class="op">;</span></span>
+<span id="cb10-45"><a href="#cb10-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-46"><a href="#cb10-46" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 4. pin!: a verem-lokális érték helyben pinelődik (Pin&lt;&amp;mut F&gt;). A `Remind` `Unpin`</span></span>
+<span id="cb10-47"><a href="#cb10-47" aria-hidden="true" tabindex="-1"></a>    <span class="co">//    (csak egy bool), ezért ebből a `Pin`-ből `&amp;mut`-ot ki lehet nyerni;</span></span>
+<span id="cb10-48"><a href="#cb10-48" aria-hidden="true" tabindex="-1"></a>    <span class="co">//    a mozgathatatlanság kikényszerítése a `!Unpin` típusnál (lásd 5.) számít.</span></span>
+<span id="cb10-49"><a href="#cb10-49" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> local <span class="op">=</span> <span class="pp">pin!</span>(Remind <span class="op">{</span> ready<span class="op">:</span> <span class="cn">false</span> <span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb10-50"><a href="#cb10-50" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> _ <span class="op">=</span> local<span class="op">;</span></span>
+<span id="cb10-51"><a href="#cb10-51" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-52"><a href="#cb10-52" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 5. !Unpin típusra a Pin::new nem hívható; csak Box::pin vagy pin!.</span></span>
+<span id="cb10-53"><a href="#cb10-53" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> _fixed <span class="op">=</span> <span class="pp">pin!</span>(Fixed(PhantomPinned))<span class="op">;</span></span>
+<span id="cb10-54"><a href="#cb10-54" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;ok&quot;</span>)<span class="op">;</span></span>
+<span id="cb10-55"><a href="#cb10-55" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ha az utolsó pontban <code>Pin::new(&amp;mut fixed)</code>-et írnánk,
+a fordító <code>E0277</code> hibát ad (<code>PhantomPinned</code> cannot
+be unpinned). A <code>Box::pin</code> tehát nem „a <code>Pin</code>
+kötelező kelléke”, hanem egyike a pinelés módjainak: <code>Unpin</code>
+típusnál a <code>Pin::new</code>, verem-lokális <code>!Unpin</code>
+értéknél a <code>pin!</code>, kupacon élő és továbbadandó futurenél a
+<code>Box::pin</code> a megfelelő. A következő, <a href="r038.html">Pin,
+Unpin, async trait-ek és a Send-határok</a> alfejezet ezt mélyebben ki
+fogja fejteni.</p>
+<h3 data-number="17.1.7"
+id="ábra-a-future-életciklusa-az-executorban"><span
+class="header-section-number">17.1.7</span> Ábra: a Future életciklusa
+az executorban</h3>
+<figure>
+<img src="assets/r037-diagram-1.png"
+alt="Egy Future életciklusa - Az async fn hívása csak létrehozza a future-t; a futás pollozással kezdődik, Pending esetén a waker biztosítja az újrapollozást." />
+<figcaption aria-hidden="true">Egy Future életciklusa - Az async fn
+hívása csak létrehozza a future-t; a futás pollozással kezdődik, Pending
+esetén a waker biztosítja az újrapollozást.</figcaption>
+</figure>
+<p>Az ábra lépései szövegesen:</p>
+<ol type="1">
+<li><strong>Hívás</strong>: az <code>async fn</code> meghívása.</li>
+<li><strong>Létrejön</strong>: a <code>Future&lt;Output = T&gt;</code>
+létrejön, de még nem fut.</li>
+<li><strong>poll</strong>: az executor pollozza.</li>
+<li><strong>Pending</strong>: a future nem kész; regisztrálja a
+wakert.</li>
+<li><strong>wake()</strong>: esemény érkezik, a waker jelez az
+executornak.</li>
+<li><strong>Újrapoll</strong>: az executor újra pollozza.</li>
+<li><strong>Ready(T)</strong>: a future kész, az eredmény elérhető.</li>
+</ol>
+<p>Az ábra azt hangsúlyozza, hogy a future életét az executor pollozása
+vezérli. A <code>Pending</code> nem hiba: a future ilyenkor adja át
+magát az ütemezőnek, és csak akkor jelentkezik újra, ha a waker jelzi,
+hogy a várt erőforrás elérhető.</p>
+<p>A következő ábra ugyanezt a fenti <code>example(a)</code>
+állapotgépén követi lépésenként (<code>a = 4</code>, a reaktor eseménye
+illusztratív <code>37</code>): a wakert nem az összetett future, hanem a
+levél-future (<code>read_value</code>) regisztrálja a reaktornál, mert
+az <code>example</code> ugyanazt a <code>cx</code>-et adja tovább; az
+újrapoll az <code>Await1</code> állapotból folytatódik, az
+<code>x = 5</code> nem számolódik újra.</p>
+<figure id="fig-r037-poll-wake">
+<div class="fig-interactive"><iframe src="figures/html/r037-poll-wake.html" title="Az executor pollozza az összetett future-t, amely ugyanazzal a kontextussal pollozza a levél-future-t; a levél regisztrálja a wakert, a wake után az újrapoll Ready(42)-t ad." loading="lazy" style="width:100%;border:0;height:840px"></iframe><noscript><img src="figures/img/r037-poll-wake.png" style="width:100.0%"
+alt="Az executor pollozza az összetett future-t, amely ugyanazzal a kontextussal pollozza a levél-future-t; a levél regisztrálja a wakert, a wake után az újrapoll Ready(42)-t ad." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/r037-poll-wake.png" style="width:100.0%"
+alt="Az executor pollozza az összetett future-t, amely ugyanazzal a kontextussal pollozza a levél-future-t; a levél regisztrálja a wakert, a wake után az újrapoll Ready(42)-t ad." /></details></div>
+<figcaption>Az example future pollozása, Pending és wake</figcaption>
+</figure>
+<h3 data-number="17.1.8" id="async-vs.-szálak-döntési-tábla"><span
+class="header-section-number">17.1.8</span> Async vs. szálak: döntési
+tábla</h3>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Szempont</th>
+<th>Async/Future</th>
+<th>Szál</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sok rövid, I/O-igényes feladat</td>
+<td>Kiváló: kis memórianyom, gyors váltás</td>
+<td>Sok szál nagy veremköltséget jelent</td>
+</tr>
+<tr>
+<td>CPU-igényes, hosszú számítás</td>
+<td>Rossz, ha egy executor szálat blokkolja</td>
+<td>Jó, ha a feladat tényleg párhuzamos</td>
+</tr>
+<tr>
+<td>Egyszerű szinkron kód</td>
+<td><code>.await</code> fertőzés, executor kell</td>
+<td>Egyszerű <code>thread::spawn</code></td>
+</tr>
+<tr>
+<td>Hibaelkülönítés</td>
+<td>Egy pánik a taskot veszi le, de a runtime marad</td>
+<td>A szál pánikja a szálat öli meg</td>
+</tr>
+<tr>
+<td>Memória</td>
+<td>Kis állapotgépek</td>
+<td>2–8 MiB verem szálanként</td>
+</tr>
+<tr>
+<td>Megfelelő Rust-megoldás</td>
+<td>Tokio <code>spawn</code></td>
+<td><code>std::thread</code> vagy rayon</td>
+</tr>
+</tbody>
+</table>
+<p>A döntési szabály: ha a feladat döntően várakozás — hálózat,
+fájlművelet, időzítő —, az async jobb. Ha a feladat ténylegesen számol,
+használjunk szálat vagy a <a href="r036.html">Adatpárhuzamosság
+rayonnal</a> crate-et, és ne blokkoljunk async taskot hosszú
+CPU-munkával.</p>
+<h3 data-number="17.1.9" id="tipikus-hibák-és-átállási-csapdák"><span
+class="header-section-number">17.1.9</span> Tipikus hibák és átállási
+csapdák</h3>
+<ol type="1">
+<li><p><strong>Az <code>async fn</code> hívása <code>.await</code>
+nélkül.</strong> A visszatérési érték <code>impl Future</code>, nem a
+várt <code>String</code> vagy <code>u32</code>. A fordító ilyenkor
+<code>Future</code> típusú értéket mutat, és a hibaüzenetben a
+<code>Display</code> hiánya vagy a típuseltérés jelenik meg.</p></li>
+<li><p><strong><code>.await</code> szinkron kódban.</strong> A
+<code>.await</code> csak <code>async fn</code>-ben vagy
+<code>async</code> blokkban használható. A következő nem fordul le, a
+hiba lényege <code>E0728</code>:</p></li>
+</ol>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">async</span> <span class="op">{</span> <span class="dv">1</span> <span class="op">+</span> <span class="dv">1</span> <span class="op">}.</span><span class="kw">await</span><span class="op">;</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<ol start="3" type="1">
+<li><p><strong>Blokkoló hívás async taskban.</strong> A
+<code>std::thread::sleep</code> vagy egy nagy
+<code>read_to_string</code> egy <code>async fn</code>-ben blokkolja az
+executor egy szálát, tönkretéve a többi task ütemezését. Helyette
+<code>tokio::time::sleep</code>-et és async I/O-t kell
+használni.</p></li>
+<li><p><strong>A <code>Waker</code> elfelejtése.</strong> Ha egy
+<code>Future</code> <code>Pending</code>-et ad, de nem regisztrálja a
+wakert, az executor nem fogja tudni, mikor érdemes újrapollozni; a
+future örökre felfüggesztve marad. Saját <code>Future</code>
+implementációban erre különösen figyelni kell.</p></li>
+</ol>
+<h3 data-number="17.1.10" id="feladatok"><span
+class="header-section-number">17.1.10</span> Feladatok</h3>
+<h4 data-number="17.1.10.1" id="fogalmi-ellenőrzés"><span
+class="header-section-number">17.1.10.1</span> 1. Fogalmi
+ellenőrzés</h4>
+<p>Mit jelent a <code>Future::poll</code> <code>Pending</code>
+visszatérési értéke? Mi a különbség az <code>async fn</code>
+<em>hívásának</em> eredménye (egy még el nem indult
+<code>impl Future</code>) és a future <code>poll</code>-jának
+<code>Ready(v)</code> eredménye között? Mikor kapjuk meg a
+<code>v</code>-t?</p>
+<h4 data-number="17.1.10.2" id="c-kód-átírása"><span
+class="header-section-number">17.1.10.2</span> 2. C++-kód átírása</h4>
+<p>Írd át a következő C++11 <code>std::async</code> alapú kódot
+idiomatikus Rust async kódra Tokio <code>spawn</code> használatával:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;future&gt;</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> compute<span class="op">()</span> <span class="op">{</span> <span class="cf">return</span> <span class="dv">40</span> <span class="op">+</span> <span class="dv">2</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> fut <span class="op">=</span> <span class="bu">std::</span>async<span class="op">(</span><span class="bu">std::</span>launch::async<span class="op">,</span> compute<span class="op">);</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> fut<span class="op">.</span>get<span class="op">()</span> <span class="op">&lt;&lt;</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h4 data-number="17.1.10.3"
+id="implementáció-saját-delayedready-future"><span
+class="header-section-number">17.1.10.3</span> 3. Implementáció: saját
+<code>DelayedReady</code> future</h4>
+<p>Készíts egy önálló crate-et a <code>~/rust-labor/r037/</code>
+munkakönyvtárban (<code>cargo new r037</code>). Implementálj egy
+<code>DelayedReady</code> struktúrát, amely az első
+<code>poll</code>-nál <code>Pending</code>-et ad, eltárolja a wakert, és
+egy külső <code>wake()</code> hívás után a második <code>poll</code>-nál
+<code>Ready(42)</code>-t ad vissza. A <code>main</code>-ben kézzel
+pollozd.</p>
+<h4 data-number="17.1.10.4"
+id="hibajavítás-blokkoló-hívás-async-taskban"><span
+class="header-section-number">17.1.10.4</span> 4. Hibajavítás: blokkoló
+hívás async taskban</h4>
+<p>Adott a következő async függvény:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> wait_a_second() <span class="op">{</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a>    <span class="pp">std::thread::</span>sleep(<span class="pp">std::time::Duration::</span>from_secs(<span class="dv">1</span>))<span class="op">;</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Miért problémás ez a Tokio executor szempontjából? Javítsd
+<code>tokio::time::sleep</code> használatára, és magyarázd el a
+különbséget.</p>
+<h3 data-number="17.1.11" id="megoldások"><span
+class="header-section-number">17.1.11</span> Megoldások</h3>
+<h4 data-number="17.1.11.1" id="fogalmi-ellenőrzés-1"><span
+class="header-section-number">17.1.11.1</span> 1. Fogalmi
+ellenőrzés</h4>
+<p>Az <code>async fn</code> hívása sosem ad <code>Poll</code>-t (és
+<code>Ready</code>-t sem): future-t ad, a <code>Ready(v)</code> csak a
+<code>poll</code>-ból jöhet. A <code>Pending</code> nem azt jelenti,
+hogy a future fut, hanem azt, hogy jelenleg nem tud befejeződni; a
+future-nek ilyenkor regisztrálnia kell a wakert, hogy az executor később
+újra pollozza. Amikor egy <code>async fn</code> <strong>hívása</strong>
+egy future-t ad vissza, az egy érték, amelynek a típusa
+<code>impl Future&lt;Output = T&gt;</code>; a függvény törzse még nem
+futott. A <code>Ready</code> a <code>poll</code> visszatérési értéke, és
+azt jelzi, hogy a future kész.</p>
+<h4 data-number="17.1.11.2" id="c-kód-átírása-1"><span
+class="header-section-number">17.1.11.2</span> 2. C++-kód átírása</h4>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="pp">tokio::</span>main<span class="at">]</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> fut <span class="op">=</span> <span class="pp">tokio::</span>spawn(compute())<span class="op">;</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> result <span class="op">=</span> fut<span class="op">.</span><span class="kw">await</span><span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;{result}&quot;</span>)<span class="op">;</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> compute() <span class="op">-&gt;</span> <span class="dt">i32</span> <span class="op">{</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a>    <span class="dv">40</span> <span class="op">+</span> <span class="dv">2</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>tokio::spawn</code> egy <code>JoinHandle</code>-t ad vissza,
+amely maga is <code>Future</code>. A <code>compute()</code> azonnal
+visszaad egy future-t, amelyet a Tokio runtime egy külön taskként
+ütemez. A <code>.await</code> a <code>JoinHandle</code>-on várja meg a
+task eredményét.</p>
+<h4 data-number="17.1.11.3" id="implementáció-delayedready"><span
+class="header-section-number">17.1.11.3</span> 3. Implementáció:
+<code>DelayedReady</code></h4>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::future::</span><span class="bu">Future</span><span class="op">;</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::pin::</span>Pin<span class="op">;</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::task::</span><span class="op">{</span>Context<span class="op">,</span> Poll<span class="op">,</span> Waker<span class="op">};</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> DelayedReady <span class="op">{</span></span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a>    waker<span class="op">:</span> <span class="dt">Option</span><span class="op">&lt;</span>Waker<span class="op">&gt;,</span></span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a>    woke<span class="op">:</span> <span class="dt">bool</span><span class="op">,</span></span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> DelayedReady <span class="op">{</span></span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> wake(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span>) <span class="op">{</span></span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a>        <span class="kw">self</span><span class="op">.</span>woke <span class="op">=</span> <span class="cn">true</span><span class="op">;</span></span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="kw">let</span> <span class="cn">Some</span>(waker) <span class="op">=</span> <span class="kw">self</span><span class="op">.</span>waker<span class="op">.</span>take() <span class="op">{</span></span>
+<span id="cb15-14"><a href="#cb15-14" aria-hidden="true" tabindex="-1"></a>            waker<span class="op">.</span>wake()<span class="op">;</span></span>
+<span id="cb15-15"><a href="#cb15-15" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb15-16"><a href="#cb15-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb15-17"><a href="#cb15-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb15-18"><a href="#cb15-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-19"><a href="#cb15-19" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> <span class="bu">Future</span> <span class="cf">for</span> DelayedReady <span class="op">{</span></span>
+<span id="cb15-20"><a href="#cb15-20" aria-hidden="true" tabindex="-1"></a>    <span class="kw">type</span> Output <span class="op">=</span> <span class="dt">i32</span><span class="op">;</span></span>
+<span id="cb15-21"><a href="#cb15-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-22"><a href="#cb15-22" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> poll(<span class="kw">mut</span> <span class="kw">self</span><span class="op">:</span> Pin<span class="op">&lt;&amp;</span><span class="kw">mut</span> <span class="dt">Self</span><span class="op">&gt;,</span> cx<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> Context<span class="op">&lt;</span><span class="ot">&#39;_</span><span class="op">&gt;</span>) <span class="op">-&gt;</span> Poll<span class="op">&lt;</span><span class="dt">i32</span><span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb15-23"><a href="#cb15-23" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="kw">self</span><span class="op">.</span>woke <span class="op">{</span></span>
+<span id="cb15-24"><a href="#cb15-24" aria-hidden="true" tabindex="-1"></a>            <span class="pp">Poll::</span>Ready(<span class="dv">42</span>)</span>
+<span id="cb15-25"><a href="#cb15-25" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb15-26"><a href="#cb15-26" aria-hidden="true" tabindex="-1"></a>            <span class="kw">self</span><span class="op">.</span>waker <span class="op">=</span> <span class="cn">Some</span>(cx<span class="op">.</span>waker()<span class="op">.</span>clone())<span class="op">;</span></span>
+<span id="cb15-27"><a href="#cb15-27" aria-hidden="true" tabindex="-1"></a>            <span class="pp">Poll::</span>Pending</span>
+<span id="cb15-28"><a href="#cb15-28" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb15-29"><a href="#cb15-29" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb15-30"><a href="#cb15-30" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb15-31"><a href="#cb15-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-32"><a href="#cb15-32" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb15-33"><a href="#cb15-33" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> future <span class="op">=</span> DelayedReady <span class="op">{</span> waker<span class="op">:</span> <span class="cn">None</span><span class="op">,</span> woke<span class="op">:</span> <span class="cn">false</span> <span class="op">};</span></span>
+<span id="cb15-34"><a href="#cb15-34" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> waker <span class="op">=</span> <span class="pp">Waker::</span>noop()<span class="op">;</span></span>
+<span id="cb15-35"><a href="#cb15-35" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> cx <span class="op">=</span> <span class="pp">Context::</span>from_waker(<span class="op">&amp;</span>waker)<span class="op">;</span></span>
+<span id="cb15-36"><a href="#cb15-36" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> pinned <span class="op">=</span> <span class="dt">Box</span><span class="pp">::</span>pin(future)<span class="op">;</span></span>
+<span id="cb15-37"><a href="#cb15-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-38"><a href="#cb15-38" aria-hidden="true" tabindex="-1"></a>    <span class="pp">assert!</span>(pinned<span class="op">.</span>as_mut()<span class="op">.</span>poll(<span class="op">&amp;</span><span class="kw">mut</span> cx)<span class="op">.</span>is_pending())<span class="op">;</span></span>
+<span id="cb15-39"><a href="#cb15-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-40"><a href="#cb15-40" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Kívülről jelezzük a készenlétet.</span></span>
+<span id="cb15-41"><a href="#cb15-41" aria-hidden="true" tabindex="-1"></a>    pinned<span class="op">.</span>as_mut()<span class="op">.</span>get_mut()<span class="op">.</span>wake()<span class="op">;</span></span>
+<span id="cb15-42"><a href="#cb15-42" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A Pin::get_mut kifejezetten `T: Unpin` feltételt kér: a DelayedReady</span></span>
+<span id="cb15-43"><a href="#cb15-43" aria-hidden="true" tabindex="-1"></a>    <span class="co">// (Option&lt;Waker&gt; + bool) Unpin, ezért a safe get_mut hívható. Egy !Unpin</span></span>
+<span id="cb15-44"><a href="#cb15-44" aria-hidden="true" tabindex="-1"></a>    <span class="co">// (például önhivatkozó async) future-re ez E0277 fordítási hiba lenne,</span></span>
+<span id="cb15-45"><a href="#cb15-45" aria-hidden="true" tabindex="-1"></a>    <span class="co">// így nem lehet véletlenül kimozgatni.</span></span>
+<span id="cb15-46"><a href="#cb15-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-47"><a href="#cb15-47" aria-hidden="true" tabindex="-1"></a>    <span class="cf">match</span> pinned<span class="op">.</span>as_mut()<span class="op">.</span>poll(<span class="op">&amp;</span><span class="kw">mut</span> cx) <span class="op">{</span></span>
+<span id="cb15-48"><a href="#cb15-48" aria-hidden="true" tabindex="-1"></a>        <span class="pp">Poll::</span>Ready(v) <span class="op">=&gt;</span> <span class="pp">println!</span>(<span class="st">&quot;ready: {v}&quot;</span>)<span class="op">,</span></span>
+<span id="cb15-49"><a href="#cb15-49" aria-hidden="true" tabindex="-1"></a>        <span class="pp">Poll::</span>Pending <span class="op">=&gt;</span> <span class="pp">println!</span>(<span class="st">&quot;még mindig pending&quot;</span>)<span class="op">,</span></span>
+<span id="cb15-50"><a href="#cb15-50" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb15-51"><a href="#cb15-51" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ez a példa előkészíti a <a href="r039.html">Tokio: taskok, I/O,
+csatornák, select és megszakítás</a> alfejezetet, ahol a valódi executor
+végzi el ugyanezt a pollozási és waker-kezelési feladatot.</p>
+<h4 data-number="17.1.11.4" id="hibajavítás-blokkoló-hívás"><span
+class="header-section-number">17.1.11.4</span> 4. Hibajavítás: blokkoló
+hívás</h4>
+<p>A <code>std::thread::sleep</code> blokkolja az aktuális szálat. A
+Tokio executor egy szálon több száz vagy több ezer async taskot futtat;
+egy szálas (<code>current_thread</code>) runtime-on minden más task
+megáll; a több szálú alapértelmezésben a blokkolt worker szál és a rá
+ütemezett taskok akadnak meg, ami terhelés alatt késleltetési csúcsokat
+és – ha a blokkolás tartós – kiéheztetést okoz. Ráadásul a blokkolás
+alatt a timer vagy I/O események sem tudnak lefutni. A javítás:</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> wait_a_second() <span class="op">{</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a>    <span class="pp">tokio::time::</span>sleep(<span class="pp">std::time::Duration::</span>from_secs(<span class="dv">1</span>))<span class="op">.</span><span class="kw">await</span><span class="op">;</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>tokio::time::sleep</code> egy olyan future-t ad, amely a
+Tokio timer-reaktorjában regisztrálja a wakert, és azonnal
+<code>Pending</code>-et ad; a szál így szabadon pollozhat más taskokat.
+Ez az alapja a <a href="r039.html">Tokio: taskok, I/O, csatornák, select
+és megszakítás</a> alfejezetnek.</p>
+<h3 data-number="17.1.12" id="rövid-összefoglaló"><span
+class="header-section-number">17.1.12</span> Rövid összefoglaló</h3>
+<p>A <code>Future</code> trait a Rust aszinkron modelljének alapja: a
+<code>poll</code> metódus <code>Ready</code>-t vagy
+<code>Pending</code>-et ad, a <code>Waker</code> pedig lehetővé teszi az
+executor értesítését. Az <code>async fn</code> hívása egy
+<code>impl Future</code> állapotgépet hoz létre, de nem futtatja a
+függvényt; a futás csak a pollozással kezdődik. A standard könyvtár nem
+tartalmaz runtime-et, ezért a Tokio biztosítja az executort és a
+reaktort. A <code>Pin</code> az önhivatkozó async állapotgép mozgatását
+akadályozza meg. A C++20 korutinokkal szemben a Rust <code>Future</code>
+poll-alapú, passzív, és a <code>.await</code> a felfüggesztési pont. A
+döntési szabály: sok várakozó I/O-ra async, hosszú CPU-munkára szál vagy
+rayon. Ez a modell készíti elő a <a href="r038.html">Pin, Unpin, async
+trait-ek és a Send-határok</a>, a <a href="r039.html">Tokio: taskok,
+I/O, csatornák, select és megszakítás</a>, valamint az <a
+href="r040.html">Az rkv hálózati szerver: TCP, protokoll, kecses
+leállás</a> alfejezeteket.</p>
+<h3 data-number="17.1.13" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">17.1.13</span> Források és ellenőrzési
+hiányok</h3>
+<p>A <code>Future</code>, <code>Poll</code>, <code>Waker</code> és
+<code>Pin</code> fogalmai a Rust Reference és a standard könyvtár
+<code>std::future</code>/<code>std::task</code>/<code>std::pin</code>
+dokumentációján alapulnak (<a href="https://doc.rust-lang.org/std/"
+class="uri">https://doc.rust-lang.org/std/</a>). A
+<code>Waker::noop()</code> a rögzített Rust 1.99.1-ben stabil. A
+hibaüzenetek pontos szövege verziófüggő. A C++20 korutinok
+viselkedésének részletei, például az <code>initial_suspend</code>
+futtatási sorrendje, a C++ szabvány és a használt fordító
+dokumentációjában ellenőrizhetők.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="r036.html">← 16.4 Adatpárhuzamosság rayonnal</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="r038.html">17.2 Pin, Unpin, async trait-ek és a Send-határok →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Host-óra kontra CUDA-esemény</title>
+<style>
+:root{--fg:#111;--bg:#fff;--muted:#666;--hl:#1f4e79;--hl2:#c55a11;--cell:#fff;--cellhl:#d9d9d9;--line:#000;--code:#f3f3f3}
+@media (prefers-color-scheme:dark){:root{--fg:#eee;--bg:#1b1b1b;--muted:#aaa;--hl:#8fb8e8;--hl2:#f0a060;--cell:#262626;--cellhl:#4a4a4a;--line:#ddd;--code:#2a2a2a}}
+*{box-sizing:border-box}
+body{margin:0;padding:10px;font:14px/1.45 system-ui,sans-serif;color:var(--fg);background:var(--bg)}
+.ctl{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:6px}
+button{font:inherit;padding:3px 10px;cursor:pointer}
+input[type=range]{flex:1;min-width:120px}
+#status{margin:4px 0 6px;min-height:2.9em}
+/* A pszeudokód a rajz ALATT, teljes szélességben (hosszú sorok ne görgessenek oldalra) */
+.wrap{display:flex;flex-direction:column;gap:10px;align-items:stretch}
+svg{width:100%;height:auto;display:block}
+pre#code{width:100%;margin:0;padding:6px 8px;background:var(--code);font:12.5px/1.5 ui-monospace,monospace;white-space:pre;overflow-x:auto}
+pre#code span{display:block;padding:0 4px}
+pre#code span.on{outline:2px solid var(--hl);font-weight:bold}
+svg text:not([fill]){fill:var(--fg);}
+svg text{font-family:system-ui,sans-serif}
+.small{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="ctl" role="group" aria-label="Lejátszás vezérlői">
+  <button id="first" title="Első lépés">⏮</button>
+  <button id="prev" title="Előző lépés">◀ Lépés</button>
+  <button id="play" title="Lejátszás / szünet">▶ Lejátszás</button>
+  <button id="next" title="Következő lépés">Lépés ▶</button>
+  <input id="pos" type="range" min="0" max="0" value="0" aria-label="Lépés kiválasztása">
+  <span id="cnt" class="small"></span>
+</div>
+<div class="ctl"><label>CPU GB/s <input type="range" id="cpu" min="10" max="40" value="20" aria-label="CPU GB/s" style="width:110px"></label><label>GPU alsó <input type="range" id="gpulo" min="100" max="272" value="100" aria-label="GPU alsó" style="width:110px"></label><label>GPU felső <input type="range" id="gpuhi" min="100" max="272" value="200" aria-label="GPU felső" style="width:110px"></label><label>PCIe alsó <input type="range" id="pcielo" min="8" max="25" value="8" aria-label="PCIe alsó" style="width:110px"></label><label>PCIe felső <input type="range" id="pciehi" min="8" max="25" value="16" aria-label="PCIe felső" style="width:110px"></label><label>log₂ N <input type="range" id="logn" min="20" max="26" value="22" aria-label="log₂ N" style="width:110px"></label><span id="vals" class="small" aria-live="polite"></span><svg width="0" height="0" style="position:absolute"><defs><pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" stroke="currentColor" stroke-width="1.5"/></pattern><pattern id="dots" width="6" height="6" patternUnits="userSpaceOnUse"><circle cx="3" cy="3" r="1.2" fill="currentColor"/></pattern></defs></svg></div>
+<div id="status" aria-live="polite"></div>
+<div class="wrap">
+  <svg id="v" viewBox="0 0 560 300" role="img" aria-label="Idővonal: a host-óra csak a kernelindítást fogja közre, az eseménypár a kernel GPU-n töltött idejét; alatta sávdiagram: a teljes GPU-időt a PCIe-átvitel uralja"></svg>
+  <pre id="code" aria-label="Pszeudokód"></pre>
+</div>
+<p class="small">Sematikus idővonal (nem méretarányos). Az időbontás a 4.4.6.5 modellbecslése (3 · N · 4 B forgalom a CPU-n és a kernelben, H→D 2 · N · 4 B, D→H N · 4 B; GB = 10^9 B), nem mérés.</p>
+<script>
+// ---- Adat: lépések (a Python-szkript számolja ki és illeszti be, a könyv példájával egyezően) ----
+// Minden lépés: {msg: "állapotsor szövege", line: kiemelt pszeudokódsor indexe vagy -1, ...saját mezők}
+let STEPS = [{"t": 1.0, "line": 1, "msg": "1. Launch: a start esemény már a streamben van, a kernelindítás bekerül a sorba (aszinkron)."}, {"t": 1.3, "line": 3, "msg": "2. A host továbbfut: GetLastError (csak indítási hiba), majd a stop esemény is a streambe kerül. Egy host-óra itt már megállna (HIBÁS mérés)."}, {"t": 2.2, "line": 4, "msg": "3. A kernel a GPU-n fut (a start eseményt a GPU a kernel előtt éri el); a host a cudaEventSynchronize-ban vár."}, {"t": 4.27, "line": 4, "msg": "4. A GPU eléri a stop eseményt: a kernel véget ért."}, {"t": 4.4, "line": 4, "msg": "5. A szinkronizáció feloldódik, a host továbbfut."}, {"t": 5.6, "line": 5, "msg": "6. cudaEventElapsedTime(start, stop): a két esemény közötti GPU-idő ms-ban; ez fedi a kernelt."}];
+const CODE = ["CHECK_CUDA(cudaEventRecord(start));                 // a streambe kerül", "vectorAddKernel<<<grid, block>>>(dA, dB, dC, N);", "CHECK_CUDA(cudaGetLastError());                     // launch hiba ellenőrzése", "CHECK_CUDA(cudaEventRecord(stop));                  // a streambe kerül", "CHECK_CUDA(cudaEventSynchronize(stop));             // várakozás a GPU-ra", "CHECK_CUDA(cudaEventElapsedTime(&elapsed_ms, start, stop));"];          // pszeudokód sorai (üres lista: a panel elrejtve)
+
+// ---- Rajzolás: ezt a függvényt kell az ábrához igazítani ----
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, text){const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);if(text!==undefined)e.textContent=text;svg.appendChild(e);return e;}
+const svg = document.getElementById("v");
+function css(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim();}
+function render(s){
+  // Példa: tömb cellákként, s.a = értékek, s.hl = kiemelt indexek
+  svg.innerHTML = "";
+  const a = s.a || [], w = 48, x0 = (560 - a.length * w) / 2, y0 = 110;
+  a.forEach((v, i) => {
+    const on = (s.hl || []).includes(i);
+    el("rect", {x: x0 + i * w, y: y0, width: w, height: w, fill: on ? css("--cellhl") : css("--cell"), stroke: css("--line"), "stroke-width": on ? 3 : 1.2});
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w / 2 + 6, "text-anchor": "middle", "font-size": 18}, String(v));
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w + 18, "text-anchor": "middle", "font-size": 12, fill: css("--muted")}, String(i));
+  });
+}
+
+function mdl(){
+  const g = id => +document.getElementById(id).value;
+  const n = Math.pow(2, g("logn")), b = 4 * n, ms = (by, gb) => by / (gb * 1e9) * 1e3;
+  const glo = Math.min(g("gpulo"), g("gpuhi")), ghi = Math.max(g("gpulo"), g("gpuhi"));
+  const plo = Math.min(g("pcielo"), g("pciehi")), phi = Math.max(g("pcielo"), g("pciehi"));
+  return {n: n, cpu: ms(3*b, g("cpu")), fast: [ms(2*b, phi), ms(3*b, ghi), ms(b, phi)], slow: [ms(2*b, plo), ms(3*b, glo), ms(b, plo)], lbl: [glo, ghi, plo, phi]};
+}
+function f2(x){ return (x < 10 ? x.toFixed(2) : x.toFixed(1)).replace(".", ","); }
+function render(s){
+  svg.setAttribute("viewBox", "0 0 640 405");
+  svg.innerHTML = "";
+  const X = t => 110 + t * 85, yh = 50, yg = 115, H = 28;
+  el("text", {x: 4, y: yh + 5, "font-size": 13}, "Host szál");
+  el("text", {x: 4, y: yg + 5, "font-size": 13}, "GPU stream");
+  const seg = (y, a, b, txt, fill, on) => { if (b <= a) return; el("rect", {x: X(a), y: y - H/2, width: X(b) - X(a), height: H, fill: fill, stroke: css("--line"), "stroke-width": on ? 2.5 : 1});
+    if (txt) el("text", {x: (X(a) + X(b)) / 2, y: y + 5, "text-anchor": "middle", "font-size": 11.5}, txt); };
+  const t = s.t;
+  seg(yh, 0.1, 0.4, "", css("--cellhl"));
+  seg(yh, 0.55, 1.0, "launch", css("--cellhl"), t <= 1.0);
+  if (t >= 1.3) seg(yh, 1.1, 1.35, "", css("--cellhl"), t < 2);
+  if (t >= 2.2) seg(yh, 1.45, Math.min(t, 4.35), t >= 4.3 ? "host vár (EventSynchronize)" : "host vár", "url(#hatch)", t < 4.4);
+  if (t >= 5.6) seg(yh, 4.45, 5.6, "ElapsedTime", css("--cellhl"), true);
+  if (t >= 2.2) seg(yg, 1.4, Math.min(t, 4.2), "kernel", css("--hl"), t < 4.3);
+  const dia = (x, lab) => { el("path", {d: `M${X(x)},${yg-18} l7,18 l-7,18 l-7,-18 z`, fill: css("--fg")}); el("text", {x: X(x), y: yg + 34, "text-anchor": "middle", "font-size": 11}, lab); };
+  if (t >= 1.0) dia(1.35, "start");
+  if (t >= 4.27) dia(4.27, "stop");
+  if (t >= 5.6) { const y = yg + 48; el("path", {d: `M${X(1.35)},${y-8} v8 H${X(4.27)} v-8`, fill: "none", stroke: css("--line"), "stroke-width": 1.5});
+    el("text", {x: (X(1.35) + X(4.27)) / 2, y: y + 16, "text-anchor": "middle", "font-size": 12, "font-weight": "bold"}, "cudaEventElapsedTime(start, stop) – fedi a kernelt"); }
+  if (t >= 1.3 && t < 4.4) { el("path", {d: `M${X(0.45)},${yh-22} v-6 H${X(1.1)} v6`, fill: "none", stroke: css("--hl2"), "stroke-width": 1.5});
+    el("text", {x: X(1.2), y: yh - 22, "font-size": 11.5, fill: css("--hl2")}, "host-óra (HIBÁS): csak az indítás, a kernelt nem fedi"); }
+  el("line", {x1: X(t), y1: 26, x2: X(t), y2: 150, stroke: css("--hl2"), "stroke-dasharray": "3 3"});
+  // 2. panel: időbontás
+  const m = mdl(), y0 = 215, sc = 560 / Math.max(8, m.slow.reduce((a, b) => a + b, 0) * 1.12, m.cpu * 1.12);
+  el("text", {x: 4, y: y0 - 10, "font-size": 12.5, "font-weight": "bold"}, "Várt időbontás (modell, nem mérés), N = 2^" + Math.log2(m.n) + " FP32");
+  const rows = [["CPU", [m.cpu]], ["GPU gyors", m.fast], ["GPU lassú", m.slow]];
+  const fills = [css("--cell"), css("--fg"), css("--cell")], pats = ["url(#dots)", css("--fg"), "url(#hatch)"];
+  rows.forEach((r, j) => { const y = y0 + 6 + j * 48; let x = 0;
+    el("text", {x: 4, y: y + 19, "font-size": 12}, r[0]);
+    r[1].forEach((v, i) => { const fill = j === 0 ? css("--cellhl") : pats[i];
+      el("rect", {x: 80 + x * sc, y: y, width: v * sc, height: 28, fill: fill, stroke: css("--line")});
+      x += v; });
+    el("text", {x: 84 + x * sc, y: y + 19, "font-size": 12, "font-weight": "bold"}, f2(x) + " ms");
+    if (j) el("text", {x: 80, y: y + 41, "font-size": 11}, "H→D " + f2(r[1][0]) + " + kernel " + f2(r[1][1]) + " + D→H " + f2(r[1][2]) + " ms");
+  });
+  const tf = m.fast.reduce((a, b) => a + b, 0), ts = m.slow.reduce((a, b) => a + b, 0);
+  el("text", {x: 4, y: 398, "font-size": 12.5}, "GPU teljes / CPU = " + f2(tf / m.cpu) + "–" + f2(ts / m.cpu) + "   (pontozott H→D, tömör kernel, sraffozott D→H)");
+  document.getElementById("vals").textContent = "CPU " + document.getElementById("cpu").value + " GB/s; GPU " + m.lbl[0] + "–" + m.lbl[1] + " GB/s; PCIe " + m.lbl[2] + "–" + m.lbl[3] + " GB/s; N = 2^" + Math.log2(m.n);
+}
+["cpu", "gpulo", "gpuhi", "pcielo", "pciehi", "logn"].forEach(id => document.getElementById(id).addEventListener("input", () => show(k)));
+
+
+// ---- Vezérlés (általában nem kell módosítani) ----
+let k = 0, timer = null;
+const pos = document.getElementById("pos"), status = document.getElementById("status");
+const codeEl = document.getElementById("code");
+if (!CODE.length) codeEl.style.display = "none";
+else codeEl.innerHTML = CODE.map((l, i) => `<span id="L${i}">${l.replace(/&/g,"&amp;").replace(/</g,"&lt;")}</span>`).join("");
+pos.max = STEPS.length - 1;
+// Új lépéssor betöltése (pl. saját bemenetből számolva): setSteps(lista)
+function setSteps(list){ stop(); STEPS = list; pos.max = STEPS.length - 1; show(0); }
+function show(i){
+  k = Math.max(0, Math.min(STEPS.length - 1, i));
+  const s = STEPS[k];
+  pos.value = k;
+  document.getElementById("cnt").textContent = `${k + 1}/${STEPS.length}`;
+  status.textContent = s.msg || "";
+  codeEl.querySelectorAll("span").forEach(x => x.classList.remove("on"));
+  if (s.line !== undefined && s.line >= 0) { const L = document.getElementById("L" + s.line); if (L) L.classList.add("on"); }
+  render(s);
+}
+function stop(){ if (timer) { clearInterval(timer); timer = null; } document.getElementById("play").textContent = "▶ Lejátszás"; }
+document.getElementById("first").onclick = () => { stop(); show(0); };
+document.getElementById("prev").onclick = () => { stop(); show(k - 1); };
+document.getElementById("next").onclick = () => { stop(); show(k + 1); };
+document.getElementById("play").onclick = () => {
+  if (timer) { stop(); return; }
+  if (k >= STEPS.length - 1) show(0);
+  document.getElementById("play").textContent = "⏸ Szünet";
+  timer = setInterval(() => { if (k >= STEPS.length - 1) stop(); else show(k + 1); }, 1300);
+};
+pos.oninput = () => { stop(); show(+pos.value); };
+document.addEventListener("keydown", e => { if (e.key === "ArrowRight") { stop(); show(k + 1); } if (e.key === "ArrowLeft") { stop(); show(k - 1); } });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => show(k));
+show(0);
+</script>
+<script>(function(){function s(){var b=document.body;parent.postMessage({figResize:Math.ceil(b.getBoundingClientRect().height)},"*")}addEventListener("load",s);addEventListener("resize",s);if(window.ResizeObserver)new ResizeObserver(s).observe(document.body);s()})()</script></body>
+</html>

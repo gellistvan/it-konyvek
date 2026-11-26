@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>16.3 Histogram – GPGPU – általános célú számítások
+GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Párhuzamos algoritmusok</a> › <a href="index.html#gpuch15">16 Redukciók, scan és histogram</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu059.html">← 16.2 Scan (prefix sum)</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu061.html">16.4 CUB és Thrust használata →</a></div>
+</nav>
+<h2 data-number="16.3" id="gpu060"><span
+class="header-section-number">16.3</span> Histogram</h2>
+<p>A hisztogram a párhuzamos számítás egyik leggyakoribb építőköve:
+adott egy bemeneti sorozat és egy véges számú rekesz (bin); minden
+elemhez hozzárendelünk egy rekeszt, majd megszámoljuk, hány elem esik az
+egyes rekeszekbe. Az eredmény egy gyakorisági eloszlás, amelyet
+képfeldolgozásban (színtónus-hisztogram), statisztikai elemzésben, gépi
+tanulási jellemzők számításakor és szimulációkban is használunk. GPU-n a
+hisztogram számítása elsőre egyszerűnek tűnik: minden szál feldolgoz egy
+elemet, és növeli a megfelelő rekesz számlálóját. A kihívást az jelenti,
+hogy több szál egyszerre ugyanabba a rekeszbe írhat – ezt a
+versenyhelyzetet atomi műveletekkel vagy privatizációval kezeljük. Ez az
+alfejezet a hisztogram mint atomi és privatizált művelet fogalmát járja
+körbe, bemutatja a blokkszintű privatizációt, elemzi a shared memory
+bank conflict és az atomi kontenció jelenségét, és egy laborfeladaton
+keresztül mérhetővé teszi a megközelítések teljesítményét. A hisztogram
+tipikus alkalmazásai: 256 rekeszes képfeldolgozási hisztogram,
+lebegőpontos adatok binningje, és a CUB <code>DeviceHistogram</code>
+könyvtári megoldása (a CUB általános használatát a következő alfejezet,
+a 16.4 mutatja be; a <code>cub::DeviceHistogram::HistogramEven</code>
+hívását a CUB dokumentációja írja le).</p>
+<h3 data-number="16.3.1" id="a-hisztogram-mint-atomi-művelet"><span
+class="header-section-number">16.3.1</span> A hisztogram mint atomi
+művelet</h3>
+<p>A legegyszerűbb GPU-s megvalósításban minden bemeneti elemhez egy
+szál tartozik. A szál kiszámítja az elem rekeszindexét, majd egy atomi
+összeadást hajt végre a globális memóriában tárolt hisztogramtömbön. Az
+<code>atomicAdd</code> garantálja, hogy az olvasás-módosítás-írás
+műveletsor oszthatatlan, így a végeredmény helyes marad még akkor is, ha
+több szál egyszerre ugyanabba a rekeszbe ír.</p>
+<p>A naiv kernel CUDA C++-ban:</p>
+<pre class="cuda"><code>// CUDA C++ (C++17)
+constexpr int NUM_BINS = 64;
+
+__global__ void hist_naive(const int* data, int* hist, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+
+    for (; idx &lt; n; idx += stride) {
+        int bin = data[idx] % NUM_BINS;
+        atomicAdd(&amp;hist[bin], 1);
+    }
+}</code></pre>
+<p>A grid-stride loop lehetővé teszi, hogy a kernel akkor is lefusson a
+teljes bemenetet, ha az elemszám nagyobb, mint az indított szálak száma.
+A bin számítása itt a <code>%</code> operátorral történik; ha a rekeszek
+száma kettő hatványa, bitművelettel (<code>&amp; (NUM_BINS-1)</code>)
+gyorsabban elvégezhető, de az általánosság kedvéért a modulo marad.</p>
+<p>A naiv megoldás előnye a rendkívüli egyszerűség: nincs szükség
+bonyolult szinkronizációra, a kód kevés sorból áll, és az atomi
+műveletek garantálják a helyes eredményt. Hátránya viszont a súlyos
+teljesítményprobléma: ha sok elem esik ugyanabba a rekeszbe, a globális
+memóriában lévő <code>hist[bin]</code> címre irányuló atomi műveletek
+sorosítva hajtódnak végre. A globális atomi művelet egy
+read-modify-write ciklus, amely a memóriavezérlőn keresztül megy; nagy
+kontenció esetén a szálak várakozni kényszerülnek, és a kernel
+átbocsátóképessége drasztikusan lecsökken. Erősen ferde eloszlásnál a
+naiv atomi megoldás a kontenció miatt várhatóan lassabb a privatizált
+változatnál; a különbség mértéke eszköz- és eloszlásfüggő (a Maxwell óta
+a shared memory atomikus műveletei natívak, az L2 atomik is gyorsak),
+ezért mérni kell.</p>
+<h3 data-number="16.3.2"
+id="privatizált-hisztogram-blokkszintű-shared-memory"><span
+class="header-section-number">16.3.2</span> Privatizált hisztogram:
+blokkszintű shared memory</h3>
+<p>A kontenció csökkentésének alapötlete az, hogy a globális atomi
+műveleteket részben kiváltjuk gyorsabb, blokkon belüli műveletekkel.
+Minden szálblokk saját, privát hisztogramot tart fenn a shared
+memóriában. A blokk szálai a bemeneti elemek feldolgozása során csak
+ebbe a privát tömbbe írnak atomi módon. A blokk végén, egy
+<code>__syncthreads()</code> után a privát hisztogramot egyetlen
+globális atomi összeadással egyesítik a globális hisztogrammal. Így a
+globális atomi műveletek száma blokkonként <code>NUM_BINS</code> darabra
+csökken, szemben a naiv megoldás <code>N</code> darabjával.</p>
+<p>Az alábbi ábra a labor három változatának adatútját foglalja össze:
+hol keletkeznek az atomi műveletek, hány éri el a globális memóriát, és
+hol áll a két <code>__syncthreads()</code>.</p>
+<figure id="fig-gpu060-hist-variants">
+<div class="fig-interactive"><iframe src="figures/html/gpu060-hist-variants.html" title="Naiv: minden elem globális atomik; blokkszintű: shared hisztogram, blokkonként 64 globális atomik; per-warp: 8 warp-másolat, összegzés után 64 globális atomik." loading="lazy" style="width:100%;border:0;height:520px"></iframe><noscript><img src="figures/img/gpu060-hist-variants.png" style="width:100.0%"
+alt="Naiv: minden elem globális atomik; blokkszintű: shared hisztogram, blokkonként 64 globális atomik; per-warp: 8 warp-másolat, összegzés után 64 globális atomik." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu060-hist-variants.png" style="width:100.0%"
+alt="Naiv: minden elem globális atomik; blokkszintű: shared hisztogram, blokkonként 64 globális atomik; per-warp: 8 warp-másolat, összegzés után 64 globális atomik." /></details></div>
+<figcaption>A hisztogram három változatának adatútja és globális
+atomik-száma (a 16.3.5 laborkonfigurációjával)</figcaption>
+</figure>
+<p>A privatizált kernel:</p>
+<pre class="cuda"><code>// CUDA C++ (C++17)
+__global__ void hist_shared(const int* data, int* hist, int n)
+{
+    __shared__ int shist[NUM_BINS];
+
+    // 1. A privát hisztogram inicializálása nullára
+    for (int i = threadIdx.x; i &lt; NUM_BINS; i += blockDim.x) {
+        shist[i] = 0;
+    }
+    __syncthreads();
+
+    // 2. Feldolgozás: atomi összeadás a shared memóriában
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    for (; idx &lt; n; idx += stride) {
+        int bin = data[idx] % NUM_BINS;
+        atomicAdd(&amp;shist[bin], 1);
+    }
+    __syncthreads();
+
+    // 3. A privát hisztogram egyesítése a globális tömbbel
+    for (int i = threadIdx.x; i &lt; NUM_BINS; i += blockDim.x) {
+        atomicAdd(&amp;hist[i], shist[i]);
+    }
+}</code></pre>
+<p>A shared memóriás <code>atomicAdd</code> lényegesen gyorsabb, mint a
+globális megfelelője, mert a shared memória a blokkhoz közeli, nagy
+sávszélességű memória, és az atomi művelet hardveres támogatása is
+hatékonyabb. Ráadásul a globális atomi műveletek száma
+<code>N</code>-ről <code>blokkok száma × NUM_BINS</code>-re csökken, ami
+a memóriavezérlő terhelését mérsékli.</p>
+<p>A privatizált megoldás korlátja a shared memória mérete. A
+<code>NUM_BINS * sizeof(int)</code> értéknek bele kell férnie a blokk
+számára elérhető shared memória keretbe (statikusan legfeljebb 48 KiB;
+ennél nagyobb dinamikus shared memory csak
+<code>cudaFuncSetAttribute</code>-tal kérhető, és a felső korlát compute
+capability-függő, lásd a CUDA Programming Guide Compute Capabilities
+táblázatát). Ha a rekeszek száma nagyon nagy (például több ezer), akkor
+a privát hisztogram nem fér el, és részleges privatizációra vagy
+többszintű megoldásra van szükség. Ilyenkor az egyik lehetőség, hogy a
+rekeszeket csoportokra osztjuk, és blokkonként csak egy csoportot
+tárolunk shared memóriában; a feldolgozást többször is elvégezzük, vagy
+a bemenetet partícionáljuk.</p>
+<p>A blokkméret és a gridméret megválasztása is fontos. A grid-stride
+loop használatával a grid méretét a rezidens kapacitáshoz igazíthatjuk:
+<code>grid = SM-szám × rezidens blokk/SM</code>, ahol az utóbbit a
+<code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code> adja (256
+szálas blokknál CC 8.6/8.9-en 6, mert egy SM legfeljebb 1536 szálat tart
+rezidensen; ellenőrzendő a célgép compute capabilityje és a kernel
+regiszterhasználata szerint). Ez a perzisztens kernel mintája: a blokkok
+száma a hardver rezidens kapacitásával egyezik, és minden blokk több
+bemeneti elemet dolgoz fel. Így a globális atomi műveletek száma
+(<code>blokkok száma × NUM_BINS</code>) lényegesen kisebb a bemenet
+méreténél, és elkerüljük a túl sok blokk indítási költségét. A block
+méretet úgy érdemes megválasztani, hogy az occupancy magas legyen, de a
+shared memória foglalása ne korlátozza túlzottan az aktív blokkok
+számát. Jelen példában <code>NUM_BINS=64</code> és
+<code>blockDim.x=256</code> esetén a shared memória 256 bájt, ami
+elhanyagolható; a blokk méretét a feldolgozási teljesítmény és a
+regiszterhasználat határozza meg.</p>
+<h3 data-number="16.3.3"
+id="bank-conflict-és-atomi-kontenció-a-privatizált-hisztogramban"><span
+class="header-section-number">16.3.3</span> Bank conflict és atomi
+kontenció a privatizált hisztogramban</h3>
+<p>A shared memória 32 bankra van osztva; minden bank egy 4 bájtos szót
+szolgál ki ciklusonként. A hisztogramban a <code>shist[bin]</code>
+elérések címei adatfüggők, és két különböző jelenség léphet fel:</p>
+<ul>
+<li><strong>Azonos bin (azonos szó):</strong> az atomi műveletek
+ugyanarra a címre sorosítva hajtódnak végre; ez atomi kontenció, nem
+bank conflict.</li>
+<li><strong>Különböző bin, azonos bank:</strong> például 64 rekesz
+esetén a 0. és a 32. bin ugyanabba a bankba esik
+(<code>bin % 32</code>), de különböző szó; ez bank conflict, a
+hozzáférések több lépésben szolgálódnak ki.</li>
+</ul>
+<p>Ezért a hisztogram ütközései nem szüntethetők meg egyszerű
+címtranszformációval. A klasszikus padding
+(<code>index + index / 32</code>) a soros, szabályos stride-ú
+hozzáférések ütközését szünteti meg (például a scan-nél), a véletlen
+címzésű hisztogramét nem. Ugyanez igaz a szorzós „padding”-re: ha a bin
+indexet egy páratlan számmal (pl. 5-tel) szorozzuk, a
+<code>bank = (5 · bin) mod 32</code> leképezés kölcsönösen egyértelmű
+mod 32, vagyis két bin pontosan akkor ütközik, ha
+<code>bin_a ≡ bin_b (mod 32)</code> – ugyanazok a párok, mint a szorzás
+nélkül –, miközben ötszörös shared memóriát foglalunk. Ez a megoldás
+tehát <strong>nem</strong> csökkenti az ütközések számát, ezért nem is
+mutatjuk be kernelként.</p>
+<p>Az alábbi ábra egy warp 32 <code>atomicAdd(&amp;shist[bin], 1)</code>
+kérését képezi le a 32 bankra négy bemenetnél: az azonos binre irányuló
+kérések sorosított atomi frissítést, az azonos bankba eső különböző
+szavak bank conflictot okoznak, és az 5-ös szorzó ugyanazokat a párokat
+ütközteti.</p>
+<figure id="fig-gpu060-atomic-bank">
+<div class="fig-interactive"><iframe src="figures/html/gpu060-atomic-bank.html" title="Négy panel: 32 különböző bank 1 lépés; egy bin 32 sorosított frissítés; 16 bankban két szó 2 lépés; az 5-szörös index ugyanígy 2 lépés." loading="lazy" style="width:100%;border:0;height:560px"></iframe><noscript><img src="figures/img/gpu060-atomic-bank.png" style="width:100.0%"
+alt="Négy panel: 32 különböző bank 1 lépés; egy bin 32 sorosított frissítés; 16 bankban két szó 2 lépés; az 5-szörös index ugyanígy 2 lépés." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu060-atomic-bank.png" style="width:100.0%"
+alt="Négy panel: 32 különböző bank 1 lépés; egy bin 32 sorosított frissítés; 16 bankban két szó 2 lépés; az 5-szörös index ugyanígy 2 lépés." /></details></div>
+<figcaption>Azonos bin vs. azonos bank egy warp shared-atomikus
+hozzáféréseiben: (a) 32 különböző bank, (b) egy bin 32 sorosított
+frissítése, (c) 16 bankban két szó, (d) az 5-szörös index mellett is
+ugyanazok a párok ütköznek</figcaption>
+</figure>
+<p>A tényleges csökkentési technikák:</p>
+<ol type="1">
+<li><strong>Per-warp privatizáció (replikáció):</strong> minden warp
+saját hisztogram-másolatot kap
+(<code>shist[WARPS_PER_BLOCK][NUM_BINS]</code>), így a warpok nem
+versengenek egymással; a blokk végén a másolatokat összegezzük. A warpon
+belüli azonos-bin kontenciót ez nem szünteti meg.</li>
+<li><strong>Warp-szintű aggregáció:</strong> a
+<code>__match_any_sync</code> (CC 7.0+) a warpon belül azonos bin-t
+kereső szálakat csoportosítja, és csoportonként egyetlen szál egyetlen
+<code>atomicAdd</code>-del adja hozzá a csoport méretét. Ez a warpon
+belüli azonos-bin kontenciót csökkenti.</li>
+<li>A rekeszek számától függően regiszterben tartott (kis rekeszszámnál)
+számlálók.</li>
+</ol>
+<p>A laborban az 1. technikát (per-warp replikáció) mérjük a naiv és a
+blokkszintű privatizált változat mellett. A shared atomikus műveletek és
+a bank conflict hatását Nsight Compute-tal lehet ellenőrizni (az
+atomikus shared műveletekre vonatkozó <code>..._op_atom</code>
+metrikacsalád tagjai, például
+<code>l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_atom.sum</code>;
+a pontos metrikanevet a telepített verzióban
+<code>ncu --query-metrics</code> adja meg). A <code>..._op_ld</code>
+metrika csak a betöltéseket számolja, ezért atomikus hisztogramnál nem
+informatív.</p>
+<h3 data-number="16.3.4" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">16.3.4</span> Tipikus hibák és helyes
+megoldások</h3>
+<p>A hisztogram implementálása során több gyakori hiba fordul elő. Az
+első a shared memória inicializálásának elmulasztása. A
+<code>shist</code> tömb tartalma definiálatlan, ha nem nullázzuk minden
+blokk elején, ezért a végeredmény szeméttel szennyezett lesz. A helyes
+megoldás a fenti kódban látható ciklus, amely a blokk minden szálával
+párhuzamosan nullázza a tömb elemeit, majd <code>__syncthreads()</code>
+hívás következik.</p>
+<p>A második tipikus hiba a szinkronizáció elhagyása. A privatizált
+kernelben két <code>__syncthreads()</code> hívásra van szükség: az első
+biztosítja, hogy az inicializálás befejeződjön, mielőtt bármely szál
+elkezdi a feldolgozást; a második pedig garantálja, hogy minden szál
+befejezte a privát hisztogram frissítését, mielőtt a blokk elkezdi az
+egyesítést. Ha ezek hiányoznak, a szálak versenyt futnak egymással, és
+az eredmény nemdeterminisztikus lesz.</p>
+<p>A harmadik hiba az out-of-range bin index. Ha a bemeneti adatok
+negatívak lehetnek, az <code>int</code> <code>%</code> operátor
+eredménye negatív szám is lehet (C++-ban a maradék előjele az osztandó
+előjelét követi), ami a tömb határain kívülre mutat. A helyes megoldás a
+bemeneti értékek normalizálása, <code>unsigned</code> modulo, vagy
+bitmaszk használata: kettes komplemensben az
+<code>&amp; (NUM_BINS - 1)</code> negatív bemenetre is nem negatív
+indexet ad, de más leképezést ad, mint a <code>%</code>, ezért a
+CPU-referenciának ugyanazt a leképezést kell használnia. A laborban
+determinisztikus bemenetet használunk, ahol ez a hiba nem fordul elő, de
+éles kódban mindig védeni kell.</p>
+<p>A negyedik hiba a shared memória méretének túlbecslése. Ha a rekeszek
+száma nagy, a <code>__shared__</code> deklaráció meghaladhatja a
+statikus shared memória limitet. Ilyenkor fordítási hibát kapunk, vagy a
+kernel nem indul el. A megoldás a dinamikus shared memória
+(<code>extern __shared__</code>) használata, a rekeszek csoportosítása,
+vagy a probléma átdolgozása többmenetes feldolgozássá.</p>
+<p>Az ötödik hiba a mérési módszertan hiányossága, és a
+<strong>nullázás</strong> elhagyása az ismételt méréseknél. A hisztogram
+kernel <em>hozzáadja</em> az eredményt a globális tömbhöz, ezért minden
+indítás előtt nullázni kell (<code>cudaMemset</code>), különben a tömb a
+futások számával arányosan nő. Minden mérés előtt legalább 5 warm-up
+futás, majd legalább 20 mért ismétlés kell <code>cudaEvent</code>-tel; a
+mediánt és a szórást (vagy IQR-t) közöljük. A futásidő önmagában nem
+elegendő, mert a GPU órajele és a háttérterhelés ingadozhat. A laborban
+ezt a módszertant követjük.</p>
+<p>Végül érdemes megemlíteni a <code>%</code> művelet költségét. Ha a
+rekeszek száma kettő hatványa, a modulo helyettesíthető bitművelettel:
+<code>bin = data[idx] &amp; (NUM_BINS - 1);</code>. Ez gyorsabb, de csak
+akkor alkalmazható, ha a rekeszszám ténylegesen kettő hatványa; negatív
+bemenetre a leképezés eltér a <code>%</code>-étől (lásd fent). A
+laborban <code>NUM_BINS = 64</code>, így ezt a trükköt is
+kipróbálhatjuk.</p>
+<h3 data-number="16.3.5"
+id="labor-hisztogram-atomi-műveletekkel-és-privatizációval"><span
+class="header-section-number">16.3.5</span> Labor: hisztogram atomi
+műveletekkel és privatizációval</h3>
+<p>A labor célja a naiv atomi, a blokkszintű privatizált és a per-warp
+privatizált hisztogram mérése több bemeneti eloszláson. Az alábbi forrás
+<code>histogram.cu</code> néven menthető, és CUDA C++ (C++17) nyelven
+fordul (statikusan átnézett, nem futtatott kód).</p>
+<h4 data-number="16.3.5.1" id="teljes-forráskód"><span
+class="header-section-number">16.3.5.1</span> Teljes forráskód</h4>
+<pre class="cuda"><code>// CUDA C++ (C++17)
+// histogram.cu – hisztogram atomicsal és privatizált shared memory-val
+#include &lt;algorithm&gt;
+#include &lt;cstdint&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;cmath&gt;
+#include &lt;vector&gt;
+#include &lt;cuda_runtime.h&gt;
+
+// a könyv kanonikus hibamakrója (1.2)
+#define CUDA_CHECK(call)                                                        \
+    do {                                                                        \
+        cudaError_t err = (call);                                               \
+        if (err != cudaSuccess) {                                               \
+            std::fprintf(stderr, &quot;CUDA hiba: %s:%d: %s\n&quot;, __FILE__, __LINE__,  \
+                         cudaGetErrorString(err));                              \
+            std::exit(EXIT_FAILURE);                                            \
+        }                                                                       \
+    } while (0)
+
+constexpr int NUM_BINS = 64;
+constexpr int N = 1 &lt;&lt; 20;          // 1 048 576 elem
+constexpr int BLOCK_SIZE = 256;
+constexpr int WARPS_PER_BLOCK = BLOCK_SIZE / 32;
+
+// --- Naiv globális atomics ---
+__global__ void hist_naive(const int* data, int* hist, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    for (; idx &lt; n; idx += stride) {
+        int bin = data[idx] % NUM_BINS;
+        atomicAdd(&amp;hist[bin], 1);
+    }
+}
+
+// --- Blokkszintű privatizáció (shared memory) ---
+__global__ void hist_shared(const int* data, int* hist, int n)
+{
+    __shared__ int shist[NUM_BINS];
+    for (int i = threadIdx.x; i &lt; NUM_BINS; i += blockDim.x) {
+        shist[i] = 0;
+    }
+    __syncthreads();
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    for (; idx &lt; n; idx += stride) {
+        int bin = data[idx] % NUM_BINS;
+        atomicAdd(&amp;shist[bin], 1);
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i &lt; NUM_BINS; i += blockDim.x) {
+        atomicAdd(&amp;hist[i], shist[i]);
+    }
+}
+
+// --- Per-warp privatizáció: minden warp saját hisztogram-másolatot kap ---
+__global__ void hist_shared_warp(const int* data, int* hist, int n)
+{
+    __shared__ int shist[WARPS_PER_BLOCK][NUM_BINS];   // 8 * 64 * 4 = 2 KiB
+    int* flat = &amp;shist[0][0];
+    for (int i = threadIdx.x; i &lt; WARPS_PER_BLOCK * NUM_BINS; i += blockDim.x) {
+        flat[i] = 0;
+    }
+    __syncthreads();
+
+    const int warp = threadIdx.x &gt;&gt; 5;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    for (; idx &lt; n; idx += stride) {
+        int bin = data[idx] % NUM_BINS;
+        atomicAdd(&amp;shist[warp][bin], 1);
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i &lt; NUM_BINS; i += blockDim.x) {
+        int sum = 0;
+        for (int w = 0; w &lt; WARPS_PER_BLOCK; ++w) sum += shist[w][i];
+        atomicAdd(&amp;hist[i], sum);
+    }
+}
+
+// --- CPU referencia ---
+void cpu_histogram(const std::vector&lt;int&gt;&amp; data, std::vector&lt;int&gt;&amp; hist)
+{
+    std::fill(hist.begin(), hist.end(), 0);
+    for (int v : data) hist[v % NUM_BINS]++;
+}
+
+// --- Bemeneti eloszlások (determinisztikus) ---
+const char* DIST_NAMES[] = {&quot;periodikus (i % 64)&quot;, &quot;egyenletes véletlen&quot;,
+                            &quot;minden elem azonos&quot;, &quot;ferde (kb. 90% a 0. binbe)&quot;};
+void fill_input(std::vector&lt;int&gt;&amp; d, int dist)
+{
+    uint32_t x = 12345u;                          // LCG
+    for (int i = 0; i &lt; (int)d.size(); ++i) {
+        x = x * 1664525u + 1013904223u;
+        switch (dist) {
+            case 0: d[i] = i % NUM_BINS; break;
+            case 1: d[i] = (x &gt;&gt; 16) % NUM_BINS; break;
+            case 2: d[i] = 7; break;
+            default: d[i] = ((x &gt;&gt; 8) % 10 &lt; 9) ? 0 : (int)((x &gt;&gt; 16) % NUM_BINS); break;
+        }
+    }
+}
+
+// --- Időmérés CUDA eventekkel; minden indítás előtt nullázás ---
+void run_kernel(void (*kernel)(const int*, int*, int),
+                const int* d_data, int* d_hist, int n,
+                int grid_size, int block_size, int num_iter,
+                cudaStream_t stream, float&amp; median_ms, float&amp; sd_ms)
+{
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&amp;start));
+    CUDA_CHECK(cudaEventCreate(&amp;stop));
+
+    // Warm-up (10 indítás, mindegyik előtt nullázás)
+    for (int w = 0; w &lt; 10; ++w) {
+        CUDA_CHECK(cudaMemsetAsync(d_hist, 0, NUM_BINS * sizeof(int), stream));
+        kernel&lt;&lt;&lt;grid_size, block_size, 0, stream&gt;&gt;&gt;(d_data, d_hist, n);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector&lt;float&gt; t(num_iter);
+    for (int i = 0; i &lt; num_iter; ++i) {
+        CUDA_CHECK(cudaMemsetAsync(d_hist, 0, NUM_BINS * sizeof(int), stream));
+        CUDA_CHECK(cudaEventRecord(start, stream));
+        kernel&lt;&lt;&lt;grid_size, block_size, 0, stream&gt;&gt;&gt;(d_data, d_hist, n);
+        CUDA_CHECK(cudaEventRecord(stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventElapsedTime(&amp;t[i], start, stop));
+    }
+    // A d_hist az utolsó (egyetlen nullázott) indítás eredményét tartalmazza.
+    double m = 0.0, v = 0.0;
+    for (float x : t) m += x;
+    m /= num_iter;
+    for (float x : t) v += (x - m) * (x - m);
+    std::vector&lt;float&gt; sorted(t);
+    std::sort(sorted.begin(), sorted.end());
+    median_ms = 0.5f * (sorted[num_iter / 2 - 1] + sorted[num_iter / 2]);   // páros num_iter
+    sd_ms = (float)std::sqrt(v / (num_iter - 1));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+}
+
+int main()
+{
+    int device = 0, sm_count = 0;
+    CUDA_CHECK(cudaGetDevice(&amp;device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&amp;sm_count, cudaDevAttrMultiProcessorCount, device));
+    // perzisztens grid: SM-szám x rezidens blokk/SM (a legkisebb a három kernel közül)
+    int blocks_per_sm = 0;
+    {
+        int b = 0;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&amp;blocks_per_sm, hist_naive, BLOCK_SIZE, 0));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&amp;b, hist_shared, BLOCK_SIZE, 0));
+        if (b &lt; blocks_per_sm) blocks_per_sm = b;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&amp;b, hist_shared_warp, BLOCK_SIZE, 0));
+        if (b &lt; blocks_per_sm) blocks_per_sm = b;
+    }
+    const int grid_size = sm_count * blocks_per_sm;
+    const int num_iter = 20;                      // mért ismétlés (a warm-up: 5 vagy több, itt 10)
+
+    int *d_data, *d_hist;
+    CUDA_CHECK(cudaMalloc(&amp;d_data, N * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&amp;d_hist, NUM_BINS * sizeof(int)));
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&amp;stream));
+
+    struct Variant { const char* name; void (*fn)(const int*, int*, int); };
+    const Variant variants[] = {{&quot;naiv&quot;, hist_naive},
+                                {&quot;shared&quot;, hist_shared},
+                                {&quot;shared/warp&quot;, hist_shared_warp}};
+
+    std::printf(&quot;Hisztogram labor (N=%d, B=%d, block=%d, grid=%d)\n&quot;,
+                N, NUM_BINS, BLOCK_SIZE, grid_size);
+    std::printf(&quot;%-30s %-12s %-10s %-10s %-8s\n&quot;,
+                &quot;Eloszlás&quot;, &quot;Változat&quot;, &quot;Medián (ms)&quot;, &quot;Szórás&quot;, &quot;Helyes?&quot;);
+
+    for (int dist = 0; dist &lt; 4; ++dist) {
+        std::vector&lt;int&gt; h_data(N), h_ref(NUM_BINS), h_out(NUM_BINS);
+        fill_input(h_data, dist);
+        cpu_histogram(h_data, h_ref);
+        CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), N * sizeof(int),
+                              cudaMemcpyHostToDevice));
+        for (const Variant&amp; v : variants) {
+            float median_ms, sd_ms;
+            run_kernel(v.fn, d_data, d_hist, N, grid_size, BLOCK_SIZE,
+                       num_iter, stream, median_ms, sd_ms);
+            CUDA_CHECK(cudaMemcpy(h_out.data(), d_hist, NUM_BINS * sizeof(int),
+                                  cudaMemcpyDeviceToHost));
+            bool ok = (h_out == h_ref);
+            std::printf(&quot;%-30s %-12s %-10.4f %-10.4f %-8s\n&quot;, DIST_NAMES[dist],
+                        v.name, median_ms, sd_ms, ok ? &quot;igen&quot; : &quot;NEM&quot;);
+        }
+    }
+
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    CUDA_CHECK(cudaFree(d_data));
+    CUDA_CHECK(cudaFree(d_hist));
+    return 0;
+}</code></pre>
+<h4 data-number="16.3.5.2" id="build-és-futtatás"><span
+class="header-section-number">16.3.5.2</span> Build és futtatás</h4>
+<p>A fordításhoz és futtatáshoz használjuk az alábbi parancsokat (a
+compute capability-t a saját GPU-hoz igazítsuk):</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_86 <span class="at">-o</span> hist histogram.cu</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./hist</span></span></code></pre></div>
+<p>A laborban rögzítendő környezet (példa, a hallgató a sajátját írja
+be):</p>
+<ul>
+<li>GPU: NVIDIA GeForce RTX 3070 (példa)</li>
+<li>Driver: &lt;kitöltendő&gt;</li>
+<li>CUDA: 12.x</li>
+<li>Compute capability: 8.6</li>
+<li>Operációs rendszer: &lt;kitöltendő&gt;</li>
+<li>Power limit / ECC / MIG: &lt;kitöltendő&gt;</li>
+<li>Háttérterhelés: nincs</li>
+</ul>
+<h4 data-number="16.3.5.3" id="mérési-napló"><span
+class="header-section-number">16.3.5.3</span> Mérési napló</h4>
+<p>A program minden eloszlásra és mindhárom kernelre 20 mért ismétlést
+futtat (10 warm-up után), minden indítás előtt nullázza a hisztogramot,
+és mediánt meg szórást ír ki. Az alábbi táblázat a mérési napló
+szerkezetét mutatja; a mért értékeket a hallgató tölti ki a saját
+futtatása alapján.</p>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr>
+<th>Eloszlás</th>
+<th>Változat</th>
+<th>Medián idő (ms)</th>
+<th>Szórás (ms)</th>
+<th>Helyes?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>periodikus (i % 64)</td>
+<td>naiv</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+</tr>
+<tr>
+<td>periodikus (i % 64)</td>
+<td>shared</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+</tr>
+<tr>
+<td>periodikus (i % 64)</td>
+<td>shared/warp</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+</tr>
+<tr>
+<td>egyenletes véletlen</td>
+<td>naiv</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+</tr>
+<tr>
+<td>egyenletes véletlen</td>
+<td>shared</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+</tr>
+<tr>
+<td>egyenletes véletlen</td>
+<td>shared/warp</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+</tr>
+<tr>
+<td>minden elem azonos</td>
+<td>naiv</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+</tr>
+<tr>
+<td>minden elem azonos</td>
+<td>shared</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+</tr>
+<tr>
+<td>minden elem azonos</td>
+<td>shared/warp</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+</tr>
+<tr>
+<td>ferde (kb. 90% a 0. binbe)</td>
+<td>naiv</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+</tr>
+<tr>
+<td>ferde (kb. 90% a 0. binbe)</td>
+<td>shared</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+</tr>
+<tr>
+<td>ferde (kb. 90% a 0. binbe)</td>
+<td>shared/warp</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+</tr>
+</tbody>
+</table>
+<p>A <strong>várt eredmény</strong> (helyesség): a periodikus bemenetnél
+(<code>data[i] = i % 64</code>) minden rekeszre
+<code>N / NUM_BINS = 1 048 576 / 64 = 16 384</code> esik; a többi
+eloszlásnál a CPU referencia adja a várt hisztogramot, és mindhárom GPU
+változatnak ugyanezt kell produkálnia. A <strong>várt tendencia</strong>
+(nem mért): a globális atomik száma a privatizált kerneleknél
+<code>grid_size × NUM_BINS</code> (például 46 SM és 6 rezidens blokk/SM
+esetén <code>276 × 64 = 17 664</code>; a blokk/SM érték az occupancy
+API-ból jön, ellenőrzendő), a naiv kernelnél <code>N = 1 048 576</code>;
+ez nagyságrendileg 59-szeres csökkenés a globális atomi műveletekben, de
+a futásidő-nyereség ebből nem következik automatikusan. A periodikus
+bemenetnél egy warp 32 egymást követő, különböző bint ér el (nincs
+azonos-bin kontenció és nincs bank conflict), ezért ott a három változat
+közötti különbség a legkisebb; az „azonos elem” és a ferde eloszlásnál a
+kontenció a naiv és a blokkszintű változatot sújtja jobban, a per-warp
+változat a warpok közötti kontenciót csökkenti. A tényleges értékeket a
+mérés adja.</p>
+<h4 data-number="16.3.5.4" id="kiegészítő-lehetőségek"><span
+class="header-section-number">16.3.5.4</span> Kiegészítő
+lehetőségek</h4>
+<p>A labor bővíthető a következőkkel:</p>
+<ul>
+<li><strong>OpenCL implementáció</strong>: az OpenCL C-ben a
+<code>atomic_add</code> függvény hasonlóan működik, a <code>local</code>
+memória használatával. A kernel szerkezete szinte azonos, csak a
+memóriamodell és a szinkronizáció
+(<code>barrier(CLK_LOCAL_MEM_FENCE)</code>) különbözik. A méréshez az
+OpenCL időmérőit (<code>clGetEventProfilingInfo</code>)
+használhatjuk.</li>
+<li><strong>JAX implementáció</strong>: a JAX-ben a
+<code>jax.lax.segment_sum</code> vagy az <code>jax.numpy.bincount</code>
+függvény hasonló műveletet végez, de ott a háttérben az XLA fordítja a
+kódot GPU/TPU kernelre. A hisztogram ott is atomi műveleteket vagy
+redukciót használ, és a teljesítmény az eszköztől függ.</li>
+<li><strong>Warp-szintű aggregáció</strong>: a
+<code>hist_shared_warp</code> kiegészítése
+<code>__match_any_sync</code>-kel (CC 7.0+), és a hatás mérése a ferde
+eloszláson.</li>
+<li><strong>Nsight Compute</strong>: a shared atomik és a bank conflict
+metrikák (<code>..._op_atom</code> család, nevek:
+<code>ncu --query-metrics</code>) összehasonlítása a kernelek
+között.</li>
+<li><strong>CUB <code>DeviceHistogram</code></strong>: könyvtári
+referencia a helyesség és a teljesítmény összevetéséhez (a CUB általános
+kétlépcsős hívási mintáját a 16.4 mutatja be; a
+<code>HistogramEven</code> paraméterezését a CUB dokumentációja adja,
+ellenőrizendő a telepített verzióban).</li>
+</ul>
+<h3 data-number="16.3.6" id="összefoglalás-és-önellenőrző-kérdés"><span
+class="header-section-number">16.3.6</span> Összefoglalás és önellenőrző
+kérdés</h3>
+<p>Ebben az alfejezetben megvizsgáltuk a hisztogram két GPU-s
+megvalósítását: a naiv, globális atomi műveleteken alapuló megoldást és
+a blokkszintű privatizációt, amely a kontenció csökkentésére shared
+memóriát használ. Bemutattuk a shared memória bank conflict és az
+azonos-bin atomi kontenció különbségét, valamint azt, hogy a padding nem
+old meg adatfüggő ütközéseket; a per-warp replikáció és a warp-szintű
+aggregáció a használható technikák. A laborban egy teljes CUDA C++
+program (nem futtatott, statikusan átnézett) segítségével mérhető a
+három megközelítés teljesítménye több eloszláson, és ellenőrizhető a
+helyesség a CPU referencia alapján.</p>
+<p><strong>Önellenőrző kérdés:</strong> Miért gyorsabb a blokkszintű
+privatizált hisztogram, mint a közvetlen globális atomi összeadás, és
+milyen feltételek mellett nem érvényesül ez az előny? (Válasz: mert a
+globális atomi műveletek sorosítják a hozzáférést a memóriavezérlőn, míg
+a shared memóriás atomi műveletek gyorsak és blokkon belül maradnak; az
+előny akkor csökken, ha a rekeszek száma olyan nagy, hogy a shared
+memória nem fér el, vagy ha a bank conflict miatt a shared memória
+hozzáférés is sorosítódik, illetve ha a bemeneti eloszlás nagyon
+egyenletes és a kontenció eleve kicsi. A shared memóriás atomik
+ütközései adatfüggők: azonos bin atomi kontenciót, különböző bin azonos
+bankban bank conflictot okoz.)</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu059.html">← 16.2 Scan (prefix sum)</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu061.html">16.4 CUB és Thrust használata →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

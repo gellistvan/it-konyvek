@@ -1,0 +1,835 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>25.4 Aszinkron tervezési minták – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – CUDA-ökoszisztéma és mélytanulás</a> › <a href="index.html#gpuch24">25 Streams, events, CUDA graphs és aszinkron végrehajtás</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu096.html">← 25.3 CUDA graphs</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu098.html">26.1 Több GPU és peer access →</a></div>
+</nav>
+<h2 data-number="25.4" id="gpu097"><span
+class="header-section-number">25.4</span> Aszinkron tervezési
+minták</h2>
+<p>Az aszinkron tervezési minták akkor válnak meghatározóvá, amikor a
+GPU-t nem egyetlen köteg futtatására használjuk, hanem adatfolyamot,
+szolgáltatást vagy interaktív munkamenetet kiszolgáló erőforrásként.
+Ilyenkor már nem elég egy kernel gyorsasága; a host és az eszköz közötti
+átfedés, a folyamatos ütemezés, a hibakezelés és a leállítás is a
+rendszer része. Az alábbi alfejezet a hosszú futású és interaktív
+GPU-munka tervezési elveit, a callback- és event-alapú
+befejezéskezelést, valamint a leállítási és hibakezelési mintákat
+tekinti át.</p>
+<h3 data-number="25.4.1" id="hosszú-futású-gpu-munka"><span
+class="header-section-number">25.4.1</span> Hosszú futású GPU-munka</h3>
+<p>Hosszú futású GPU-munkának nevezzük azt az üzemmódot, amikor a GPU
+nem egyetlen rövid feladatot hajt végre, hanem órákon, napokon vagy
+folyamatosan dolgozik. Gyakori példák:</p>
+<ul>
+<li>videó- vagy jelfolyam feldolgozása,</li>
+<li>tudományos szimuláció adatfolyam-szerű mentése és újraindítása,</li>
+<li>gépi tanulási adatbetöltés és előfeldolgozás,</li>
+<li>valós idejű inferencia-kiszolgáló,</li>
+<li>Monte Carlo-szimulációk hosszú sorozata,</li>
+<li>adatbázis- vagy gráffeldolgozó rendszer GPU-gyorsított
+szakaszai.</li>
+</ul>
+<p>Ezekben az esetekben a teljes bemenet gyakran nem fér a
+GPU-memóriába, vagy éppen a kívánt válaszidő miatt chunkokra
+(darabokra), ablakokra (window) és pipeline-okra van szükség. A cél nem
+egyetlen kernel minimális futásideje, hanem a steady-state
+átbocsátóképesség, az erőforrások újrafelhasználása, a memóriaszivárgás
+elkerülése és a hibák utáni tiszta leállás.</p>
+<h3 data-number="25.4.2" id="chunkolt-feldolgozás-és-pipeline"><span
+class="header-section-number">25.4.2</span> Chunkolt feldolgozás és
+pipeline</h3>
+<p>Tegyük fel, hogy egy nagy adatfolyamot kell feldolgozni: minden
+chunkra ugyanaz a művelet fut, de a chunkok között nincs szükség
+globális sorrendre. Ekkor a klasszikus megoldás egy háromfázisú
+aszinkron GPU-pipeline (1–3. lépés), amelyet egy host oldali
+utófeldolgozás (4. lépés) zár:</p>
+<ol type="1">
+<li>host–device másolás (<code>H2D</code>),</li>
+<li>GPU-kernel végrehajtása,</li>
+<li>device–host másolás (<code>D2H</code>),</li>
+<li>host oldali utófeldolgozás, ellenőrzés vagy callback.</li>
+</ol>
+<p>A stream- és event-objektumok segítségével a másolások és a kernelek
+átfedésben futhatnak. Amíg az egyik chunk kernelét számolja a GPU, addig
+a következő chunk feltöltése és az előző chunk visszamásolása is
+folyhat, ha külön streameket használunk.</p>
+<p>A legfontosabb tervezési szabály: <strong>soha ne tegyünk globális
+szinkronizálást minden chunk végére</strong>. A
+<code>cudaDeviceSynchronize()</code> minden chunk után az összes stream
+munkáját, egy chunkonkénti <code>cudaStreamSynchronize()</code> pedig
+legalább az adott stream munkáját megvárja; mindkét esetben a host addig
+nem ad ki új chunkot, a GPU-sor kiürül, és a pipelining összeomlik.
+Helyette az egyes fázisok közötti függőségeket eventekkel kell
+kifejezni, és csak a szükséges pontokon szinkronizálni.</p>
+<h3 data-number="25.4.3" id="visszanyomás-és-korlátos-ablak"><span
+class="header-section-number">25.4.3</span> Visszanyomás és korlátos
+ablak</h3>
+<p>Ha a host gyorsabban termeli a chunkokat, mint ahogy a GPU
+feldolgozza, akkor a ki nem fejezett aszinkron műveletek,
+memóriapufferek és event-objektumok száma korlátlanul nőhet. Ez hosszú
+futású munkánál memórianyomáshoz, scheduling overheadhez és nehezen
+diagnosztizálható késésekhez vezet.</p>
+<p>A megoldás a <strong>korlátos csúszóablak</strong>: egyszerre
+legfeljebb <code>W</code> chunk lehet folyamatban. Amikor a host újabb
+chunkot szeretne indítani, előbb meg kell várnia, hogy a
+<code>W</code>-vel korábbi chunk befejeződött. Ezt meg lehet oldani:</p>
+<ul>
+<li>egy <code>std::atomic&lt;size_t&gt;</code> számlálóval, amelyet
+callback növel,</li>
+<li>eventekre való <code>cudaEventSynchronize()</code> hívással a
+legrégebbi befejezetlen chunkon,</li>
+<li>saját gyűrűpufferrel, amelyben újrahasználjuk a memóriát és az
+eseményeket.</li>
+</ul>
+<p>A gyűrűpuffer különösen hasznos, mert elkerüli a folyamatos
+allokációt. Hosszú futású rendszerben soha ne hozzunk létre minden
+chunkhoz új <code>cudaMallocHost</code>-ot, új streamet vagy új eventet;
+használjunk előre lefoglalt poolt.</p>
+<h3 data-number="25.4.4" id="steady-state-és-első-válaszidő"><span
+class="header-section-number">25.4.4</span> Steady-state és első
+válaszidő</h3>
+<p>Hosszú futású munkák mérésekor külön kell választani:</p>
+<ul>
+<li><strong>első chunk latency</strong>: az első eredmény megérkezéséig
+eltelt idő, beleértve a CUDA context inicializálását, az első
+allokációkat és a warm-upot,</li>
+<li><strong>steady-state throughput</strong>: a bemelegedés utáni
+chunk/másodperc vagy GiB/s érték,</li>
+<li><strong>tail latency (farokkésleltetés)</strong>: a
+késleltetés-eloszlás magas percentilise (például p99, p99,9); a
+leállítás előtti utolsó chunkok befejezési késése ettől külön mennyiség,
+amelyet itt <strong>záró (drain) késleltetésnek</strong> nevezünk.</li>
+</ul>
+<p>A gyakorlatban az első néhány másodperc gyakran nem reprezentatív,
+ezért a benchmarkot warm-up után kell mérni. Ugyanakkor interaktív vagy
+szolgáltatásjellegű rendszerekben az első token késleltetése önálló SLA
+lehet.</p>
+<h3 data-number="25.4.5" id="interaktív-gpu-munka"><span
+class="header-section-number">25.4.5</span> Interaktív GPU-munka</h3>
+<p>Interaktív GPU-munkánál a felhasználó vagy egy másik rendszer
+kérésére rövid GPU-feladatokat indítunk, és az eredményre viszonylag
+gyorsan szükség van. Példák:</p>
+<ul>
+<li>interaktív vizualizáció, például szűrő, transzformáció vagy
+megjelenítés,</li>
+<li>kérés-válasz alapú kiértékelés,</li>
+<li>jegyzetfüzetben futtatott tudományos számítás,</li>
+<li>játék vagy valós idejű szimuláció.</li>
+</ul>
+<p>A fő cél itt nem a maximális throughput, hanem a
+<strong>válaszkészség</strong>, a <strong>haladásjelzés</strong> és a
+<strong>megszakíthatóság</strong>. Ugyanazok az aszinkron eszközök
+használhatók, de más prioritással.</p>
+<h3 data-number="25.4.6" id="ne-blokkoljuk-a-host-szálat"><span
+class="header-section-number">25.4.6</span> Ne blokkoljuk a host
+szálat</h3>
+<p>Az interaktív alkalmazás akkor lesz jól használható, ha a GPU-kérés
+közben a host képes más feladatot végezni, például frissíteni a
+felhasználói felületet, fogadni új kéréseket vagy előkészíteni a
+következő szakaszt. Ezért a <code>cudaMemcpy</code> helyett
+<code>cudaMemcpyAsync</code>, a szinkron
+<code>cudaDeviceSynchronize</code> helyett stream- vagy event-alapú
+várakozás használata indokolt.</p>
+<p>Példa haladásjelzésre:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Feltételezések (vázlat): done: std::atomic&lt;bool&gt;, amelyet a stream végén egy</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co">// host-függvény állít true-ra; progress_event: egy korábban rögzített cudaEvent_t;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co">// report_progress() és process_ui_events(): az alkalmazás saját függvényei.</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="dt">bool</span> reported <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="cf">while</span> <span class="op">(!</span>done<span class="op">.</span>load<span class="op">(</span><span class="bu">std::</span>memory_order_acquire<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>reported<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>        <span class="dt">cudaError_t</span> q <span class="op">=</span> cudaEventQuery<span class="op">(</span>progress_event<span class="op">);</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>q <span class="op">==</span> cudaSuccess<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>            report_progress<span class="op">();</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>            <span class="co">// csak egyszer jelentünk, a ciklus tovább figyeli a done-t</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>            reported <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>q <span class="op">!=</span> cudaErrorNotReady<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>            <span class="co">// más hiba (pl. aszinkron eszközhiba): nem szabad elnyelni</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>            CUDA_CHECK<span class="op">(</span>q<span class="op">);</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>    process_ui_events<span class="op">();</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>this_thread::sleep_for<span class="op">(</span><span class="bu">std::</span>chrono::milliseconds<span class="op">(</span><span class="dv">10</span><span class="op">));</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>cudaEventQuery</code> nem blokkol: ha az esemény még nem
+következett be, <code>cudaErrorNotReady</code> értéket ad, így a hívó
+tovább tud lépni; minden más nem-<code>cudaSuccess</code> visszatérési
+érték valódi hiba, amelyet ellenőrizni kell.</p>
+<h3 data-number="25.4.7" id="megszakítás-és-prioritás"><span
+class="header-section-number">25.4.7</span> Megszakítás és
+prioritás</h3>
+<p>Interaktív munkában gyakori, hogy a felhasználó megszakít egy
+hosszabb számítást. A GPU-n futó kernel kívülről ritkán állítható le
+közvetlenül; a leállítás kooperatív. A bevett minta:</p>
+<ul>
+<li>a kernel ciklusában rendszeresen ellenőriz egy <code>cancel</code>
+flaget, amelyet <code>volatile</code>-ként vagy atomi hozzáféréssel
+(például <code>cuda::atomic_ref</code>) olvas, különben a fordító
+regiszterben tarthatja az értéket, és a kernel sosem látja a host által
+írt újat,</li>
+<li>ha a flag igaz, a kernel kiszáll,</li>
+<li>a flaget a host vagy egy külön vezérlő streamen (NonBlocking, pinned
+forrásból) <code>cudaMemcpyAsync</code> írja be – ez csak akkor működik,
+ha a másolás a kernellel egyidejűleg futhat –, vagy egyszerűbben mapped
+(zero-copy) pinned flaget használunk, amelyet a host közvetlenül
+ír.</li>
+</ul>
+<pre class="cuda"><code>// Host: pinned, mapped flag (zero-copy); vázlat, nem fordítva
+int *h_cancel, *d_cancel;
+cudaHostAlloc(&amp;h_cancel, sizeof(int), cudaHostAllocMapped);
+cudaHostGetDevicePointer(&amp;d_cancel, h_cancel, 0);
+*h_cancel = 0;
+
+__global__ void long_kernel(const float* in, float* out, size_t n,
+                            const volatile int* cancel) {
+    size_t stride = size_t(gridDim.x) * blockDim.x;
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i &lt; n; i += stride) {
+        if (*cancel) return;      // az olvasás költsége miatt ritkábban is ellenőrizhető
+        out[i] = 2.0f * in[i];
+    }
+}
+// Megszakításkor a host egyszerűen: *(volatile int*)h_cancel = 1;</code></pre>
+<p>A flag minden iterációban történő olvasása költséges lehet, ezért
+hosszú kernelnél érdemes csak minden k-adik iterációban ellenőrizni. Ez
+a megoldás nagy grid-stride loopoknál jól működik. Rövid, egyetlen
+hullámból álló kerneleknél általában nincs értelme, mert a kernel
+hamarabb befejeződik, mint ahogy a megszakítás eljutna hozzá. Ilyenkor
+inkább a chunkok közötti leállítás a megoldás: egy batch feldolgozását
+chunkokra osztjuk, és minden chunk indítása előtt a host lekérdezi a
+megszakítási kérést.</p>
+<p>CUDA-stream szinten prioritást is be lehet állítani:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> high <span class="op">=</span> <span class="dv">0</span><span class="op">,</span> low <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>cudaDeviceGetStreamPriorityRange<span class="op">(&amp;</span>low<span class="op">,</span> <span class="op">&amp;</span>high<span class="op">);</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="dt">cudaStream_t</span> interactive_stream<span class="op">;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>cudaStreamCreateWithPriority<span class="op">(&amp;</span>interactive_stream<span class="op">,</span> cudaStreamNonBlocking<span class="op">,</span> high<span class="op">);</span></span></code></pre></div>
+<p>Így a fontos interaktív kernel megelőzheti a háttérben futó munkát. A
+prioritásos ütemezés pontos viselkedése GPU- és driverfüggő, ezért
+méréssel kell igazolni.</p>
+<h3 data-number="25.4.8"
+id="event-és-callback-a-befejezés-kezelésére"><span
+class="header-section-number">25.4.8</span> Event és callback a
+befejezés kezelésére</h3>
+<p>A CUDA aszinkron modelljében az <strong>event</strong> az
+eszközműveletek közötti függőség és a befejezés megfigyelésének alapvető
+eszköze. A <strong>callback</strong> pedig lehetővé teszi, hogy a host
+egy stream adott pontján automatikusan értesüljön, anélkül hogy blokkoló
+szinkronizálást hívnánk.</p>
+<h3 data-number="25.4.9" id="event-mint-függőségi-pont"><span
+class="header-section-number">25.4.9</span> Event mint függőségi
+pont</h3>
+<p>Egy eventet egy streamhez rögzítünk:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>cudaEventRecord<span class="op">(</span>copy_done<span class="op">,</span> copy_stream<span class="op">);</span></span></code></pre></div>
+<p>Ez azt jelenti, hogy az event akkor válik befejezetté, amikor a
+<code>copy_stream</code> összes, az event rögzítése előtti művelete
+lezárult. Egy másik stream így várhat rá:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a>cudaStreamWaitEvent<span class="op">(</span>compute_stream<span class="op">,</span> copy_done<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>cudaMemcpyAsync<span class="op">(...,</span> compute_stream<span class="op">);</span> <span class="co">// vagy kernel</span></span></code></pre></div>
+<p>Ez a mechanizmus az alapja a H2D → kernel → D2H pipeline-nak. Az
+eventek között elapsed time is mérhető:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="dt">float</span> ms <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>cudaEventElapsedTime<span class="op">(&amp;</span>ms<span class="op">,</span> start<span class="op">,</span> stop<span class="op">);</span></span></code></pre></div>
+<p>Időmérésre azonban külön eventpárt használjunk, és a mérést ne
+keverjük a funkcionális függőségi eventekkel.</p>
+<h3 data-number="25.4.10" id="callback-host-oldali-értesítésre"><span
+class="header-section-number">25.4.10</span> Callback host oldali
+értesítésre</h3>
+<p>A streamhez host-oldali függvényt a
+<code>cudaLaunchHostFunc(stream, fn, userData)</code> hívással adhatunk
+(szignatúra: <code>void CUDART_CB fn(void* userData)</code>,
+<code>cudaHostFn_t</code>). A régebbi <code>cudaStreamAddCallback</code>
+elavult (deprecated) a <code>cudaLaunchHostFunc</code> javára, és más
+szignatúrájú callbacket vár:
+<code>void CUDART_CB cb(cudaStream_t stream, cudaError_t status, void* userData)</code>;
+a kettő nem keverhető. A host-függvény akkor fut le, amikor a streamben
+az összes korábbi eszközművelet befejeződött:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">// cudaLaunchHostFunc(stream, my_callback, &amp;counter);</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> CUDART_CB my_callback<span class="op">(</span><span class="dt">void</span><span class="op">*</span> user_data<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span><span class="op">*</span> data <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;*&gt;(</span>user_data<span class="op">);</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    data<span class="op">-&gt;</span>fetch_add<span class="op">(</span><span class="dv">1</span><span class="op">,</span> <span class="bu">std::</span>memory_order_release<span class="op">);</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A callback a stream sorrendjében hajtódik végre, de host-kód, nem
+GPU-kód. <strong>Szabály:</strong> a callbackből semmilyen CUDA API nem
+hívható (sem szinkronizáló, sem aszinkron), mert az nem engedélyezett; a
+callback ezen felül legyen rövid és ne blokkoljon, mert a stream további
+műveleteinek ütemezését is feltartja.</p>
+<p>Gyakori kombináció:</p>
+<ol type="1">
+<li>A kernel után
+<code>cudaEventRecord(compute_done, compute_stream)</code>.</li>
+<li>A másoló stream <code>cudaStreamWaitEvent</code>-tel megvárja.</li>
+<li>A D2H másolás után <code>cudaLaunchHostFunc</code> értesíti a
+hostot, hogy az eredmény a host memóriában van.</li>
+<li>A callback növeli a befejezett chunkok számlálóját, vagy jelzi egy
+<code>std::condition_variable</code>-nek az új eredményt.</li>
+</ol>
+<p>Így a host nem kénytelen folyamatosan pollozni, az értesítés
+automatikus.</p>
+<h3 data-number="25.4.11" id="tervezési-hiba-callback-túlterhelés"><span
+class="header-section-number">25.4.11</span> Tervezési hiba: callback
+túlterhelés</h3>
+<p>Hibás minta:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> CUDART_CB bad_callback<span class="op">(</span><span class="dt">void</span><span class="op">*</span> data<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">// TILOS: CUDA API-hívás callbackből (szabályszegés, nem csak lassú)</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    cudaStreamSynchronize<span class="op">(</span><span class="kw">nullptr</span><span class="op">);</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    heavy_cpu_work<span class="op">();</span>                <span class="co">// rossz: hosszú munka a stream ütemezőjében</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Az első sor szabályszegés (a callbackből CUDA API nem hívható), a
+második teljesítményhiba: egy hosszú pipeline-ban visszafogja a
+következő chunkok ütemezését. Helyes megoldás: a callback csak jelölje,
+hogy egy munka elkészült, a tényleges feldolgozást pedig egy másik host
+szál végezze.</p>
+<h3 data-number="25.4.12" id="hibakezelés-aszinkron-környezetben"><span
+class="header-section-number">25.4.12</span> Hibakezelés aszinkron
+környezetben</h3>
+<p>Az aszinkron CUDA-hívásoknál a hiba nem mindig ott jelentkezik, ahol
+keletkezett. A <code>cudaMemcpyAsync</code>, a kernelindítás vagy a
+<code>cudaEventRecord</code> azonnal visszatérhet, a tényleges hiba
+később, egy szinkronizáló híváskor jelenik meg.</p>
+<h3 data-number="25.4.13" id="késleltetett-hibák"><span
+class="header-section-number">25.4.13</span> Késleltetett hibák</h3>
+<p>A kernelindítás után a <code>cudaGetLastError()</code> csak a launch
+szintű hibákat mutatja, például érvénytelen grid- vagy blockméretet,
+hiányzó eszközt vagy rossz streamet. Az aszinkron végrehajtás közben
+keletkező memóriahibák, illegal instruction vagy eszközhibák gyakran
+csak a következő pontokon figyelhetők meg:</p>
+<ul>
+<li><code>cudaStreamSynchronize(stream)</code>,</li>
+<li><code>cudaEventSynchronize(event)</code>,</li>
+<li><code>cudaEventQuery(event)</code>,</li>
+<li><code>cudaDeviceSynchronize()</code>,</li>
+<li>a következő CUDA-hívás, amely a context állapotát ellenőrzi.</li>
+</ul>
+<p>Emiatt a megbízható CUDA-kód minden aszinkron folyamat végén
+szinkronizál, és a szinkronizálás után is ellenőrzi a hibát.</p>
+<h3 data-number="25.4.14"
+id="hibaellenőrző-makró-aszinkron-műveletekhez"><span
+class="header-section-number">25.4.14</span> Hibaellenőrző makró
+aszinkron műveletekhez</h3>
+<p>A könyv kanonikus <code>CUDA_CHECK</code> makrója (1.2) aszinkron
+pipeline-ban is használható; a lényeg, hogy a szinkronizáló hívások
+visszatérési értékét is ellenőrizzük:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUDA_CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp">                                        </span><span class="op">\</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                                        </span><span class="op">\</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="dt">cudaError_t</span><span class="pp"> </span><span class="va">err_</span><span class="pp"> </span><span class="op">=</span><span class="pp"> </span><span class="op">(</span>call<span class="op">);</span><span class="pp">                              </span><span class="op">\</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span><span class="va">err_</span><span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                              </span><span class="op">\</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="bu">std::</span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA error at </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp">   </span><span class="op">\</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="pp">                         </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">,</span><span class="pp">                    </span><span class="op">\</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="pp">                         </span>cudaGetErrorString<span class="op">(</span><span class="va">err_</span><span class="op">));</span><span class="pp">             </span><span class="op">\</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="bu">std::</span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                            </span><span class="op">\</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="op">}</span><span class="pp">                                                       </span><span class="op">\</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span></code></pre></div>
+<p>A makrót a launch előtti és a szinkronizáló hívásokra is használjuk.
+A <code>cudaStreamSynchronize</code> visszatérési értékét például mindig
+ellenőrizni kell:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a>CUDA_CHECK<span class="op">(</span>cudaStreamSynchronize<span class="op">(</span>compute_stream<span class="op">));</span></span></code></pre></div>
+<h3 data-number="25.4.15"
+id="leállítás-és-erőforrás-felszabadítás"><span
+class="header-section-number">25.4.15</span> Leállítás és
+erőforrás-felszabadítás</h3>
+<p>A leállítás sorrendje aszinkron rendszerben:</p>
+<ol type="1">
+<li>Jelezzük a termelő szálnak, hogy ne indítson újabb chunkot.</li>
+<li>Megvárjuk a folyamatban lévő chunkok befejezését.</li>
+<li>Szinkronizáljuk az összes streamet és eventet.</li>
+<li>Felszabadítjuk a device- és host-memóriákat.</li>
+<li>Töröljük az eventeket és streameket.</li>
+</ol>
+<p>Tipikus hiba, ha a host memóriát felszabadítja, miközben egy stream
+még mindig használja:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Hibás: a másolás host-oldali célpufferét felszabadítjuk, de a stream még nem fejeződött be</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="co">// (h_dst: pinned host puffer, d_src: device puffer)</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>cudaMemcpyAsync<span class="op">(</span>h_dst<span class="op">,</span> d_src<span class="op">,</span> bytes<span class="op">,</span> cudaMemcpyDeviceToHost<span class="op">,</span> stream<span class="op">);</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>cudaFreeHost<span class="op">(</span>h_dst<span class="op">);</span> <span class="co">// rossz: lehet, hogy a másolás még folyamatban van</span></span></code></pre></div>
+<p>Helyes sorrend:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a>cudaMemcpyAsync<span class="op">(</span>h_dst<span class="op">,</span> d_src<span class="op">,</span> bytes<span class="op">,</span> cudaMemcpyDeviceToHost<span class="op">,</span> stream<span class="op">);</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>CUDA_CHECK<span class="op">(</span>cudaStreamSynchronize<span class="op">(</span>stream<span class="op">));</span>   <span class="co">// előbb megvárjuk a másolást</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>CUDA_CHECK<span class="op">(</span>cudaFreeHost<span class="op">(</span>h_dst<span class="op">));</span></span></code></pre></div>
+<p>Ne építsünk a felszabadító hívások esetleges implicit szinkronizáló
+viselkedésére: a <code>cudaFree</code>/<code>cudaFreeHost</code>
+szinkronizációs tulajdonságai nem a megbízható mintát jelentik, a
+sorrendet mi biztosítjuk.</p>
+<p>Ha a kernel esetleg beragadt, akkor a folyamat leállítása előtt
+watchdog- vagy timeout-mechanizmust kell alkalmazni. Többfelhasználós
+környezetben ne hívjunk meggondolatlanul
+<code>cudaDeviceReset</code>-et, mert az az eszközön lévő más
+folyamatokat is érintheti. Izolált laborban használhatunk külső
+timeoutot, például konténeres futásidő-korlátot vagy
+<code>timeout</code> parancsot.</p>
+<h3 data-number="25.4.16" id="labor-aszinkron-pipeline-tervezése"><span
+class="header-section-number">25.4.16</span> Labor: aszinkron pipeline
+tervezése</h3>
+<p>A labor célja egy olyan pipeline elkészítése, amely egy nagy
+adathalmazt chunkokra oszt, és a másolást, a GPU-számítást, valamint a
+visszamásolást event-alapú függőségekkel átfedésben végzi. A feladat a
+hosszú futású feldolgozás egy kis, ellenőrizhető modellje.</p>
+<h3 data-number="25.4.17" id="kiinduló-környezet"><span
+class="header-section-number">25.4.17</span> Kiinduló környezet</h3>
+<p>Az alábbi környezetet rögzítsük minden méréshez:</p>
+<table>
+<thead>
+<tr>
+<th>Paraméter</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU</td>
+<td>NVIDIA A100 40 GB PCIe, ECC be, MIG ki</td>
+</tr>
+<tr>
+<td>Driver</td>
+<td>550.54.14</td>
+</tr>
+<tr>
+<td>CUDA toolkit</td>
+<td>12.4</td>
+</tr>
+<tr>
+<td>Operációs rendszer</td>
+<td>Ubuntu 22.04</td>
+</tr>
+<tr>
+<td>Precision</td>
+<td>FP32</td>
+</tr>
+<tr>
+<td>Fordító</td>
+<td>nvcc, C++17</td>
+</tr>
+</tbody>
+</table>
+<p>A konkrét értékeket mindenki a saját környezetéhez igazítja; a
+naplóban nem helyettesíthetők az itt szereplő példaértékek valós
+mérésként.</p>
+<h3 data-number="25.4.18" id="kernelszámítás"><span
+class="header-section-number">25.4.18</span> Kernelszámítás</h3>
+<p>Az egyszerű feladat egy vektor skálázása:</p>
+<pre class="cuda"><code>__global__ void scale_kernel(const float* in, float* out,
+                             float alpha, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = gridDim.x * blockDim.x;
+    for (size_t i = idx; i &lt; n; i += stride) {
+        out[i] = alpha * in[i];
+    }
+}</code></pre>
+<p>A kernel memória-korlátos, ezért alkalmas a másolási átfedés
+megfigyelésére.</p>
+<h3 data-number="25.4.19" id="aszinkron-pipeline-cuda-c-ban"><span
+class="header-section-number">25.4.19</span> Aszinkron pipeline CUDA
+C++-ban</h3>
+<p>A kód <code>W = 4</code> pufferpárból és eventhármasból álló gyűrűt
+használ (korlátos csúszóablak): a <code>W</code>-vel korábbi chunk
+befejezését a host <code>cudaEventSynchronize</code>-zal megvárja,
+mielőtt a slotot újra felhasználja. A foglalás és az inicializálás a
+mért szakaszon kívül, egyszer történik. A host-függvény a befejezett
+D2H-másolást jelzi (<code>cudaLaunchHostFunc</code>). A kódot nem
+fordítottuk és nem futtattuk.</p>
+<figure id="fig-gpu097-ring-pipeline">
+<div class="fig-interactive"><iframe src="figures/html/gpu097-ring-pipeline.html" title="Felül négy slot, S0–S3, mindegyikben h_in, h_out, d_in, d_out puffer és a három esemény jelölője; az S0 a 0. és 4., az S1 az 1. és 5. chunkot kapja, és így tovább, szaggatott visszanyíl jelzi az újrahasznosítást. Alul idővonal Host, copy_stream, compute_stream és out_stream sávval: a host az első négy chunkot azonnal kiadja, majd a 4–7. chunk előtt sraffozott várakozás következik a 0–3. chunk out_done eseményéig. A stream-sávokon a H2D, a kernel és a D2H blokkok a chunk sorszámával, kör, háromszög és négyzet jelöli a copy_done, compute_done és out_done eseményt, csillag a host-függvényt. Szaggatott nyilak: a chunk 0 copy_done-ja a kernelhez, a compute_done a D2H-hoz, az out_done(0) a 4. chunk kiadásához." loading="lazy" style="width:100%;border:0;height:720px"></iframe><noscript><img src="figures/img/gpu097-ring-pipeline.png" style="width:100.0%"
+alt="Felül négy slot, S0–S3, mindegyikben h_in, h_out, d_in, d_out puffer és a három esemény jelölője; az S0 a 0. és 4., az S1 az 1. és 5. chunkot kapja, és így tovább, szaggatott visszanyíl jelzi az újrahasznosítást. Alul idővonal Host, copy_stream, compute_stream és out_stream sávval: a host az első négy chunkot azonnal kiadja, majd a 4–7. chunk előtt sraffozott várakozás következik a 0–3. chunk out_done eseményéig. A stream-sávokon a H2D, a kernel és a D2H blokkok a chunk sorszámával, kör, háromszög és négyzet jelöli a copy_done, compute_done és out_done eseményt, csillag a host-függvényt. Szaggatott nyilak: a chunk 0 copy_done-ja a kernelhez, a compute_done a D2H-hoz, az out_done(0) a 4. chunk kiadásához." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu097-ring-pipeline.png" style="width:100.0%"
+alt="Felül négy slot, S0–S3, mindegyikben h_in, h_out, d_in, d_out puffer és a három esemény jelölője; az S0 a 0. és 4., az S1 az 1. és 5. chunkot kapja, és így tovább, szaggatott visszanyíl jelzi az újrahasznosítást. Alul idővonal Host, copy_stream, compute_stream és out_stream sávval: a host az első négy chunkot azonnal kiadja, majd a 4–7. chunk előtt sraffozott várakozás következik a 0–3. chunk out_done eseményéig. A stream-sávokon a H2D, a kernel és a D2H blokkok a chunk sorszámával, kör, háromszög és négyzet jelöli a copy_done, compute_done és out_done eseményt, csillag a host-függvényt. Szaggatott nyilak: a chunk 0 copy_done-ja a kernelhez, a compute_done a D2H-hoz, az out_done(0) a 4. chunk kiadásához." /></details></div>
+<figcaption>A
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>W</mi><mo>=</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">W = 4</annotation></semantics></math>
+slotos csúszóablak és a három stream eseménylánca 8 chunkra (elméleti
+modell, illusztratív időtartamok, nem mérés): a chunk
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>i</mi><annotation encoding="application/x-tex">i</annotation></semantics></math>
+a slot
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>i</mi><mrow><mspace width="0.222em"></mspace><mrow><mi>mod</mi><mo>&#8289;</mo></mrow><mspace width="0.222em"></mspace><mn>4</mn></mrow></mrow><annotation encoding="application/x-tex">i \bmod 4</annotation></semantics></math>-et
+használja, a 4. chunk kiadása a host
+<code>cudaEventSynchronize(s.out_done)</code> hívásában a chunk 0
+<code>out_done</code> eseményéig blokkol, így egyszerre legfeljebb 4
+chunk van folyamatban.</figcaption>
+</figure>
+<pre class="cuda"><code>// CUDA C++17, nvcc 12.x
+#include &lt;cuda_runtime.h&gt;
+#include &lt;algorithm&gt;
+#include &lt;atomic&gt;
+#include &lt;chrono&gt;
+#include &lt;cmath&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;vector&gt;
+
+#define CUDA_CHECK(call)                                        \
+    do {                                                        \
+        cudaError_t err_ = (call);                              \
+        if (err_ != cudaSuccess) {                              \
+            std::fprintf(stderr, &quot;CUDA error at %s:%d: %s\n&quot;,   \
+                         __FILE__, __LINE__,                    \
+                         cudaGetErrorString(err_));             \
+            std::exit(EXIT_FAILURE);                            \
+        }                                                       \
+    } while (0)
+
+__global__ void scale_kernel(const float* in, float* out,
+                             float alpha, size_t n) {
+    size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    size_t stride = size_t(gridDim.x) * blockDim.x;
+    for (size_t i = idx; i &lt; n; i += stride) {
+        out[i] = alpha * in[i];
+    }
+}
+
+// Host-függvény (cudaHostFn_t): CUDA API nem hívható belőle
+void CUDART_CB on_d2h_done(void* user_data) {
+    static_cast&lt;std::atomic&lt;size_t&gt;*&gt;(user_data)-&gt;fetch_add(1, std::memory_order_release);
+}
+
+struct Slot {
+    float *h_in = nullptr, *h_out = nullptr, *d_in = nullptr, *d_out = nullptr;
+    cudaEvent_t copy_done, compute_done, out_done;
+};
+
+int main() {
+    const size_t chunk_count = 256;
+    const size_t n_per_chunk = 1u &lt;&lt; 20;           // 1 Mi float, 4 MiB chunkonként
+    const size_t bytes = n_per_chunk * sizeof(float);
+    const int W = 4;                               // csúszóablak: folyamatban lévő chunkok
+    const float alpha = 1.5f;
+
+    // Egyszeri előkészítés (nem mért): streamek, W darab puffer és event
+    cudaStream_t copy_stream, compute_stream, out_stream;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&amp;copy_stream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&amp;compute_stream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&amp;out_stream, cudaStreamNonBlocking));
+
+    std::vector&lt;Slot&gt; slots(W);
+    for (Slot&amp; s : slots) {
+        CUDA_CHECK(cudaMallocHost(&amp;s.h_in, bytes));
+        CUDA_CHECK(cudaMallocHost(&amp;s.h_out, bytes));
+        CUDA_CHECK(cudaMalloc(&amp;s.d_in, bytes));
+        CUDA_CHECK(cudaMalloc(&amp;s.d_out, bytes));
+        for (size_t j = 0; j &lt; n_per_chunk; ++j) s.h_in[j] = static_cast&lt;float&gt;(j) * 0.001f;
+        CUDA_CHECK(cudaEventCreate(&amp;s.copy_done));
+        CUDA_CHECK(cudaEventCreate(&amp;s.compute_done));
+        CUDA_CHECK(cudaEventCreate(&amp;s.out_done));
+    }
+
+    std::atomic&lt;size_t&gt; finished{0};
+
+    // Egy teljes pipeline-futás count darab chunkkal; a függvény a végén minden streamet
+    // szinkronizál
+    auto run_pipeline = [&amp;](size_t count) {
+        finished.store(0);
+        for (size_t i = 0; i &lt; count; ++i) {
+            Slot&amp; s = slots[i % W];
+            // Csúszóablak: a slot előző használatának (W-vel korábbi chunk) végét megvárjuk.
+            // Soha nem rögzített eventre a cudaEventSynchronize azonnal visszatér.
+            CUDA_CHECK(cudaEventSynchronize(s.out_done));
+
+            CUDA_CHECK(cudaMemcpyAsync(s.d_in, s.h_in, bytes,
+                                    cudaMemcpyHostToDevice, copy_stream));
+            CUDA_CHECK(cudaEventRecord(s.copy_done, copy_stream));
+
+            CUDA_CHECK(cudaStreamWaitEvent(compute_stream, s.copy_done, 0));
+            int block = 256;
+            int grid = static_cast&lt;int&gt;((n_per_chunk + block - 1) / block);
+            scale_kernel&lt;&lt;&lt;grid, block, 0, compute_stream&gt;&gt;&gt;(
+                s.d_in, s.d_out, alpha, n_per_chunk);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaEventRecord(s.compute_done, compute_stream));
+
+            CUDA_CHECK(cudaStreamWaitEvent(out_stream, s.compute_done, 0));
+            CUDA_CHECK(cudaMemcpyAsync(s.h_out, s.d_out, bytes,
+                                    cudaMemcpyDeviceToHost, out_stream));
+            CUDA_CHECK(cudaLaunchHostFunc(out_stream, on_d2h_done, &amp;finished));
+            CUDA_CHECK(cudaEventRecord(s.out_done, out_stream));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(copy_stream));
+        CUDA_CHECK(cudaStreamSynchronize(compute_stream));
+        CUDA_CHECK(cudaStreamSynchronize(out_stream));
+    };
+
+    // Warm-up (nem mért): 5 teljes futás
+    const int kWarm = 5, kReps = 20;
+    for (int w = 0; w &lt; kWarm; ++w) run_pipeline(chunk_count);
+
+    // Mérés: 20 ismétlés; host-időmérő a teljes, host-szinkronizált átfutás körül
+    // (a chunkok végigfutása a host szempontjából: kiadás + mindhárom stream
+    // szinkronizálása), ezért itt a host-óra indokolt
+    bool ok = true;
+    std::vector&lt;double&gt; times;
+    for (int rep = 0; rep &lt; kReps; ++rep) {
+        auto t0 = std::chrono::steady_clock::now();
+        run_pipeline(chunk_count);
+        auto t1 = std::chrono::steady_clock::now();
+        times.push_back(std::chrono::duration&lt;double, std::milli&gt;(t1 - t0).count());
+        if (finished.load(std::memory_order_acquire) != chunk_count) ok = false;
+        std::printf(&quot;rep %d: %.3f ms\n&quot;, rep, times.back());
+    }
+
+    // Eredményellenőrzés (nem mért): minden slot h_out puffere == alpha * h_in
+    for (const Slot&amp; s : slots) {
+        for (size_t j = 0; j &lt; n_per_chunk; ++j) {
+            float expect = alpha * s.h_in[j];
+            float tol = 1e-5f * std::fabs(expect) + 1e-7f;
+            if (std::fabs(s.h_out[j] - expect) &gt; tol) { ok = false; break; }
+        }
+    }
+
+    // Statisztika: medián és szórás
+    std::vector&lt;double&gt; sorted = times;
+    std::sort(sorted.begin(), sorted.end());
+    size_t m = sorted.size();
+    double median = (m % 2) ? sorted[m / 2] : 0.5 * (sorted[m / 2 - 1] + sorted[m / 2]);
+    double iqr = sorted[3 * m / 4] - sorted[m / 4];
+    double mean = 0.0, var = 0.0;
+    for (double t : times) mean += t;
+    mean /= times.size();
+    for (double t : times) var += (t - mean) * (t - mean);
+    double stddev = std::sqrt(var / (times.size() - 1));
+    std::printf(&quot;median=%.3f ms, IQR=%.3f ms, mean=%.3f ms, std=%.3f ms, &quot;
+                &quot;callbacks ok=%d, check=%s\n&quot;,
+                median, iqr, mean, stddev, int(finished.load() == chunk_count),
+                        ok ? &quot;PASS&quot; : &quot;FAIL&quot;);
+
+    // Leállítás: minden stream szinkronizálva volt, utána felszabadítás
+    for (Slot&amp; s : slots) {
+        CUDA_CHECK(cudaFreeHost(s.h_in));
+        CUDA_CHECK(cudaFreeHost(s.h_out));
+        CUDA_CHECK(cudaFree(s.d_in));
+        CUDA_CHECK(cudaFree(s.d_out));
+        CUDA_CHECK(cudaEventDestroy(s.copy_done));
+        CUDA_CHECK(cudaEventDestroy(s.compute_done));
+        CUDA_CHECK(cudaEventDestroy(s.out_done));
+    }
+    CUDA_CHECK(cudaStreamDestroy(copy_stream));
+    CUDA_CHECK(cudaStreamDestroy(compute_stream));
+    CUDA_CHECK(cudaStreamDestroy(out_stream));
+    return 0;
+}</code></pre>
+<p>A kódban minden kernelindítás után <code>cudaGetLastError</code>,
+minden szinkronizálás körül <code>CUDA_CHECK</code> fut. A host-függvény
+csak atomi számlálót növel, ezért rövid marad és nem hív CUDA API-t. A
+memóriafoglalás, az inicializálás és a felszabadítás nem esik a mért
+szakaszba; a puffer- és eventszám <code>W</code>-vel korlátos, nem a
+chunkok számával nő (2 × 4 × 4 MiB pinned és ugyanennyi device memória a
+2 GiB + 2 GiB helyett).</p>
+<h3 data-number="25.4.20" id="fordítás-és-futtatás"><span
+class="header-section-number">25.4.20</span> Fordítás és futtatás</h3>
+<p>Fordítás:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-o</span> async_pipeline async_pipeline.cu</span></code></pre></div>
+<p>Futtatás izolált laborban:</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="fu">timeout</span> 120 ./async_pipeline</span></code></pre></div>
+<p>Ha a kód hosszabb ideig futna, a <code>timeout</code> és a konténer
+erőforráskorlátja megakadályozza a beragadt kernelt.</p>
+<h3 data-number="25.4.21" id="mérési-napló"><span
+class="header-section-number">25.4.21</span> Mérési napló</h3>
+<p>A mérési naplóban a <strong>várt</strong> és a <strong>mért</strong>
+értékeket külön kell vezetni. Az alábbi táblázat kitöltendő; az itt
+feltüntetett számok nem tekinthetők hiteles mérésnek.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Mérőszám</th>
+<th>Várt</th>
+<th>Mért</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Teljes adatmennyiség</td>
+<td>256 × 4 MiB = 1 GiB</td>
+<td><code>&lt;rögzítendő&gt;</code></td>
+</tr>
+<tr>
+<td>Kernelszámítási idő, eszközmemória alapján</td>
+<td>≈ 2 GiB / ~1,5 TB/s ≈ 1,4 ms</td>
+<td><code>&lt;Nsight Compute vagy event&gt;</code></td>
+</tr>
+<tr>
+<td>H2D másolási idő, PCIe alapján</td>
+<td>≈ 1 GiB / ~12–25 GiB/s</td>
+<td><code>&lt;mérendő&gt;</code></td>
+</tr>
+<tr>
+<td>D2H másolási idő</td>
+<td>≈ 1 GiB / ~12–25 GiB/s</td>
+<td><code>&lt;mérendő&gt;</code></td>
+</tr>
+<tr>
+<td>Ideális átfedéses átfutás</td>
+<td>max(H2D, D2H, kernel) + overhead</td>
+<td><code>&lt;mérési napló&gt;</code></td>
+</tr>
+<tr>
+<td>20 futtatás mediánja és IQR-je (5 warm-up után; a program írja
+ki)</td>
+<td>a fenti becslésekből: ≈ max(H2D, D2H, kernel) + belépési/kilépési
+késleltetés</td>
+<td><code>&lt;mérendő&gt;</code></td>
+</tr>
+<tr>
+<td>Első chunk callback késleltetés</td>
+<td>kis, stream ütemezés + kernel</td>
+<td><code>&lt;mérendő&gt;</code></td>
+</tr>
+<tr>
+<td>H2D, kernel és D2H átfedése az Nsight Systems timeline-ban</td>
+<td>a három fázis időben átfedve látszik (vizuális ellenőrzés, nincs
+szabványos metrika)</td>
+<td><code>&lt;nsys riport / megfigyelés&gt;</code></td>
+</tr>
+</tbody>
+</table>
+<p>A várt értékeknél mindig írjuk le, mely sávszélességből vagy
+eszközteljesítményből származnak, és hogy milyen feltételezésekkel
+élünk. Például ha a PCIe irányonkénti sávszélessége 12 GiB/s, akkor a
+H2D várhatóan 1 GiB / 12 GiB/s ≈ 0,083 s, a D2H hasonló. Ha a PCIe
+duplex, a teljes átfutás közel lehet a nagyobbik irány idejéhez; ha nem
+teljesen átfedhető, akkor az összeghez.</p>
+<h3 data-number="25.4.22" id="értékelési-szempontok"><span
+class="header-section-number">25.4.22</span> Értékelési szempontok</h3>
+<p>A labor akkor sikeres, ha:</p>
+<ul>
+<li>a callbackek száma megegyezik a chunkok számával,</li>
+<li>a program <code>check=PASS</code>-t ír ki (az eredmény egyezik
+<code>alpha * h_in</code>-nel),</li>
+<li>a mért medián a várt aszinkron képlet közelében van,</li>
+<li>az Nsight Systems timeline-ban a H2D, kernel és D2H fázisok átfedése
+látható,</li>
+<li>nincs felszabadítási hiba vagy memóriaszivárgás,</li>
+<li>a leállítás után minden CUDA API-hibaellenőrzés tiszta.</li>
+</ul>
+<h3 data-number="25.4.23" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">25.4.23</span> Tipikus hibák és helyes
+megoldások</h3>
+<p>Az aszinkron tervezési mintákban visszatérő hibák:</p>
+<ol type="1">
+<li><p><strong>Default stream használata nem non-blocking
+módban.</strong> A default stream szinkronizációs szemantikája miatt az
+implicit szinkronizáció tönkreteheti az átfedést. Használjunk explicit
+streameket, és ha szükséges, <code>cudaStreamNonBlocking</code>
+flaget.</p></li>
+<li><p><strong>Esemény újrahasznosítása chunkok között.</strong> Az
+event újrarögzítése megengedett: a <code>cudaStreamWaitEvent</code> a
+híváskor érvényes legutóbbi rögzítést veszi figyelembe. Hiba akkor
+keletkezik, ha egy Record–Wait pár közé másik Record kerül, vagy ha az
+eventet még azelőtt rögzítjük újra, hogy a rá váró munka kiadása
+megtörtént. Biztonságos minta: chunkonkénti event, vagy egy gyűrűben
+újrahasznosított event, amelyet csak a rá épülő munka befejezése után
+rögzítünk újra.</p></li>
+<li><p><strong>CUDA-hívás vagy hosszú munka a callbackben.</strong> A
+callbackből (és a <code>cudaLaunchHostFunc</code> host-függvényéből)
+semmilyen CUDA API-hívás nem engedélyezett (nem csak a szinkronizáló; a
+hívás <code>cudaErrorNotPermitted</code> hibát adhat vagy nem definiált
+viselkedést okozhat), és a hosszú munka a stream további ütemezését is
+feltartja. Csak rövid értesítést (például atomi számláló növelése)
+tegyünk bele.</p></li>
+<li><p><strong>Memória felszabadítása szinkronizálás nélkül.</strong> A
+stream még használhatja a buffert. Előbb
+<code>cudaStreamSynchronize</code> vagy
+<code>cudaEventSynchronize</code>, majd
+<code>cudaFreeHost</code>.</p></li>
+<li><p><strong>A hibaellenőrzés elhagyása a szinkronizálás
+után.</strong> A launch utáni <code>cudaGetLastError</code> nem mutatja
+az aszinkron hibát. A szinkronizáló hívás visszatérési értékét is
+ellenőrizni kell.</p></li>
+<li><p><strong>Korlátlan chunk-ablak.</strong> Hosszú futású
+pipeline-ban a host elébe megy a GPU-nak, ami memórianyomást és
+event-túlcsordulást okozhat. Vezessünk be legfeljebb <code>W</code>
+folyamatban lévő chunkot.</p></li>
+<li><p><strong>Interaktív leállítás tervezése nélkül.</strong> Ha egy
+hosszú kernel nem ellenőriz leállítási flaget, a felhasználó nem tudja
+megszakítani. Tervezzük meg a kooperatív leállítás (cancel)
+mechanizmusát már a kernel API-jában.</p></li>
+</ol>
+<h3 data-number="25.4.24" id="opencl--és-jax-vonatkozások"><span
+class="header-section-number">25.4.24</span> OpenCL- és
+JAX-vonatkozások</h3>
+<p>Az aszinkron tervezési alapelvek nem csak CUDA-ra érvényesek.</p>
+<ul>
+<li><strong>OpenCL:</strong> az out-of-order command queue, a
+<code>cl_event</code> és a <code>clSetEventCallback</code> hasonló
+szerepet töltenek be. Az események parancsok (enqueue-olt műveletek)
+közötti függőségeket fejeznek ki az <code>event_wait_list</code>
+paraméterrel; akár különböző command queue-k között is, ha a queue-k
+ugyanahhoz a kontextushoz tartoznak; a kernelen belüli, work-group-ok
+közötti szinkronizációra viszont nem alkalmasak. A callback ott is
+host-oldali befejezésértesítést ad. Vázlat (nem fordítva):</li>
+</ul>
+<div class="sourceCode" id="cb17"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a>cl_event ev<span class="op">;</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a>clEnqueueNDRangeKernel<span class="op">(</span>q<span class="op">,</span> k<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> NULL<span class="op">,</span> <span class="op">&amp;</span>gsz<span class="op">,</span> NULL<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> NULL<span class="op">,</span> <span class="op">&amp;</span>ev<span class="op">);</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a>clSetEventCallback<span class="op">(</span>ev<span class="op">,</span> CL_COMPLETE<span class="op">,</span> on_complete<span class="op">,</span> user_data<span class="op">);</span> <span class="co">// host-oldali értesítés</span></span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a>clEnqueueReadBuffer<span class="op">(</span>q<span class="op">,</span> buf<span class="op">,</span> CL_FALSE<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> n<span class="op">,</span> host<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="op">&amp;</span>ev<span class="op">,</span> NULL<span class="op">);</span> <span class="co">// függ a kerneltől</span></span></code></pre></div>
+<ul>
+<li><strong>JAX:</strong> az API hívásai gyakran aszinkron dispatch-ek;
+a <code>block_until_ready()</code> explicit szinkronizálás, a hiánya
+pedig lehetővé teszi az XLA által szervezett pipeline-t. A JAX-keretben
+a callback- és eseménykezelés gyakran rejtve marad, de a sharding és az
+eszköz-összehangolás mögött ugyanazok a függőségi gráfok dolgoznak.
+Példa: <code>y = f(x); y.block_until_ready()</code> megvárja az
+aszinkron dispatch eredményét, ezért időméréshez szükséges (vázlat, nem
+futtatva).</li>
+</ul>
+<h3 data-number="25.4.25" id="önellenőrző-kérdések"><span
+class="header-section-number">25.4.25</span> Önellenőrző kérdések</h3>
+<ol type="1">
+<li>Miért nem elég a <code>cudaGetLastError()</code> közvetlenül a
+kernelindítás után egy hosszú aszinkron pipeline hibáinak
+kimutatására?</li>
+<li>Hogyan tervezd meg egy olyan GPU-feladat leállítását, amely egyetlen
+nagy grid-stride kernelben dolgozik fel egy nagy adathalmazt?</li>
+<li>Milyen veszélye van annak, ha hosszú futású pipeline-ban minden
+chunkhoz új pinned memóriát allokálunk?</li>
+<li>Mi a különbség a <code>cudaEventQuery</code>, a
+<code>cudaEventSynchronize</code> és a
+<code>cudaStreamSynchronize</code> szerepe között egy interaktív
+alkalmazásban?</li>
+</ol>
+<p>Megoldókulcs (röviden):</p>
+<ol type="1">
+<li>A <code>cudaGetLastError()</code> csak a launch-szintű hibákat adja;
+az aszinkron végrehajtási hibák (illegal address, eszközhiba) csak a
+későbbi szinkronizáló hívásnál vagy lekérdezésnél jelennek meg, ezért
+ott kell ellenőrizni a visszatérési értéket.</li>
+<li>Kooperatív leállítás: <code>volatile</code>/atomi, mapped host
+<code>cancel</code> flag, amelyet a kernel a ciklusában (esetleg
+ritkábban) ellenőriz; vagy a munkát chunkokra osztjuk és a chunkok
+között ellenőrizzük a kérést.</li>
+<li>A foglalás költséges és fragmentál, a pinned memória korlátos
+erőforrás (a fizikai lapok lefoglalása a hostot terheli), és a pufferek
+száma korlátlanul nőhet; megoldás: <code>W</code> elemű gyűrűpuffer
+előre foglalt memóriával.</li>
+<li>A <code>cudaEventQuery</code> nem blokkol
+(<code>cudaSuccess</code>/<code>cudaErrorNotReady</code>), a
+<code>cudaEventSynchronize</code> egy pontig, a
+<code>cudaStreamSynchronize</code> a stream teljes eddigi munkájáig
+blokkol; interaktív felületen az első alkalmas a pollozásra, a másik
+kettő csak külön szálon.</li>
+</ol>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu096.html">← 25.3 CUDA graphs</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu098.html">26.1 Több GPU és peer access →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

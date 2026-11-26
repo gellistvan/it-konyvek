@@ -1,0 +1,873 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>33.3 Optimalizálás és mérés – GPGPU – általános célú számítások
+GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz7">VII. RÉSZ – Mérnökség és záróprojekt</a> › <a href="index.html#gpuch32">33 Záróprojekt: optimalizált GPGPU rendszer</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu127.html">← 33.2 Kernelimplementáció</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu129.html">33.4 Validáció és dokumentáció →</a></div>
+</nav>
+<h2 data-number="33.3" id="gpu128"><span
+class="header-section-number">33.3</span> Optimalizálás és mérés</h2>
+<p>A záróprojekt ezen szakasza a 33.2 alfejezetben elkészült,
+funkcionálisan már helyes kernel teljesítményét veszi célba. A hangsúly
+nem az újabb funkciókon, hanem a mérésen, a profilkép értelmezésén és a
+hangolási döntések igazolásán van. A módszertant egy kis, ellenőrizhető
+<strong>1D, 3 pontos stencil mikrobenchmarkon</strong> mutatjuk be, mert
+ezen a tiling, az occupancy és a stream-alapú átfedés hatása jól
+elkülöníthető, a numerikus ellenőrzés (CPU-referencia) pedig egyszerű.
+Ez nem helyettesíti a záróprojekt kernelét: az utolsó feladatban (6.)
+ugyanezt a ciklust a 33.2 <code>heat_step_tiled</code> kernelére és a
+33.1 charter metrikáira kell alkalmazni, ugyanazzal a mérési
+protokollal.</p>
+<h3 data-number="33.3.1"
+id="a-teljesítmény-hangolása-mint-mérésvezérelt-folyamat"><span
+class="header-section-number">33.3.1</span> A teljesítmény hangolása
+mint mérésvezérelt folyamat</h3>
+<p>A teljesítmény hangolása nem azt jelenti, hogy „kipróbálunk néhány
+trükköt, és megnézzük, gyorsabb lett-e”. Ez egy irányított kísérleti
+ciklus:</p>
+<ol type="1">
+<li><strong>Baseline rögzítése:</strong> a jelenlegi változat
+futásideje, átbocsátóképessége, erőforrás-használata és környezeti
+paraméterei.</li>
+<li><strong>Profilkép készítése:</strong> Nsight Compute vagy Nsight
+Systems segítségével megállapítjuk, hogy a kernel mire vár: memóriára,
+számításra, szinkronizációra vagy ütemezésre.</li>
+<li><strong>Hipotézis:</strong> a profilkép alapján megfogalmazzuk, mi a
+szűk keresztmetszet, és milyen beavatkozás javíthat rajta.</li>
+<li><strong>Beavatkozás:</strong> egyetlen változtatást hajtunk végre,
+például shared memory tilinget vezetünk be, módosítjuk a blokkméretet,
+vagy streamre bontjuk a feldolgozást.</li>
+<li><strong>Mérés és döntés:</strong> a változtatást ugyanazon a
+bemeneten, azonos környezetben megmérjük; ha javult, megtartjuk, ha
+romlott, visszaállítjuk, és finomítjuk a hipotézist.</li>
+</ol>
+<p>A folyamat legfontosabb eleme a mérés. GPU-n egyetlen futásidő nem
+bizonyíték: a boost-órajel, a hőmérséklet, a driver ütemezése és a
+háttérterhelés is torzíthat. Ezért minden állítást ismételt méréssel,
+szórással és rögzített környezettel kell alátámasztani.</p>
+<h3 data-number="33.3.2" id="rögzített-környezet"><span
+class="header-section-number">33.3.2</span> Rögzített környezet</h3>
+<p>A záróprojekt egyetlen referencia-konfigurációt használ (33.1–33.4);
+a mezőket a saját gépről kell kitölteni (<code>nvidia-smi</code>,
+<code>nvcc --version</code>):</p>
+<pre class="text"><code>GPU:                NVIDIA RTX A4000 (példa, a saját GPU-ra cserélendő)
+Compute capability: 8.6 (48 SM, 16 GB GDDR6, névleges 448 GB/s)
+Driver:             [kitöltendő]
+CUDA:               [kitöltendő]
+OS:                 [kitöltendő]
+Power limit:        [kitöltendő]
+ECC:                [kitöltendő]
+MIG:                [kitöltendő]
+Háttérterhelés:     nincs más GPU-folyamat</code></pre>
+<p>Ez a mező a tényleges eszközhöz igazítandó. A mérési jegyzőkönyvben
+akkor is szerepelnie kell, ha csak saját fejlesztőgépen dolgozunk. Az
+alábbi számítások a CC 8.6-os referencia-GPU-ra vonatkoznak; más compute
+capability más korlátokat ad.</p>
+<h3 data-number="33.3.3" id="mérési-protokoll"><span
+class="header-section-number">33.3.3</span> Mérési protokoll</h3>
+<p>A kernel időmérésre a <code>cudaEvent_t</code> a legmegbízhatóbb,
+mert a GPU streamjén belül mér, és nem tartalmazza a host oldali
+<code>std::chrono</code> késleltetéseit. A minta:</p>
+<pre class="cuda"><code>cudaEvent_t start, stop;
+CUDA_CHECK(cudaEventCreate(&amp;start));
+CUDA_CHECK(cudaEventCreate(&amp;stop));
+
+// Warm-up
+for (int i = 0; i &lt; 5; ++i) {
+    stencil_naive&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_in, d_out, n);
+}
+CUDA_CHECK(cudaDeviceSynchronize());
+
+// Mérés: legalább 20 ismétlés, ismétlésenként külön eseménypárral
+const int iters = 20;
+std::vector&lt;float&gt; t(iters);
+for (int i = 0; i &lt; iters; ++i) {
+    CUDA_CHECK(cudaEventRecord(start, 0));
+    stencil_naive&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_in, d_out, n);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(stop, 0));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    CUDA_CHECK(cudaEventElapsedTime(&amp;t[i], start, stop));
+}
+std::sort(t.begin(), t.end());
+float median_ms = 0.5f * (t[iters / 2 - 1] + t[iters / 2]);   // iters páros</code></pre>
+<p>A medián mellett a szórást (vagy IQR-t) és a relatív szórást is
+közölni kell. Ha a szórás 5 %-nál nagyobb, akkor a mérés nem tekinthető
+stabilnak: ellenőrizni kell a boost-órajelet, a hőmérsékletet, a
+háttérfolyamatokat vagy a kernelben lévő nem determinisztikus
+műveleteket.</p>
+<p>A sávszélességet a tényleges adatmozgatásra számítjuk, nem a névleges
+csúcsértékre. Két különböző forgalmat kell megkülönböztetni. A
+<em>logikai load/store-forgalom</em> a naiv kernelnél kimeneti
+elemenként 3 olvasás + 1 írás = <code>(3 + 1) * 4 = 16</code> bájt, a
+tiled kernelnél a halótól eltekintve (a globális memóriából) 1 olvasás +
+1 írás = 8 bájt. A <em>DRAM-forgalom</em> viszont mindkét változatnál
+közel az algoritmikus minimum, elemenként 8 bájt (4 bájt olvasás + 4
+bájt írás), mert a szomszédos szálak ismételt olvasásait az L1/L2
+gyorsítótár elnyeli. Az effektív sávszélességet ezért mindkét kernelre
+azonos, algoritmikus alapon (8 bájt/elem) számítjuk, hogy az értékek
+összehasonlíthatók legyenek; a valódi DRAM-forgalmat
+<code>ncu</code>-val kell megmérni (<code>dram__bytes_read.sum</code>,
+<code>dram__bytes_write.sum</code>). A mérési jegyzőkönyvben fel kell
+tüntetni, melyik definíciót használtuk.</p>
+<h3 data-number="33.3.4"
+id="tiling-a-gyorsítótár--és-loadstore-terhelés-csökkentése"><span
+class="header-section-number">33.3.4</span> Tiling: a gyorsítótár- és
+load/store-terhelés csökkentése</h3>
+<p>Az 1D stencil számítása:</p>
+<pre class="text"><code>out[i] = (in[i - 1] + in[i] + in[i + 1]) / 3.0f;</code></pre>
+<p>A naiv kernel közvetlenül a globális memóriából olvassa a három
+bemeneti elemet:</p>
+<pre class="cuda"><code>__global__ void stencil_naive(const float* __restrict__ in,
+                              float* __restrict__ out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &gt;= n) return;
+
+    float acc = 0.0f;
+    for (int r = -RADIUS; r &lt;= RADIUS; ++r) {
+        int j = min(max(i + r, 0), n - 1);
+        acc += in[j];
+    }
+    out[i] = acc / (2 * RADIUS + 1);
+}</code></pre>
+<p>Itt minden bemeneti elemet három különböző szál is beolvas. Az L1/L2
+cache ezt nagyrészt elnyeli, de a load/store-egységek és a gyorsítótár
+terhelése így is nagyobb a szükségesnél. A shared memory tiling lényege,
+hogy a blokk betölti a szükséges bemeneti tartományt a gyors on-chip
+memóriába, majd a belső számítások már onnan dolgoznak:</p>
+<pre class="cuda"><code>__global__ void stencil_tiled(const float* __restrict__ in,
+                              float* __restrict__ out, int n) {
+    extern __shared__ float s[];
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int local = threadIdx.x + RADIUS;
+
+    // Minden szál tölt (az n-en túli szálak is, az utolsó elemre fogva),
+    // így a részleges utolsó blokkban sincs inicializálatlan shared elem.
+    s[local] = in[min(i, n - 1)];
+
+    if (threadIdx.x &lt; RADIUS) {
+        int left = blockIdx.x * blockDim.x - RADIUS + (int)threadIdx.x;
+        s[threadIdx.x] = in[max(left, 0)];
+
+        int right = (blockIdx.x + 1) * blockDim.x + (int)threadIdx.x;
+        s[blockDim.x + RADIUS + threadIdx.x] = in[min(right, n - 1)];
+    }
+
+    __syncthreads();
+
+    if (i &lt; n) {
+        float acc = 0.0f;
+        for (int r = -RADIUS; r &lt;= RADIUS; ++r) {
+            acc += s[local + r];
+        }
+        out[i] = acc / (2 * RADIUS + 1);
+    }
+}</code></pre>
+<p>A kernel indítása dinamikus shared memory-val:</p>
+<pre class="cuda"><code>const int block = 256;
+const int shared_bytes = (block + 2 * RADIUS) * sizeof(float);
+stencil_tiled&lt;&lt;&lt;grid, block, shared_bytes&gt;&gt;&gt;(d_in, d_out, n);</code></pre>
+<p>A <code>__syncthreads()</code> garantálja, hogy minden szál befejezte
+a shared memóriába írást, mielőtt bármelyik olvasná azt. A 3 pontos
+stencil átfedő ablakokat használ: a blokk belső elemeit többször is
+felhasználjuk, de globális memóriából mindegyiket csak egyszer olvassuk
+be; a halókezelés a blokkhatároknál a szomszédos elemeket is elérhetővé
+teszi. Ez azonban nem garantál gyorsulást: mivel az L1/L2 a naiv
+változatban is újrahasznosít, a DRAM-forgalom alig változik, és a
+<code>__syncthreads()</code> meg a halo-betöltés miatt a tiled kernel
+1D, kis sugarú stencilnél akár lassabb is lehet. Hogy a tiling segít-e,
+mérés dönti el.</p>
+<h3 data-number="33.3.5" id="bank-conflict-a-tiled-stencilben"><span
+class="header-section-number">33.3.5</span> Bank conflict a tiled
+stencilben</h3>
+<p>A shared memóriás olvasás <code>s[local - 1]</code>,
+<code>s[local]</code>, <code>s[local + 1]</code> mintája egységnyi
+(stride-1) hozzáférés: egy warp 32 szála 32 egymást követő 4 bájtos szót
+olvas, ezek 32 különböző bankba esnek, tehát <strong>nincs bank
+conflict</strong>. A három olvasás egymástól független utasítás, nem
+kerül egy időben ugyanabba a bankba. Bank conflict akkor keletkezne, ha
+a szálak eltolása a bankszámmal (32) nem relatív prím, például
+<code>s[2 * tid]</code> (2-way conflict) vagy egy 32 széles 2D tömb
+oszlopirányú olvasása; az utóbbi tipikus gyógymódja a padding
+(<code>float tile[32][33]</code>). Az 1D stencilnél ezért ez nem szűk
+keresztmetszet, de a
+<code>l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum</code>
+metrikával ellenőrizhető (várt érték: 0; a metrikanevet
+<code>ncu --query-metrics</code> kimenettel ellenőrizzük). A 33.2
+alfejezet 18 × 18-as csempéje viszont 16 × 16-os blokkal 2-utas
+konfliktust ad: egy warp két 16 szálas sora 18 szónyi eltolással olvas,
+így két-két szál ugyanarra a bankra esik (a konfliktusfok Pythonban
+számolva, nem mérve). Megszüntethető 32 × 8-as blokkal (egy warp = egy
+csempesor, <code>tile[TILE_Y + 2][32 + 2]</code>), vagy úgy, hogy a
+sorhossz 16-tal kongruens legyen 32 szerint (pl. 48 szó, több padding);
+hogy megéri-e, a metrika és a futásidő dönti el.</p>
+<h3 data-number="33.3.6" id="occupancy-és-launch-paraméterek"><span
+class="header-section-number">33.3.6</span> Occupancy és launch
+paraméterek</h3>
+<p>A tiling önmagában nem elég, ha a kernel nem tud elég aktív warpot
+futtatni a késleltetés elrejtéséhez. Az occupancy azt mutatja meg, hogy
+az SM-en elérhető maximális warpszámhoz képest mennyi aktív warp
+van:</p>
+<pre class="text"><code>occupancy = aktív warpok / maximális warpok SM-enként</code></pre>
+<p>A korlátokat a regiszterhasználat, a shared memory, a szálszám és a
+blokkszám együtt adja; a legszigorúbb dönt. A számítás a CC 8.6-os
+referencia-GPU-ra érvényes (SM-enként legfeljebb 1536 szál = 48 warp,
+legfeljebb 16 blokk, 65 536 regiszter, 100 KB shared memory; a 8.0 és
+9.0 más: 64 warp). A példakódban a <code>stencil_tiled</code>
+<code>block = 256</code> mérettel és
+<code>shared_bytes = (256 + 2) * 4 = 1032</code> bájttal fut. Ha a
+fordító 32 regisztert használ szálanként (az érték a fordítótól függ,
+<code>-Xptxas -v</code>-vel kell megnézni), a regiszterkorlát:</p>
+<pre class="text"><code>65536 / (256 * 32) = 8 blokk</code></pre>
+<p>A shared memory korlátot 100 KB SM-enkénti kerettel számolva (a
+blokkonkénti futásidejű foglalás miatt kissé kevesebb, de
+nagyságrendileg):</p>
+<pre class="text"><code>100 * 1024 / 1032 ≈ 99 blokk</code></pre>
+<p>A szálkorlát:</p>
+<pre class="text"><code>1536 / 256 = 6 blokk  (6 * 8 = 48 warp)</code></pre>
+<p>A legszigorúbb korlát tehát a szálkorlát: 6 blokk, azaz 48 aktív
+warp, ami a 48 warpos maximumhoz képest 100 %-os elméleti occupancy (a
+regiszterkorlát 8 blokkot engedne, de ez nem érvényesül). Ez kedvező, de
+nem szabad vakon maximalizálni.</p>
+<p>Az alacsonyabb occupancy nem mindig rossz. Ha egy kernel
+compute-bound, és a szálaknak több regiszterre van szükségük, a magas
+blokkszám miatti regiszterkiömlés (spill) drágább lehet, mint a kisebb
+foglaltság. Ilyenkor a <code>__launch_bounds__</code> direktíva segíthet
+a fordítónak a regiszterhasználat korlátozásában:</p>
+<pre class="cuda"><code>__global__ __launch_bounds__(256, 2)
+void stencil_tiled(...) { ... }</code></pre>
+<p>Ez azt mondja a fordítónak, hogy SM-enként legalább 2 blokkot
+szeretnénk futtatni. A <code>nvcc</code> ekkor úgy osztja el a
+regisztereket, hogy a cél elérhető legyen. A
+<code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code> API-val
+futásidőben lekérdezhetjük az elméleti (a kernel erőforrásigényéből
+számolt) foglaltságot; a ténylegesen elért értéket az Nsight Compute
+mutatja:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> num_blocks_per_sm <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>CUDA_CHECK<span class="op">(</span>cudaOccupancyMaxActiveBlocksPerMultiprocessor<span class="op">(</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>    <span class="op">&amp;</span>num_blocks_per_sm<span class="op">,</span> stencil_tiled<span class="op">,</span> block<span class="op">,</span> shared_bytes<span class="op">));</span></span></code></pre></div>
+<p>A laborban érdemes a blokkméretet 128, 256 és 512 között is
+megvizsgálni. A túl kicsi blokk növeli a halók relatív költségét, a túl
+nagy blokk csökkenti az ütemezési rugalmasságot, és a tail-effect miatt
+az utolsó blokk kihasználatlan lehet. A Nsight Compute
+<code>Occupancy</code> szekciója megmutatja a tényleges értéket (például
+az <code>sm__warps_active.avg.pct_of_peak_sustained_active</code>
+metrika); a metrikaneveket <code>ncu --query-metrics</code> kimenettel
+ellenőrizzük.</p>
+<h3 data-number="33.3.7" id="streamek-és-átfedés"><span
+class="header-section-number">33.3.7</span> Streamek és átfedés</h3>
+<p>A záróprojekt gyakran nem egyetlen kernelből áll: host-device
+másolás, több kernel és utófeldolgozás is tartozik hozzá. Ha a host
+sorosan vár minden lépésre, a GPU kihasználatlan marad. A stream-ek
+segítségével a memóriamásolást és a kernelszámítást átfedhetjük.</p>
+<p>Az 1D stencil streamesített változata a bemenetet négy darabra
+bontja. A stencil a chunk határán a szomszéd chunk elemeit is olvassa,
+ezért a kernel csak akkor indulhat, ha a két szomszédos chunk H2D
+másolása is befejeződött; ezt eseményekkel
+(<code>cudaStreamWaitEvent</code>) biztosítjuk. A kernel a teljes
+(device-oldali) bemeneten dolgozik, és csak a
+<code>[begin, begin + count)</code> tartományt számolja ki (a teljes kód
+a laborban):</p>
+<pre class="cuda"><code>const int num_chunks = 4;                    // n % (num_chunks * block) == 0 szükséges
+const int chunk = n / num_chunks;
+// st[]: a streamek; ev[]: chunkonként egy H2D-kész esemény (cudaEventDisableTiming)
+
+for (int c = 0; c &lt; num_chunks; ++c) {       // 1. kör: az összes H2D másolás
+    cudaStream_t s = st[c % num_streams];
+    CUDA_CHECK(cudaMemcpyAsync(d_in + c * chunk, h_in + c * chunk,
+                          chunk * sizeof(float), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaEventRecord(ev[c], s));
+}
+for (int c = 0; c &lt; num_chunks; ++c) {       // 2. kör: kernel + D2H
+    cudaStream_t s = st[c % num_streams];
+    if (c &gt; 0)              CUDA_CHECK(cudaStreamWaitEvent(s, ev[c - 1], 0));
+    if (c + 1 &lt; num_chunks) CUDA_CHECK(cudaStreamWaitEvent(s, ev[c + 1], 0));
+    stencil_tiled&lt;&lt;&lt;chunk / block, block, shared_bytes, s&gt;&gt;&gt;(
+        d_in, d_out, n, c * chunk, chunk);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpyAsync(h_out + c * chunk, d_out + c * chunk,
+                          chunk * sizeof(float), cudaMemcpyDeviceToHost, s));
+}
+CUDA_CHECK(cudaDeviceSynchronize());
+// Validáció: h_out == CPU-referencia;
+// a streames és az egy streames változat eredménye egyezzen.</code></pre>
+<figure id="fig-gpu128-stream-idovonal">
+<div class="fig-interactive"><iframe src="figures/html/gpu128-stream-idovonal.html" title="Két Gantt-diagram. Felül egy stream: a négy H2D másolás (egyenként kb. 2,68 ms) sorban, majd chunkonként a kernel (kb. 0,30 ms) és a D2H másolás; teljes idő kb. 22,7 ms. Alul két stream három sávon (H2D-másolómotor, D2H-másolómotor, SM): a stream 0 tömör, a stream 1 vonalkázott; szaggatott nyilak jelzik, hogy a K(c) kernel a szomszédos chunkok H2D-eseményére vár; a K1 a H2D3 vége, vagyis a H2D2 után indul, a D2H0 átfed a H2D3-mal; teljes idő kb. 19,1 ms, a nyereség kb. 3,6 ms." loading="lazy" style="width:100%;border:0;height:520px"></iframe><noscript><img src="figures/img/gpu128-stream-idovonal.png" style="width:100.0%"
+alt="Két Gantt-diagram. Felül egy stream: a négy H2D másolás (egyenként kb. 2,68 ms) sorban, majd chunkonként a kernel (kb. 0,30 ms) és a D2H másolás; teljes idő kb. 22,7 ms. Alul két stream három sávon (H2D-másolómotor, D2H-másolómotor, SM): a stream 0 tömör, a stream 1 vonalkázott; szaggatott nyilak jelzik, hogy a K(c) kernel a szomszédos chunkok H2D-eseményére vár; a K1 a H2D3 vége, vagyis a H2D2 után indul, a D2H0 átfed a H2D3-mal; teljes idő kb. 19,1 ms, a nyereség kb. 3,6 ms." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu128-stream-idovonal.png" style="width:100.0%"
+alt="Két Gantt-diagram. Felül egy stream: a négy H2D másolás (egyenként kb. 2,68 ms) sorban, majd chunkonként a kernel (kb. 0,30 ms) és a D2H másolás; teljes idő kb. 22,7 ms. Alul két stream három sávon (H2D-másolómotor, D2H-másolómotor, SM): a stream 0 tömör, a stream 1 vonalkázott; szaggatott nyilak jelzik, hogy a K(c) kernel a szomszédos chunkok H2D-eseményére vár; a K1 a H2D3 vége, vagyis a H2D2 után indul, a D2H0 átfed a H2D3-mal; teljes idő kb. 19,1 ms, a nyereség kb. 3,6 ms." /></details></div>
+<figcaption>Négy chunkos stencil: 1 stream vs. 2 stream (modell, nem
+mérés;
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>n</mi><mo>=</mo><msup><mn>2</mn><mn>26</mn></msup></mrow><annotation encoding="application/x-tex">n = 2^{26}</annotation></semantics></math>,
+PCIe 4.0 x16 kb. 25 GB/s, 448 GB/s, két másolómotor)</figcaption>
+</figure>
+<p>A <code>h_in</code> és <code>h_out</code> pinned
+(<code>cudaMallocHost</code>), a streamek és az események a végén
+felszabadítandók (<code>cudaStreamDestroy</code>,
+<code>cudaEventDestroy</code>, <code>cudaFreeHost</code>); a teljes
+lista a laborkódban szerepel.</p>
+<p>Fontos, hogy a host memória pinned (<code>cudaMallocHost</code>)
+legyen: a lapozható memóriából a DMA-motor nem tud aszinkron módon
+másolni. Az átfedés akkor működik, ha a másolások és a kernelek
+különböző streamekhez tartoznak, és a GPU-nak van szabad másoló és
+számító egysége. A Nsight Systems timeline nézete mutatja meg, hogy a
+H2D másolás, a kernel és a D2H másolás valóban átfed-e.</p>
+<p>Ha csak egy streamet használunk, a hívások sorba állnak. A streames
+változat akkor hoz nyereséget, ha a másolási idő összemérhető a
+kernelidővel. Ha a kernel és a másolás ideje nagyon eltér, az átfedés
+legfeljebb a rövidebbiket rejti el, a nyereség kicsi, és a több stream
+csak bonyolítja a kódot. Ezért ezt is méréssel kell igazolni.</p>
+<h3 data-number="33.3.8" id="benchmark-és-összehasonlítás"><span
+class="header-section-number">33.3.8</span> Benchmark és
+összehasonlítás</h3>
+<p>A hangolás során minden változatot ugyanazzal a bemenettel,
+pontossággal és mérési protokollal kell összehasonlítani. A laborban az
+alábbi négy változatot érdemes megmérni:</p>
+<table>
+<colgroup>
+<col style="width: 8%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+</colgroup>
+<thead>
+<tr>
+<th>Változat</th>
+<th style="text-align: right;">Rács</th>
+<th style="text-align: right;">Blokk</th>
+<th style="text-align: right;">Shared</th>
+<th style="text-align: right;">Regiszter</th>
+<th style="text-align: right;">Kernelidő</th>
+<th style="text-align: right;">Effektív sávszélesség</th>
+<th style="text-align: right;">Relatív</th>
+<th style="text-align: right;">Szórás</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Naiv</td>
+<td style="text-align: right;">262144</td>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">0 B</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">[mért] ms</td>
+<td style="text-align: right;">[mért] GB/s</td>
+<td style="text-align: right;">1,0×</td>
+<td style="text-align: right;">[mért]</td>
+</tr>
+<tr>
+<td>Tiled</td>
+<td style="text-align: right;">262144</td>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">1032 B</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">[mért] ms</td>
+<td style="text-align: right;">[mért] GB/s</td>
+<td style="text-align: right;">[mért]×</td>
+<td style="text-align: right;">[mért]</td>
+</tr>
+<tr>
+<td>Tiled, hangolt blokk</td>
+<td style="text-align: right;">[mért]</td>
+<td style="text-align: right;">[mért]</td>
+<td style="text-align: right;">[mért]</td>
+<td style="text-align: right;">[mért]</td>
+<td style="text-align: right;">[mért] ms</td>
+<td style="text-align: right;">[mért] GB/s</td>
+<td style="text-align: right;">[mért]×</td>
+<td style="text-align: right;">[mért]</td>
+</tr>
+</tbody>
+</table>
+<p>A táblázatban a <code>[mért]</code> mezőket a labor során kell
+kitölteni. A streames lánc (H2D + kernel + D2H) nem kernelidő: saját
+táblába kerül.</p>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 26%" />
+<col style="width: 26%" />
+<col style="width: 26%" />
+</colgroup>
+<thead>
+<tr>
+<th>Teljes lánc (H2D + kernel + D2H)</th>
+<th style="text-align: right;">Medián idő (ms)</th>
+<th style="text-align: right;">Szórás (ms)</th>
+<th style="text-align: right;">Nyereség (ms és %)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1 stream</td>
+<td style="text-align: right;">[mért]</td>
+<td style="text-align: right;">[mért]</td>
+<td style="text-align: right;">–</td>
+</tr>
+<tr>
+<td>2 stream</td>
+<td style="text-align: right;">[mért]</td>
+<td style="text-align: right;">[mért]</td>
+<td style="text-align: right;">[mért]</td>
+</tr>
+</tbody>
+</table>
+<p>Várt: a nyereség felső korlátja ≈ min(kernelidő, másolási idő) ≈ a
+kernelidő, mert n = 2^26 mellett a másolás (≈ 2 × 10 ms PCIe 4.0 x16-on;
+becslés, ellenőrzendő) sokkal hosszabb. A pipeline-ismétlések száma 20,
+a közölt érték a medián. A „várt” becslést a memóriamodellből adhatjuk
+meg. Ha a bemenet <code>N = 2^26</code> float elem, mindkét kernel
+algoritmikus DRAM-forgalma <code>N * 8</code> bájt (4 bájt olvasás + 4
+bájt írás elemenként); a naiv kernel logikai load/store-forgalma
+<code>N * 16</code> bájt, de ezt az L1/L2 nagyrészt elnyeli. A
+referencia-GPU (RTX A4000) névleges 448 GB/s sávszélességén az alsó
+korlát:</p>
+<pre class="text"><code>mindkét kernelre: 2^26 * 8 / 448e9 = 536 870 912 / 448e9 ≈ 1,20 ms</code></pre>
+<p>A valós kernel ennél lassabb lesz (egy valós GPU a névleges csúcsnak
+jellemzően csak egy részét éri el), és a modell <em>nem</em> jósol
+különbséget a naiv és a tiled változat között: ha a mérés különbséget
+mutat, azt a profilkép (L1/L2 találati arány, szektorszám,
+szinkronizációs költség) alapján kell magyarázni, és a tiled változat
+akár lassabb is lehet. Ez a várt érték csak modellszámítás, nem
+ellenőrzött hardveres mérés. A laborban a tényleges mért értékek
+eltérhetnek a modelltől; az eltérés elemzése éppen a tanulási cél
+része.</p>
+<h3 data-number="33.3.9" id="nsight-alapú-optimalizálás"><span
+class="header-section-number">33.3.9</span> Nsight-alapú
+optimalizálás</h3>
+<p>A Nsight Compute a kernelen belüli metrikákat mutatja meg. A laborban
+használt parancsok:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co"># -arch a saját GPU-hoz igazítva</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-O3</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-arch</span><span class="op">=</span>sm_86 <span class="at">-lineinfo</span> stencil.cu <span class="at">-o</span> stencil</span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Egy kernel egy indítása teljes profillal (pozicionális argumentumok: n, block, streams);</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a><span class="co"># -s 5: az 5 warm-up indítás kihagyása, -c 1: egy mért indítás</span></span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a><span class="ex">ncu</span> <span class="at">--set</span> full <span class="at">--csv</span> <span class="at">-k</span> regex:stencil_naive <span class="at">-s</span> 5 <span class="at">-c</span> 1 ./stencil 67108864 256 0 <span class="op">&gt;</span> ncu_naive.csv</span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a><span class="ex">ncu</span> <span class="at">--set</span> full <span class="at">--csv</span> <span class="at">-k</span> regex:stencil_tiled <span class="at">-s</span> 5 <span class="at">-c</span> 1 ./stencil 67108864 256 0 <span class="op">&gt;</span> ncu_tiled.csv</span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a><span class="co"># Célzott mérés</span></span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a><span class="ex">ncu</span> <span class="at">--section</span> SpeedOfLight <span class="dt">\</span></span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a>    <span class="at">--section</span> Occupancy <span class="dt">\</span></span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a>    <span class="at">--section</span> MemoryWorkloadAnalysis <span class="dt">\</span></span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a>    ./stencil 67108864 256 0</span></code></pre></div>
+<p>A következő metrikákat érdemes figyelni:</p>
+<ul>
+<li><code>gpu__time_duration.avg</code>: a kernel átlagos
+futásideje.</li>
+<li><code>sm__throughput.avg.pct_of_peak_sustained_elapsed</code>: az
+SM-ek kihasználtsága a csúcsteljesítményhez képest.</li>
+<li><code>l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum</code>: a
+globális memóriából az L1-be beolvasott 32 bájtos szektorok száma. A
+naiv és tiled változat között itt csökkenést várunk; a DRAM-forgalom
+(<code>dram__bytes_read.sum</code>) ettől függetlenül alig
+változhat.</li>
+<li><code>l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum</code>:
+shared memory bank conflict.</li>
+<li><code>launch__occupancy_limit_shared_mem</code>: a shared memory
+miatti occupancy korlát.</li>
+<li><code>smsp__average_warp_latency_per_inst_issued.ratio</code>:
+átlagos warp-késleltetés (a metrikaneveket
+<code>ncu --query-metrics</code> kimenettel ellenőrizzük a telepített
+verzióban).</li>
+</ul>
+<p>A Nsight Systems a teljes alkalmazás idővonalát mutatja. A streames
+változat ellenőrzésére:</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nsys</span> profile <span class="at">-o</span> stencil_2s <span class="at">--stats</span><span class="op">=</span>true ./stencil 67108864 256 2</span></code></pre></div>
+<p>Az elkészült <code>stencil_2s.nsys-rep</code> fájlban a
+<code>H2D</code>, <code>kernel</code> és <code>D2H</code> sávok átfedése
+vizuálisan ellenőrizhető. Ha a sávok szorosan egymás után következnek,
+akkor az átfedés nem jött létre, és a memóriamásolás valószínűleg
+lapozható memóriából történik, vagy a stream szinkronizációs pontja
+sorosít.</p>
+<h3 data-number="33.3.10" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">33.3.10</span> Tipikus hibák és helyes
+megoldások</h3>
+<ol type="1">
+<li><p><strong>Túl korai optimalizálás mérés nélkül.</strong><br />
+Hiba: valaki a kód első változatába azonnal beépíti a tilinget, az
+occupancy-hangolást és a streameket, de nem készít baseline-t.<br />
+Helyes: először a naiv verziót mérjük meg, és a profilkép alapján
+döntünk.</p></li>
+<li><p><strong>Csak a kernelidőt nézzük, a host-device másolást
+nem.</strong><br />
+Hiba: a kernel gyors, de a teljes alkalmazás lassú a sok
+<code>cudaMemcpy</code> miatt.<br />
+Helyes: a mérési naplóban külön soroljuk fel a H2D, a kernel és a D2H
+időket.</p></li>
+<li><p><strong>Az occupancy-t öncélként maximalizáljuk.</strong><br />
+Hiba: a regiszterhasználatot mesterségesen leszorítjuk, ami spillt okoz,
+csak hogy magasabb legyen az occupancy.<br />
+Helyes: az occupancy-t a profilkép kontextusában értelmezzük. Ha a
+kernel memória-késleltetésre vár, akkor hasznos a magas foglaltság; ha
+számításkorlátos, akkor a kevesebb aktív warp is elég lehet.</p></li>
+<li><p><strong>Bank conflict feltételezése vagy figyelmen kívül hagyása
+mérés nélkül.</strong><br />
+Hiba: a stride-1 stencil-olvasást (<code>s[local - 1]</code>,
+<code>s[local]</code>, <code>s[local + 1]</code>) conflictosnak
+gondoljuk, vagy a valóban conflictos mintát (például
+<code>s[2 * tid]</code>, 2D tömb oszlopirányú olvasása) nem
+ellenőrizzük.<br />
+Helyes: a stride-1 olvasás conflict-mentes; a gyanús mintákat a Nsight
+Compute metrikájával mérjük, és szükség esetén paddinget
+alkalmazunk.</p></li>
+<li><p><strong>Nem elegendő ismétlés vagy hideg cache.</strong><br />
+Hiba: egyetlen futásból vonunk le következtetést.<br />
+Helyes: legalább 5 warm-up, legalább 20 ismétlés, medián és
+szórás.</p></li>
+<li><p><strong>Változó órajel és hőmérséklet.</strong><br />
+Hiba: a GPU boost-órajele a mérés közben ingadozik, a mérési naplóban
+mégis állandó csúcsértékkel számolunk.<br />
+Helyes: a mérés előtt rögzítjük a power limitet, az órajelet és a
+hőmérsékletet; szükség esetén <code>nvidia-smi</code> naplót
+készítünk.</p></li>
+<li><p><strong>Stream esetén lapozható host memória.</strong><br />
+Hiba: <code>malloc</code>-kal, <code>new</code>-val vagy
+<code>std::vector</code>-ral foglalt lapozható host memóriából hívunk
+<code>cudaMemcpyAsync</code>-et, ami nem fedhető át teljesen a
+számítással (a driver közbülső pufferen át másol). (A
+<code>cudaMalloc</code> eszközmemóriát foglal, nem host memóriát.)<br />
+Helyes: <code>cudaMallocHost</code> vagy <code>cudaHostRegister</code>
+használata. Darabolt feldolgozásnál a chunk-határokon a stencil halo
+elemei is kellenek: a szomszéd chunk másolásának befejezését eseménnyel
+kell bevárni, és a streames változat eredményét a nem streames
+változattal kell összevetni.</p></li>
+<li><p><strong>Nem ellenőrzött kernelhiba.</strong><br />
+Hiba: a kernel indítása után nem hívunk <code>cudaGetLastError</code>-t,
+és a mérési eredményt hibás kernelre is rögzítjük.<br />
+Helyes: minden API-hívást ellenőrizni kell, a mérés előtt
+<code>cudaDeviceSynchronize</code>-et hívunk.</p></li>
+</ol>
+<h3 data-number="33.3.11" id="labor-nsight-alapú-optimalizálás"><span
+class="header-section-number">33.3.11</span> Labor: Nsight-alapú
+optimalizálás</h3>
+<h4 data-number="33.3.11.1" id="kiinduló-kód"><span
+class="header-section-number">33.3.11.1</span> Kiinduló kód</h4>
+<p>A labor az alábbi, teljes példát használja. A kód FP32 pontossággal,
+1D, 3 pontos stencilt számol, és <strong>pozicionális</strong>
+parancssori argumentumokból veszi az <code>n</code> méretet, a
+blokkméretet és a streamszámot
+(<code>./stencil [n] [block] [streams]</code>). Minden kernelindítás
+után hibaellenőrzés van, minden változat eredményét CPU-referenciához
+hasonlítja, és az időket eseményenként mérve szórással adja meg. A kódot
+a könyv szerzői nem fordították és nem futtatták hardveren.</p>
+<pre class="cuda"><code>// stencil.cu
+// CUDA C++ (C++17); nvcc 12.x; GPU: a 33.1 referencia-GPU (CC 8.6 -&gt; sm_86), verziók a naplóba
+// Fordítás: nvcc -O3 -std=c++17 -arch=sm_86 -lineinfo stencil.cu -o stencil
+// Futtatás: ./stencil [n] [block] [streams]    pl. ./stencil 67108864 256 2
+#include &lt;cuda_runtime.h&gt;
+#include &lt;algorithm&gt;
+#include &lt;chrono&gt;
+#include &lt;cmath&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;vector&gt;
+
+#define CUDA_CHECK(call)                                               \
+    do {                                                               \
+        cudaError_t err_ = (call);                                     \
+        if (err_ != cudaSuccess) {                                     \
+            std::fprintf(stderr, &quot;CUDA error %s:%d: %s\n&quot;,             \
+                         __FILE__, __LINE__, cudaGetErrorString(err_)); \
+            std::exit(EXIT_FAILURE);                                   \
+        }                                                              \
+    } while (0)
+
+constexpr int RADIUS = 1;
+constexpr int ITERS = 20;
+
+__global__ void stencil_naive(const float* __restrict__ in,
+                              float* __restrict__ out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &gt;= n) return;
+
+    float acc = 0.0f;
+    for (int r = -RADIUS; r &lt;= RADIUS; ++r) {
+        int j = min(max(i + r, 0), n - 1);   // CUDA beépített int min/max
+        acc += in[j];
+    }
+    out[i] = acc / (2 * RADIUS + 1);
+}
+
+// Az out[begin .. begin+count) tartományt számolja; `in` a teljes bemenet (device).
+// Egy blokk blockDim.x elemet dolgoz fel. A nem streames futás: begin = 0, count = n.
+__global__ void stencil_tiled(const float* __restrict__ in,
+                              float* __restrict__ out, int n,
+                              int begin, int count) {
+    extern __shared__ float s[];
+    int base = begin + blockIdx.x * blockDim.x;
+    int i = base + threadIdx.x;
+    int local = threadIdx.x + RADIUS;
+
+    s[local] = in[min(i, n - 1)];            // minden szál tölt: nincs inicializálatlan elem
+    if (threadIdx.x &lt; RADIUS) {
+        s[threadIdx.x] = in[max(base - RADIUS + (int)threadIdx.x, 0)];
+        s[blockDim.x + RADIUS + threadIdx.x] =
+            in[min(base + (int)blockDim.x + (int)threadIdx.x, n - 1)];
+    }
+    __syncthreads();
+
+    if (i &lt; begin + count &amp;&amp; i &lt; n) {
+        float acc = 0.0f;
+        for (int r = -RADIUS; r &lt;= RADIUS; ++r) {
+            acc += s[local + r];
+        }
+        out[i] = acc / (2 * RADIUS + 1);
+    }
+}
+
+static void mean_sd(const std::vector&lt;double&gt;&amp; t, double&amp; m, double&amp; sd) {
+    m = 0.0;
+    for (double x : t) m += x;
+    m /= t.size();
+    double v = 0.0;
+    for (double x : t) v += (x - m) * (x - m);
+    sd = t.size() &gt; 1 ? std::sqrt(v / (t.size() - 1)) : 0.0;
+}
+
+// Medián (a vektor másolatán rendez)
+static double median(std::vector&lt;double&gt; t) {
+    std::sort(t.begin(), t.end());
+    size_t k = t.size();
+    return (k % 2) ? t[k / 2] : 0.5 * (t[k / 2 - 1] + t[k / 2]);
+}
+
+// Kernel mérése: 5 warm-up, majd ITERS külön eseménypárral mért futás
+template &lt;typename Launch&gt;
+static void bench(const char* name, Launch launch, double bytes_per_iter) {
+    for (int w = 0; w &lt; 5; ++w) launch();
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    cudaEvent_t e0, e1;
+    CUDA_CHECK(cudaEventCreate(&amp;e0));
+    CUDA_CHECK(cudaEventCreate(&amp;e1));
+    std::vector&lt;double&gt; t;
+    for (int it = 0; it &lt; ITERS; ++it) {
+        CUDA_CHECK(cudaEventRecord(e0, 0));
+        launch();
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(e1, 0));
+        CUDA_CHECK(cudaEventSynchronize(e1));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&amp;ms, e0, e1));
+        t.push_back(ms);
+    }
+    CUDA_CHECK(cudaEventDestroy(e0));
+    CUDA_CHECK(cudaEventDestroy(e1));
+    double m, sd;
+    mean_sd(t, m, sd);
+    double med = median(t);
+    std::printf(&quot;%-8s medián %.3f ms +- %.3f ms (%.1f %%), &quot;
+                &quot;eff. savszelesseg (8 B/elem): %.1f GB/s\n&quot;,
+                name, med, sd, 100.0 * sd / m, bytes_per_iter / (med * 1e-3) / 1e9);
+}
+
+int main(int argc, char** argv) {
+    int n = (argc &gt; 1) ? std::atoi(argv[1]) : (1 &lt;&lt; 26);
+    int block = (argc &gt; 2) ? std::atoi(argv[2]) : 256;
+    int streams_count = (argc &gt; 3) ? std::atoi(argv[3]) : 0;
+    const int num_chunks = 4;
+    if (n &lt;= 0 || block &lt;= 0 || block &lt; RADIUS ||
+        (streams_count &gt; 0 &amp;&amp; n % (num_chunks * block) != 0)) {
+        std::fprintf(stderr, &quot;hibas argumentum &quot;
+                     &quot;(streames futashoz n %% (4 * block) == 0 kell)\n&quot;);
+        return 1;
+    }
+
+    const size_t bytes = (size_t)n * sizeof(float);
+    float *h_in = nullptr, *h_out = nullptr;
+    CUDA_CHECK(cudaMallocHost(&amp;h_in, bytes));
+    CUDA_CHECK(cudaMallocHost(&amp;h_out, bytes));
+    for (int i = 0; i &lt; n; ++i) h_in[i] = static_cast&lt;float&gt;(i % 1000) * 0.001f;
+
+    // CPU-referencia (azonos műveleti sorrend: bitazonos eredményt várunk)
+    std::vector&lt;float&gt; ref(n);
+    for (int i = 0; i &lt; n; ++i) {
+        float acc = 0.0f;
+        for (int r = -RADIUS; r &lt;= RADIUS; ++r) {
+            int j = std::min(std::max(i + r, 0), n - 1);
+            acc += h_in[j];
+        }
+        ref[i] = acc / (2 * RADIUS + 1);
+    }
+    auto validate = [&amp;](const char* name) {
+        double maxdiff = 0.0;
+        for (int i = 0; i &lt; n; ++i)
+            maxdiff = std::fmax(maxdiff, std::fabs((double)h_out[i] - ref[i]));
+        std::printf(&quot;%-8s max |GPU - CPU| = %.3e\n&quot;, name, maxdiff);
+    };
+
+    float *d_in = nullptr, *d_out = nullptr;
+    CUDA_CHECK(cudaMalloc(&amp;d_in, bytes));
+    CUDA_CHECK(cudaMalloc(&amp;d_out, bytes));
+    CUDA_CHECK(cudaMemcpy(d_in, h_in, bytes, cudaMemcpyHostToDevice));
+
+    const int grid = (n + block - 1) / block;
+    const int shared_bytes = (block + 2 * RADIUS) * sizeof(float);
+    // algoritmikus forgalom: 4 B olvasás + 4 B írás / elem
+    const double bytes_alg = 8.0 * n;
+
+    bench(&quot;naive&quot;, [&amp;] { stencil_naive&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_in, d_out, n); }, bytes_alg);
+    CUDA_CHECK(cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost));
+    validate(&quot;naive&quot;);
+
+    bench(&quot;tiled&quot;, [&amp;] {
+        stencil_tiled&lt;&lt;&lt;grid, block, shared_bytes&gt;&gt;&gt;(d_in, d_out, n, 0, n);
+    }, bytes_alg);
+    CUDA_CHECK(cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost));
+    validate(&quot;tiled&quot;);
+
+    if (streams_count &gt; 0) {
+        const int chunk = n / num_chunks;
+        // Teljes (H2D + kernel + D2H) futás `ns` streammel; a végén a host-órás idő (ms)
+        auto pipeline = [&amp;](int ns) {
+            std::vector&lt;cudaStream_t&gt; st(ns);
+            for (auto&amp; x : st) CUDA_CHECK(cudaStreamCreate(&amp;x));
+            std::vector&lt;cudaEvent_t&gt; ev(num_chunks);
+            for (auto&amp; e : ev)
+                CUDA_CHECK(cudaEventCreateWithFlags(&amp;e, cudaEventDisableTiming));
+            auto t0 = std::chrono::steady_clock::now();
+            for (int c = 0; c &lt; num_chunks; ++c) {
+                cudaStream_t s = st[c % ns];
+                CUDA_CHECK(cudaMemcpyAsync(d_in + (size_t)c * chunk, h_in + (size_t)c * chunk,
+                                      chunk * sizeof(float), cudaMemcpyHostToDevice, s));
+                CUDA_CHECK(cudaEventRecord(ev[c], s));
+            }
+            for (int c = 0; c &lt; num_chunks; ++c) {
+                cudaStream_t s = st[c % ns];
+                if (c &gt; 0)              CUDA_CHECK(cudaStreamWaitEvent(s, ev[c - 1], 0));
+                if (c + 1 &lt; num_chunks) CUDA_CHECK(cudaStreamWaitEvent(s, ev[c + 1], 0));
+                stencil_tiled&lt;&lt;&lt;chunk / block, block, shared_bytes, s&gt;&gt;&gt;(
+                    d_in, d_out, n, c * chunk, chunk);
+                CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaMemcpyAsync(h_out + (size_t)c * chunk,
+                                           d_out + (size_t)c * chunk,
+                                           chunk * sizeof(float),
+                                           cudaMemcpyDeviceToHost, s));
+            }
+            CUDA_CHECK(cudaDeviceSynchronize());
+            auto t1 = std::chrono::steady_clock::now();
+            for (auto&amp; e : ev) CUDA_CHECK(cudaEventDestroy(e));
+            for (auto&amp; x : st) CUDA_CHECK(cudaStreamDestroy(x));
+            return std::chrono::duration&lt;double, std::milli&gt;(t1 - t0).count();
+        };
+        for (int ns : {1, streams_count}) {
+            for (int w = 0; w &lt; 5; ++w) pipeline(ns);        // 5 warm-up
+            std::vector&lt;double&gt; t;
+            for (int it = 0; it &lt; 20; ++it) t.push_back(pipeline(ns));   // 20 ismétlés
+            double m, sd;
+            mean_sd(t, m, sd);
+            std::printf(&quot;pipeline, %d stream: medián %.3f ms +- %.3f ms &quot;
+                        &quot;(teljes lánc: H2D + kernel + D2H)\n&quot;, ns, median(t), sd);
+            validate(&quot;pipeline&quot;);
+        }
+    }
+
+    CUDA_CHECK(cudaFree(d_in));
+    CUDA_CHECK(cudaFree(d_out));
+    CUDA_CHECK(cudaFreeHost(h_in));
+    CUDA_CHECK(cudaFreeHost(h_out));
+    return 0;
+}</code></pre>
+<h4 data-number="33.3.11.2" id="feladatok"><span
+class="header-section-number">33.3.11.2</span> Feladatok</h4>
+<ol type="1">
+<li><p><strong>Baseline:</strong> futtasd a naiv és a tiled változatot
+<code>n = 67 108 864</code> mérettel, <code>block = 256</code>
+blokkmérettel. Töltsd ki a mérési napló táblázatát. Számítsd ki az
+effektív sávszélességet a tényleges adatmozgatásból.</p></li>
+<li><p><strong>Tiling elemzése:</strong> készíts Nsight Compute profilt
+a naiv és a tiled kernelről. Hasonlítsd össze a
+<code>gpu__time_duration.avg</code>, a globális memória szektorok számát
+és a DRAM-bájtokat (<code>dram__bytes_read.sum</code>). Fogalmazd meg,
+hogy a tiling mit változtatott a load/store- és a DRAM-forgalmon, és
+miért. Mérd meg a bank-konfliktus metrikát a 33.2
+<code>heat_step_tiled</code> kernelére is.</p></li>
+<li><p><strong>Occupancy hangolás:</strong> futtasd a tiled kernelt
+<code>block = 128</code>, <code>256</code>, <code>512</code> értékekkel.
+Jegyezd fel a regiszterhasználatot és a shared memory méretet. A Nsight
+Compute <code>Occupancy</code> szekciójával ellenőrizd a foglaltságot.
+Döntsd el, melyik blokkméret a legjobb, és indokold meg.</p></li>
+<li><p><strong>Streamek:</strong> implementáld a 2 streames változatot a
+fenti minta alapján. Készíts Nsight Systems profilt, és ellenőrizd a
+H2D, kernel és D2H átfedést. Ha nincs átfedés, keresd meg a sorosítás
+okát.</p></li>
+<li><p><strong>Dokumentáció:</strong> a mérési naplóban tüntesd fel a
+GPU típusát, a drivert, a CUDA-verziót, az FP32 pontosságot, a warm-up
+és ismétlésszámot, az átlagot és a szórást. A mért eredményt külön
+oszlopban jelöld, a modellből számított várt értéket pedig
+külön.</p></li>
+<li><p><strong>Visszakötés a záróprojekthez:</strong> alkalmazd ugyanezt
+a ciklust (baseline, profil, hipotézis, egyetlen beavatkozás, mérés) a
+33.2 alfejezet <code>heat_step_naive</code> és
+<code>heat_step_tiled</code> kernelére a 33.1 charter metrikáival (4096
+× 4096, 1000 lépés, effektív sávszélesség a 448 GB/s névleges értékhez
+viszonyítva), és hasonlítsd össze a következtetéseket a 1D
+mikrobenchmarkéval.</p></li>
+</ol>
+<p>A feladatokhoz nem tartozik megoldás: a válasz a saját mérésből és
+profilból adódik.</p>
+<h4 data-number="33.3.11.3" id="példa-mérési-napló"><span
+class="header-section-number">33.3.11.3</span> Példa mérési napló</h4>
+<pre class="text"><code>GPU:                NVIDIA RTX A4000 (példa; a saját GPU-ra cserélendő)
+Driver:             [kitöltendő]
+CUDA:               [kitöltendő]
+Precision:          FP32
+Bemenet:            1D float, n = 2^26
+Warm-up:            5
+Ismétlés:           20
+Várt modell:        mindkét kernelre &gt;= ~1,20 ms (8 B/elem, 448 GB/s)
+
+Változat                  Blokk   Kernelidő   Eff. sávsz.   Relatív   Szórás
+naive                     256     [mért] ms   [mért] GB/s   1,00×     [mért]
+tiled                     256     [mért] ms   [mért] GB/s   [mért]×   [mért]
+tiled + block hangolás    [mért]  [mért] ms   [mért] GB/s   [mért]×   [mért]</code></pre>
+<p>A teljes lánc (H2D + kernel + D2H, 1 és 2 stream) idejét külön
+táblázatban, mediánnal kell rögzíteni. A táblázatot a labor során
+tényleges mérésekkel kell kitölteni. A várt érték csak tájékoztató
+modellszámítás, nem helyettesíti a reprodukálható futást.</p>
+<h3 data-number="33.3.12" id="önellenőrző-kérdés"><span
+class="header-section-number">33.3.12</span> Önellenőrző kérdés</h3>
+<p>Miért nem elegendő a kernelidőt nézni akkor, ha a záróprojekt
+rendszere host-device másolást is végez?<br />
+<strong>Válaszvázlat:</strong> A teljes alkalmazás futásideje a H2D
+másolás, a kernel és a D2H másolás összege, illetve átfedés esetén azok
+időbeli ütemezése. Ha csak a kernelidőt mérjük, nem látjuk a lapozható
+memória, a szinkron másolás vagy a stream nélküli sorosítás hatását. A
+Nsight Systems timeline és külön eseményekkel mért fázisidők együttesen
+mutatják meg, hol vész el az idő, és hol érdemes streameket vagy pinned
+memóriát bevezetni.</p>
+<h3 data-number="33.3.13" id="összegzés"><span
+class="header-section-number">33.3.13</span> Összegzés</h3>
+<p>A teljesítmény hangolása a záróprojektben nem egyetlen nagy
+optimalizálás, hanem egymásra épülő, méréssel igazolt lépések sorozata.
+A tiling csökkenti a globális load/store-forgalmat és a
+gyorsítótár-terhelést (a DRAM-forgalmat csak akkor, ha az L1/L2 nem
+úgyis elnyeli az újraolvasást), az occupancy-hangolás a késleltetés
+elrejtését javítja, a streamek pedig a másolás és számítás átfedését
+teszik lehetővé. Minden beavatkozást ugyanazon bemeneten, rögzített
+környezetben kell mérni, és a profilképnek meg kell erősítenie a várt
+hatást. Csak így lehet különválasztani a valódi nyereséget a zajtól, és
+így készíthető elő a 33.4 alfejezetben következő validációs és
+dokumentációs szakasz.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu127.html">← 33.2 Kernelimplementáció</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu129.html">33.4 Validáció és dokumentáció →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

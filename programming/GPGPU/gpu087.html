@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>23.2 CUTLASS – GPGPU – általános célú számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – CUDA-ökoszisztéma és mélytanulás</a> › <a href="index.html#gpuch22">23 CUTLASS, tensor cores és mixed precision</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu086.html">← 23.1 Tensor Core architektúra</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu088.html">23.3 Mixed precision →</a></div>
+</nav>
+<h2 data-number="23.2" id="gpu087"><span
+class="header-section-number">23.2</span> CUTLASS</h2>
+<p>A CUTLASS (CUDA Templates for Linear Algebra Subroutines and Solvers)
+az NVIDIA nyílt forráskódú, kizárólag C++ sablonokra épülő könyvtára,
+amely hatékony GPU-implementációkat ad a lineáris algebrai
+primitívekhez, elsősorban a GEMM-hez. A CUTLASS nem egy fekete doboz: a
+fejlesztő fordítási időben dönt a tile méretekről, a
+memória-elrendezésről, a pipeline mélységéről és az epilogue
+műveletéről. Ez az alfejezet a CUTLASS GEMM hierarchiáját mutatja be, és
+egy izolált laboron keresztül demonstrálja a használatát.</p>
+<h3 data-number="23.2.1"
+id="a-cutlass-sablonkönyvtár-és-a-gemm-hierarchia"><span
+class="header-section-number">23.2.1</span> A CUTLASS sablonkönyvtár és
+a GEMM hierarchia</h3>
+<p>A CUTLASS alapgondolata az, hogy a GEMM-et rétegesen bontja fel, és
+minden réteget külön sablonparaméterként kezel. A hierarchia alulról
+felfelé a következő:</p>
+<ul>
+<li><strong>Thread szint:</strong> a legelemibb szint, amely a
+memória-hozzáférésekért és az epilogue műveleteiért felel. Itt történik
+a vektorizált betöltés, a kimeneti elemek megformázása, valamint a
+skálázás és az aktiváció.</li>
+<li><strong>Warp szint:</strong> a warpok a Tensor Core
+<code>mma.sync</code> utasításokat hajtják végre, és a hozzájuk tartozó
+fragmenteket kezelik. A CUTLASS itt definiálja a warp tile méreteit,
+amelyek meghatározzák, hogy egy warp hány adatelemen dolgozik
+egyszerre.</li>
+<li><strong>Threadblock szint:</strong> egy SM-re kerülő szálblokk,
+amely a threadblock tile-t birtokolja. A threadblock felelős a shared
+memory-ba való betöltésért, a warpok közötti munkamegosztásért és a K
+dimenzió mentén történő iterációért.</li>
+<li><strong>Kernel szint:</strong> a GPU kernel függvénye, amely a
+gridet és a threadblockok közötti swizzle-t vezérli.</li>
+<li><strong>Device szint:</strong> a teljes GEMM művelet, amely a kernel
+launch konfigurációját, a workspace memóriát és a streamet foglalja
+össze.</li>
+</ul>
+<p>A hierarchia lelkét a <strong>tile</strong> fogalma adja. A CUTLASS a
+teljes mátrixszorzást kisebb, jól meghatározott méretű blokkokra osztja.
+Például egy FP16 Tensor Core GEMM esetében tipikus konfiguráció:</p>
+<pre class="cuda"><code>using Gemm = cutlass::gemm::device::Gemm&lt;
+    cutlass::half_t, cutlass::layout::RowMajor,   // A
+    cutlass::half_t, cutlass::layout::RowMajor,   // B
+    float, cutlass::layout::RowMajor,             // C
+    float,                                         // akkumulátor
+    cutlass::arch::OpClassTensorOp,                // Tensor Core
+    cutlass::arch::Sm80,                           // compute capability
+    cutlass::gemm::GemmShape&lt;128, 128, 32&gt;,        // threadblock tile
+    cutlass::gemm::GemmShape&lt;64, 64, 32&gt;,          // warp tile
+    cutlass::gemm::GemmShape&lt;16, 8, 16&gt;,           // instruction shape (mma.sync.m16n8k16)
+    cutlass::epilogue::thread::LinearCombination&lt;
+        float, 128 / cutlass::sizeof_bits&lt;float&gt;::value,
+        float, float&gt;,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle&lt;&gt;,
+    3                                                // pipeline stages
+&gt;;</code></pre>
+<p>Ebben a konfigurációban a threadblock tile 128×128×32: minden
+szálblokk egy 128 sorból, 128 oszlopból és 32 K-mélységből álló
+mátrixszeletet dolgoz fel. A warp tile 64×64×32: a threadblock 4 warpja
+(2×2) ilyen altile-eket kap. Az instruction shape 16×8×16 az Sm80 FP16
+Tensor Core <code>mma.sync.m16n8k16</code> utasítás geometriája (a
+16×8×8 a Turing-örökség). A pipeline stages értéke 3, ami azt jelenti,
+hogy a CUTLASS a K dimenzió mentén három K-tile-t tölt be előre a shared
+memory-ba, átfedve a memória-hozzáférést és a számítást.</p>
+<h3 data-number="23.2.2" id="tile-warp-és-threadblock"><span
+class="header-section-number">23.2.2</span> Tile, warp és
+threadblock</h3>
+<p>A CUTLASS GEMM végrehajtása a következő lépésekből áll. A grid a M és
+N dimenziók mentén osztja fel a kimeneti mátrixot. Minden threadblock
+egy (CTileM × CTileN) kimeneti régiót kap. A K dimenzió mentén a
+threadblock szekvenciálisan halad: minden iterációban betölt egy (CTileM
+× CTileK) méretű A-szeletet és egy (CTileK × CTileN) méretű B-szeletet a
+global memóriából a shared memory-ba. Ezt követően a warpok a shared
+memory-ból olvasnak, és a Tensor Core <code>mma</code> utasításokkal
+kiszámítják a részösszeget, amelyet a regiszterekben akkumulálnak.
+Amikor a teljes K dimenziót bejárták, az epilogue kiírja az eredményt a
+global memóriába.</p>
+<p>A threadblock tile méretének megválasztása kulcsfontosságú. A nagyobb
+tile jobb adat-újrafelhasználást tesz lehetővé, mert a shared memory-ból
+többször olvassák be ugyanazt az elemet, csökkentve a global memória
+forgalmát. Ugyanakkor a nagyobb tile több shared memory-t fogyaszt, és
+kevesebb szálblokk fér el egy SM-en, ami rontja az occupancy-t. A
+CUTLASS a shared memory igényt a tile méretekből és a pipeline
+stage-ekből számítja ki. Ha a konfiguráció nem fér el az SM shared
+memory limitjében, a kernelindítás (futásidőben) hibát jelez; a CUTLASS
+dinamikus shared memóriát használ.</p>
+<p>A warp tile határozza meg, hogy a threadblockon belül hogyan oszlanak
+meg a feladatok. A fenti példában a 128×128-as threadblock tile-t 2×2-es
+warp rácsra osztjuk, így minden warp egy 64×64-es altile-t kap. A warp
+az <code>MmaTensorOp</code> operátorral dolgozik, amely a Tensor Core
+<code>mma.sync</code> utasítást használja. Az instruction shape 16×8×16
+azt jelenti, hogy egyetlen <code>mma.sync</code> hívás egy 16×8-as
+kimeneti csempét számol 16 K-mélységgel. A warp a saját altile-jét több
+ilyen <code>mma</code> utasításra bontja.</p>
+<p>Az alábbi ábra a labor konfigurációjával mutatja a négy szintet: a
+threadblock tile-t a C-ben, a 2×2 warp tile-t, egy warp 32
+<code>mma.sync</code> csempéjét és a 3 stage-es shared körpuffert.</p>
+<figure id="fig-gpu087-cutlass">
+<div class="fig-interactive"><iframe src="figures/html/gpu087-cutlass.html" title="A 128×128-as threadblock tile négy 64×64-es warp tile-ra, azok 32 darab 16×8-as mma.sync csempére bomlanak; a shared memória három K-szeletet tart." loading="lazy" style="width:100%;border:0;height:520px"></iframe><noscript><img src="figures/img/gpu087-cutlass.png" style="width:90.0%"
+alt="A 128×128-as threadblock tile négy 64×64-es warp tile-ra, azok 32 darab 16×8-as mma.sync csempére bomlanak; a shared memória három K-szeletet tart." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu087-cutlass.png" style="width:90.0%"
+alt="A 128×128-as threadblock tile négy 64×64-es warp tile-ra, azok 32 darab 16×8-as mma.sync csempére bomlanak; a shared memória három K-szeletet tart." /></details></div>
+<figcaption>CUTLASS GEMM hierarchia – threadblock tile, warp tile,
+mma.sync csempe és 3 stage-es pipeline (a 23.2.6 labor
+konfigurációja)</figcaption>
+</figure>
+<p>A CUTLASS 3.x-ben a CuTe absztrakció tovább egyszerűsíti a
+hierarchiát. A <code>cute::gemm</code> ugyanazt a hardvert célozza, de
+magasabb szintű, funkcionálisabb felületet ad. A klasszikus CUTLASS 2.x
+API azonban továbbra is elérhető, és jól szemlélteti a hierarchikus
+tiling fogalmát. A laborban ezért a klasszikus API-t használjuk.</p>
+<h3 data-number="23.2.3" id="epilogue"><span
+class="header-section-number">23.2.3</span> Epilogue</h3>
+<p>Az epilogue a CUTLASS azon rétege, amely a Tensor Core kimeneti
+fragmentjeit feldolgozza és a global memóriába írja. Az epilogue
+elkülönítése azért fontos, mert a GEMM magja nem változik, ha például
+bias-t, ReLU-t vagy skálázást akarunk hozzáadni. A CUTLASS az
+epilogue-ot funktorként valósítja meg, így a felhasználó saját
+epilogue-ot írhat anélkül, hogy a kernel többi részét módosítaná.</p>
+<p>A leggyakoribb epilogue a
+<code>cutlass::epilogue::thread::LinearCombination</code>, amely a<br />
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>C</mi><mo>=</mo><mi>α</mi><mo>⋅</mo><mi>A</mi><mo>⋅</mo><mi>B</mi><mo>+</mo><mi>β</mi><mo>⋅</mo><mi>C</mi></mrow><annotation encoding="application/x-tex">
+C = \alpha \cdot A \cdot B + \beta \cdot C
+</annotation></semantics></math> műveletet végzi. A fenti
+sablonparaméterben a <code>LinearCombination</code> az
+<code>ElementC</code> típusú kimeneti elemeket kezeli, és az FP32
+akkumulátor értékeket a kívánt kimeneti típusra konvertálja. Az epilogue
+elemenkénti (thread-szintű) műveleteket végez, de a threadblock-szintű
+epilogue shared memóriát és vektorizált tároló iterátorokat használ a
+kimenet kiírásához.</p>
+<p>Elemenkénti aktivációhoz a CUTLASS kész epilogue-osztályokat ad,
+például a <code>cutlass::epilogue::thread::LinearCombinationRelu</code>
+osztályt
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>C</mi><mo>=</mo><mrow><mi>max</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><mn>0</mn><mo>,</mo><mspace width="0.222em"></mspace><mi>α</mi><mi>A</mi><mi>B</mi><mo>+</mo><mi>β</mi><mi>C</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">C = \max(0,\ \alpha AB + \beta C)</annotation></semantics></math>),
+amelyet a <code>LinearCombination</code> helyére kell tenni a
+<code>Gemm</code> sablonban:</p>
+<pre class="cuda"><code>// nem fordított vázlat; a sablonparaméterek a CUTLASS verziója szerint ellenőrizendők
+using EpilogueRelu = cutlass::epilogue::thread::LinearCombinationRelu&lt;
+    ElementC,                                       // kimeneti elem
+    128 / cutlass::sizeof_bits&lt;ElementC&gt;::value,    // vektorhossz
+    ElementAccumulator,                             // akkumulátor
+    ElementAccumulator&gt;;                            // skálázás típusa</code></pre>
+<p>Saját epilogue-funktor írásakor a CUTLASS epilogue-interfészét kell
+megvalósítani (<code>Params</code> struktúra,
+<code>is_source_needed()</code>,
+<code>operator()(accumulator, source)</code> hívás,
+<code>CUTLASS_HOST_DEVICE</code> minősítők); nincs általános
+<code>cutlass::epilogue::thread::Epilogue</code> sablon, amelybe egy
+tetszőleges funktor beilleszthető volna. Az interfész pontos alakját a
+<code>cutlass/epilogue/thread/</code> fejlécek mintái (pl.
+<code>linear_combination_relu.h</code>) mutatják.</p>
+<h3 data-number="23.2.4" id="stream-k"><span
+class="header-section-number">23.2.4</span> Stream-K</h3>
+<p>A hagyományos data-parallel GEMM a gridet az M és N dimenziók mentén
+osztja fel, és minden threadblock a teljes K dimenziót bejárja. Ez a
+megközelítés akkor optimális, ha a threadblockok száma jól illeszkedik
+az SM-ek számához, és a K dimenzió elegendően nagy ahhoz, hogy a
+pipeline feltöltődjön. Ha azonban a K dimenzió rövid, vagy a
+threadblockok száma nem tölti ki a GPU-t, a terhelés egyenetlen lesz,
+mert néhány SM hamarabb végez, mint a többi.</p>
+<p>A <strong>stream-K</strong> a CUTLASS-ban már a 2.11-es kiadástól
+elérhető (<code>GemmUniversalStreamk</code>, Ampere-példa az
+<code>examples/47_ampere_gemm_universal_streamk</code> könyvtárban; a
+pontos verziótörténetet a CUTLASS release notes tartalmazza), a 3.x-ben
+pedig <code>StreamKScheduler</code> tile scheduler néven érhető el.
+Ahelyett, hogy minden threadblock a teljes K dimenziót dolgozná fel, a
+stream-K a K dimenzió mentén is partícionál: a threadblockok egyenlő
+mennyiségű MMA-iterációt kapnak, és a részösszegeket workspace-alapú
+(szemaforos) fixup-pal vonják össze; a redukció módja (determinisztikus
+vagy nem determinisztikus) konfigurálható.</p>
+<p>A stream-K a <strong>hullámkvantálás</strong> problémáját kezeli: ha
+a kimeneti csempék száma nem osztható egyenletesen az SM-ek számával, az
+utolsó hullámban sok SM tétlen marad. Ezért akkor előnyös, ha a csempék
+száma kicsi az SM-ek számához képest, vagy nem osztható vele; nem a
+pipeline stage-ek és a K oszthatósága számít. A laborban a hagyományos
+data-parallel konfigurációt használjuk, mert az itt mutatott klasszikus
+<code>device::Gemm</code> API a hierarchia fogalmait szemlélteti jobban;
+a stream-K konfigurálását a CUTLASS dokumentációja és mintái
+mutatják.</p>
+<h3 data-number="23.2.5" id="gyakori-hibák-és-megoldások"><span
+class="header-section-number">23.2.5</span> Gyakori hibák és
+megoldások</h3>
+<p>A CUTLASS használata során a következő tipikus hibákra érdemes
+figyelni:</p>
+<ol type="1">
+<li><p><strong>A shared memory limit figyelmen kívül hagyása.</strong> A
+CUTLASS dinamikus shared memóriát használ, ezért a túl nagy tile vagy
+túl sok pipeline stage miatt a szükséges shared memory meghaladja az
+SM/blokk limitjét; ezt nem a fordító, hanem a futásidő jelzi (a
+<code>cudaFuncSetAttribute</code> vagy a kernelindítás hibát ad, a
+CUTLASS <code>Status</code> visszatérési értékében). A
+<code>-Xptxas -v</code> csak a statikus shared memory használatát
+mutatja. Megoldás: csökkentsük a tile méretet vagy a stage-ek számát, és
+ellenőrizzük a <code>gemm.initialize()</code>/<code>gemm()</code>
+státuszát.</p></li>
+<li><p><strong>A mutatók és leading dimension-ök igazításának
+elhagyása.</strong> A CUTLASS vektorizált betöltést használ, amely a
+konfigurált igazítást feltételezi (általában 16 bájt). A nem megfelelően
+igazított operandust a <code>Gemm::can_implement(args)</code> jelzi (pl.
+<code>Status::kErrorMisalignedOperand</code>), nem lassulás vagy hibás
+eredmény. Megoldás: a <code>cudaMalloc</code> által adott igazított
+címeket használjuk, ügyeljünk a leading dimension osztható voltára, és
+mindig ellenőrizzük a <code>can_implement</code> státuszát.</p></li>
+<li><p><strong>Az epilogue típusainak eltévesztése.</strong> Ha a
+kimeneti mátrix típusa FP16, de az epilogue FP32-re van beállítva, a
+<code>LinearCombination</code> nem konvertál megfelelően, és a numerikus
+tartomány túlcsordulhat. Megoldás: mindig ellenőrizzük az
+<code>ElementC</code> és az epilogue kimeneti elemtípusának (a
+<code>LinearCombination</code> első sablonparamétere)
+egyezését.</p></li>
+<li><p><strong>A stream-K redukciós módja és a determinizmus.</strong> A
+stream-K részösszegeit a CUTLASS workspace-alapú fixup-pal vonja össze;
+a nem determinisztikus redukciós mód a lebegőpontos összeadás sorrendje
+miatt nem garantál bit-azonos eredményt. Ha determinizmus szükséges,
+válasszuk a determinisztikus redukciós módot, vagy használjunk
+hagyományos data-parallel konfigurációt, és rögzítsük a
+konfigurációt.</p></li>
+<li><p><strong>A pipeline stage-ek helytelen beállítása.</strong> Túl
+kevés stage nem fedi át a memória-hozzáférést és a számítást, túl sok
+stage pedig feleslegesen foglalja a shared memory-t. A legtöbb Tensor
+Core konfigurációnál a 3–5 stage optimális.</p></li>
+</ol>
+<h3 data-number="23.2.6" id="labor-cutlass-gemm-példa"><span
+class="header-section-number">23.2.6</span> Labor: CUTLASS GEMM
+példa</h3>
+<p>Ez a labor egy FP16 Tensor Core GEMM-et futtat a CUTLASS
+segítségével, és ellenőrzi az eredményt egy CPU referencia ellen. A cél
+a hierarchikus tiling, az epilogue és a mérési módszertan gyakorlati
+bemutatása.</p>
+<h4 data-number="23.2.6.1" id="labor-környezet"><span
+class="header-section-number">23.2.6.1</span> Labor környezet</h4>
+<p>A mérés előtt rögzítendő konfiguráció (a kitöltendő értékeket a saját
+környezetből kell kiolvasni; futtatott mérés nem áll rendelkezésre):</p>
+<table>
+<colgroup>
+<col style="width: 61%" />
+<col style="width: 38%" />
+</colgroup>
+<thead>
+<tr>
+<th>Paraméter</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU</td>
+<td>&lt;kitöltendő&gt; (az <code>Sm80</code> példához pl. NVIDIA A100,
+compute capability 8.0; a 40 GB és 80 GB PCIe változat más
+csúcs-sávszélességű)</td>
+</tr>
+<tr>
+<td>CUDA, fordító</td>
+<td>&lt;kitöltendő&gt; (nvcc 12.x, C++17)</td>
+</tr>
+<tr>
+<td>Driver</td>
+<td>&lt;kitöltendő&gt;</td>
+</tr>
+<tr>
+<td>Operációs rendszer</td>
+<td>&lt;kitöltendő&gt;</td>
+</tr>
+<tr>
+<td>CUTLASS</td>
+<td>&lt;kitöltendő&gt; (a példa a 2.x <code>device::Gemm</code> API-t
+használja)</td>
+</tr>
+<tr>
+<td>Power limit, órajel, ECC, MIG</td>
+<td>&lt;kitöltendő&gt;</td>
+</tr>
+</tbody>
+</table>
+<p>A mátrix méret:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>M</mi><mo>=</mo><mi>N</mi><mo>=</mo><mi>K</mi><mo>=</mo><mn>16384</mn></mrow><annotation encoding="application/x-tex">M = N = K = 16384</annotation></semantics></math>.
+Az A és B mátrixok FP16 típusúak, a C kimenet FP32. Az elemek 0.5-re
+vannak állítva, így a várt matematikai eredmény minden elemre:
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>16384</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>5</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>5</mn><mo>=</mo><mn>4096</mn><mo>,</mo><mn>0</mn><mi>.</mi></mrow><annotation encoding="application/x-tex">
+16384 \cdot 0{,}5 \cdot 0{,}5 = 4096{,}0.
+</annotation></semantics></math> A CUTLASS konfiguráció a fent
+bemutatott FP16 Tensor Core GEMM, 128×128×32 threadblock tile, 64×64×32
+warp tile, 16×8×16 instruction shape, 3 pipeline stage.</p>
+<h4 data-number="23.2.6.2" id="cuda-c-kód"><span
+class="header-section-number">23.2.6.2</span> CUDA C++ kód</h4>
+<pre class="cuda"><code>// CUDA C++17, nvcc 12.4, CUTLASS 2.x device::Gemm API; nem fordított és nem futtatott példa
+#include &lt;algorithm&gt;
+#include &lt;cmath&gt;
+#include &lt;cstdlib&gt;
+#include &lt;iostream&gt;
+#include &lt;vector&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cutlass/cutlass.h&gt;
+#include &lt;cutlass/gemm/device/gemm.h&gt;
+#include &lt;cutlass/util/host_tensor.h&gt;
+#include &lt;cutlass/util/device_memory.h&gt;
+
+#define CUDA_CHECK(call)                                                      \
+    do {                                                                      \
+        cudaError_t err_ = (call);                                            \
+        if (err_ != cudaSuccess) {                                            \
+            std::cerr &lt;&lt; &quot;CUDA error at &quot; &lt;&lt; __FILE__ &lt;&lt; &quot;:&quot; &lt;&lt; __LINE__      \
+                      &lt;&lt; &quot;: &quot; &lt;&lt; cudaGetErrorString(err_) &lt;&lt; std::endl;       \
+            std::exit(EXIT_FAILURE);                                          \
+        }                                                                     \
+    } while (0)
+
+#define CUTLASS_CHECK(call)                                                   \
+    do {                                                                      \
+        cutlass::Status status_ = (call);                                     \
+        if (status_ != cutlass::Status::kSuccess) {                           \
+            std::cerr &lt;&lt; &quot;CUTLASS error at &quot; &lt;&lt; __FILE__ &lt;&lt; &quot;:&quot; &lt;&lt; __LINE__   \
+                      &lt;&lt; &quot;: &quot; &lt;&lt; cutlass::cutlassGetStatusString(status_)     \
+                      &lt;&lt; std::endl;                                           \
+            std::exit(EXIT_FAILURE);                                          \
+        }                                                                     \
+    } while (0)
+
+using ElementA = cutlass::half_t;
+using ElementB = cutlass::half_t;
+using ElementC = float;
+using ElementAccumulator = float;
+using LayoutA = cutlass::layout::RowMajor;
+using LayoutB = cutlass::layout::RowMajor;
+using LayoutC = cutlass::layout::RowMajor;
+
+using Gemm = cutlass::gemm::device::Gemm&lt;
+    ElementA, LayoutA,
+    ElementB, LayoutB,
+    ElementC, LayoutC,
+    ElementAccumulator,
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape&lt;128, 128, 32&gt;,
+    cutlass::gemm::GemmShape&lt;64, 64, 32&gt;,
+    cutlass::gemm::GemmShape&lt;16, 8, 16&gt;,
+    cutlass::epilogue::thread::LinearCombination&lt;
+        ElementC,
+        128 / cutlass::sizeof_bits&lt;ElementC&gt;::value,
+        ElementAccumulator,
+        ElementAccumulator&gt;,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle&lt;&gt;,
+    3
+&gt;;
+
+int main() {
+    // C: 16384^2 float = 1,07 GB; A, B: 0,54 GB-onként
+    const int M = 16384, N = 16384, K = 16384;
+
+    // Host mátrixok (a HostTensor a device-oldali másolatot is kezeli)
+    cutlass::HostTensor&lt;ElementA, LayoutA&gt; A(cutlass::MatrixCoord(M, K));
+    cutlass::HostTensor&lt;ElementB, LayoutB&gt; B(cutlass::MatrixCoord(K, N));
+    cutlass::HostTensor&lt;ElementC, LayoutC&gt; C(cutlass::MatrixCoord(M, N));
+
+    for (size_t i = 0; i &lt; A.size(); ++i) A.host_data()[i] = ElementA(0.5f);
+    for (size_t i = 0; i &lt; B.size(); ++i) B.host_data()[i] = ElementB(0.5f);
+    for (size_t i = 0; i &lt; C.size(); ++i) C.host_data()[i] = 0.0f;
+
+    A.sync_device();
+    B.sync_device();
+    C.sync_device();
+
+    // CUTLASS argumentumok: a Gemm saját Arguments típusa, TensorRef-ekkel
+    ElementAccumulator alpha = 1.0f;
+    ElementAccumulator beta = 0.0f;
+
+    typename Gemm::Arguments args({M, N, K},
+                                  A.device_ref(),
+                                  B.device_ref(),
+                                  C.device_ref(),   // C (forrás, beta = 0)
+                                  C.device_ref(),   // D (kimenet)
+                                  {alpha, beta});
+
+    Gemm gemm;
+    CUTLASS_CHECK(gemm.can_implement(args));
+    size_t workspace_size = Gemm::get_workspace_size(args);
+    cutlass::device_memory::allocation&lt;uint8_t&gt; workspace(workspace_size);
+    CUTLASS_CHECK(gemm.initialize(args, workspace.get()));
+    // Warm-up: a könyv protokollja szerint 5 hívás
+    for (int i = 0; i &lt; 5; ++i) CUTLASS_CHECK(gemm());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Mérés: 20 ismétlés, az eseménypár egyszer létrehozva
+    const int num_runs = 20;
+    std::vector&lt;float&gt; t(num_runs);
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&amp;start));
+    CUDA_CHECK(cudaEventCreate(&amp;stop));
+    for (int i = 0; i &lt; num_runs; ++i) {
+        CUDA_CHECK(cudaEventRecord(start));
+        CUTLASS_CHECK(gemm());
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&amp;t[i], start, stop));
+    }
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    float mean_ms = 0.0f;
+    for (float v : t) mean_ms += v;
+    mean_ms /= num_runs;
+    float ss = 0.0f;
+    for (float v : t) ss += (v - mean_ms) * (v - mean_ms);
+    float std_ms = std::sqrt(ss / (num_runs - 1));
+    std::sort(t.begin(), t.end());
+    float med_ms = 0.5f * (t[num_runs / 2 - 1] + t[num_runs / 2]);
+
+    // Eredmény visszamásolása
+    C.sync_host();
+
+    // Ellenőrzés CPU referencia ellen
+    float max_error = 0.0f;
+    for (size_t i = 0; i &lt; C.size(); ++i) {
+        float expected = static_cast&lt;float&gt;(K) * 0.5f * 0.5f;  // 4096.0
+        max_error = std::max(max_error, std::fabs(C.host_data()[i] - expected));
+    }
+
+    double flops = 2.0 * static_cast&lt;double&gt;(M) * static_cast&lt;double&gt;(N)
+                   * static_cast&lt;double&gt;(K);
+    double tflops = flops / (med_ms * 1e-3) / 1e12;
+
+    std::cout &lt;&lt; &quot;Median time: &quot; &lt;&lt; med_ms &lt;&lt; &quot; ms (&quot; &lt;&lt; num_runs
+              &lt;&lt; &quot; runs), stddev &quot; &lt;&lt; std_ms &lt;&lt; &quot; ms&quot; &lt;&lt; std::endl;
+    std::cout &lt;&lt; &quot;Achieved TFLOPS: &quot; &lt;&lt; tflops &lt;&lt; std::endl;
+    std::cout &lt;&lt; &quot;Max abs error: &quot; &lt;&lt; max_error &lt;&lt; std::endl;
+
+    return 0;
+}</code></pre>
+<h4 data-number="23.2.6.3" id="build-és-futtatás"><span
+class="header-section-number">23.2.6.3</span> Build és futtatás</h4>
+<p>A buildparancs (a CUTLASS include útvonalait a saját környezethez
+kell igazítani):</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># nem futtatott parancs</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="dt">\</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>     <span class="at">-I</span>/path/to/cutlass/include <span class="dt">\</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>     <span class="at">-I</span>/path/to/cutlass/tools/util/include <span class="dt">\</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>     cutlass_gemm_lab.cu <span class="at">-o</span> cutlass_gemm_lab</span></code></pre></div>
+<p>A kernel regiszter- és shared memory használatát a következő
+kapcsolóval ellenőrizhetjük:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-Xptxas</span> <span class="at">-v</span> <span class="dt">\</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>     <span class="at">-I</span>/path/to/cutlass/include <span class="dt">\</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>     <span class="at">-I</span>/path/to/cutlass/tools/util/include <span class="dt">\</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>     cutlass_gemm_lab.cu <span class="at">-o</span> cutlass_gemm_lab</span></code></pre></div>
+<p>Futtatás:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./cutlass_gemm_lab</span></span></code></pre></div>
+<h4 data-number="23.2.6.4" id="mérési-napló"><span
+class="header-section-number">23.2.6.4</span> Mérési napló</h4>
+<p>A mérés 5 warm-up után 20 futásból áll; futtatott mérés híján az
+alábbi táblázat sablon, a mért mezők üresek, az elemzett (analitikus)
+értékek külön oszlopban a levezetésükkel.</p>
+<table>
+<colgroup>
+<col style="width: 26%" />
+<col style="width: 45%" />
+<col style="width: 28%" />
+</colgroup>
+<thead>
+<tr>
+<th>Paraméter</th>
+<th>Várt / levezetett</th>
+<th>Mért érték</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Medián futási idő</td>
+<td>lásd lent</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+</tr>
+<tr>
+<td>Szórás (20 futás)</td>
+<td>–</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+</tr>
+<tr>
+<td>Elért TFLOPS (medián)</td>
+<td>lásd lent</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+</tr>
+<tr>
+<td>Max abszolút hiba</td>
+<td>0,0 (lásd lent)</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+</tr>
+<tr>
+<td>Regiszterhasználat szálanként</td>
+<td>–</td>
+<td>&lt;<code>-Xptxas -v</code> vagy Nsight – kitöltendő&gt;</td>
+</tr>
+<tr>
+<td>Shared memory threadblockonként</td>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>3</mn><mo>⋅</mo><mo stretchy="false" form="prefix">(</mo><mn>128</mn><mo>⋅</mo><mn>32</mn><mo>+</mo><mn>32</mn><mo>⋅</mo><mn>128</mn><mo stretchy="false" form="postfix">)</mo><mo>⋅</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">3\cdot(128\cdot 32 + 32\cdot 128)\cdot 2</annotation></semantics></math>
+B
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>=</mo><mn>48</mn></mrow><annotation encoding="application/x-tex">= 48</annotation></semantics></math>
+KiB (padding nélkül, becslés)</td>
+<td>&lt;Nsight – kitöltendő&gt;</td>
+</tr>
+<tr>
+<td>Occupancy</td>
+<td>–</td>
+<td>&lt;Nsight / occupancy API – kitöltendő&gt;</td>
+</tr>
+<tr>
+<td>Minimális global memóriaforgalom (A+B olvasás, C írás)</td>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>54</mn><mo>+</mo><mn>1</mn><mo>,</mo><mn>07</mn><mo>≈</mo><mn>2</mn><mo>,</mo><mn>15</mn></mrow><annotation encoding="application/x-tex">2\cdot 0{,}54 + 1{,}07 \approx 2{,}15</annotation></semantics></math>
+GB</td>
+<td>–</td>
+</tr>
+</tbody>
+</table>
+<p>A várt és a mért eredmény külön kezelése:</p>
+<ul>
+<li><strong>Várt matematikai eredmény:</strong> minden C elem értéke
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>4096</mn><mo>,</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">4096{,}0</annotation></semantics></math>,
+mert a bemeneti elemek 0,5 pontosan reprezentálhatók FP16-ban, a szorzat
+0,25, és az FP32 akkumuláció a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>16384</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>25</mn></mrow><annotation encoding="application/x-tex">16384\cdot 0{,}25</annotation></semantics></math>
+összegét pontosan adja (2 hatványok és kis egész többszörösök, kerekítés
+nélkül).</li>
+<li><strong>Mért GPU kimenet:</strong> a futtatás után kell kitölteni (a
+várt maximális abszolút hiba 0,0).</li>
+<li><strong>Várt teljesítmény (levezetés):</strong> a feladat
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mo>⋅</mo><msup><mn>16384</mn><mn>3</mn></msup><mo>≈</mo><mn>8</mn><mo>,</mo><mn>80</mn><mo>⋅</mo><msup><mn>10</mn><mn>12</mn></msup></mrow><annotation encoding="application/x-tex">2\cdot 16384^3 \approx 8{,}80\cdot 10^{12}</annotation></semantics></math>
+FLOP. Az A100 FP16 Tensor Core csúcsa dense módban 312 TFLOPS, így a
+számítási alsó időkorlát kb. 28,2 ms. Ha a csúcs 70–85%-át feltételezzük
+(hardver- és verziófüggő becslés, nem garantált érték), kb. 218–265
+TFLOPS, azaz kb. 33–40 ms várható. A memóriaforgalom miatti alsó korlát
+(2,15 GB a ~1,5–2 TB/s sávszélességen, kb. 1 ms) ennél jóval kisebb,
+tehát a feladat számítás-korlátos.</li>
+<li><strong>Mért teljesítmény:</strong> &lt;kitöltendő&gt;; az elért
+csúcsarány csak ennek ismeretében értékelhető.</li>
+</ul>
+<p>Ez a labor demonstrálja a CUTLASS GEMM hierarchiájának gyakorlati
+használatát, a tile-ok és az epilogue beállítását, valamint a mérési
+módszertan alapelveit. A következő alfejezet (23.3) a mixed precision
+fogalomkörét és a numerikus viselkedést tárgyalja, építve az itt
+bevezetett CUTLASS konfigurációkra.</p>
+<h3 data-number="23.2.7" id="önellenőrző-kérdés"><span
+class="header-section-number">23.2.7</span> Önellenőrző kérdés</h3>
+<p>Mi a különbség a threadblock tile, a warp tile és az instruction
+shape között a CUTLASS GEMM hierarchiájában, és miért fontos az epilogue
+elkülönítése a GEMM kerneltől?</p>
+<p><em>Válasz:</em> A threadblock tile (itt 128×128×32) az egy szálblokk
+által a shared memóriába töltött és kiszámított C-régió és K-szelet; a
+warp tile (64×64×32) egy warp része ebből (itt 2×2 warp); az instruction
+shape (16×8×16) egyetlen <code>mma.sync</code> utasítás csempéje – egy
+warp tile K = 16-os lépésenként (64/16)·(64/8) = 32 ilyen utasításra
+bomlik. Az epilogue elkülönítése miatt a skálázás, a bias, az aktiváció
+és a típuskonverzió a GEMM-mag változtatása nélkül cserélhető (például
+<code>LinearCombination</code> → <code>LinearCombinationRelu</code>), és
+a kimenet egyszer, a regiszterekből íródik ki, külön kernel és extra
+global memóriaforgalom nélkül.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu086.html">← 23.1 Tensor Core architektúra</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu088.html">23.3 Mixed precision →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

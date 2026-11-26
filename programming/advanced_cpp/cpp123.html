@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>32.2 Implementáció és optimalizálás – Fejlett C++ - haladó
+nyelvi eszközök és technikák</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz7">VII. RÉSZ – Esettanulmányok, záróprojekt és jövő</a> › <a href="index.html#cppch31">32 Záróprojekt: szakértői C++ rendszer</a></p>
+<div class="links"><a class="prev" rel="prev" href="cpp122.html">← 32.1 Követelmények és architektúra</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="cpp124.html">32.3 Tesztelés, benchmark és biztonság →</a></div>
+</nav>
+<h2 data-number="32.2" id="cpp123"><span
+class="header-section-number">32.2</span> Implementáció és
+optimalizálás</h2>
+<p>A záróprojekt (32.1) során rögzítettük a rendszer követelményeit és
+architektúráját. Most a tervből működő, mérhető implementációt
+készítünk. A fejezetben egy egyszerű, de valósághű adatfeldolgozó
+csővezetéket valósítunk meg, és bemutatjuk az optimalizálás ciklusát:
+mérés – elemzés – átalakítás – ismételt mérés. A hangsúly a modern C++
+eszközök tudatos használatán és a reprodukálható mérési módszertanon
+van, nem pedig a trükkös kódrészleteken.</p>
+<h3 data-number="32.2.1" id="az-architektúra-leképezése-kódba"><span
+class="header-section-number">32.2.1</span> Az architektúra leképezése
+kódba</h3>
+<p>A tervezett rendszer fő komponensei: bemeneti olvasó, szűrő,
+transzformáló, aggregáló és kimeneti író. Ezeket a komponenseket önálló,
+tesztelhető egységekként valósítjuk meg, és egy <code>Pipeline</code>
+osztály köti össze őket. Az interfészeket C++20
+<code>concept</code>-ekkel írjuk le, így a fordító már fordítási időben
+ellenőrzi a komponensek kompatibilitását. A komponensek
+sablonparaméterek, hogy a feldolgozó típusok cserélhetők legyenek
+anélkül, hogy a <code>Pipeline</code> forráskódját módosítanánk.</p>
+<p>Kezdjük a rekord definíciójával. A <code>SensorRecord</code> a
+32.1-ben bevezetett <code>mt::Sample</code> leegyszerűsített, ahhoz
+hasonló rekordja: a <code>timestamp</code> a <code>timestamp_us</code>
+mezőnek, a <code>sensor_id</code> és a <code>value</code> a
+<code>Sample</code> azonos nevű mezőinek felel meg, de a
+<code>value</code> itt <code>double</code> (ott <code>float</code>), és
+a mezők sorrendje is eltér. <strong>Az eltérés szándékos:</strong> ez az
+egység nem a 32.1 UDP-s, <code>IPipeline</code>/<code>IDataSink</code>
+virtuális interfészekre épülő MiniTelemetry-rendszerét építi tovább,
+hanem egy önálló, fájlból olvasó, concept-alapú összegző pipeline-t
+mutat be az implementációs és optimalizálási módszertan szemléltetésére;
+a két egység mintái (rekord, hibamodell) nem cserélhetők
+közvetlenül.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Egy bemeneti szenzoradat (az mt::Sample-höz hasonló, de önálló rekord; lásd fent)</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> SensorRecord <span class="op">{</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>uint64_t timestamp<span class="op">;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> value<span class="op">;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>uint32_t sensor_id<span class="op">;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A rekord triviálisan másolható és mozgatható, ami megkönnyíti az
+érték szerinti átadást a feldolgozási láncban.</p>
+<p>Most definiáljuk a komponensek interfészeit concept-ekkel:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// A sablonparaméter neve nem egyezhet a concept nevével ([temp.local]), ezért T.</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">template</span><span class="op">&lt;</span><span class="kw">typename</span> T<span class="op">&gt;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">concept</span> Reader <span class="op">=</span> <span class="kw">requires</span><span class="op">(</span>T r<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span> r<span class="op">.</span>next<span class="op">()</span> <span class="op">}</span> <span class="op">-&gt;</span> <span class="bu">std::</span>convertible_to<span class="op">&lt;</span><span class="bu">std::</span>optional<span class="op">&lt;</span>SensorRecord<span class="op">&gt;&gt;;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A <code>Reader</code> concept előírja, hogy a <code>next()</code>
+tagfüggvény <code>std::optional&lt;SensorRecord&gt;</code>-ot adjon
+vissza, amely a bemenet végét <code>std::nullopt</code>-tal jelzi.</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">template</span><span class="op">&lt;</span><span class="kw">typename</span> T<span class="op">&gt;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">concept</span> Filter <span class="op">=</span> <span class="kw">requires</span><span class="op">(</span>T f<span class="op">,</span> <span class="at">const</span> SensorRecord<span class="op">&amp;</span> rec<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span> f<span class="op">(</span>rec<span class="op">)</span> <span class="op">}</span> <span class="op">-&gt;</span> <span class="bu">std::</span>convertible_to<span class="op">&lt;</span><span class="dt">bool</span><span class="op">&gt;;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="kw">template</span><span class="op">&lt;</span><span class="kw">typename</span> T<span class="op">&gt;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="kw">concept</span> Transform <span class="op">=</span> <span class="kw">requires</span><span class="op">(</span>T t<span class="op">,</span> <span class="at">const</span> SensorRecord<span class="op">&amp;</span> rec<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span> t<span class="op">(</span>rec<span class="op">)</span> <span class="op">}</span> <span class="op">-&gt;</span> <span class="bu">std::</span>convertible_to<span class="op">&lt;</span>SensorRecord<span class="op">&gt;;</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="kw">template</span><span class="op">&lt;</span><span class="kw">typename</span> T<span class="op">&gt;</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="kw">concept</span> Aggregator <span class="op">=</span> <span class="kw">requires</span><span class="op">(</span>T a<span class="op">,</span> <span class="at">const</span> SensorRecord<span class="op">&amp;</span> rec<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span> a<span class="op">.</span>add<span class="op">(</span>rec<span class="op">)</span> <span class="op">}</span> <span class="op">-&gt;</span> <span class="bu">std::</span>same_as<span class="op">&lt;</span><span class="dt">void</span><span class="op">&gt;;</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span> a<span class="op">.</span>result<span class="op">()</span> <span class="op">}</span> <span class="op">-&gt;</span> <span class="bu">std::</span>same_as<span class="op">&lt;</span><span class="dt">double</span><span class="op">&gt;;</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>Ezek a concept-ek nemcsak dokumentálják a komponensek elvárt
+működését, hanem fordítási időben megakadályozzák a nem kompatibilis
+típusok használatát. A hibaüzenetek így sokkal olvashatóbbak, mint a
+hagyományos sablonhibák.</p>
+<p>A <code>Pipeline</code> osztály:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">template</span><span class="op">&lt;</span>Reader READER<span class="op">,</span> Filter FILTER<span class="op">,</span> Transform TRANSFORM<span class="op">,</span> Aggregator AGG<span class="op">&gt;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> Pipeline <span class="op">{</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    Pipeline<span class="op">(</span>READER reader<span class="op">,</span> FILTER filter<span class="op">,</span> TRANSFORM transform<span class="op">,</span> AGG agg<span class="op">)</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>        <span class="op">:</span> <span class="va">reader_</span><span class="op">(</span><span class="bu">std::</span>move<span class="op">(</span>reader<span class="op">)),</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>          <span class="va">filter_</span><span class="op">(</span><span class="bu">std::</span>move<span class="op">(</span>filter<span class="op">)),</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>          <span class="va">transform_</span><span class="op">(</span><span class="bu">std::</span>move<span class="op">(</span>transform<span class="op">)),</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>          <span class="va">agg_</span><span class="op">(</span><span class="bu">std::</span>move<span class="op">(</span>agg<span class="op">))</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">{}</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> run<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="op">(</span><span class="kw">auto</span> rec <span class="op">=</span> <span class="va">reader_</span><span class="op">.</span>next<span class="op">())</span> <span class="op">{</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span><span class="va">filter_</span><span class="op">(*</span>rec<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>                <span class="va">agg_</span><span class="op">.</span>add<span class="op">(</span><span class="va">transform_</span><span class="op">(*</span>rec<span class="op">));</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="va">agg_</span><span class="op">.</span>result<span class="op">();</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>    READER <span class="va">reader_</span><span class="op">;</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>    FILTER <span class="va">filter_</span><span class="op">;</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>    TRANSFORM <span class="va">transform_</span><span class="op">;</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>    AGG <span class="va">agg_</span><span class="op">;</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A konstruktor paraméterként veszi át a komponenseket, és
+<code>std::move</code>-tal továbbítja azokat a tagváltozókba. Ez
+lehetővé teszi, hogy a komponensek hatékonyan mozgathatók legyenek, és a
+<code>Pipeline</code> birtokolja az erőforrásaikat (RAII). A
+<code>run()</code> tagfüggvény szekvenciálisan dolgozza fel a
+rekordokat: beolvas, szűr, transzformál, aggregál. A ciklus mindaddig
+fut, amíg az olvasó <code>std::nullopt</code>-ot nem ad vissza.</p>
+<p>A konkrét komponensek:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> FileReader <span class="op">{</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">explicit</span> FileReader<span class="op">(</span><span class="bu">std::</span>istream<span class="op">&amp;</span> input<span class="op">)</span> <span class="op">:</span> <span class="va">input_</span><span class="op">(</span>input<span class="op">)</span> <span class="op">{}</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>optional<span class="op">&lt;</span>SensorRecord<span class="op">&gt;</span> next<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>        SensorRecord rec<span class="op">;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(!(</span><span class="va">input_</span> <span class="op">&gt;&gt;</span> rec<span class="op">.</span>timestamp <span class="op">&gt;&gt;</span> rec<span class="op">.</span>value <span class="op">&gt;&gt;</span> rec<span class="op">.</span>sensor_id<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="bu">std::</span>nullopt<span class="op">;</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> rec<span class="op">;</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>istream<span class="op">&amp;</span> <span class="va">input_</span><span class="op">;</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> PositiveFilter <span class="op">{</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> <span class="kw">operator</span><span class="op">()(</span><span class="at">const</span> SensorRecord<span class="op">&amp;</span> rec<span class="op">)</span> <span class="at">const</span> <span class="kw">noexcept</span> <span class="op">{</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> rec<span class="op">.</span>value <span class="op">&gt;</span> <span class="fl">0.0</span><span class="op">;</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> ScaleTransform <span class="op">{</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a>    <span class="kw">explicit</span> ScaleTransform<span class="op">(</span><span class="dt">double</span> factor<span class="op">)</span> <span class="op">:</span> <span class="va">factor_</span><span class="op">(</span>factor<span class="op">)</span> <span class="op">{}</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a>    SensorRecord <span class="kw">operator</span><span class="op">()(</span><span class="at">const</span> SensorRecord<span class="op">&amp;</span> rec<span class="op">)</span> <span class="at">const</span> <span class="kw">noexcept</span> <span class="op">{</span></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">{</span>rec<span class="op">.</span>timestamp<span class="op">,</span> rec<span class="op">.</span>value <span class="op">*</span> <span class="va">factor_</span><span class="op">,</span> rec<span class="op">.</span>sensor_id<span class="op">};</span></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> <span class="va">factor_</span><span class="op">;</span></span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> SumAggregator <span class="op">{</span></span>
+<span id="cb5-33"><a href="#cb5-33" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb5-34"><a href="#cb5-34" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> add<span class="op">(</span><span class="at">const</span> SensorRecord<span class="op">&amp;</span> rec<span class="op">)</span> <span class="kw">noexcept</span> <span class="op">{</span></span>
+<span id="cb5-35"><a href="#cb5-35" aria-hidden="true" tabindex="-1"></a>        <span class="va">sum_</span> <span class="op">+=</span> rec<span class="op">.</span>value<span class="op">;</span></span>
+<span id="cb5-36"><a href="#cb5-36" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-37"><a href="#cb5-37" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> result<span class="op">()</span> <span class="at">const</span> <span class="kw">noexcept</span> <span class="op">{</span></span>
+<span id="cb5-38"><a href="#cb5-38" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="va">sum_</span><span class="op">;</span></span>
+<span id="cb5-39"><a href="#cb5-39" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-40"><a href="#cb5-40" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb5-41"><a href="#cb5-41" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> <span class="va">sum_</span> <span class="op">=</span> <span class="fl">0.0</span><span class="op">;</span></span>
+<span id="cb5-42"><a href="#cb5-42" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>Ez a referencia implementáció egyszerű, de működő és tesztelhető. A
+<code>FileReader</code> a formázott beolvasást
+(<code>operator&gt;&gt;</code>) használja, ami kényelmes, de számos
+rejtett költséggel járhat, mint például a <code>std::locale</code>
+kezelése és a számformátumok feldolgozása. A <code>PositiveFilter</code>
+és a <code>ScaleTransform</code> <code>noexcept</code> jelöléssel jelzi,
+hogy nem dobnak kivételt – ez fontos a fordító számára az
+optimalizáláshoz és a kivételbiztonsági garanciákhoz. A
+<code>SumAggregator</code> egyszerű összegzést végez.</p>
+<p>A <code>Pipeline</code> használata:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sstream&gt;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cassert&gt;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> test_pipeline<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>istringstream input<span class="op">(</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;100 1.5 1</span><span class="sc">\n</span><span class="st">&quot;</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;200 -0.5 1</span><span class="sc">\n</span><span class="st">&quot;</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;300 2.0 2</span><span class="sc">\n</span><span class="st">&quot;</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;400 0.0 2</span><span class="sc">\n</span><span class="st">&quot;</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;500 3.5 1</span><span class="sc">\n</span><span class="st">&quot;</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">);</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>    FileReader reader<span class="op">(</span>input<span class="op">);</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>    PositiveFilter filter<span class="op">;</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>    ScaleTransform transform<span class="op">(</span><span class="fl">2.0</span><span class="op">);</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>    SumAggregator agg<span class="op">;</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>    Pipeline<span class="op">&lt;</span>FileReader<span class="op">,</span> PositiveFilter<span class="op">,</span> ScaleTransform<span class="op">,</span> SumAggregator<span class="op">&gt;</span> pipeline<span class="op">(</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>move<span class="op">(</span>reader<span class="op">),</span> <span class="bu">std::</span>move<span class="op">(</span>filter<span class="op">),</span> <span class="bu">std::</span>move<span class="op">(</span>transform<span class="op">),</span> <span class="bu">std::</span>move<span class="op">(</span>agg<span class="op">));</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> result <span class="op">=</span> pipeline<span class="op">.</span>run<span class="op">();</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Pozitív értékek: 1.5, 2.0, 3.5 -&gt; 2-szeres: 3, 4, 7 -&gt; összeg: 14</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>    <span class="ot">assert</span><span class="op">(</span>result <span class="op">==</span> <span class="fl">14.0</span><span class="op">);</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ez a teszt ellenőrzi a pipeline helyes működését, és a laborban
+kiindulópontként szolgál.</p>
+<h3 data-number="32.2.2" id="az-implementáció-lépései"><span
+class="header-section-number">32.2.2</span> Az implementáció
+lépései</h3>
+<p>Az implementáció során először egy működő, de nem optimalizált
+változatot készítünk, amelyre kiterjedt egységteszteket írunk. Ez lesz a
+referencia. Ezután profilozással azonosítjuk a szűk keresztmetszeteket,
+és célzottan optimalizálunk. Minden optimalizálási lépés után újra
+futtatjuk a teszteket és a benchmarkokat, hogy biztosítsuk a helyes
+működést és mérhető javulást.</p>
+<p>A referencia implementáció szekvenciális, és a beolvasást
+<code>operator&gt;&gt;</code> segítségével végzi. A profilozás
+valószínűleg a beolvasást és a feldolgozási hurkot fogja mutatni. Ezt
+méréssel igazoljuk.</p>
+<h3 data-number="32.2.3" id="mérés-és-profilozás-a-kiindulópont"><span
+class="header-section-number">32.2.3</span> Mérés és profilozás: a
+kiindulópont</h3>
+<p>Mielőtt bármilyen optimalizálásba kezdenénk, rögzítenünk kell a
+mérési környezetet. Ez a labor kötelező eleme. A mérési naplónak
+legalább az alábbi adatokat kell tartalmaznia:</p>
+<ul>
+<li><strong>Fordító</strong>: pl. GCC 13.2, Clang 17.0, MSVC 19.38.
+Pontos verzióval; a verziók változhatnak, ezért a laborban ellenőrizni
+kell.</li>
+<li><strong>C++ szabvány</strong>: C++20 vagy C++23, ahogy a build
+beállítja.</li>
+<li><strong>Optimalizáció</strong>: <code>-O3 -DNDEBUG</code> (vagy az
+adott fordító megfelelője).</li>
+<li><strong>Hardver</strong>: CPU modell, memória, operációs
+rendszer.</li>
+<li><strong>Input méret</strong>: a rekordok száma és a bemenet jellege
+(pl. 10 000 000 rekord).</li>
+<li><strong>Futtatások száma</strong>: legalább 5, a statisztikai szórás
+csökkentése érdekében.</li>
+<li><strong>Mért idő</strong>: átlag, medián, szórás.</li>
+<li><strong>Várt idő</strong>: becslés vagy korábbi mérés alapján.</li>
+</ul>
+<p>A benchmarkhoz a Google Benchmark könyvtárat használjuk, de bármilyen
+stabil időmérés megfelel. A könyvtár API-ja változhat, ezért az aktuális
+verziót a laborban ellenőrizni kell. A benchmark kód:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;benchmark/benchmark.h&gt;</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="at">static</span> <span class="dt">void</span> BM_Pipeline<span class="op">(</span>benchmark<span class="op">::</span>State<span class="op">&amp;</span> state<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Bemeneti adat előkészítése memóriában</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>stringstream input<span class="op">;</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ... feltöltés 10 000 000 rekorddal ...</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="kw">auto</span> _ <span class="op">:</span> state<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>        input<span class="op">.</span>clear<span class="op">();</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>        input<span class="op">.</span>seekg<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>        FileReader reader<span class="op">(</span>input<span class="op">);</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>        PositiveFilter filter<span class="op">;</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>        ScaleTransform transform<span class="op">(</span><span class="fl">2.0</span><span class="op">);</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>        SumAggregator agg<span class="op">;</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>        Pipeline<span class="op">&lt;</span>FileReader<span class="op">,</span> PositiveFilter<span class="op">,</span> ScaleTransform<span class="op">,</span> SumAggregator<span class="op">&gt;</span> pipeline<span class="op">(</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>move<span class="op">(</span>reader<span class="op">),</span> <span class="bu">std::</span>move<span class="op">(</span>filter<span class="op">),</span> <span class="bu">std::</span>move<span class="op">(</span>transform<span class="op">),</span> <span class="bu">std::</span>move<span class="op">(</span>agg<span class="op">));</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>        <span class="kw">auto</span> result <span class="op">=</span> pipeline<span class="op">.</span>run<span class="op">();</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>        benchmark<span class="op">::</span>DoNotOptimize<span class="op">(</span>result<span class="op">);</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>BENCHMARK<span class="op">(</span>BM_Pipeline<span class="op">)-&gt;</span>Unit<span class="op">(</span>benchmark<span class="op">::</span>kMillisecond<span class="op">);</span></span></code></pre></div>
+<p>A <code>benchmark::DoNotOptimize</code> megakadályozza, hogy a
+fordító eltávolítsa a számítást, mert a <code>result</code> változót a
+benchmark keretrendszer „használja”.</p>
+<p>A profilozáshoz Linuxon a <code>perf record</code> és a
+<code>perf report</code> eszközök használhatók, Windows-on a Visual
+Studio Profiler, macOS-en pedig az Instruments. A profilozás célja, hogy
+azonosítsuk a tényleges forró pontokat, mielőtt optimalizálnánk. A
+tipikus eredmény ebben a példában: a <code>FileReader::next()</code>
+formázott beolvasása viszi el az idő nagy részét, mivel a
+<code>std::istream</code> és a <code>std::locale</code> réteg nagyon
+lassú a nyers karakterfeldolgozáshoz képest.</p>
+<h3 data-number="32.2.4"
+id="első-optimalizálás-alacsony-szintű-beolvasás"><span
+class="header-section-number">32.2.4</span> Első optimalizálás: alacsony
+szintű beolvasás</h3>
+<p>A profilozás eredménye alapján az első lépés a beolvasás
+optimalizálása. A <code>std::from_chars</code> (C++17-től egész és
+lebegőpontos típusokra is; a lebegőpontos túlterhelés könyvtári
+támogatása késett: libstdc++ GCC 11-től, MSVC STL 19.24-től, libc++-ban
+jóval később – a <code>__cpp_lib_to_chars</code> makróval ellenőrizendő)
+sokkal gyorsabb, mert nem használ lokált, nem dob kivételt, és
+közvetlenül a karakterpufferből dolgozik. Cserébe a hibakezelést nekünk
+kell megvalósítani, és a bemeneti formátumnak szigorúan meghatározottnak
+kell lennie.</p>
+<p>Új olvasó komponens:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> FastFileReader <span class="op">{</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">explicit</span> FastFileReader<span class="op">(</span><span class="bu">std::</span>string_view data<span class="op">)</span> <span class="op">:</span> <span class="va">data_</span><span class="op">(</span>data<span class="op">)</span> <span class="op">{}</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>optional<span class="op">&lt;</span>SensorRecord<span class="op">&gt;</span> next<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> <span class="dt">char</span><span class="op">*</span> end <span class="op">=</span> <span class="va">data_</span><span class="op">.</span>data<span class="op">()</span> <span class="op">+</span> <span class="va">data_</span><span class="op">.</span>size<span class="op">();</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> <span class="dt">char</span><span class="op">*</span> p <span class="op">=</span> skip_ws<span class="op">(</span><span class="va">data_</span><span class="op">.</span>data<span class="op">(),</span> end<span class="op">);</span>   <span class="co">// a sorvégi &#39;\n&#39; és a szóközök átlépése</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>p <span class="op">==</span> end<span class="op">)</span> <span class="cf">return</span> <span class="bu">std::</span>nullopt<span class="op">;</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>        SensorRecord rec<span class="op">{};</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>        <span class="kw">auto</span> r1 <span class="op">=</span> <span class="bu">std::</span>from_chars<span class="op">(</span>p<span class="op">,</span> end<span class="op">,</span> rec<span class="op">.</span>timestamp<span class="op">);</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>r1<span class="op">.</span>ec <span class="op">!=</span> <span class="bu">std::</span>errc<span class="op">{})</span> <span class="cf">return</span> <span class="bu">std::</span>nullopt<span class="op">;</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>        p <span class="op">=</span> skip_ws<span class="op">(</span>r1<span class="op">.</span>ptr<span class="op">,</span> end<span class="op">);</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>        <span class="kw">auto</span> r2 <span class="op">=</span> <span class="bu">std::</span>from_chars<span class="op">(</span>p<span class="op">,</span> end<span class="op">,</span> rec<span class="op">.</span>value<span class="op">);</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>r2<span class="op">.</span>ec <span class="op">!=</span> <span class="bu">std::</span>errc<span class="op">{})</span> <span class="cf">return</span> <span class="bu">std::</span>nullopt<span class="op">;</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>        p <span class="op">=</span> skip_ws<span class="op">(</span>r2<span class="op">.</span>ptr<span class="op">,</span> end<span class="op">);</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>        <span class="kw">auto</span> r3 <span class="op">=</span> <span class="bu">std::</span>from_chars<span class="op">(</span>p<span class="op">,</span> end<span class="op">,</span> rec<span class="op">.</span>sensor_id<span class="op">);</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>r3<span class="op">.</span>ec <span class="op">!=</span> <span class="bu">std::</span>errc<span class="op">{})</span> <span class="cf">return</span> <span class="bu">std::</span>nullopt<span class="op">;</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>        <span class="va">data_</span><span class="op">.</span>remove_prefix<span class="op">(</span><span class="kw">static_cast</span><span class="op">&lt;</span><span class="bu">std::</span>size_t<span class="op">&gt;(</span>r3<span class="op">.</span>ptr <span class="op">-</span> <span class="va">data_</span><span class="op">.</span>data<span class="op">()));</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> rec<span class="op">;</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a>    <span class="at">static</span> <span class="at">const</span> <span class="dt">char</span><span class="op">*</span> skip_ws<span class="op">(</span><span class="at">const</span> <span class="dt">char</span><span class="op">*</span> p<span class="op">,</span> <span class="at">const</span> <span class="dt">char</span><span class="op">*</span> end<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="op">(</span>p <span class="op">!=</span> end <span class="op">&amp;&amp;</span> <span class="op">(*</span>p <span class="op">==</span> <span class="ch">&#39; &#39;</span> <span class="op">||</span> <span class="op">*</span>p <span class="op">==</span> <span class="ch">&#39;</span><span class="sc">\t</span><span class="ch">&#39;</span> <span class="op">||</span> <span class="op">*</span>p <span class="op">==</span> <span class="ch">&#39;</span><span class="sc">\n</span><span class="ch">&#39;</span> <span class="op">||</span> <span class="op">*</span>p <span class="op">==</span> <span class="ch">&#39;</span><span class="sc">\r</span><span class="ch">&#39;</span><span class="op">))</span> <span class="op">++</span>p<span class="op">;</span></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> p<span class="op">;</span></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>string_view <span class="va">data_</span><span class="op">;</span></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>Ez a kód a bemenetet <code>std::string_view</code>-ként kapja, ami
+azt feltételezi, hogy a teljes bemenet a memóriában van. A
+<code>next()</code> minden hívásnál a <code>std::from_chars</code>
+segítségével kiolvas három értéket, majd a
+<code>remove_prefix</code>-szel eltávolítja a feldolgozott részt a
+nézetből. A hibakezelés egyszerű: ha a konverzió hibát jelez,
+<code>std::nullopt</code>-ot adunk vissza. A
+<code>std::from_chars</code> nem ugrik át szóközt, ezért a
+<code>skip_ws</code> segédfüggvény lépi át a mezők közötti szóközöket és
+a sorvégi <code>'\n'</code>-t is; enélkül a második rekordnál az olvasás
+hibával megállna, és csak az első rekordot adná vissza (a mérés ilyenkor
+nem a teljes bemenet feldolgozását mérné). A valós bemenetnél
+robosztusabb hibakezelés szükséges (a hibás sor és a bemenet vége
+megkülönböztetése), de a laborban a bemenet formátuma rögzített. A
+<code>std::from_chars</code> lebegőpontos túlterhelése tehát
+szabványverziótól (C++17) függetlenül csak a megfelelő könyvtárverzióval
+érhető el (GCC 11, MSVC STL 19.24, libc++-ban később); a döntő feltétel
+a könyvtár, nem a <code>-std</code> kapcsoló, ezért a
+<code>__cpp_lib_to_chars</code> makróval ellenőrizni kell.</p>
+<p>A <code>FastFileReader</code> megfelel a <code>Reader</code>
+concept-nek, így a <code>Pipeline</code> osztály változtatás nélkül
+használhatja. Ez mutatja a concept-alapú tervezés előnyét: a komponensek
+cserélhetők, amíg az interfészük illeszkedik.</p>
+<p>A benchmarkban a <code>FastFileReader</code>-től alacsonyabb
+beolvasási idő várható (becslés); ezt csak akkor szabad gyorsulásnak
+tekinteni, ha a teszt megerősíti, hogy a <code>FastFileReader</code>
+ugyanannyi rekordot ad vissza, mint a <code>FileReader</code>. A mért
+értéket a mérési naplóban dokumentáljuk.</p>
+<h3 data-number="32.2.5"
+id="második-optimalizálás-párhuzamos-feldolgozás"><span
+class="header-section-number">32.2.5</span> Második optimalizálás:
+párhuzamos feldolgozás</h3>
+<p>A rekordok feldolgozása független, így a feldolgozást
+párhuzamosíthatjuk. Azonban a bemeneti adatfolyam szekvenciális olvasása
+miatt a párhuzamosítás nem triviális: vagy előbb beolvassuk az összes
+rekordot egy vektorba, vagy a feldolgozó szálak maguk olvasnak egy közös
+szinkronizált forrásból. Az egyszerűség kedvéért feltesszük, hogy a
+bemenet elfér a memóriában, és a rekordokat egy
+<code>std::vector</code>-ba töltjük.</p>
+<p>A párhuzamos összegzés naiv megvalósítása: minden elemre atomi
+összeadás egyetlen közös <code>std::atomic&lt;double&gt;</code>-ra
+(C++20 óta a lebegőpontos atomicnak van <code>fetch_add</code>-ja,
+CAS-ciklus nem kell):</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="dt">double</span> parallel_sum_naive<span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>vector<span class="op">&lt;</span>SensorRecord<span class="op">&gt;&amp;</span> records<span class="op">,</span> <span class="dt">double</span> scale<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="dt">double</span><span class="op">&gt;</span> sum<span class="op">{</span><span class="fl">0.0</span><span class="op">};</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="bu">std::</span>jthread<span class="op">&gt;</span> threads<span class="op">;</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="bu">std::</span>size_t num_threads <span class="op">=</span> <span class="bu">std::</span>max<span class="op">&lt;</span><span class="bu">std::</span>size_t<span class="op">&gt;(</span><span class="dv">1</span><span class="op">,</span> <span class="bu">std::</span>thread::hardware_concurrency<span class="op">());</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="bu">std::</span>size_t chunk_size <span class="op">=</span> <span class="op">(</span>records<span class="op">.</span>size<span class="op">()</span> <span class="op">+</span> num_threads <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> num_threads<span class="op">;</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="bu">std::</span>size_t i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> num_threads<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> <span class="bu">std::</span>size_t begin <span class="op">=</span> <span class="bu">std::</span>min<span class="op">(</span>i <span class="op">*</span> chunk_size<span class="op">,</span> records<span class="op">.</span>size<span class="op">());</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> <span class="bu">std::</span>size_t end <span class="op">=</span> <span class="bu">std::</span>min<span class="op">(</span>begin <span class="op">+</span> chunk_size<span class="op">,</span> records<span class="op">.</span>size<span class="op">());</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>        threads<span class="op">.</span>emplace_back<span class="op">([&amp;</span>records<span class="op">,</span> begin<span class="op">,</span> end<span class="op">,</span> scale<span class="op">,</span> <span class="op">&amp;</span>sum<span class="op">]</span> <span class="op">{</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>            <span class="cf">for</span> <span class="op">(</span><span class="bu">std::</span>size_t j <span class="op">=</span> begin<span class="op">;</span> j <span class="op">&lt;</span> end<span class="op">;</span> <span class="op">++</span>j<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>                <span class="at">const</span> <span class="kw">auto</span><span class="op">&amp;</span> rec <span class="op">=</span> records<span class="op">[</span>j<span class="op">];</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> <span class="op">(</span>rec<span class="op">.</span>value <span class="op">&gt;</span> <span class="fl">0.0</span><span class="op">)</span> sum<span class="op">.</span>fetch_add<span class="op">(</span>rec<span class="op">.</span>value <span class="op">*</span> scale<span class="op">,</span> <span class="bu">std::</span>memory_order_relaxed<span class="op">);</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a>        <span class="op">});</span></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a>    threads<span class="op">.</span>clear<span class="op">();</span>   <span class="co">// a jthread destruktora csatlakozik</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> sum<span class="op">.</span>load<span class="op">();</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ez a kód helyes, de minden elem ugyanazt a cache-sort írja, ezért a
+szálak versenyeznek és a cache-vonal folyamatosan vándorol a magok
+között, így a skálázódás gyenge, ráadásul a
+<code>std::atomic&lt;double&gt;</code> nem minden platformon lock-free.
+Az összeadás sorrendje is futásonként változhat, ami a lebegőpontos
+eredményben kis eltérést okozhat. A <code>hardware_concurrency()</code>
+0-t is adhat, ezért a szálszámot legalább 1-re korlátozzuk (különben
+nullával osztanánk).</p>
+<figure id="fig-cpp123-false-sharing">
+<div class="fig-interactive"><iframe src="figures/html/cpp123-false-sharing.html" title="Három panel, mindegyikben négy mag (C0–C3) saját L1-gyorsítótárral és alattuk 64 bájtos cache-vonalak. Első: egyetlen 8 bájtos sum egy vonalban, mind a négy mag ezt írja, a vonal számozott szaggatott nyilakkal körbejár a magok között. Második (ellenpélda, nem a könyv kódja): double partial[4] egy vonalban, minden mag a saját elemét írja, a vonal mégis vándorol. Harmadik (a könyv parallel_sum függvénye): a magok helyi változóban összegeznek, és a végén egyszer írnak a saját, 56 bájt paddinggel kitöltött 64 bájtos AlignedSum vonalukba; ciklus közben nincs vonalátadás." loading="lazy" style="width:100%;border:0;height:700px"></iframe><noscript><img src="figures/img/cpp123-false-sharing.png" style="width:90.0%"
+alt="Három panel, mindegyikben négy mag (C0–C3) saját L1-gyorsítótárral és alattuk 64 bájtos cache-vonalak. Első: egyetlen 8 bájtos sum egy vonalban, mind a négy mag ezt írja, a vonal számozott szaggatott nyilakkal körbejár a magok között. Második (ellenpélda, nem a könyv kódja): double partial[4] egy vonalban, minden mag a saját elemét írja, a vonal mégis vándorol. Harmadik (a könyv parallel_sum függvénye): a magok helyi változóban összegeznek, és a végén egyszer írnak a saját, 56 bájt paddinggel kitöltött 64 bájtos AlignedSum vonalukba; ciklus közben nincs vonalátadás." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/cpp123-false-sharing.png" style="width:90.0%"
+alt="Három panel, mindegyikben négy mag (C0–C3) saját L1-gyorsítótárral és alattuk 64 bájtos cache-vonalak. Első: egyetlen 8 bájtos sum egy vonalban, mind a négy mag ezt írja, a vonal számozott szaggatott nyilakkal körbejár a magok között. Második (ellenpélda, nem a könyv kódja): double partial[4] egy vonalban, minden mag a saját elemét írja, a vonal mégis vándorol. Harmadik (a könyv parallel_sum függvénye): a magok helyi változóban összegeznek, és a végén egyszer írnak a saját, 56 bájt paddinggel kitöltött 64 bájtos AlignedSum vonalukba; ciklus közben nincs vonalátadás." /></details></div>
+<figcaption>Közös atomic, false sharing és szálankénti részösszeg
+cache-vonal szinten (szemléltető modell, nem mérés; 64 bájtos vonal,
+x86-64)</figcaption>
+</figure>
+<p>Helyette jobb minta a per-szál részösszeg, majd a részösszegek
+egyesítése. Ezzel a párhuzamos szakaszban nincs szükség atomi műveletre,
+a részösszegeket a végén egyetlen szál adja össze. A részösszegeket
+cache-line méretre igazított struktúrába helyezzük; megjegyzés: ebben a
+változatban a <code>partial_sums[i]</code> szálanként csak egyszer
+íródik (a ciklus helyi változóban összegez), ezért a false sharing
+hatása kicsi, az igazítás akkor számít igazán, ha a szálak a ciklusban
+közvetlenül a megosztott tömb elemét frissítenék.</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> <span class="kw">alignas</span><span class="op">(</span><span class="bu">std::</span>hardware_destructive_interference_size<span class="op">)</span> AlignedSum <span class="op">{</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> value <span class="op">=</span> <span class="fl">0.0</span><span class="op">;</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="dt">double</span> parallel_sum<span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>vector<span class="op">&lt;</span>SensorRecord<span class="op">&gt;&amp;</span> records<span class="op">,</span> <span class="dt">double</span> scale<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="bu">std::</span>size_t num_threads <span class="op">=</span> <span class="bu">std::</span>max<span class="op">&lt;</span><span class="bu">std::</span>size_t<span class="op">&gt;(</span><span class="dv">1</span><span class="op">,</span> <span class="bu">std::</span>thread::hardware_concurrency<span class="op">());</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="bu">std::</span>size_t chunk_size <span class="op">=</span> <span class="op">(</span>records<span class="op">.</span>size<span class="op">()</span> <span class="op">+</span> num_threads <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> num_threads<span class="op">;</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span>AlignedSum<span class="op">&gt;</span> partial_sums<span class="op">(</span>num_threads<span class="op">);</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="bu">std::</span>jthread<span class="op">&gt;</span> threads<span class="op">;</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="bu">std::</span>size_t i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> num_threads<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> <span class="bu">std::</span>size_t begin <span class="op">=</span> <span class="bu">std::</span>min<span class="op">(</span>i <span class="op">*</span> chunk_size<span class="op">,</span> records<span class="op">.</span>size<span class="op">());</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> <span class="bu">std::</span>size_t end <span class="op">=</span> <span class="bu">std::</span>min<span class="op">(</span>begin <span class="op">+</span> chunk_size<span class="op">,</span> records<span class="op">.</span>size<span class="op">());</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a>        threads<span class="op">.</span>emplace_back<span class="op">([&amp;</span>records<span class="op">,</span> begin<span class="op">,</span> end<span class="op">,</span> scale<span class="op">,</span> <span class="op">&amp;</span>partial_sums<span class="op">,</span> i<span class="op">]</span> <span class="op">{</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a>            <span class="dt">double</span> local <span class="op">=</span> <span class="fl">0.0</span><span class="op">;</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a>            <span class="cf">for</span> <span class="op">(</span><span class="bu">std::</span>size_t j <span class="op">=</span> begin<span class="op">;</span> j <span class="op">&lt;</span> end<span class="op">;</span> <span class="op">++</span>j<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>                <span class="at">const</span> <span class="kw">auto</span><span class="op">&amp;</span> rec <span class="op">=</span> records<span class="op">[</span>j<span class="op">];</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> <span class="op">(</span>rec<span class="op">.</span>value <span class="op">&gt;</span> <span class="fl">0.0</span><span class="op">)</span> local <span class="op">+=</span> rec<span class="op">.</span>value <span class="op">*</span> scale<span class="op">;</span></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a>            partial_sums<span class="op">[</span>i<span class="op">].</span>value <span class="op">=</span> local<span class="op">;</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a>        <span class="op">});</span></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a>    threads<span class="op">.</span>clear<span class="op">();</span>   <span class="co">// a jthread destruktora csatlakozik; a részösszegek ezután olvashatók</span></span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-25"><a href="#cb10-25" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> total <span class="op">=</span> <span class="fl">0.0</span><span class="op">;</span></span>
+<span id="cb10-26"><a href="#cb10-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="at">const</span> <span class="kw">auto</span><span class="op">&amp;</span> ps <span class="op">:</span> partial_sums<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-27"><a href="#cb10-27" aria-hidden="true" tabindex="-1"></a>        total <span class="op">+=</span> ps<span class="op">.</span>value<span class="op">;</span></span>
+<span id="cb10-28"><a href="#cb10-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-29"><a href="#cb10-29" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> total<span class="op">;</span></span>
+<span id="cb10-30"><a href="#cb10-30" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>std::hardware_destructive_interference_size</code> a
+<code>&lt;new&gt;</code> fejlécben C++17 óta szabványos, de nem minden
+fordító definiálja (a <code>__cpp_lib_hardware_interference_size</code>
+makróval ellenőrizhető), és értéke fordítófüggő. A GCC headerben (vagy
+modulinterfészben) való használatkor <code>-Winterference-size</code>
+figyelmeztetést ad (a főforrásfájlban a <code>parallel_sum</code>
+figyelmeztetés nélkül fordul, ezért a hiányzó figyelmeztetés nem
+jelenti, hogy a probléma nem áll fenn), mert az érték a fordítási
+kapcsolóktól és a célarchitektúrától függ, és az ABI-ba kerülhet
+(nyilvános headerben használva különösen veszélyes). Ha nem elérhető,
+64-et használhatunk (x86-64). A laborban ezt ellenőrizni kell.</p>
+<p>Ez a párhuzamos megvalósítás már jól skálázódik, és elkerüli a hamis
+megosztást (false sharing). A <code>std::jthread</code> automatikusan
+csatlakozik a destruktorában, így ha kivétel keletkezik, a szálak nem
+maradnak lógva.</p>
+<p>A párhuzamos összegzést integrálhatjuk egy új aggregátorba, vagy a
+<code>Pipeline::run()</code>-t módosíthatjuk, hogy párhuzamosan
+dolgozzon. A laborban az olvasó feladata lehet egy
+<code>ParallelSumAggregator</code> létrehozása, amely a
+<code>add()</code> hívásokat eltárolja, és a <code>result()</code>
+hívásakor párhuzamosan összegez.</p>
+<h3 data-number="32.2.6" id="tipikus-hibák-és-elkerülésük"><span
+class="header-section-number">32.2.6</span> Tipikus hibák és
+elkerülésük</h3>
+<p>A fejezet során felismerhetővé válnak a leggyakoribb hibák, amelyeket
+a záróprojekt során el kell kerülni:</p>
+<ol type="1">
+<li><p><strong>Túl korai optimalizálás</strong><br />
+Csak profilozás után optimalizáljunk. A referencia implementáció
+egyszerű, de jól mérhető. Az optimalizálás előtt mindig igazoljuk
+méréssel, hogy az adott kódrészlet valóban szűk keresztmetszet.</p></li>
+<li><p><strong>Benchmark hibák</strong><br />
+A mérési környezetet pontosan rögzíteni kell. A benchmarknak megfelelő
+bemelegítési időt kell adni, és a <code>DoNotOptimize</code> vagy
+hasonló technikával meg kell akadályozni, hogy a fordító eltávolítsa a
+mért kódot. A dead code elimination gyakori csapda: ha az eredményt nem
+használjuk fel, a fordító kihagyhatja a számítást.</p></li>
+<li><p><strong>False sharing</strong><br />
+Párhuzamos kódban, ha több szál ugyanabba a cache line-ba ír, a
+teljesítmény drámaian romlik. A per-szál részösszegeket cache-line
+méretre igazított struktúrába kell helyezni.</p></li>
+<li><p><strong>Rossz atomics használat</strong><br />
+A <code>std::atomic&lt;double&gt;</code> közvetlen használata párhuzamos
+összegzésnél hatékonytalan és bonyolult. A per-szál részösszeg minta
+egyszerűbb és gyorsabb. Ha atomics szükséges, a megfelelő
+<code>memory_order</code> kiválasztása kritikus; a
+<code>std::memory_order_relaxed</code> nem mindig elegendő, ha
+szinkronizációra is szükség van.</p></li>
+<li><p><strong>A <code>std::from_chars</code> hibakezelésének
+elhanyagolása</strong><br />
+A <code>std::from_chars</code> nem dob kivételt, hanem hibakódot ad. A
+hibakód ellenőrzése kötelező; különben a parse csendben rossz adatot
+adhat, ami nem elfogadható.</p></li>
+<li><p><strong>Move szemantika helytelen használata</strong><br />
+A <code>Pipeline</code> konstruktorában <code>std::move</code>-tal adjuk
+át a komponenseket, de a <code>run()</code> metódusban a
+<code>transform_(*rec)</code> kifejezés lemásolja a rekordot. Ha a
+rekord nagy lenne, érdemes lenne a transzformálónak rvalue referenciát
+is támogatnia, de ezt csak akkor tegyük, ha a profilozás
+indokolja.</p></li>
+<li><p><strong>A párhuzamos kód determinizmusának
+elvesztése</strong><br />
+A párhuzamos összegzés során a lebegőpontos összeadás sorrendje
+megváltozik, ami kismértékű eltérést okozhat a szekvenciális eredményhez
+képest. Ezt a tesztekben figyelembe kell venni: a várt eredményt
+toleranciával kell összehasonlítani, vagy a párhuzamos összegzést úgy
+kell megtervezni, hogy a részek összeadása meghatározott sorrendben
+történjen.</p></li>
+<li><p><strong>A
+<code>std::hardware_destructive_interference_size</code>
+hordozhatósága</strong><br />
+Bár a szabvány definiálja, nem minden fordító ad értelmes értéket. Ha
+nem elérhető, konzervatív 64 byte-os igazítást használjunk, és ezt a
+kódban kommentben jelezzük.</p></li>
+</ol>
+<hr />
+<h3 data-number="32.2.7"
+id="labor-implementációs-és-optimalizálási-terv"><span
+class="header-section-number">32.2.7</span> Labor: implementációs és
+optimalizálási terv</h3>
+<p>A labor célja, hogy az olvasó a fent bemutatott pipeline-t
+implementálja, méréseket végezzen, és dokumentálja az optimalizálási
+lépéseket. Az átadandó eredmény a forráskód, a CMake build, a tesztek, a
+benchmarkok, a mérési napló és egy rövid elemzés.</p>
+<p><strong>Feladatok:</strong></p>
+<ol type="1">
+<li><p><strong>Implementáld a referencia pipeline-t</strong><br />
+Hozd létre a <code>SensorRecord</code>, a <code>FileReader</code>, a
+<code>PositiveFilter</code>, a <code>ScaleTransform</code>, a
+<code>SumAggregator</code> és a <code>Pipeline</code> osztályokat a
+fentiek szerint. Készíts egységteszteket a komponensekhez és a
+pipeline-hoz.</p></li>
+<li><p><strong>Hozz létre reprodukálható buildet</strong><br />
+Készítsen <code>CMakeLists.txt</code>-t, amely legalább GCC, Clang és
+MSVC (ahol elérhető) támogatását jelzi. A fordítási kapcsolók:
+<code>-O3 -DNDEBUG</code>, C++20 szabvány. A tesztcél ne kapja meg a
+<code>-DNDEBUG</code>-ot (pl.
+<code>target_compile_options(tests PRIVATE -UNDEBUG)</code>), különben
+az <code>assert</code> üres, és a hibás implementáció is „átmegy”; vagy
+<code>assert</code> helyett hibakódot adó ellenőrzést használjon
+(<code>if (result != 14.0) { std::fprintf(stderr, "FAIL: %g\n", result); return 1; }</code>).
+A build és a tesztek futtatása egyetlen parancsot igényeljen (pl.
+<code>cmake --build build &amp;&amp; ctest --test-dir build</code>). A
+laborban legalább az egyik fordítóval futtasson.</p></li>
+<li><p><strong>Állítsd be a benchmark környezetet</strong><br />
+Használd a Google Benchmark könyvtárat (vagy saját időmérést). A
+benchmark kódot a fentiekhez hasonlóan készítse el. Rögzítsd a bemeneti
+adat előállítását: pl. 10 000 000 rekord generálása determinisztikus
+módon.</p></li>
+<li><p><strong>Végezze el a mérést</strong><br />
+Mérd a referencia implementációt legalább 5 futtatással, és jegyezze fel
+az átlagot, mediánt, szórást. A mérési naplóban adja meg a fordítót,
+szabványt, optimalizációt, hardvert, input méretet és a futtatások
+számát.</p></li>
+<li><p><strong>Profilozás</strong><br />
+Végezzen profilozást (perf, Visual Studio Profiler, Instruments), és
+azonosítsa a forró pontokat. A laborban elegendő a legfőbb szűk
+keresztmetszetet leírni.</p></li>
+<li><p><strong>Optimalizálja a beolvasást</strong><br />
+Implementáld a <code>FastFileReader</code>-t
+<code>std::from_chars</code> segítségével. Ellenőrizd, hogy a
+<code>std::from_chars</code> lebegőpontos konverziója elérhető-e az
+adott fordítóval; ha nem, egész számokra optimalizáljon, vagy használj
+alternatív parse-t. Futtasd a teszteket és a benchmarkot, és rögzítsd az
+eredményt.</p></li>
+<li><p><strong>Párhuzamosítsa a feldolgozást</strong><br />
+Készíts párhuzamos összegzést per-szál részösszegekkel, cache-line
+igazítással. Futtasd a teszteket és a benchmarkot. Ügyeljen a
+determinizmusra és a lebegőpontos eltérésekre.</p></li>
+<li><p><strong>Hasonlítsd össze a mért és várt
+eredményeket</strong><br />
+A mérési naplóban külön oszlopban add meg a várt időt (becslés vagy
+korábbi mérés alapján). Elemezd az eltéréseket: ha a mért idő jelentősen
+eltér a várttól, indokold (pl. gyorsítótár-méret, CPU-terhelés,
+párhuzamosítási overhead).</p></li>
+<li><p><strong>Dokumentáld a tanulságokat</strong><br />
+Foglalja össze, melyik optimalizálás mennyit javított, és milyen
+kompromisszumokkal járt (pl. olvashatóság, hordozhatóság,
+bonyolultság).</p></li>
+</ol>
+<p><strong>Minta mérési napló:</strong></p>
+<table>
+<colgroup>
+<col style="width: 9%" />
+<col style="width: 8%" />
+<col style="width: 9%" />
+<col style="width: 7%" />
+<col style="width: 6%" />
+<col style="width: 11%" />
+<col style="width: 15%" />
+<col style="width: 15%" />
+<col style="width: 12%" />
+</colgroup>
+<thead>
+<tr>
+<th>Változat</th>
+<th>Fordító</th>
+<th>Szabvány</th>
+<th>Optim.</th>
+<th>Input</th>
+<th>Futtatások</th>
+<th>Átlag idő (ms)</th>
+<th>Várt idő (ms)</th>
+<th>Megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Referencia</td>
+<td>&lt;kitöltendő&gt;</td>
+<td>C++20</td>
+<td>-O3</td>
+<td>10M rekord</td>
+<td>5</td>
+<td>&lt;mért&gt;</td>
+<td>&lt;becslés&gt;</td>
+<td>formázott beolvasás</td>
+</tr>
+<tr>
+<td>from_chars</td>
+<td>&lt;kitöltendő&gt;</td>
+<td>C++20</td>
+<td>-O3</td>
+<td>10M rekord</td>
+<td>5</td>
+<td>&lt;mért&gt;</td>
+<td>&lt;becslés&gt;</td>
+<td>előbb ellenőrizd: ugyanannyi rekord olvasódik be</td>
+</tr>
+<tr>
+<td>Párhuzamos (szálszám: &lt;kitöltendő&gt;)</td>
+<td>&lt;kitöltendő&gt;</td>
+<td>C++20</td>
+<td>-O3</td>
+<td>10M rekord</td>
+<td>5</td>
+<td>&lt;mért&gt;</td>
+<td>&lt;becslés&gt;</td>
+<td>per-szál részösszeg</td>
+</tr>
+</tbody>
+</table>
+<p>A táblázat sablon: a szöveg nem közöl mért értéket, az átlagidőt és a
+fordítót az olvasó a saját méréséből tölti ki. A fenti kódrészletek
+önállóan nem fordulnak (az include-ok és a <code>main</code>
+hiányoznak); a laborban az olvasó állítja össze a teljes, fordítható
+forrást a <code>&lt;charconv&gt;</code>, <code>&lt;optional&gt;</code>,
+<code>&lt;concepts&gt;</code>, <code>&lt;atomic&gt;</code>,
+<code>&lt;thread&gt;</code>, <code>&lt;new&gt;</code>,
+<code>&lt;algorithm&gt;</code>, <code>&lt;vector&gt;</code>,
+<code>&lt;string_view&gt;</code>, <code>&lt;istream&gt;</code>,
+<code>&lt;sstream&gt;</code>, <code>&lt;cstdint&gt;</code>,
+<code>&lt;cassert&gt;</code> fejlécekkel.</p>
+<h3 data-number="32.2.8" id="összefoglalás"><span
+class="header-section-number">32.2.8</span> Összefoglalás</h3>
+<p>A fejezet bemutatta, hogyan lehet egy tervezett rendszert modern C++
+eszközökkel implementálni, és hogyan végezzünk mérésen alapuló
+optimalizálást. A <code>concept</code>-ekkel ellátott interfészek, a
+RAII és a move szemantika használata nemcsak a kód minőségét javítja,
+hanem lehetővé teszi a komponensek cseréjét anélkül, hogy a
+<code>Pipeline</code>-t módosítanánk. Az optimalizálás során a
+profilozás és a benchmarkok vezéreltek, és minden lépést méréssel
+igazoltunk.</p>
+<p>A következő fejezet (32.3) a tesztelésre, benchmarkra és biztonságra
+fókuszál, amelyre az itt bevezetett mérési keret épít. Az itt bemutatott
+technikák – <code>std::from_chars</code>, párhuzamos feldolgozás,
+cache-line igazítás – alapvetőek lesznek a további munkában.</p>
+<h3 data-number="32.2.9" id="önellenőrző-kérdés"><span
+class="header-section-number">32.2.9</span> Önellenőrző kérdés</h3>
+<p>Milyen veszélyei vannak a <code>std::atomic&lt;double&gt;</code>
+közvetlen használatának párhuzamos összegzésnél, és miért jobb a
+per-szál részösszeg minta?</p>
+<p><strong>Válaszvázlat:</strong> Az
+<code>std::atomic&lt;double&gt;</code> összeadása CAS-hurokkal (vagy
+<code>fetch_add</code>-dal) történik, erős versengésnél a cache-sor
+oda-vissza vándorol, ezért lassú, és a lebegőpontos összeadás nem
+asszociatív, így az eredmény futásonként eltérhet. A per-szál részösszeg
+megosztott írás nélkül dolgozik (a részösszegek külön cache-sorban, a
+false sharing elkerülésére), a végén egy rögzített sorrendű redukció
+adja az eredményt: gyorsabb és reprodukálható.</p>
+<h3 data-number="32.2.10" id="tesztpélda"><span
+class="header-section-number">32.2.10</span> Tesztpélda</h3>
+<p>A fenti <code>test_pipeline()</code> függvény egy ellenőrizhető teszt
+(csak <code>-DNDEBUG</code> nélkül: NDEBUG mellett az
+<code>assert</code> üres, lásd a labor 2. pontját), amely a várt
+eredményt 14.0-ként adja meg. A laborban ez a teszt biztosítja a
+referencia implementáció helyes működését, és az optimalizálások után is
+futtatandó.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="cpp122.html">← 32.1 Követelmények és architektúra</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="cpp124.html">32.3 Tesztelés, benchmark és biztonság →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

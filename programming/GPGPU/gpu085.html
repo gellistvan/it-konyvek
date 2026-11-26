@@ -1,0 +1,973 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>22.4 Könyvtárak integrálása – GPGPU – általános célú számítások
+GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – CUDA-ökoszisztéma és mélytanulás</a> › <a href="index.html#gpuch21">22 Könyvtárak: cuBLAS, cuSPARSE, cuFFT, cuRAND, Thrust, CUB</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu084.html">← 22.3 Thrust és CUB</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu086.html">23.1 Tensor Core architektúra →</a></div>
+</nav>
+<h2 data-number="22.4" id="gpu085"><span
+class="header-section-number">22.4</span> Könyvtárak integrálása</h2>
+<p>A CUDA-könyvtárak akkor válnak igazán értékessé, amikor nem izolált
+fekete dobozként hívjuk őket, hanem a saját kerneljeinkkel, streamekkel
+és memóriakezelésünkkel összehangoltan dolgoznak. Ez az alfejezet azt a
+mérnöki réteget tárgyalja, amely a könyvtári hívások és a saját kód
+közötti határfelületen húzódik. Három pillért járunk körbe: az
+API-interopot, a stream- és memóriamenedzsmentet, valamint a verzió- és
+ABI-kérdéseket. Az alfejezet végén egy integrációs és buildtervet adunk,
+amelyre a későbbi alfejezetek is építhetnek. (Megjegyzés: a fejezet
+címében szereplő cuFFT-nek és cuRAND-nak nincs önálló alfejezete; a
+stream- és handle-kezelés rájuk is érvényes, részletes tárgyalásuk a
+könyvtártérkép áttekintésében szerepel.)</p>
+<h3 data-number="22.4.1"
+id="a-könyvtárak-és-a-saját-kód-együttműködése"><span
+class="header-section-number">22.4.1</span> A könyvtárak és a saját kód
+együttműködése</h3>
+<p>A CUDA-ökoszisztéma könyvtárai két nagy csoportra oszthatók abból a
+szempontból, hogyan illeszthetők a saját kódba. A handle-alapú
+könyvtárak – mint a cuBLAS, cuSPARSE, cuFFT és cuRAND – egy
+kontextusobjektumot (például <code>cublasHandle_t</code>,
+<code>cusparseHandle_t</code>) használnak, amely tárolja a művelethez
+szükséges állapotot: a streamet, az esetleges pointer mode-ot, a
+matematikai módot és a belső munkaterületre vonatkozó beállításokat. A
+header-only template könyvtárak – a Thrust és a CUB – ezzel szemben
+fordítási időben illeszkednek a kódba, és gyakran közvetlenül a
+kernelben vagy a kernel és a host közötti vékony rétegben használjuk
+őket.</p>
+<p>A két csoport együttműködése a saját kóddal más természetű, ezért
+külön érdemes megvizsgálni.</p>
+<h4 data-number="22.4.1.1"
+id="handle-alapú-könyvtárak-és-a-saját-kernel"><span
+class="header-section-number">22.4.1.1</span> Handle-alapú könyvtárak és
+a saját kernel</h4>
+<p>A handle-alapú könyvtárak általában host oldali API-t kínálnak: a
+hívást a CPU indítja, a tényleges munka a GPU-n, aszinkron módon
+történik. A saját kernelünk és a könyvtári művelet közötti adatcsere
+device pointereken keresztül valósul meg. A könyvtárak
+<code>cudaMalloc</code>-kal vagy azzal kompatibilis módon lefoglalt
+eszközmemóriát várnak, ezért a saját kernelünk által feltöltött puffert
+közvetlenül átadhatjuk a könyvtárnak, és viszont.</p>
+<p>Tekintsünk egy tipikus mintát: a saját kernel feltölt egy mátrixot,
+majd a cuBLAS <code>cublasSgemm</code> függvénye mátrixszorzást hajt
+végre rajta. A kód vázlata a következő lehet:</p>
+<pre class="cuda"><code>// CUDA C++17, nvcc 12.4, -arch=sm_86
+// vázlat: a teljes program a 22.4.4.2 (A program váza) kódja
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cublas_v2.h&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+
+#define CUDA_CHECK(call)                                              \
+    do {                                                              \
+        cudaError_t err = (call);                                     \
+        if (err != cudaSuccess) {                                     \
+            std::fprintf(stderr, &quot;CUDA error at %s:%d: %s\n&quot;,         \
+                         __FILE__, __LINE__, cudaGetErrorString(err)); \
+            std::exit(EXIT_FAILURE);                                  \
+        }                                                             \
+    } while (0)
+
+#define CUBLAS_CHECK(call)                                            \
+    do {                                                              \
+        cublasStatus_t st = (call);                                   \
+        if (st != CUBLAS_STATUS_SUCCESS) {                            \
+            std::fprintf(stderr, &quot;cuBLAS error at %s:%d: %d\n&quot;,       \
+                         __FILE__, __LINE__, static_cast&lt;int&gt;(st));   \
+            std::exit(EXIT_FAILURE);                                  \
+        }                                                             \
+    } while (0)
+
+__global__ void fillMatrixKernel(float* A, int n, float val) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n * n) {
+        A[idx] = val;
+    }
+}
+
+int main() {
+    constexpr int n = 1024;
+    constexpr size_t bytes = sizeof(float) * n * n;
+
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&amp;handle));
+
+    float *d_A, *d_B, *d_C;
+    CUDA_CHECK(cudaMalloc(&amp;d_A, bytes));
+    CUDA_CHECK(cudaMalloc(&amp;d_B, bytes));
+    CUDA_CHECK(cudaMalloc(&amp;d_C, bytes));
+
+    // Saját kernel futtatása a default streamen
+    int threads = 256;
+    int blocks = (n * n + threads - 1) / threads;
+    fillMatrixKernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(d_A, n, 1.0f);
+    fillMatrixKernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(d_B, n, 2.0f);
+
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    // cuBLAS hívás ugyanazon a streamen (a handle alapértelmezetten a default stream)
+    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                             n, n, n, &amp;alpha, d_A, n, d_B, n, &amp;beta, d_C, n));
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+    // az eredmény ellenőrzése és a takarítás a 22.4.4.2 teljes példájában található
+    return 0;
+}</code></pre>
+<p>Ebben a példában a saját kernel és a cuBLAS hívás között nincs
+explicit szinkronizáció, mert mindkettő ugyanazon a streamen fut: a
+kernel befejezése után a cuBLAS művelet következik. Ez a minta csak
+akkor működik, ha a cuBLAS handle streamje megegyezik a kernel indítási
+streamjével – itt mindkettő a default stream. A gyakorlatban azonban
+érdemes saját streameket használni, és a handle-hez rendelni azokat,
+ahogy a 22.4.2 szakaszban látni fogjuk.</p>
+<p>A saját kernel és a könyvtári hívás közötti hibahatár szintén fontos.
+A könyvtárak a saját hibakódjaikat adják vissza
+(<code>cublasStatus_t</code>, <code>cusparseStatus_t</code> stb.), míg a
+kernelhibákat <code>cudaGetLastError</code>-rel és
+<code>cudaDeviceSynchronize</code>-szal kérdezhetjük le. A két réteget
+egyaránt ellenőrizni kell, mert egy hibás könyvtári hívás után a GPU
+állapota bizonytalan lehet. A fenti kód <code>CUDA_CHECK</code> és
+<code>CUBLAS_CHECK</code> makrói ezt a célt szolgálják.</p>
+<h4 data-number="22.4.1.2"
+id="header-only-könyvtárak-thrust-és-cub"><span
+class="header-section-number">22.4.1.2</span> Header-only könyvtárak:
+Thrust és CUB</h4>
+<p>A Thrust és a CUB nem igényel külön linkelést, mert a sablonjaik a
+fejlécekben élnek. A Thrust konténerei
+(<code>thrust::device_vector</code>) és algoritmusai a device
+pointerekkel is együttműködnek. Ha a saját kernelünk egy
+<code>float*</code> mutatót tölt fel, akkor azt
+<code>thrust::device_ptr&lt;float&gt;</code>-ként becsomagolva
+közvetlenül átadhatjuk egy Thrust-algoritmusnak:</p>
+<pre class="cuda"><code>#include &lt;thrust/device_ptr.h&gt;
+#include &lt;thrust/reduce.h&gt;
+
+// d_C a korábbi cuBLAS kimenet
+float sum = thrust::reduce(thrust::device_pointer_cast(d_C),
+                           thrust::device_pointer_cast(d_C + n * n),
+                           0.0f);</code></pre>
+<p>A <code>thrust::device_pointer_cast</code> nem végez másolást, csupán
+egy típusos burkolót hoz létre, így a saját kernel és a Thrust között
+nincs adatvesztés. Fordított irányban, ha egy Thrust konténer mögöttes
+nyers mutatójára van szükségünk, a <code>thrust::raw_pointer_cast</code>
+használható.</p>
+<p>A CUB ezzel szemben elsősorban eszközoldali primitíveket biztosít:
+<code>BlockReduce</code>, <code>BlockScan</code>,
+<code>WarpReduce</code> és hasonlók, amelyeket a saját kernelünkön belül
+hívhatunk. Ez a legerősebb integrációs forma, mert a CUB kódja a kernel
+részeként fordul le, és nincs szükség külön memóriafoglalásra vagy
+streamkezelésre. Példa egy blokkszintű redukcióra:</p>
+<pre class="cuda"><code>#include &lt;cub/cub.cuh&gt;
+
+__global__ void reduceBlockKernel(const float* input, float* output, int n) {
+    // Minden blokk a saját szeletét redukálja
+    typedef cub::BlockReduce&lt;float, 256&gt; BlockReduce;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float val = (idx &lt; n) ? input[idx] : 0.0f;
+
+    float block_sum = BlockReduce(temp_storage).Sum(val);
+
+    if (tid == 0) {
+        output[blockIdx.x] = block_sum;
+    }
+}</code></pre>
+<p>A CUB itt teljesen a kernelbe ágyazódik, így a saját kód és a
+könyvtár közötti határ eltűnik: a CUB csupán egy jól optimalizált,
+újrahasznosítható építőelem. Ugyanakkor a CUB fejlécek verziója és a
+CUDA toolkit verziója közötti kompatibilitásra figyelni kell, amit a
+22.4.3 szakasz tárgyal.</p>
+<h4 data-number="22.4.1.3"
+id="a-könyvtárak-és-a-saját-kód-közötti-munkamegosztás"><span
+class="header-section-number">22.4.1.3</span> A könyvtárak és a saját
+kód közötti munkamegosztás</h4>
+<p>Az integráció során érdemes világosan elhatárolni, hogy melyik réteg
+mit végez. A saját kernel általában a feladat-specifikus elő- és
+utófeldolgozást végzi: adatgenerálás, formátumkonverzió,
+peremfeltételek, ritka mátrix összeállítása. A könyvtárak a nagy
+számítási magot szolgáltatják: GEMM, SpMV, FFT, random generálás,
+redukció, rendezés. A határfelületen a következő szabályokat érdemes
+betartani:</p>
+<ul>
+<li>A device pointereket soha ne dereferáljuk a hoston; minden
+adatátadás a GPU memóriájában történjen.</li>
+<li>A könyvtári hívások előtt és után a szükséges szinkronizációt
+explicit módon kezeljük streamekkel és eseményekkel.</li>
+<li>A könyvtárak által igényelt munkaterületet (workspace) a hívás előtt
+le kell foglalni, és a méretét a könyvtár által szolgáltatott
+<code>_bufferSize</code> vagy <code>_getWorkspaceSize</code> függvénnyel
+kell lekérdezni.</li>
+</ul>
+<p>A következő szakasz ezeket a stream- és memóriaszempontokat
+részletezi.</p>
+<h3 data-number="22.4.2" id="stream-és-memória"><span
+class="header-section-number">22.4.2</span> Stream és memória</h3>
+<p>A GPU-n futó műveletek sorrendjét a streamek határozzák meg. A
+könyvtárak alapértelmezés szerint a default streamen hajtódnak végre, de
+a legtöbb handle-alapú könyvtár lehetővé teszi, hogy egy adott streamhez
+kössük őket. Ez az integráció egyik legfontosabb lépése, mert csak így
+garantálható, hogy a saját kernel és a könyvtári hívás közötti
+sorrendiség explicit legyen, és kihasználhassuk az átfedést.</p>
+<h4 data-number="22.4.2.1"
+id="stream-hozzárendelése-a-könyvtárakhoz"><span
+class="header-section-number">22.4.2.1</span> Stream hozzárendelése a
+könyvtárakhoz</h4>
+<p>A cuBLAS esetében a <code>cublasSetStream</code> függvénnyel
+rendelhetünk streamet a handle-hez:</p>
+<pre class="cuda"><code>cudaStream_t stream1, stream2;
+CUDA_CHECK(cudaStreamCreate(&amp;stream1));
+CUDA_CHECK(cudaStreamCreate(&amp;stream2));
+
+cublasSetStream(handle, stream1);</code></pre>
+<p>Ezután minden cuBLAS hívás a <code>stream1</code>-en fut. Hasonló a
+helyzet a cuSPARSE-nál (<code>cusparseSetStream</code>), a cuFFT-nél
+(<code>cufftSetStream</code>) és a cuRAND-nál
+(<code>curandSetStream</code>). A saját kernelünket pedig a
+<code>&lt;&lt;&lt;..., stream1&gt;&gt;&gt;</code> szintaxissal
+indíthatjuk ugyanarra a streamre, így a sorrend garantált.</p>
+<p>Fontos, hogy a stream hozzárendelése a handle-hez nem szinkronizálja
+a korábbi műveleteket; csupán a későbbi hívások streamjét állítja be. Ha
+egy handle-t több streamen akarunk használni, akkor vagy több handle-t
+hozunk létre, vagy minden hívás előtt átállítjuk a streamet – ez utóbbi
+azonban többletköltséggel járhat, és a párhuzamos végrehajtást is
+megnehezíti. Több stream esetén a legtisztább megoldás, ha minden
+streamhez külön handle tartozik.</p>
+<h4 data-number="22.4.2.2" id="aszinkron-végrehajtás-és-események"><span
+class="header-section-number">22.4.2.2</span> Aszinkron végrehajtás és
+események</h4>
+<p>Ha a saját kernel és a könyvtári hívás különböző streameken fut, a
+köztük lévő függőséget eseményekkel kell kifejezni. Tegyük fel, hogy a
+saját kernel feltölt egy mátrixot a <code>stream1</code>-en, majd a
+cuBLAS a <code>stream2</code>-n fogja használni. Ekkor a
+<code>stream2</code>-t meg kell várakoztatni a kernel befejezésére:</p>
+<pre class="cuda"><code>cudaEvent_t event;
+CUDA_CHECK(cudaEventCreate(&amp;event));
+
+// Kernel indítása stream1-en
+fillMatrixKernel&lt;&lt;&lt;blocks, threads, 0, stream1&gt;&gt;&gt;(d_A, n, 1.0f);
+
+// Esemény rögzítése stream1-en a kernel után
+CUDA_CHECK(cudaEventRecord(event, stream1));
+
+// stream2 várakoztatása az eseményre
+CUDA_CHECK(cudaStreamWaitEvent(stream2, event, 0));
+
+// cuBLAS hívás stream2-n (a handle streamje stream2)
+cublasSetStream(handle, stream2);
+CUBLAS_CHECK(cublasSgemm(handle, ...));</code></pre>
+<p>Az esemény rögzítése és a <code>cudaStreamWaitEvent</code>
+biztosítja, hogy a cuBLAS csak a kernel befejezése után induljon, annak
+ellenére, hogy a két művelet más streamen van. Ez a minta
+elengedhetetlen az átfedés maximalizálásához: míg a <code>stream2</code>
+a cuBLAS-t futtatja, a <code>stream1</code> már a következő kernelre
+léphet.</p>
+<p>A könyvtárak általában aszinkron módon működnek: a hívás visszatérése
+nem jelenti a művelet befejezését. Ezért a mérés előtt mindig
+szinkronizálni kell a streamet vagy az eszközt. A
+<code>cudaDeviceSynchronize</code> a legegyszerűbb, de minden streamet
+várakoztat; ha csak egy adott streamre vagyunk kíváncsiak, használjunk
+<code>cudaStreamSynchronize</code>-t.</p>
+<h4 data-number="22.4.2.3" id="memóriaallokáció-és-workspace"><span
+class="header-section-number">22.4.2.3</span> Memóriaallokáció és
+workspace</h4>
+<p>A könyvtárak gyakran igényelnek ideiglenes munkaterületet. A cuSPARSE
+SpMV például a <code>cusparseSpMV_bufferSize</code> hívással kéri le a
+szükséges bájtok számát, majd a <code>cusparseSpMV</code> függvénynek át
+kell adni egy ekkora puffert:</p>
+<pre class="cuda"><code>cusparseSpMatDescr_t matA;
+cusparseDnVecDescr_t vecX, vecY;
+// ... leírók létrehozása ...
+
+size_t bufferSize = 0;
+CUSPARSE_CHECK(cusparseSpMV_bufferSize(handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                       &amp;alpha, matA, vecX, &amp;beta, vecY,
+                                       CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT,
+                                       &amp;bufferSize));
+
+void* dBuffer = nullptr;
+CUDA_CHECK(cudaMalloc(&amp;dBuffer, bufferSize));
+
+CUSPARSE_CHECK(cusparseSpMV(handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                            &amp;alpha, matA, vecX, &amp;beta, vecY,
+                            CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, dBuffer));</code></pre>
+<p>A workspace mérete függ az algoritmustól és az adatméretektől, ezért
+mindig a <code>_bufferSize</code> függvénnyel kell lekérdezni. A cuFFT
+hasonlóan <code>cufftMakePlanMany</code> és <code>cufftEstimate*</code>
+függvényekkel, vagy a <code>cufftSetWorkArea</code> segítségével kezeli
+a munkaterületet. A cuBLAS újabb verziói (cuBLASLt) szintén workspace-t
+igényelhetnek.</p>
+<p>A memóriaallokáció módja is integrációs kérdés. A hagyományos
+<code>cudaMalloc</code> mellett a CUDA 11.2 óta elérhető
+<code>cudaMallocAsync</code> streamhez kötött (stream-sorrendű) memóriát
+foglal egy memóriapoolból. A memória <strong>nem szabadul fel
+automatikusan</strong> a szinkronizációkor: explicit
+<code>cudaFreeAsync(ptr, stream)</code> (vagy <code>cudaFree</code>)
+kell, amely a stream-sorrendnek megfelelően adja vissza a területet a
+poolnak; elmaradása memóriaszivárgás. Használati minta:
+<code>CUDA_CHECK(cudaMallocAsync(&amp;p, bytes, stream)); ...; CUDA_CHECK(cudaFreeAsync(p, stream));</code>.
+Ez csökkentheti az allokációs költséget, és jól illeszkedik a könyvtárak
+streamkezeléséhez. A managed memory (<code>cudaMallocManaged</code>)
+használata esetén a könyvtárak is képesek a migrációt kezelni, de a
+teljesítmény érdekében <code>cudaMemPrefetchAsync</code>-szel explicit
+módon a megfelelő eszközre kell húzni az adatot.</p>
+<p>Fontos megjegyezni, hogy a könyvtárak általában nem támogatják a
+memóriaaliasolást: a bemeneti és kimeneti pufferek nem fedhetik át
+egymást, hacsak a dokumentáció másként nem rendelkezik. A saját
+kernelünk és a könyvtári hívás közötti adatátadásnál ezért mindig külön
+puffereket használjunk, és a szükséges másolásokat a GPU-n belül,
+például <code>cudaMemcpyAsync</code>-vel végezzük.</p>
+<h4 data-number="22.4.2.4" id="stream-és-memória-a-gyakorlatban"><span
+class="header-section-number">22.4.2.4</span> Stream és memória a
+gyakorlatban</h4>
+<p>A következő vázlat egy olyan integrációs mintát mutat, amelyben a
+saját kernel, a cuBLAS, a cuSPARSE és a CUB együtt dolgozik két
+streamen, eseményekkel szinkronizálva:</p>
+<pre class="cuda"><code>// Feltételezve, hogy a handle-ek és a streamek létre vannak hozva
+cublasSetStream(cublasHandle, stream1);
+cusparseSetStream(cusparseHandle, stream1);
+
+// (a hívások visszatérési értékét a *_CHECK makrókkal kell ellenőrizni)
+// 1. Saját kernel feltölti az SpMV bemenetét (x) a stream1-en, majd esemény
+fillVectorKernel&lt;&lt;&lt;blocksX, threads, 0, stream1&gt;&gt;&gt;(d_x, n, 3.0f);
+cudaEventRecord(event, stream1);
+
+// 2. Saját kernel feltölti az A mátrixot, majd cuBLAS GEMM a stream1-en
+fillMatrixKernel&lt;&lt;&lt;blocksA, threads, 0, stream1&gt;&gt;&gt;(d_A, n, 1.0f);
+cublasSgemm(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n,
+            &amp;alpha, d_A, n, d_B, n, &amp;beta, d_C, n);
+
+// 3. stream2 csak az x feltöltésére vár (nem a GEMM-re), így az SpMV átfedhet a GEMM-mel
+cudaStreamWaitEvent(stream2, event, 0);
+cusparseSetStream(cusparseHandle, stream2);
+cusparseSpMV(cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+             &amp;alpha, matA, vecX, &amp;beta, vecY,
+             CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, dBuffer);
+
+// 4. CUB DeviceReduce az összegzéshez (host oldali hívás, stream2-n); cudaError_t-et ad vissza
+CUDA_CHECK(cub::DeviceReduce::Sum(d_temp_storage, temp_storage_bytes, d_y, d_sum, n,
+                                  stream2));</code></pre>
+<p>Itt a CUB eszközoldali redukciója host oldali API-val, de stream
+paraméterrel történik, így a stream2-höz kötődik. A CUB
+<code>DeviceReduce</code> szintén workspace-t igényel, amelynek méretét
+a <code>cub::DeviceReduce::Sum</code> első hívása adja meg
+<code>nullptr</code> pufferrel.</p>
+<p>Az alábbi sematikus idővonal a vázlat két streamjét mutatja: mivel az
+eseményt a vektor feltöltése után rögzítjük, az SpMV és a redukció a
+GEMM-mel párhuzamosan futhat; ha az esemény a GEMM után állna, a két
+stream sorossá válna.</p>
+<figure id="fig-gpu085-streamek">
+<div class="fig-interactive"><iframe src="figures/html/gpu085-streamek.html" title="A stream2 csak a vektor feltöltése utáni eseményre vár, ezért az SpMV és a redukció a GEMM-mel párhuzamosan fut; ha az esemény a GEMM után van, a két stream sorossá válik." loading="lazy" style="width:100%;border:0;height:400px"></iframe><noscript><img src="figures/img/gpu085-streamek.png" style="width:95.0%"
+alt="A stream2 csak a vektor feltöltése utáni eseményre vár, ezért az SpMV és a redukció a GEMM-mel párhuzamosan fut; ha az esemény a GEMM után van, a két stream sorossá válik." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu085-streamek.png" style="width:95.0%"
+alt="A stream2 csak a vektor feltöltése utáni eseményre vár, ezért az SpMV és a redukció a GEMM-mel párhuzamosan fut; ha az esemény a GEMM után van, a két stream sorossá válik." /></details></div>
+<figcaption>Két stream eseményalapú függősége – helyes (átfedő) és hibás
+(soros) eseményhely (sematikus, a hosszak nem mértek)</figcaption>
+</figure>
+<h3 data-number="22.4.3" id="verzió-és-abi"><span
+class="header-section-number">22.4.3</span> Verzió és ABI</h3>
+<p>A könyvtárak integrálásakor a verziók és az ABI-kompatibilitás
+kezelése kritikus, mert a hibás kombináció futásidejű hibákhoz, nem
+determinisztikus viselkedéshez vagy akár eszközleálláshoz vezethet. Ez a
+szakasz a leggyakoribb buktatókat és a buildtervezéshez szükséges
+alapelveket foglalja össze.</p>
+<h4 data-number="22.4.3.1"
+id="cuda-toolkit-driver-és-compute-capability"><span
+class="header-section-number">22.4.3.1</span> CUDA toolkit, driver és
+compute capability</h4>
+<p>A CUDA programok futtatásához három verziót kell
+megkülönböztetni:</p>
+<ul>
+<li><strong>CUDA toolkit verzió</strong> (például 12.4): ez határozza
+meg a fejléceket, a fordítót (<code>nvcc</code>) és a könyvtárak
+binárisait.</li>
+<li><strong>Driver verzió</strong> (például 550.54.14): a kernel
+betöltéséhez és a futáshoz szükséges; a drivernek kompatibilisnek kell
+lennie a toolkit által generált kóddal. A CUDA kisebb verziói általában
+visszafelé kompatibilisek a driverrel, de a nagyobb verziók (például
+CUDA 13) újabb drivert igényelhetnek.</li>
+<li><strong>Compute capability</strong> (például 8.6 az RTX 3080
+esetén): a hardver architektúráját jelöli, és a <code>-arch=sm_86</code>
+kapcsolóval kell megadni a fordítás során. A compute capability
+határozza meg, mely utasítások és szolgáltatások érhetők el (például
+tensor core-ok, async copy).</li>
+</ul>
+<p>A build során mindhárom verziót rögzíteni kell. Az
+<code>nvcc -arch=sm_86</code> rövidítés: <code>compute_86</code> PTX-et
+és <code>sm_86</code> SASS-t generál. Ez a binárist
+<strong>csak</strong> a 8.6-os (vagy ugyanazon major verzión belül
+magasabb minor verziójú, pl. 8.9-es) GPU-n teszi futtathatóvá
+közvetlenül, illetve bármely <code>compute_86</code>-nál nem alacsonyabb
+képességű GPU-n PTX-ből JIT-fordítással. <strong>Alacsonyabb compute
+capability-n (pl. sm_80, A100) az <code>sm_86</code>-ra fordított
+bináris nem fut</strong> (<code>cudaErrorNoKernelImageForDevice</code>),
+mert a PTX nem fordítható vissza régebbi architektúrára, a SASS pedig
+nem kompatibilis lefelé. Több célgépre fordításnál adjunk meg több
+célt:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-gencode</span> arch=compute_80,code=sm_80 <span class="dt">\</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>     <span class="at">-gencode</span> arch=compute_86,code=sm_86 <span class="dt">\</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>     <span class="at">-gencode</span> arch=compute_86,code=compute_86 <span class="dt">\</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>     <span class="at">-o</span> app app.cu   <span class="co"># nem futtatott parancs; a GPU-compilation részletei az NVCC guide-ban</span></span></code></pre></div>
+<h4 data-number="22.4.3.2" id="könyvtári-verziók-és-abi"><span
+class="header-section-number">22.4.3.2</span> Könyvtári verziók és
+ABI</h4>
+<p>A cuBLAS, cuSPARSE, cuFFT és cuRAND a CUDA toolkit részei, de
+<strong>külön verziószámozást</strong> használnak, amely nem azonos a
+toolkit verziójával (pl. a CUDA 12.x-ben a cuFFT 11.x, a cuRAND 10.x). A
+pontos komponensverziók a CUDA Toolkit Release Notes „Component
+versions” táblájában találhatók. A fejlécekben definiált API-k és a
+dinamikus könyvtárak (<code>.so</code> Linuxon, <code>.dll</code>
+Windowson) közötti ABI-kompatibilitás a következőképpen alakul:</p>
+<ul>
+<li>A <strong>minor verziófrissítések</strong> (pl. 12.4 → 12.5)
+általában ABI-kompatibilisek: a régebbi binárisok futnak az újabb
+könyvtárral; az újabb binárist régebbi könyvtárral futtatni általában
+nem garantált. A minor-verzió-kompatibilitás elsősorban a drivert és a
+runtime-ot védi, feltéve, hogy a driver támogatja. A CUDA dokumentáció
+ezt a <em>compatibility</em> fejezetben tárgyalja; mindig ellenőrizni
+kell az aktuális táblázatot.</li>
+<li>A <strong>major verzióváltások</strong> (pl. CUDA 11 → 12) gyakran
+API-változásokat is hoznak, és előfordulhat, hogy a forráskódot
+módosítani kell. Az ABI ilyenkor nem garantált.</li>
+<li>A <strong>header-only könyvtárak</strong> (Thrust, CUB) nem
+rendelkeznek külön bináris ABI-val, de a fejlécek verziója és a CUDA
+toolkit verziója közötti kompatibilitás számít. Ha például egy külső
+forrásból származó, újabb CUB fejlécet használunk egy régebbi
+toolkitkel, az inkompatibilis lehet a <code>nvcc</code> belső
+fejléceivel. Ezért ajánlott a toolkithez mellékelt CUB-ot
+használni.</li>
+</ul>
+<p>A gyakorlatban a legbiztonságosabb stratégia, ha a könyvtárakat a
+CUDA toolkitkel együtt telepítjük, és a build során a toolkit
+<code>include</code> és <code>lib</code> könyvtárait használjuk. A CMake
+<code>FindCUDAToolkit</code> modulja automatikusan felismeri a toolkit
+verzióját és a könyvtárakat.</p>
+<h4 data-number="22.4.3.3" id="statikus-és-dinamikus-linkelés"><span
+class="header-section-number">22.4.3.3</span> Statikus és dinamikus
+linkelés</h4>
+<p>A CUDA könyvtárak dinamikus és statikus változatban is elérhetők. A
+dinamikus linkelés (alapértelmezett) a következőképpen néz ki:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-arch</span><span class="op">=</span>sm_86 <span class="at">-o</span> app app.cu <span class="at">-lcublas</span> <span class="at">-lcusparse</span> <span class="at">-lcufft</span> <span class="at">-lcurand</span></span></code></pre></div>
+<p>Ez kisebb binárist eredményez, de a futtatógépen a megfelelő CUDA
+runtime könyvtáraknak jelen kell lenniük. A statikus linkelés:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># nem fordított, verziófüggő példa; a pontos könyvtárlistát a cuBLAS/cuSPARSE/cuFFT</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="co"># „Static library” dokumentáció adja</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-arch</span><span class="op">=</span>sm_86 <span class="at">-o</span> app app.cu <span class="dt">\</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">-lcublas_static</span> <span class="at">-lcublasLt_static</span> <span class="at">-lcusparse_static</span> <span class="at">-lcufft_static</span> <span class="at">-lcurand_static</span> <span class="dt">\</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">-lculibos</span> <span class="at">-ldl</span> <span class="at">-lpthread</span> <span class="at">-lrt</span></span></code></pre></div>
+<p>A statikus változat nagyobb binárist hoz létre, de csökkenti a
+futásidejű függőségeket. A statikus linkelésnél a
+<code>cublas_static</code> a <code>-lcublasLt_static</code>-ot és a
+<code>-lculibos</code>-t is igényli (Linuxon
+<code>-ldl -lpthread -lrt</code>), újabb verzióknál a cuSPARSE további
+függőségei (pl. <code>-lnvJitLink_static</code>) is szükségesek
+lehetnek; a hiányzó elem feloldatlan szimbólumot okoz. A
+<code>-lcudart_static</code> az <code>nvcc</code> alapértelmezése
+(<code>--cudart static</code>); a pontos lista verziófüggő, ezért a
+saját toolkit dokumentációja szerint ellenőrizendő. A gyakorlatban a
+dinamikus linkelés a kényelmesebb, és a CUDA runtime általában elérhető
+a GPU-s környezetekben.</p>
+<p>A cuBLASLt külön könyvtár (<code>-lcublasLt</code>), amely a cuBLAS
+„lightweight” API-ját tartalmazza. A cuSPARSE, cuFFT és cuRAND hasonlóan
+külön könyvtárak. Minden használt könyvtárat explicit módon linkelni
+kell, mert az <code>nvcc</code> nem húzza be őket automatikusan.</p>
+<h4 data-number="22.4.3.4" id="verzió-ellenőrzés-futásidőben"><span
+class="header-section-number">22.4.3.4</span> Verzió-ellenőrzés
+futásidőben</h4>
+<p>A könyvtárak általában biztosítanak verziólekérdező függvényeket.
+Például:</p>
+<pre class="cuda"><code>int cublasVersion = 0;
+cublasGetVersion(handle, &amp;cublasVersion);
+printf(&quot;cuBLAS version: %d\n&quot;, cublasVersion);
+
+int cusparseVersion = 0;
+cusparseGetVersion(handle, &amp;cusparseVersion);
+printf(&quot;cuSPARSE version: %d\n&quot;, cusparseVersion);</code></pre>
+<p>A Thrust és a CUB verziója fordítási időben a
+<code>THRUST_VERSION</code> és a <code>CUB_VERSION</code> makrókból,
+újabb CCCL-lel a <code>CCCL_VERSION</code> makróból érhető el. Ezeket a
+számokat érdemes naplózni a mérési környezet rögzítésekor, mert a
+teljesítmény és a viselkedés verziófüggő lehet.</p>
+<p>A buildtervnek ezért a következőket kell tartalmaznia:</p>
+<ul>
+<li>CUDA toolkit verzió (pl. 12.4)</li>
+<li>Driver verzió (pl. 550.54.14)</li>
+<li>Compute capability (pl. 8.6)</li>
+<li>A használt könyvtárak és verzióik (cuBLAS, cuSPARSE, cuFFT, cuRAND,
+Thrust, CUB)</li>
+<li>A linkelés módja (dinamikus/statikus)</li>
+<li>A fordítóparancs és a környezeti változók (pl.
+<code>CUDA_HOME</code>, <code>LD_LIBRARY_PATH</code>)</li>
+</ul>
+<h3 data-number="22.4.4" id="labor-integrációs-és-buildterv"><span
+class="header-section-number">22.4.4</span> Labor: integrációs és
+buildterv</h3>
+<p>A következő labor egy olyan kis alkalmazást mutat be, amely a fenti
+elveket gyakorlatba ülteti. A feladat egy integrációs és buildterv
+elkészítése, amely saját kernelt, cuBLAS-t, cuSPARSE-t, Thrust/CUB-ot és
+streameket használ. A labor nem helyettesíti a teljes körű benchmarkot,
+de alkalmas az együttműködés ellenőrzésére és a tipikus hibák
+felismerésére.</p>
+<h4 data-number="22.4.4.1" id="laborcél-és-környezet"><span
+class="header-section-number">22.4.4.1</span> Laborcél és környezet</h4>
+<p><strong>Cél:</strong> Egy olyan CUDA C++17 program írása, amely: 1.
+Saját kernelrel feltölt egy 1024×1024-es mátrixot és egy 1024 hosszú
+vektort. 2. cuBLAS <code>cublasSgemm</code> segítségével mátrixszorzást
+végez. 3. cuSPARSE <code>cusparseSpMV</code> segítségével egy ritka
+mátrix-vektor szorzást hajt végre. 4. CUB <code>DeviceReduce</code>
+segítségével kiszámolja az eredményvektor összegét. 5. A műveleteket két
+streamen futtatja, eseményekkel szinkronizálva. 6. A hibákat minden
+API-hívásnál ellenőrzi, és a verziókat naplózza.</p>
+<p><strong>Környezet (helyőrző – a laborban cseréld a sajátodra; az
+értékek nem mért adatok):</strong> - GPU: NVIDIA RTX 3080 (compute
+capability 8.6) - Driver: 550.54.14 - CUDA toolkit: 12.4 - nvcc: 12.4 -
+cuBLAS, cuSPARSE: &lt;kitöltendő – a futásidőben kiírt vagy a Release
+Notes „Component versions” szerinti verzió&gt; - Thrust/CUB: a toolkit
+része; verzió: &lt;kitöltendő – THRUST_VERSION / CUB_VERSION /
+CCCL_VERSION kiírásából&gt; - OS: Ubuntu 22.04 LTS - Fordítás: dinamikus
+linkelés</p>
+<h4 data-number="22.4.4.2" id="a-program-váza"><span
+class="header-section-number">22.4.4.2</span> A program váza</h4>
+<p>Az alábbi kód a teljes integrációs mintát tartalmazza. A kommentek
+jelzik a kulcslépéseket, és a hibamakrók biztosítják az ellenőrzést. A
+kód fordítással ellenőrzendő, és a labor során a mérési részt a valós
+környezethez kell igazítani.</p>
+<pre class="cuda"><code>// lab_integr.cu – CUDA C++17, nvcc 12.4, -arch=sm_86
+// Helyőrző környezet: RTX 3080, driver 550.54.14, CUDA 12.4
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cublas_v2.h&gt;
+#include &lt;cusparse.h&gt;
+#include &lt;cub/cub.cuh&gt;
+#include &lt;thrust/version.h&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;cmath&gt;
+
+#define CUDA_CHECK(call)                                              \
+    do {                                                              \
+        cudaError_t err = (call);                                     \
+        if (err != cudaSuccess) {                                     \
+            std::fprintf(stderr, &quot;CUDA error at %s:%d: %s\n&quot;,         \
+                         __FILE__, __LINE__, cudaGetErrorString(err)); \
+            std::exit(EXIT_FAILURE);                                  \
+        }                                                             \
+    } while (0)
+
+#define CUBLAS_CHECK(call)                                            \
+    do {                                                              \
+        cublasStatus_t st = (call);                                   \
+        if (st != CUBLAS_STATUS_SUCCESS) {                            \
+            std::fprintf(stderr, &quot;cuBLAS error at %s:%d: %d\n&quot;,       \
+                         __FILE__, __LINE__, static_cast&lt;int&gt;(st));   \
+            std::exit(EXIT_FAILURE);                                  \
+        }                                                             \
+    } while (0)
+
+#define CUSPARSE_CHECK(call)                                          \
+    do {                                                              \
+        cusparseStatus_t st = (call);                                 \
+        if (st != CUSPARSE_STATUS_SUCCESS) {                          \
+            std::fprintf(stderr, &quot;cuSPARSE error at %s:%d: %d\n&quot;,     \
+                         __FILE__, __LINE__, static_cast&lt;int&gt;(st));   \
+            std::exit(EXIT_FAILURE);                                  \
+        }                                                             \
+    } while (0)
+
+__global__ void fillMatrixKernel(float* A, int n, float val) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n * n) A[idx] = val;
+}
+
+__global__ void fillVectorKernel(float* x, int n, float val) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n) x[idx] = val;
+}
+
+int main() {
+    constexpr int n = 1024;            // mátrixméret
+    constexpr int nnz = 1024;          // ritka mátrix nemnulla elemei
+    constexpr size_t matBytes = sizeof(float) * n * n;
+    constexpr size_t vecBytes = sizeof(float) * n;
+
+    // Verziók kiírása
+    int cublasVer = 0, cusparseVer = 0;
+    cublasHandle_t cublasHandle;
+    cusparseHandle_t cusparseHandle;
+    CUBLAS_CHECK(cublasCreate(&amp;cublasHandle));
+    CUSPARSE_CHECK(cusparseCreate(&amp;cusparseHandle));
+    CUBLAS_CHECK(cublasGetVersion(cublasHandle, &amp;cublasVer));
+    CUSPARSE_CHECK(cusparseGetVersion(cusparseHandle, &amp;cusparseVer));
+    std::printf(&quot;cuBLAS version: %d\n&quot;, cublasVer);
+    std::printf(&quot;cuSPARSE version: %d\n&quot;, cusparseVer);
+    std::printf(&quot;Thrust version: %d\n&quot;, THRUST_VERSION);
+    std::printf(&quot;CUB version: %d\n&quot;, CUB_VERSION);
+
+    // Streamek létrehozása
+    cudaStream_t stream1, stream2;
+    CUDA_CHECK(cudaStreamCreate(&amp;stream1));
+    CUDA_CHECK(cudaStreamCreate(&amp;stream2));
+
+    // Handle-ek streamhez kötése
+    CUBLAS_CHECK(cublasSetStream(cublasHandle, stream1));
+    CUSPARSE_CHECK(cusparseSetStream(cusparseHandle, stream2));
+
+    // Eszközmemória foglalás
+    float *d_A, *d_B, *d_C, *d_x, *d_y, *d_sum;
+    CUDA_CHECK(cudaMalloc(&amp;d_A, matBytes));
+    CUDA_CHECK(cudaMalloc(&amp;d_B, matBytes));
+    CUDA_CHECK(cudaMalloc(&amp;d_C, matBytes));
+    CUDA_CHECK(cudaMalloc(&amp;d_x, vecBytes));
+    CUDA_CHECK(cudaMalloc(&amp;d_y, vecBytes));
+    CUDA_CHECK(cudaMalloc(&amp;d_sum, sizeof(float)));
+
+    // --- Előkészítés: minden allokáció, szinkron feltöltés, leíró és workspace
+    // az első kernelindítás előtt, hogy az indítási fázisban ne legyen
+    // implicit szinkronizáló cudaMalloc vagy pageable másolás ---
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+
+    // Ritka mátrix CSR formátumban (diagonális minta)
+    int* h_csrOffsets = new int[n + 1];
+    int* h_csrColumns = new int[nnz];
+    float* h_csrValues = new float[nnz];
+    for (int i = 0; i &lt; n + 1; ++i) h_csrOffsets[i] = i;
+    for (int i = 0; i &lt; nnz; ++i) {
+        h_csrColumns[i] = i;
+        h_csrValues[i] = 1.0f;
+    }
+
+    int *d_csrOffsets, *d_csrColumns;
+    float *d_csrValues;
+    CUDA_CHECK(cudaMalloc(&amp;d_csrOffsets, sizeof(int) * (n + 1)));
+    CUDA_CHECK(cudaMalloc(&amp;d_csrColumns, sizeof(int) * nnz));
+    CUDA_CHECK(cudaMalloc(&amp;d_csrValues, sizeof(float) * nnz));
+    CUDA_CHECK(cudaMemcpy(d_csrOffsets, h_csrOffsets, sizeof(int) * (n + 1),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_csrColumns, h_csrColumns, sizeof(int) * nnz,
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_csrValues, h_csrValues, sizeof(float) * nnz,
+                          cudaMemcpyHostToDevice));
+
+    // cuSPARSE leírók
+    cusparseSpMatDescr_t matA;
+    cusparseDnVecDescr_t vecX, vecY;
+    CUSPARSE_CHECK(cusparseCreateCsr(&amp;matA, n, n, nnz,
+                                     d_csrOffsets, d_csrColumns, d_csrValues,
+                                     CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+                                     CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F));
+    CUSPARSE_CHECK(cusparseCreateDnVec(&amp;vecX, n, d_x, CUDA_R_32F));
+    CUSPARSE_CHECK(cusparseCreateDnVec(&amp;vecY, n, d_y, CUDA_R_32F));
+
+    // SpMV workspace
+    size_t bufferSize = 0;
+    CUSPARSE_CHECK(cusparseSpMV_bufferSize(cusparseHandle,
+                                           CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                           &amp;alpha, matA, vecX, &amp;beta, vecY,
+                                           CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT,
+                                           &amp;bufferSize));
+    void* dBuffer = nullptr;
+    CUDA_CHECK(cudaMalloc(&amp;dBuffer, bufferSize));
+
+    // CUB DeviceReduce workspace
+    void* d_temp_storage = nullptr;
+    size_t temp_storage_bytes = 0;
+    CUDA_CHECK(cub::DeviceReduce::Sum(d_temp_storage, temp_storage_bytes,
+                                      d_y, d_sum, n, stream2));
+    CUDA_CHECK(cudaMalloc(&amp;d_temp_storage, temp_storage_bytes));
+
+    cudaEvent_t event;
+    CUDA_CHECK(cudaEventCreate(&amp;event));
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // --- Indítási fázis: csak kernelindítás, esemény és könyvtárhívás ---
+    int threads = 256;
+    int blocksMat = (n * n + threads - 1) / threads;
+    int blocksVec = (n + threads - 1) / threads;
+    // Először az SpMV bemenete (x), és közvetlenül utána az esemény: a stream2 csak
+    // ettől függ, így a GEMM-mel (stream1) átfedhet.
+    fillVectorKernel&lt;&lt;&lt;blocksVec, threads, 0, stream1&gt;&gt;&gt;(d_x, n, 3.0f);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(event, stream1));
+
+    fillMatrixKernel&lt;&lt;&lt;blocksMat, threads, 0, stream1&gt;&gt;&gt;(d_A, n, 1.0f);
+    CUDA_CHECK(cudaGetLastError());
+    fillMatrixKernel&lt;&lt;&lt;blocksMat, threads, 0, stream1&gt;&gt;&gt;(d_B, n, 2.0f);
+    CUDA_CHECK(cudaGetLastError());
+
+    // cuBLAS GEMM a stream1-en
+    CUBLAS_CHECK(cublasSgemm(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N,
+                             n, n, n, &amp;alpha, d_A, n, d_B, n, &amp;beta, d_C, n));
+
+    // stream2 várakoztatása a d_x feltöltésére (nem a GEMM-re), majd SpMV
+    CUDA_CHECK(cudaStreamWaitEvent(stream2, event, 0));
+    CUSPARSE_CHECK(cusparseSpMV(cusparseHandle,
+                                CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                &amp;alpha, matA, vecX, &amp;beta, vecY,
+                                CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, dBuffer));
+
+    // CUB DeviceReduce az összeg kiszámításához stream2-n
+    CUDA_CHECK(cub::DeviceReduce::Sum(d_temp_storage, temp_storage_bytes,
+                                      d_y, d_sum, n, stream2));
+
+    // Szinkronizáció
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Ellenőrzés: az összegnek 3 * 1024 = 3072-nek kell lennie
+    float h_sum = 0.0f;
+    CUDA_CHECK(cudaMemcpy(&amp;h_sum, d_sum, sizeof(float), cudaMemcpyDeviceToHost));
+    std::printf(&quot;Computed sum: %f, expected: %f\n&quot;, h_sum, 3.0f * n);
+
+    // Tisztítás
+    delete[] h_csrOffsets;
+    delete[] h_csrColumns;
+    delete[] h_csrValues;
+    CUDA_CHECK(cudaFree(d_A)); CUDA_CHECK(cudaFree(d_B)); CUDA_CHECK(cudaFree(d_C));
+    CUDA_CHECK(cudaFree(d_x)); CUDA_CHECK(cudaFree(d_y)); CUDA_CHECK(cudaFree(d_sum));
+    CUDA_CHECK(cudaFree(d_csrOffsets)); CUDA_CHECK(cudaFree(d_csrColumns));
+    CUDA_CHECK(cudaFree(d_csrValues)); CUDA_CHECK(cudaFree(dBuffer));
+    CUDA_CHECK(cudaFree(d_temp_storage));
+    CUSPARSE_CHECK(cusparseDestroySpMat(matA));
+    CUSPARSE_CHECK(cusparseDestroyDnVec(vecX));
+    CUSPARSE_CHECK(cusparseDestroyDnVec(vecY));
+    CUBLAS_CHECK(cublasDestroy(cublasHandle));
+    CUSPARSE_CHECK(cusparseDestroy(cusparseHandle));
+    CUDA_CHECK(cudaEventDestroy(event));
+    CUDA_CHECK(cudaStreamDestroy(stream1));
+    CUDA_CHECK(cudaStreamDestroy(stream2));
+
+    return 0;
+}</code></pre>
+<h4 data-number="22.4.4.3" id="build-parancs"><span
+class="header-section-number">22.4.4.3</span> Build parancs</h4>
+<p>A fenti kódot a következő paranccsal fordíthatjuk:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-arch</span><span class="op">=</span>sm_86 <span class="at">-I</span><span class="va">${CUDA_HOME}</span>/include <span class="at">-L</span><span class="va">${CUDA_HOME}</span>/lib64 <span class="dt">\</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a>     <span class="at">-lcublas</span> <span class="at">-lcusparse</span> <span class="at">-o</span> lab_integr lab_integr.cu</span></code></pre></div>
+<p>Ha a CUDA toolkit a szabványos helyen van
+(<code>/usr/local/cuda</code>), a <code>-I</code> és <code>-L</code>
+elhagyható. A <code>-arch=sm_86</code> csak a compute capability 8.6-os
+GPU-ra (és PTX-JIT-tel újabbakra) alkalmas; <strong>A100-on (sm_80) nem
+fut</strong>. Más GPU esetén a megfelelő értéket kell használni (pl.
+<code>sm_80</code> A100-hoz, <code>sm_89</code> RTX 4090-hez), több
+célgépnél a fenti <code>-gencode</code> fat binary-t. A labor során ezt
+a környezethez kell igazítani.</p>
+<h4 data-number="22.4.4.4" id="mérési-terv-és-napló"><span
+class="header-section-number">22.4.4.4</span> Mérési terv és napló</h4>
+<p>A program jelenlegi formája funkcionális ellenőrzést végez, de
+teljesítménymérést nem. A mérési tervhez a következő lépéseket kell
+hozzáadni:</p>
+<ol type="1">
+<li>A műveletek időméréséhez <code>cudaEvent</code>-eket kell rögzíteni
+a streameken a kernel- és könyvtári hívások körül.</li>
+<li>Warm-up futtatás: a teljes szekvenciát legalább 5-ször le kell
+futtatni a hideg indítási hatások kiküszöbölésére.</li>
+<li>Ezután legalább 20 mért ismétlés következik; minden műveletet a
+saját streamjén rögzített eseménypár mér
+(<code>cudaEventRecord(e0, stream1)</code> …
+<code>cudaEventRecord(e1, stream1)</code> a GEMM-hez, a stream2-n az
+SpMV-hez és a CUB-hoz), és a mediánt, a szórást (vagy IQR-t)
+közöljük.</li>
+<li>A sávszélességet a tényleges adatmozgás alapján kell kiszámolni: a
+GEMM esetén a minimális forgalom
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>3</mn><msup><mi>n</mi><mn>2</mn></msup><mo>⋅</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">3 n^2 \cdot 4</annotation></semantics></math>
+B
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>≈</mo><mn>12</mn><mo>,</mo><mn>6</mn></mrow><annotation encoding="application/x-tex">\approx 12{,}6</annotation></semantics></math>
+MB (A és B olvasása, C írása; a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><msup><mi>n</mi><mn>3</mn></msup></mrow><annotation encoding="application/x-tex">2n^3</annotation></semantics></math>
+a FLOP-szám, nem bájt), az SpMV esetén a CSR struktúra és a vektorok
+mérete.</li>
+</ol>
+<p>A <strong>várt eredmények</strong> a következők (analitikusan vagy
+korábbi tapasztalatból becsülve):</p>
+<ul>
+<li>A <code>cublasSgemm</code> 1024×1024-es mátrixokra:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mo>⋅</mo><msup><mn>1024</mn><mn>3</mn></msup><mo>≈</mo><mn>2</mn><mo>,</mo><mn>15</mn></mrow><annotation encoding="application/x-tex">2\cdot 1024^3 \approx 2{,}15</annotation></semantics></math>
+GFLOP. Egy RTX 3080 névleges FP32 csúcsa (kb. 30 TFLOP/s) mellett a
+számítási alsó korlát kb. 0,07 ms; a gyakorlati hatásfokkal együtt
+<strong>becslés szerint</strong> nagyjából 0,1–0,3 ms várható
+(analitikus becslés
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><msup><mi>n</mi><mn>3</mn></msup><mi>/</mi><msub><mi>P</mi><mtext mathvariant="normal">eff</mtext></msub></mrow><annotation encoding="application/x-tex">2n^3/P_{\text{eff}}</annotation></semantics></math>,
+nem mérés). A pontos érték a laborban mérendő.</li>
+<li>A <code>cusparseSpMV</code> diagonális CSR mátrixszal (1024 nemnulla
+elem) elhanyagolható futási időt igényel, mert a mátrix rendkívül ritka.
+A mérési naplóban ezért nagy szórás várható; a hangsúly a funkcionális
+helyességen van.</li>
+<li>A CUB <code>DeviceReduce</code> 1024 elemre szintén nagyon gyors, a
+mérési zaj dominálhat.</li>
+<li>A számított összegnek pontosan <code>3072.0f</code>-nek kell lennie,
+mivel a ritka mátrix az egységmátrix, és a vektor minden eleme 3.0.</li>
+</ul>
+<p>A <strong>mért eredmények</strong> táblázatát a labor során kell
+kitölteni. Az alábbi sablon mutatja a szükséges mezőket:</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+</colgroup>
+<thead>
+<tr>
+<th>Futás sorszáma</th>
+<th>GEMM idő (ms)</th>
+<th>SpMV idő (ms)</th>
+<th>CUB Reduce idő (ms)</th>
+<th>Összeg (h_sum)</th>
+<th>Megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1–5 (warm-up)</td>
+<td>–</td>
+<td>–</td>
+<td>–</td>
+<td>–</td>
+<td>hideg indítás, nem számít bele</td>
+</tr>
+<tr>
+<td>6–25</td>
+<td>…</td>
+<td>…</td>
+<td>…</td>
+<td>…</td>
+<td>…</td>
+</tr>
+<tr>
+<td>medián</td>
+<td>…</td>
+<td>…</td>
+<td>…</td>
+<td>…</td>
+<td>…</td>
+</tr>
+<tr>
+<td>szórás/IQR</td>
+<td>…</td>
+<td>…</td>
+<td>…</td>
+<td>…</td>
+<td>…</td>
+</tr>
+</tbody>
+</table>
+<p>Az átfedést <code>nsys profile ./lab_integr</code> idővonalán
+ellenőrizzük: a GEMM (stream1) és az SpMV (stream2) sávjának időben át
+kell fednie (nem futtatva, a labor feladata). A mérési naplóban
+rögzíteni kell a GPU modellt, a drivert, a CUDA-verziót, a compute
+capability-t és az órajelet/power limitet is. A jelen laborban ezeket
+helyőrzőként adtuk meg; a tényleges futtatás során a
+<code>nvidia-smi</code> kimenetét kell rögzíteni.</p>
+<p><strong>Fontos:</strong> A fenti kódot nem fordítottuk és nem
+futtattuk (statikusan átnézett példa); fordítással és futtatással a
+labor során kell ellenőrizni, mérést nem végeztünk. A mért eredmények
+mezőit a labor során kell kitölteni, és a valós számokat a saját
+környezetben kell reprodukálni. A várt eredmények becslések, amelyeket a
+mérés erősíthet vagy cáfolhat.</p>
+<h3 data-number="22.4.5" id="gyakori-hibák-és-megoldások"><span
+class="header-section-number">22.4.5</span> Gyakori hibák és
+megoldások</h3>
+<p>Az integráció során a következő hibák fordulnak elő leggyakrabban, és
+a megoldásuk is egyszerű, ha ismerjük őket:</p>
+<ol type="1">
+<li><p><strong>A handle streamje nincs beállítva.</strong> A
+<code>cudaStreamCreate</code> alapértelmezetten
+<strong>blokkoló</strong> streamet hoz létre, amely a legacy default
+streammel implicit szinkronizál, ezért ilyenkor a default streamen futó
+cuBLAS és az egyéni (blokkoló) streamen futó kernel sorrendje implicit
+módon adott. A sorrend <strong>nem</strong> garantált, ha a stream
+<code>cudaStreamNonBlocking</code>, ha
+<code>--default-stream per-thread</code> fordítási módot használunk,
+illetve két különböző explicit stream között (ezeket eseménnyel kell
+összekötni). Ne támaszkodjunk az implicit szinkronizációra. Megoldás:
+minden handle-hez rendeljünk streamet a <code>cublasSetStream</code>-mel
+(vagy a megfelelő függvénnyel), és a kernelindításnál ugyanazt a
+streamet adjuk meg.</p></li>
+<li><p><strong>Hiányzó vagy rossz méretű workspace.</strong> A cuSPARSE,
+cuFFT és a CUB <code>DeviceReduce</code> workspace-t igényel. Ha a
+puffert nem foglaljuk le, vagy a méretét nem a <code>_bufferSize</code>
+függvénnyel kérdezzük le, a hívás hibát ad vagy memóriatúllépést
+okozhat. Megoldás: először <code>nullptr</code> pufferrel kérdezzük le a
+szükséges méretet, majd foglaljuk le, és csak utána hívjuk a
+műveletet.</p></li>
+<li><p><strong>Skalár pointer mode hibája.</strong> A cuBLAS
+<code>cublasSetPointerMode</code> segítségével lehet beállítani, hogy a
+skalár argumentumok (<code>alpha</code>, <code>beta</code>) host vagy
+device pointeren vannak-e. Az alapértelmezés
+<code>CUBLAS_POINTER_MODE_HOST</code>. Ha a mód nem egyezik a tényleges
+átadással (pl. host mutatót adunk át device módban), a tipikus
+következmény érvénytelen memóriahozzáférés vagy hibás eredmény, nem
+szükségszerűen <code>CUBLAS_STATUS_INVALID_VALUE</code>. Megoldás: ha
+eltérünk az alapértelmezéstől, állítsuk be a pointer mode-ot, és a
+skalárokat ennek megfelelően adjuk át.</p></li>
+<li><p><strong>Szinkronizáció hiánya a mérés előtt.</strong> A könyvtári
+hívások aszinkronok; ha <code>cudaDeviceSynchronize</code> vagy
+<code>cudaStreamSynchronize</code> nélkül próbálunk eredményt olvasni,
+érvénytelen adatot kapunk. Megoldás: minden mérési pont előtt
+szinkronizáljuk a megfelelő streamet.</p></li>
+<li><p><strong>CUB fejléc verzióeltérés.</strong> Ha a CUB fejléceket
+külön töltjük le, és azok verziója nem egyezik a CUDA toolkit belső
+fejléceivel, fordítási hibák léphetnek fel. Megoldás: a toolkithez
+mellékelt CUB-ot használjuk, és a <code>CUB_VERSION</code> makrót
+naplózzuk.</p></li>
+<li><p><strong>Statikus linkelés könyvtári sorrendje.</strong> A
+statikus linkelésnél a könyvtárakat a függőségi sorrendben kell
+felsorolni (a <code>cublasLt_static</code>-ot és a
+<code>culibos</code>-t is), a <code>-lcudart_static</code> az
+<code>nvcc</code> alapértelmezése. Az <code>nvcc</code> nem old fel
+minden statikus függőséget magától, ezért kézi <code>-l</code>
+megadásnál ügyeljünk a sorrendre; szükség esetén <code>-Xlinker</code>
+kapcsolók is használhatók.</p></li>
+<li><p><strong>Compute capability eltérés.</strong> Ha a bináris
+egyetlen, a GPU-nál magasabb compute capability-re készült (pl.
+<code>sm_86</code> binárist futtatunk sm_80-as A100-on), a kernelindítás
+<code>cudaErrorNoKernelImageForDevice</code> hibával meghiúsul. Ha a
+bináris alacsonyabb képességre készült SASS-t és újabbra PTX-et
+tartalmaz, a JIT-fordítás miatt lassabb indulás és kisebb teljesítmény
+lehetséges. Megoldás: a célhardverekre <code>-gencode</code>-dal
+készítsünk SASS-t, és tegyünk bele PTX-et a jövőbeli GPU-kra.</p></li>
+</ol>
+<p>Ezek a hibák mind megelőzhetők a fenti minták követésével és a
+verziók, streamek, memória és workspace gondos kezelésével.</p>
+<h3 data-number="22.4.6" id="összefoglalás"><span
+class="header-section-number">22.4.6</span> Összefoglalás</h3>
+<p>A CUDA-könyvtárak és a saját kód integrálása három területet igényel:
+az API-interop, a stream- és memóriamenedzsment, valamint a verzió- és
+ABI-kezelés. A handle-alapú könyvtárakat streamekhez kell kötni, a
+workspace-eket a <code>_bufferSize</code> függvényekkel kell lefoglalni,
+és a műveletek közötti függőségeket eseményekkel kell kifejezni. A
+header-only könyvtárak, mint a Thrust és a CUB, szorosan illeszkednek a
+saját kódba, de a fejlécverziókat ellenőrizni kell. A buildtervnek
+rögzítenie kell a CUDA toolkit, a driver és a compute capability
+verzióit, valamint a linkelés módját. A laborban bemutatott integrációs
+példa ezeket az elveket egyetlen, ellenőrizhető programban foglalja
+össze.</p>
+<p><strong>Önellenőrző kérdés:</strong> Miért kell a cuBLAS handle-hez
+streamet rendelni, ha a saját kernel és a könyvtári hívás között
+sorrendiséget akarunk biztosítani? Válasz: mert a handle streamje
+határozza meg, melyik streamen fut a könyvtári művelet. Ha a kernel egy
+egyéni streamen indul, a cuBLAS pedig a default streamen, a sorrend
+blokkoló streamnél (legacy default stream) implicit szinkronizáció miatt
+adott, de nem garantált <code>cudaStreamNonBlocking</code> streamnél
+vagy per-thread default stream esetén; ilyenkor az adatfüggőség
+sérülhet. A <code>cublasSetStream</code> hívással a handle-t ugyanahhoz
+a streamhez kötjük, így a kernel és a könyvtári hívás ugyanabban a
+sorban hajtódik végre, és az adatcsere helyes lesz.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu084.html">← 22.3 Thrust és CUB</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu086.html">23.1 Tensor Core architektúra →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

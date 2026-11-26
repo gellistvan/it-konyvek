@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>26.2 NCCL és kollektív műveletek – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – CUDA-ökoszisztéma és mélytanulás</a> › <a href="index.html#gpuch25">26 Multi-GPU, NCCL, NVLink és unified memory</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu098.html">← 26.1 Több GPU és peer access</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu100.html">26.3 NVLink, NVSwitch és GPUDirect →</a></div>
+</nav>
+<h2 data-number="26.2" id="gpu099"><span
+class="header-section-number">26.2</span> NCCL és kollektív
+műveletek</h2>
+<p>A 26.1. alfejezet a több GPU közötti közvetlen adatmozgatás, a
+peer-to-peer hozzáférés és a GPU–GPU másolás alapjait mutatta be. Ebben
+az egységben egy réteggel feljebb lépünk: olyan műveleteket vizsgálunk,
+amelyekben sok GPU közösen, egyetlen kommunikációs lépésben cserél vagy
+redukál adatot. Ezek a kollektív műveletek alkotják a multi-GPU tanítás,
+a szimuláció, a gráf- és lineáris algebrai algoritmusok gerincét. A
+fejezet középpontjában az all-reduce, a gyűrű- és faalgoritmusok,
+valamint az NCCL gyakorlati használata áll.</p>
+<h3 data-number="26.2.1" id="mi-a-kollektív-kommunikáció"><span
+class="header-section-number">26.2.1</span> Mi a kollektív
+kommunikáció?</h3>
+<p>A kollektív kommunikáció olyan adatcsere, amelyben egy egész
+processzcsoport vagy rank-halmaz vesz részt, és a művelet szemantikája
+nem egyetlen pont-pont kapcsolatra, hanem a csoport egészére vonatkozik.
+A leggyakoribb műveletek a következők.</p>
+<ul>
+<li><strong>All-reduce:</strong> minden rank egy saját puffert ad meg, a
+rendszer a megadott redukciós műveletet (például összeg, maximum,
+minimum) alkalmazza az összes rank adatára, és az eredményt minden rank
+megkapja. A multi-GPU tanításban a gradiensátlagolás tipikusan
+all-reduce.</li>
+<li><strong>Broadcast:</strong> egy kiválasztott gyökérrank adatát az
+összes többi rank megkapja.</li>
+<li><strong>Reduce:</strong> hasonló az all-reduce-hoz, de az eredmény
+csak egyetlen kijelölt rankra kerül.</li>
+<li><strong>All-gather:</strong> minden rank elküldi a saját adatát, és
+minden rank összegyűjti az összes rank adatát.</li>
+<li><strong>Reduce-scatter:</strong> az all-reduce első felét valósítja
+meg: a redukált eredményt darabokra vágva szétszórja a rankok
+között.</li>
+<li><strong>All-to-all:</strong> minden rank minden másik ranknak
+különböző adatdarabot küld.</li>
+</ul>
+<p>A fejezet elsősorban az all-reduce-ra koncentrál, mert ez a
+legfontosabb és egyben a leginkább optimalizálható kollektív művelet a
+GPU-s számításban.</p>
+<h3 data-number="26.2.2" id="miért-nem-elég-a-naiv-megoldás"><span
+class="header-section-number">26.2.2</span> Miért nem elég a naiv
+megoldás?</h3>
+<p>Egy naiv all-reduce megvalósítható úgy, hogy minden rank elküldi az
+adatát egy központi ranknak, az elvégzi a redukciót, majd a végeredményt
+szétküldi (broadcast). Ez a séma egyszerű, de a központi rank hálózati
+sávszélessége szűk keresztmetszetté válik: a bejövő forgalom a rankok
+számával arányosan nő, a kimenő forgalom szintén. Nagy méretű
+üzeneteknél a központi rank CPU- vagy GPU-kártyája egyszerűen nem tud
+annyi adatot fogadni és küldeni, amennyit a többi rank képes lenne
+előállítani. Ráadásul a modern multi-GPU csomópontokban a GPU-k közötti
+hálózat gyakran nem egyetlen közös busz, hanem hierarchikus: NVLink,
+NVSwitch, PCIe, InfiniBand. Egy jó kollektív algoritmus figyelembe veszi
+ezt a topológiát, és a hálózat linkeit egyenletesen terheli.</p>
+<h3 data-number="26.2.3" id="gyűrű-all-reduce"><span
+class="header-section-number">26.2.3</span> Gyűrű all-reduce</h3>
+<p>A gyűrű all-reduce az egyik legfontosabb algoritmus nagy üzenetekhez.
+Tegyük fel, hogy P rank van, és minden rank S bájt méretű adatot
+szeretne összegezni. A gyűrű algoritmus logikai gyűrűt alkot a
+rankokból: minden ranknak van egy bal és egy jobb szomszédja. Az adatot
+P darabra, chunkra vágjuk, minden chunk mérete körülbelül S/P.</p>
+<p>Az all-reduce két fázisból áll.</p>
+<ol type="1">
+<li><strong>Reduce-scatter:</strong> P−1 lépésben minden rank az
+aktuálisan birtokolt egyik chunkot elküldi a jobb szomszédjának, és a
+bal szomszédtól kapott chunkot hozzáadja a saját megfelelő részéhez.
+Minden lépés után továbbadja a kapott, részben redukált adatot. A P−1
+lépés végére minden rank egy-egy chunk teljes, az összes rankra
+kiterjedő redukált értékét birtokolja.</li>
+<li><strong>All-gather:</strong> újabb P−1 lépésben a teljesen redukált
+chunkokat körbeküldik a gyűrűn, így a végére minden rank minden chunkot
+megkap, vagyis a teljes redukált eredményt.</li>
+</ol>
+<p>Példa P=4 rankra (rank r a lépésben a <code>(r-t) mod 4</code> indexű
+chunkot küldi a jobb szomszédnak, <code>t</code> a lépés sorszáma
+0-tól). A reduce-scatter 3 lépése:</p>
+<table>
+<thead>
+<tr>
+<th>Lépés</th>
+<th>Rank 0 küldi</th>
+<th>Rank 1 küldi</th>
+<th>Rank 2 küldi</th>
+<th>Rank 3 küldi</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>chunk 0</td>
+<td>chunk 1</td>
+<td>chunk 2</td>
+<td>chunk 3</td>
+</tr>
+<tr>
+<td>1</td>
+<td>chunk 3</td>
+<td>chunk 0</td>
+<td>chunk 1</td>
+<td>chunk 2</td>
+</tr>
+<tr>
+<td>2</td>
+<td>chunk 2</td>
+<td>chunk 3</td>
+<td>chunk 0</td>
+<td>chunk 1</td>
+</tr>
+</tbody>
+</table>
+<p>Ezután a rank <code>r</code> a <code>(r+1) mod 4</code> indexű chunk
+teljes redukált értékét birtokolja; az all-gather 3 lépése ugyanígy
+körbeadja a kész chunkokat.</p>
+<figure id="fig-gpu099-ring-allreduce">
+<div class="fig-interactive"><iframe src="figures/html/gpu099-ring-allreduce.html" title="Hat kis panel két sorban, mindegyikben egy 4×4-es rács: sorok a rank 0–3, oszlopok a c0–c3 chunkok; a cellában felül a részösszeg, alul a hozzájáruló rankok. Felső sor, reduce-scatter t = 0, 1, 2: a vastag keretes cella a küldött chunk, a szürke a fogadott és frissített; a t = 2 után a rank 0 c1, a rank 1 c2, a rank 2 c3 és a rank 3 c0 cellája 10, hozzájárulók 0123, dupla kerettel. Alsó sor, all-gather t = 3, 4, 5: a teljes chunkok körbejárnak, a fogadó felülírja a saját cellát; a t = 5 után minden cella 10. Lábjegyzet: rankonként 6 × S/4 = 1,5 MiB forgalom." loading="lazy" style="width:100%;border:0;height:700px"></iframe><noscript><img src="figures/img/gpu099-ring-allreduce.png" style="width:100.0%"
+alt="Hat kis panel két sorban, mindegyikben egy 4×4-es rács: sorok a rank 0–3, oszlopok a c0–c3 chunkok; a cellában felül a részösszeg, alul a hozzájáruló rankok. Felső sor, reduce-scatter t = 0, 1, 2: a vastag keretes cella a küldött chunk, a szürke a fogadott és frissített; a t = 2 után a rank 0 c1, a rank 1 c2, a rank 2 c3 és a rank 3 c0 cellája 10, hozzájárulók 0123, dupla kerettel. Alsó sor, all-gather t = 3, 4, 5: a teljes chunkok körbejárnak, a fogadó felülírja a saját cellát; a t = 5 után minden cella 10. Lábjegyzet: rankonként 6 × S/4 = 1,5 MiB forgalom." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu099-ring-allreduce.png" style="width:100.0%"
+alt="Hat kis panel két sorban, mindegyikben egy 4×4-es rács: sorok a rank 0–3, oszlopok a c0–c3 chunkok; a cellában felül a részösszeg, alul a hozzájáruló rankok. Felső sor, reduce-scatter t = 0, 1, 2: a vastag keretes cella a küldött chunk, a szürke a fogadott és frissített; a t = 2 után a rank 0 c1, a rank 1 c2, a rank 2 c3 és a rank 3 c0 cellája 10, hozzájárulók 0123, dupla kerettel. Alsó sor, all-gather t = 3, 4, 5: a teljes chunkok körbejárnak, a fogadó felülírja a saját cellát; a t = 5 után minden cella 10. Lábjegyzet: rankonként 6 × S/4 = 1,5 MiB forgalom." /></details></div>
+<figcaption>Gyűrű all-reduce
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>P</mi><mo>=</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">P = 4</annotation></semantics></math>
+rankkal (a rank
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>r</mi><annotation encoding="application/x-tex">r</annotation></semantics></math>
+minden eleme
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>r</mi><mo>+</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">r + 1</annotation></semantics></math>):
+a felső sor a reduce-scatter, az alsó az all-gather három-három lépése
+utáni állapot. A
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>t</mi><mo>=</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">t = 2</annotation></semantics></math>
+lépés után a rank 0, 1, 2, 3 a c1, c2, c3, c0 chunk teljes összegét (10)
+birtokolja, hat lépés után minden cella 10; rankonként
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>6</mn><mo>⋅</mo><mi>S</mi><mi>/</mi><mn>4</mn><mo>=</mo><mn>1</mn><mo>,</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">6 \cdot S/4 = 1{,}5</annotation></semantics></math>
+MiB megy át
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>S</mi><mo>=</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">S = 1</annotation></semantics></math>
+MiB).</figcaption>
+</figure>
+<p>A gyűrű all-reduce minden lépésben minden linket egyszerre használ,
+így a hálózati sávszélesség kihasználása jó. A per rank elküldött
+adatmennyiség:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mo>⋅</mo><mfrac><mrow><mi>P</mi><mo>−</mo><mn>1</mn></mrow><mi>P</mi></mfrac><mo>⋅</mo><mi>S</mi><mo>,</mo></mrow><annotation encoding="application/x-tex">
+2 \cdot \frac{P-1}{P} \cdot S,
+</annotation></semantics></math></p>
+<p>ami nagy P esetén közelítőleg 2S. Az ideális futásidő modellje:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mtext mathvariant="normal">ring</mtext></msub><mo>=</mo><mn>2</mn><mo stretchy="false" form="prefix">(</mo><mi>P</mi><mo>−</mo><mn>1</mn><mo stretchy="false" form="postfix">)</mo><mi>L</mi><mo>+</mo><mn>2</mn><mo stretchy="false" form="prefix">(</mo><mi>P</mi><mo>−</mo><mn>1</mn><mo stretchy="false" form="postfix">)</mo><mfrac><mi>S</mi><mrow><mi>P</mi><mi>B</mi></mrow></mfrac><mo>,</mo></mrow><annotation encoding="application/x-tex">
+T_{\text{ring}} = 2(P-1)L + 2(P-1)\frac{S}{P B},
+</annotation></semantics></math></p>
+<p>ahol L a lépésenkénti latencia, B a link sávszélessége. Jól látható,
+hogy a gyűrű előnye nagy S esetén mutatkozik meg, mert a sávszélességi
+tag a chunkmérettel csökken, a latencia viszont O(P), ezért kis
+üzenetekre nem feltétlenül optimális.</p>
+<h3 data-number="26.2.4" id="fa-all-reduce"><span
+class="header-section-number">26.2.4</span> Fa all-reduce</h3>
+<p>A fa all-reduce a latenciára optimalizál. Itt a rankok egy bináris
+fát alkotnak. A redukció fázisban minden levél elküldi a saját adatát a
+szülőjének, a szülő összeadja a gyermekeitől kapott értékeket a
+sajátjával, majd továbbküldi a saját szülőjének. Így a gyökér log2(P)
+lépés után megkapja a teljes redukált eredményt. Ezután a broadcast
+fázisban a gyökér visszaszórja az eredményt a fa mentén, szintén log2(P)
+lépésben. Az NCCL valójában kettős bináris fát használ, és az üzenetet
+pipeline-osan, kisebb darabokban továbbítja, így a fa
+sávszélesség-kihasználása jobb a naiv leírásnál.</p>
+<p>A fa latenciája jobb, mint a gyűrűé: O(log P) lépés. Azonban a
+gyökérhez közelebbi linkeken nagyobb adatforgalom halad át, mert a
+gyökér felé haladva az üzenetek nem csökkennek chunkokra. Kis
+üzeneteknél a latencia dominál, ezért a fa jól működik. Nagy üzeneteknél
+viszont a gyökér linkje szűk keresztmetszet lesz, és a fa rosszabb
+sávszélesség-kihasználást ad, mint a gyűrű.</p>
+<p>A gyakorlatban az NCCL általában automatikusan választ a gyűrű, a fa
+és más algoritmusok (például NVLS, CollNet) között, a méret, a rankok
+száma és a detektált topológia alapján. A felhasználónak csak
+diagnosztikai célból érdemes környezeti változókkal felülbírálni,
+például az <code>NCCL_ALGO=Ring</code> vagy <code>NCCL_ALGO=Tree</code>
+beállítással.</p>
+<h3 data-number="26.2.5" id="nccl-a-gyakorlatban"><span
+class="header-section-number">26.2.5</span> NCCL a gyakorlatban</h3>
+<p>Az NVIDIA Collective Communications Library (NCCL) a fenti kollektív
+műveletek GPU-optimalizált implementációját adja. Az NCCL nem igényel
+MPI-t, de az MPI-vel jól együttműködik: tipikusan az MPI biztosítja a
+processzek indítását, a rank azonosítást és a vezérlést, az NCCL pedig a
+GPU-k közötti kollektív adatmozgatást végzi. Az NCCL a CUDA
+stream-szemantikát követi: minden művelet egy CUDA streamen fut,
+aszinkron módon, ezért a hívás után a stream szinkronizálásával lehet
+megvárni a befejezést.</p>
+<p>A legfontosabb NCCL API-elemek:</p>
+<ul>
+<li><code>ncclComm_t</code>: egy kommunikátor, amely egy rank-halmazt
+fog össze.</li>
+<li><code>ncclGetUniqueId</code>: egyedi azonosítót generál, amelyet
+minden ranknak meg kell kapnia.</li>
+<li><code>ncclCommInitRank</code>: létrehoz egy kommunikátort; minden
+rank megadja a saját rankjét és a rankok számát.</li>
+<li><code>ncclAllReduce</code>: végrehajtja az all-reduce műveletet a
+megadott streamen.</li>
+<li><code>ncclCommDestroy</code>: felszabadítja a kommunikátort.</li>
+<li><code>ncclCommInitAll</code>: egyetlen folyamatból, több GPU-ra
+egyszerre hoz létre kommunikátorokat; ha ezután egy host szál több
+kommunikátoron (eszközön) ad ki kollektív hívást, azokat
+<code>ncclGroupStart()</code>/<code>ncclGroupEnd()</code> közé kell
+tenni, különben holtpont lehet.</li>
+<li><code>ncclSend</code>/<code>ncclRecv</code>: pont-pont küldés és
+fogadás, <code>ncclGroupStart/End</code> között használva.</li>
+<li>Diagnosztika: <code>NCCL_DEBUG=INFO</code> kiírja a kiválasztott
+algoritmust, a topológiát és a hálózati útvonalat.</li>
+</ul>
+<p>A kommunikátor inicializálásához az egyik rank generálja az
+azonosítót, majd azt továbbítani kell a többi ranknak (broadcast). Ez a
+lépés történhet MPI-vel, de megoldható más out-of-band csatornán is.</p>
+<h3 data-number="26.2.6" id="nccl-all-reduce-labor"><span
+class="header-section-number">26.2.6</span> NCCL all-reduce labor</h3>
+<p>A következő labor egy minimális NCCL all-reduce példát mutat be,
+amely négy GPU-t használ. A kód minden rankon feltölti a bemeneti
+puffert <code>rank + 1</code> értékekkel, végrehajt egy all-reduce
+összeget, majd ellenőrzi, hogy minden elem a várt értéket tartalmazza.
+Az all-reduce előtt és után CUDA eventekkel mérjük a futásidőt, és
+kiszámítjuk a sávszélességi mutatókat.</p>
+<pre class="cuda"><code>// CUDA C++ (C++17), NCCL 2.x, MPI
+// Fordítás: lásd a kód utáni parancsot.
+#include &lt;mpi.h&gt;
+#include &lt;nccl.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;cmath&gt;
+#include &lt;algorithm&gt;
+#include &lt;vector&gt;
+
+#define CUDA_CHECK(call) do { \
+    cudaError_t err = (call); \
+    if (err != cudaSuccess) { \
+        std::fprintf(stderr, &quot;CUDA error %s:%d: %s\n&quot;, __FILE__, __LINE__, \
+                     cudaGetErrorString(err)); \
+        MPI_Abort(MPI_COMM_WORLD, static_cast&lt;int&gt;(err)); \
+    } \
+} while (0)
+
+#define NCCL_CHECK(call) do { \
+    ncclResult_t res = (call); \
+    if (res != ncclSuccess) { \
+        std::fprintf(stderr, &quot;NCCL error %s:%d: %s\n&quot;, __FILE__, __LINE__, \
+                     ncclGetErrorString(res)); \
+        MPI_Abort(MPI_COMM_WORLD, static_cast&lt;int&gt;(res)); \
+    } \
+} while (0)
+
+__global__ void fill_value(float* x, size_t n, float v) {
+    size_t i = static_cast&lt;size_t&gt;(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i &lt; n) x[i] = v;
+}
+
+int main(int argc, char** argv) {
+    MPI_Init(&amp;argc, &amp;argv);
+    int world_rank = 0, world_size = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &amp;world_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &amp;world_size);
+
+    int device_count = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&amp;device_count));
+    // Helyi rank: az azonos csomóponton futó processzek közötti sorszám,
+    // így több csomópontnál is helyes a GPU-hozzárendelés.
+    MPI_Comm local_comm;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, world_rank,
+                        MPI_INFO_NULL, &amp;local_comm);
+    int local_rank = 0;
+    MPI_Comm_rank(local_comm, &amp;local_rank);
+    MPI_Comm_free(&amp;local_comm);
+    if (local_rank &gt;= device_count) {
+        std::fprintf(stderr, &quot;Rank %d: nincs szabad GPU (%d db)\n&quot;,
+                     world_rank, device_count);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    CUDA_CHECK(cudaSetDevice(local_rank));
+
+    const size_t N = (argc &gt; 1) ? std::atoll(argv[1]) : (1 &lt;&lt; 22);
+    float* sendbuff = nullptr;
+    float* recvbuff = nullptr;
+    CUDA_CHECK(cudaMalloc(&amp;sendbuff, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;recvbuff, N * sizeof(float)));
+
+    const float local_value = static_cast&lt;float&gt;(world_rank + 1);
+    const int threads = 256;
+    const int blocks = static_cast&lt;int&gt;((N + threads - 1) / threads);
+    fill_value&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(sendbuff, N, local_value);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    ncclUniqueId id;
+    if (world_rank == 0) NCCL_CHECK(ncclGetUniqueId(&amp;id));
+    MPI_Bcast(&amp;id, sizeof(ncclUniqueId), MPI_BYTE, 0, MPI_COMM_WORLD);
+
+    ncclComm_t comm;
+    NCCL_CHECK(ncclCommInitRank(&amp;comm, world_size, id, world_rank));
+
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&amp;stream));
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&amp;start));
+    CUDA_CHECK(cudaEventCreate(&amp;stop));
+
+    // Warm-up: 5 all-reduce.
+    const int WARM = 5, REPS = 20;
+    for (int w = 0; w &lt; WARM; ++w) {
+        NCCL_CHECK(ncclAllReduce(sendbuff, recvbuff, N, ncclFloat, ncclSum, comm, stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    MPI_Barrier(MPI_COMM_WORLD);   // a rankok egyszerre kezdik a mérést
+
+    // Időzített ismétlések: ismétlésenként külön eseménypár, rankonként medián.
+    std::vector&lt;float&gt; t(REPS);
+    for (int r = 0; r &lt; REPS; ++r) {
+        CUDA_CHECK(cudaEventRecord(start, stream));
+        NCCL_CHECK(ncclAllReduce(sendbuff, recvbuff, N, ncclFloat, ncclSum, comm, stream));
+        CUDA_CHECK(cudaEventRecord(stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&amp;t[r], start, stop));
+    }
+    std::sort(t.begin(), t.end());
+    float local_median = 0.5f * (t[REPS / 2 - 1] + t[REPS / 2]);
+    // A rankok mediánjainak maximuma (az nccl-tests is a rankok maximumát veszi)
+    float elapsed_ms = 0.0f;
+    MPI_Reduce(&amp;local_median, &amp;elapsed_ms, 1, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    float* h_recv = static_cast&lt;float*&gt;(std::malloc(N * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(h_recv, recvbuff, N * sizeof(float), cudaMemcpyDeviceToHost));
+
+    const float expected = static_cast&lt;float&gt;(world_size * (world_size + 1) / 2);
+    double max_abs_diff = 0.0;
+    for (size_t i = 0; i &lt; N; ++i) {
+        const double diff = std::fabs(static_cast&lt;double&gt;(h_recv[i]) - expected);
+        if (diff &gt; max_abs_diff) max_abs_diff = diff;
+    }
+
+    const double bytes = static_cast&lt;double&gt;(N) * sizeof(float);
+    const double t_s = static_cast&lt;double&gt;(elapsed_ms) * 1e-3;
+    // nccl-tests definíció: algbw = S/t, busbw = algbw * 2(P-1)/P (all-reduce)
+    const double algbw = bytes / t_s / 1e9;                            // GB/s
+    const double busbw = algbw * 2.0 * (world_size - 1) / world_size;  // GB/s
+    if (world_rank == 0) {
+        std::printf(&quot;N=%zu P=%d median_elapsed=%.3f ms algbw=%.3f GB/s &quot;
+                    &quot;busbw=%.3f GB/s max_abs_diff=%.9g\n&quot;,
+                    N, world_size, elapsed_ms, algbw, busbw, max_abs_diff);
+    }
+
+    std::free(h_recv);
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    NCCL_CHECK(ncclCommDestroy(comm));
+    CUDA_CHECK(cudaFree(recvbuff));
+    CUDA_CHECK(cudaFree(sendbuff));
+    MPI_Finalize();
+    return 0;
+}</code></pre>
+<p>A kódban <code>sendbuff</code> és <code>recvbuff</code> külön
+pufferek; a laborban ez biztonságos, és elkerüli a nem in-place
+műveletből adódó hibákat. A várt eredmény
+<code>world_size * (world_size + 1) / 2</code>, mivel a bemenet a
+rankokon <code>1, 2, 3, 4</code>, összegük <code>10</code>. Mivel ezek
+egész számok pontosan ábrázolhatók FP32-ben, a hibának nullának kell
+lennie.</p>
+<p>A fordítás tipikus parancsa:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-ccbin</span> mpic++ <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-I</span><span class="va">${CUDA_HOME}</span>/include <span class="at">-I</span><span class="va">${NCCL_HOME}</span>/include <span class="dt">\</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>     nccl_allreduce.cu <span class="at">-o</span> nccl_allreduce <span class="dt">\</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>     <span class="at">-L</span><span class="va">${CUDA_HOME}</span>/lib64 <span class="at">-lcudart</span> <span class="at">-L</span><span class="va">${NCCL_HOME}</span>/lib <span class="at">-lnccl</span></span></code></pre></div>
+<p>Futtatás:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">mpirun</span> <span class="at">-np</span> 4 ./nccl_allreduce 16777216</span></code></pre></div>
+<p>Egy 4 GPU-s csomóponton <code>-np 4</code> négy processzt indít. Több
+csomópontnál csomópontonként annyi processz kell, ahány GPU-t használni
+akarunk (például <code>--map-by ppr:4:node</code>); a kód a helyi rankot
+<code>MPI_Comm_split_type</code>-pal számítja. A tényleges processz-GPU
+hozzárendelést a klaszter ütemezője és a
+<code>CUDA_VISIBLE_DEVICES</code> együtt határozza meg. A kódot nem
+futtattuk; a mérési táblázatot a laborban kell kitölteni.</p>
+<h3 data-number="26.2.7"
+id="mérési-napló-és-az-eredmények-elkülönítése"><span
+class="header-section-number">26.2.7</span> Mérési napló és az
+eredmények elkülönítése</h3>
+<p>A könyv módszertana szerint a mérési környezetet és a mért
+eredményeket rögzíteni kell. Az alábbi táblázat egy
+<strong>példa</strong> laborprotokollt mutat. A „mért” oszlopban a saját
+laborban mért értékek kerülnek; itt csak a szerkezet látható. A „várt”
+oszlop a gyűrű modellből számított becslést tartalmazza, nem mérési
+eredmény.</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Környezet</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU</td>
+<td>4× NVIDIA A100 40 GB (példa)</td>
+</tr>
+<tr>
+<td>Driver</td>
+<td>535.154.05 (példa)</td>
+</tr>
+<tr>
+<td>CUDA</td>
+<td>12.2 (példa)</td>
+</tr>
+<tr>
+<td>NCCL</td>
+<td>2.19.3 (példa)</td>
+</tr>
+<tr>
+<td>MPI</td>
+<td>OpenMPI 4.1.5 (példa)</td>
+</tr>
+<tr>
+<td>Interconnect</td>
+<td>NVLink/NVSwitch (példa)</td>
+</tr>
+<tr>
+<td><code>NCCL_ALGO</code></td>
+<td>nincs beállítva (automatikus választás; a ténylegesen használt
+algoritmust <code>NCCL_DEBUG=INFO</code> kimenetéből rögzítsük, a
+gyűrűmodellel való összevetéshez <code>NCCL_ALGO=Ring</code>-gel is
+mérjünk)</td>
+</tr>
+<tr>
+<td><code>NCCL_PROTO</code></td>
+<td>gyári</td>
+</tr>
+</tbody>
+</table>
+<p>A laborban a következő két bemenetméreten érdemes mérni:</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+</colgroup>
+<thead>
+<tr>
+<th>N</th>
+<th>Ismétlések (5 warm-up után)</th>
+<th>Mért futásidő (ms, medián; a rankok maximuma)</th>
+<th>Mért <code>algbw</code> (GB/s)</th>
+<th>Mért <code>busbw</code> (GB/s)</th>
+<th>Várt <code>busbw</code> (GB/s)</th>
+<th>Várt max. absz. hiba</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1&lt;&lt;22</td>
+<td>20</td>
+<td>[laborban]</td>
+<td>[laborban]</td>
+<td>[laborban]</td>
+<td>a gyűrű modellből becsülve</td>
+<td>0</td>
+</tr>
+<tr>
+<td>1&lt;&lt;24</td>
+<td>20</td>
+<td>[laborban]</td>
+<td>[laborban]</td>
+<td>[laborban]</td>
+<td>a gyűrű modellből becsülve</td>
+<td>0</td>
+</tr>
+</tbody>
+</table>
+<p>Az nccl-tests definíciója szerint <code>algbw = S/t</code>,
+all-reduce esetén <code>busbw = algbw · 2(P-1)/P</code>; a
+<code>busbw</code> a rankonként elküldött forgalomnak felel meg, ezért
+közvetlenül a link sávszélességéhez hasonlítható. A <code>T_ring</code>
+modellből nagy S esetén <code>t ≈ 2(P-1)S/(P·B)</code>, tehát a várt
+<code>busbw</code> a sávszélességi tagra közelítőleg a linken elérhető
+tényleges <code>B_eff</code>, a várt <code>algbw</code> pedig ennek
+<code>P/(2(P-1))</code>-szerese. A becslést a laborban a saját hardverre
+kell kalibrálni; a táblázatban szereplő számok nem helyettesítik a
+mérést, és az <code>nccl-tests</code> <code>all_reduce_perf</code>
+azonos paraméterű <code>algbw</code>/<code>busbw</code> oszlopaival
+ellenőrizhetők.</p>
+<h3 data-number="26.2.8" id="tipikus-hibák-és-megoldások"><span
+class="header-section-number">26.2.8</span> Tipikus hibák és
+megoldások</h3>
+<p>A kollektív kommunikációban a hibák gyakran nem azonnali crash-t,
+hanem holtpontot vagy nem determinisztikus hibát okoznak.</p>
+<ol type="1">
+<li><p><strong>Nem minden rank hívja meg a kollektív műveletet.</strong>
+Az all-reduce egy csoportos művelet; ha egyetlen rank kihagyja, a többi
+rank várakozni fog a beérkező adatra, és a program lefagy. A megoldás:
+minden kollektív hívásnak ugyanabban a sorrendben kell megjelennie
+minden rankon, akár hibakezelés után is.</p></li>
+<li><p><strong>A <code>ncclCommInitRank</code> rank argumentuma nem
+egyezik az MPI rank-kel.</strong> Ha a rank nem konzisztens, a
+kommunikátor hibásan jön létre, és az adatcsere szemantikája sérül. A
+laborban mindig ugyanazt a ranket használjuk az MPI-ben és az
+NCCL-ben.</p></li>
+<li><p><strong>A stream szinkronizálás hiánya.</strong> Az
+<code>ncclAllReduce</code> aszinkron, ezért ha közvetlenül utána a
+<code>recvbuff</code>-ot olvassuk <code>cudaStreamSynchronize</code>
+nélkül, versenyhelyzetet kapunk. A példa ezért hív szinkronizálást a
+<code>cudaEventElapsedTime</code> előtt.</p></li>
+<li><p><strong>Hibás GPU-kiválasztás több folyamatnál.</strong> Ha két
+rank ugyanazt a GPU-t használja, az NCCL ezt nem engedi: a
+kommunikátor-inicializálás hibával (<code>Duplicate GPU detected</code>,
+<code>ncclInvalidUsage</code>) leáll. A
+<code>cudaSetDevice(local_rank)</code> hívásnak a megfelelő rankre kell
+mutatnia.</p></li>
+<li><p><strong>A <code>ncclUniqueId</code> broadcastolásának
+hiánya.</strong> Ha az azonosítót nem juttatjuk el minden rankhoz, a
+<code>ncclCommInitRank</code> hibát ad vagy eltérő kommunikátorokat hoz
+létre. A <code>MPI_Bcast</code> a <code>sizeof(ncclUniqueId)</code>
+méretet használja, mert a típus opak.</p></li>
+<li><p><strong>A <code>sendbuff</code> és <code>recvbuff</code>
+átfedését feltételező in-place művelet.</strong> Az NCCL all-reduce
+támogatja az in-place használatot, ha a két pointer azonos, de ezt
+ellenőrizni kell a használt NCCL-verzióban. A biztonság kedvéért a labor
+külön puffereket használ.</p></li>
+</ol>
+<h3 data-number="26.2.9" id="önellenőrző-kérdés"><span
+class="header-section-number">26.2.9</span> Önellenőrző kérdés</h3>
+<p>Hány linket terhel a gyűrű all-reduce P=4 rank, S=1 MiB üzenet
+esetén, és mennyi a per rank elküldött adatmennyiség?</p>
+<p><strong>Válasz:</strong> a gyűrű mind a 4 linket használja
+párhuzamosan; a per rank elküldött adat
+<code>2 · (3/4) · 1 MiB = 1,5 MiB</code>, mert az all-reduce két fázisa
+3-3 lépésből áll, és minden lépésben S/P = 256 KiB chunkot
+mozgatunk.</p>
+<p><strong>2. kérdés.</strong> Miért nem helyes
+<code>world_rank % device_count</code>-tal GPU-t választani
+többcsomópontos futásnál, és mi a javasolt megoldás?</p>
+<p><strong>Válasz:</strong> a világrank nem a csomóponton belüli
+sorszám; a helyi rankot
+<code>MPI_Comm_split_type(MPI_COMM_TYPE_SHARED)</code>-del vagy
+<code>OMPI_COMM_WORLD_LOCAL_RANK</code>-kal kell venni.</p>
+<p>Az NCCL és a kollektív műveletek fogalma itt megalapozza a következő
+egységet, amely a 26.3 alfejezetben az NVLink, NVSwitch és GPUDirect
+részleteit, valamint a multi-GPU topológia teljesítményre gyakorolt
+hatását tárgyalja. A topológia és a P2P-mérés ismeretében a gyűrű/fa
+választás szempontjai a mért sávszélességek alapján értelmezhetők.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu098.html">← 26.1 Több GPU és peer access</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu100.html">26.3 NVLink, NVSwitch és GPUDirect →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>10.1 CUDA-hibakódok és ellenőrzés – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. RÉSZ – CUDA programozási modell</a> › <a href="index.html#gpuch09">10 Hibakezelés, debugging és compute-sanitizer</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu033.html">← 9.4 Összetett együttműködési minták</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu035.html">10.2 cuda-gdb és kernel-debugging →</a></div>
+</nav>
+<h2 data-number="10.1" id="gpu034"><span
+class="header-section-number">10.1</span> CUDA-hibakódok és
+ellenőrzés</h2>
+<p>A CUDA futásidejű hibakezelése az egyik legfontosabb, mégis gyakran
+alábecsült eleme a GPU-programozásnak. Az aszinkron végrehajtás, a
+kernelindítások speciális szintaxisa és a hibák késleltetett
+jelentkezése miatt a hagyományos, szinkron kódból ismert kivételkezelési
+minták nem ültethetők át közvetlenül. Ebben az alfejezetben a futásidejű
+hibák és hibakódok természetét vizsgáljuk meg, bemutatjuk a
+<code>cudaGetLastError</code> és <code>cudaPeekAtLastError</code>
+működését, és kialakítunk egy olyan hibaellenőrző makrót és függvényt
+(kivételdobó változattal), amely a könyv további laborjainak alapját
+képezi. A következő két alfejezetben a <code>cuda-gdb</code>-t, majd a
+compute-sanitizert tárgyaljuk.</p>
+<h3 data-number="10.1.1" id="futásidejű-hibák-és-hibakódok"><span
+class="header-section-number">10.1.1</span> Futásidejű hibák és
+hibakódok</h3>
+<p>A CUDA Runtime API függvényei a legtöbb esetben egy
+<code>cudaError_t</code> típusú értéket adnak vissza. Ez az érték jelzi,
+hogy a hívás sikeres volt-e, vagy milyen hibába ütközött. A lehetséges
+hibakódokat a <code>cudaError_t</code> enumeráció definiálja, és a
+<code>cudaGetErrorString</code> függvény segítségével ember által
+olvasható szöveggé alakíthatók.</p>
+<p>A sikeres végrehajtást a <code>cudaSuccess</code> (értéke 0) jelzi.
+Minden más érték hibát jelent. Néhány gyakori hibakód:</p>
+<ul>
+<li><code>cudaErrorInvalidValue</code>: egy paraméter értéke nem
+megengedett tartományba esik (pl. érvénytelen másolási irány, null
+mutató ott, ahol nem engedett).</li>
+<li><code>cudaErrorInvalidConfiguration</code>: a kernel konfigurációja
+érvénytelen, például a blokk mérete meghaladja az eszköz által
+támogatott maximumot (legtöbb GPU-n legfeljebb 1024 szál
+blokkonként).</li>
+<li><code>cudaErrorMemoryAllocation</code>: a <code>cudaMalloc</code>
+vagy más memóriafoglaló hívás nem tudta kielégíteni a kérést, gyakran
+“out of memory” állapot miatt.</li>
+<li><code>cudaErrorInvalidDevice</code>: a megadott eszközazonosító nem
+létezik.</li>
+<li><code>cudaErrorNoDevice</code>: nincs elérhető CUDA-képes eszköz a
+rendszerben.</li>
+<li><code>cudaErrorInvalidDevicePointer</code>: (CUDA 10.1 óta elavult)
+érvénytelen device-mutató; a mai runtime ilyenkor jellemzően
+<code>cudaErrorInvalidValue</code>-t ad.</li>
+<li><code>cudaErrorIllegalAddress</code>: a kernel futása közben
+érvénytelen memóriacímet próbált elérni, ami gyakran a
+<code>cudaDeviceSynchronize</code> hívásnál derül ki.</li>
+<li><code>cudaErrorLaunchFailure</code>: kivétel történt a kernel futása
+közben (pl. trap, érvénytelen mutató); sticky hiba, a szinkronizációs
+pontnál jelentkezik.</li>
+<li><code>cudaErrorAssert</code>: a kernelben egy <code>assert</code>
+utasítás meghiúsult.</li>
+</ul>
+<p>A hibákat két csoportra kell bontani. A <strong>nem sticky</strong>
+hibák (pl. <code>cudaErrorInvalidConfiguration</code>,
+<code>cudaErrorMemoryAllocation</code>,
+<code>cudaErrorInvalidValue</code>) a hibás hívás visszatérési
+értékeként jelennek meg, és beállítják a futásidő „utolsó hiba”
+változóját is; ezt a <code>cudaGetLastError</code> kiolvassa és törli. A
+következő API-hívások ettől függetlenül a saját eredményüket adják, a
+program (a hibás hívás kivételével) folytatható. A
+<strong>sticky</strong> hibák (pl. <code>cudaErrorIllegalAddress</code>,
+<code>cudaErrorLaunchFailure</code>, <code>cudaErrorAssert</code>) a
+CUDA-kontextust tartósan érvénytelenítik: minden későbbi, a kontextust
+használó CUDA-hívás ugyanezt a hibát adja vissza, és a
+<code>cudaGetLastError</code> hívás sem teszi újra használhatóvá a
+kontextust; a CUDA dokumentációja szerint ilyenkor a folyamatot le kell
+állítani és újra kell indítani. Ez a viselkedés eltér a szokásos C++
+kivételkezeléstől, ahol egy kivétel után a végrehajtás folytatódhat.</p>
+<p>Fontos megérteni, hogy a hibakódok nem mindig a hibát okozó hívás
+közvetlen visszatérési értékében jelennek meg. A CUDA végrehajtási
+modell aszinkron, ami azt jelenti, hogy a kernelindítás
+(<code>&lt;&lt;&lt;...&gt;&gt;&gt;</code>) visszatér a hostra, mielőtt a
+kernel ténylegesen befejeződne, sőt gyakran mielőtt elindulna. A
+kernelindítás során fellépő hibák (például érvénytelen blokkméret) a
+launch után lekérdezhetők a <code>cudaGetLastError</code> segítségével,
+de a kernel futása közbeni hibák (például illegális memória-hozzáférés)
+csak akkor válnak ismertté, amikor a host explicit vagy implicit
+szinkronizációt hajt végre (például <code>cudaDeviceSynchronize</code>,
+<code>cudaMemcpy</code> device→host irányban, vagy egy másik, ugyanazon
+a streamen futó művelet befejeződése). Ezért a hibakezelési stratégiát
+ehhez a modellhez kell igazítani.</p>
+<h3 data-number="10.1.2"
+id="cudagetlasterror-és-cudapeekatlasterror"><span
+class="header-section-number">10.1.2</span>
+<code>cudaGetLastError</code> és <code>cudaPeekAtLastError</code></h3>
+<p>A CUDA Runtime API két függvényt biztosít a legutóbb feljegyzett hiba
+lekérdezésére:</p>
+<ul>
+<li><code>cudaError_t cudaGetLastError(void)</code> – visszaadja az
+utolsó hibát, majd <strong>törli</strong> a hibastátust, vagyis a
+következő hívás már <code>cudaSuccess</code> értéket ad, hacsak
+időközben nem lépett fel újabb hiba.</li>
+<li><code>cudaError_t cudaPeekAtLastError(void)</code> – visszaadja az
+utolsó hibát, de <strong>nem törli</strong> azt. A hibastátus megmarad,
+így később ismételten lekérdezhető.</li>
+</ul>
+<p>A két függvény különbsége akkor válik fontossá, ha a hibát több
+helyen is szeretnénk megvizsgálni anélkül, hogy elveszítenénk az
+információt. Tipikus használati eset a hibakeresés: ha egy hiba után
+több diagnosztikai üzenetet akarunk kiírni, és nem akarjuk, hogy az első
+hibaellenőrző hívás “elfogyassza” a hibakódot, akkor
+<code>cudaPeekAtLastError</code>-t használunk. A hibát végül a
+<code>cudaGetLastError</code> hívással törölhetjük, hogy a következő
+műveletek tiszta lappal induljanak.</p>
+<p>Például egy hibás kernelindítás után a következő kódrészlet megőrzi a
+hibát további vizsgálatra:</p>
+<pre class="cuda"><code>kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(args);
+cudaError_t err = cudaPeekAtLastError(); // hibát ad, de nem törli
+if (err != cudaSuccess) {
+    fprintf(stderr, &quot;Kernel launch hiba: %s\n&quot;, cudaGetErrorString(err));
+    // további diagnosztika
+}
+// később: cudaGetLastError() törli a hibát</code></pre>
+<p>Fontos, hogy a <code>cudaGetLastError</code> és
+<code>cudaPeekAtLastError</code> is az utolsó <strong>hibát</strong>
+adják vissza, nem az utolsó <strong>művelet</strong> sikerességét. Ha az
+utolsó hibát már töröltük, és azóta nem volt újabb hiba, akkor
+<code>cudaSuccess</code>-t adnak.</p>
+<p>Tegyük fel, hogy a következő szekvenciát hajtjuk végre:</p>
+<ol type="1">
+<li><code>cudaMalloc(&amp;d_ptr, 1024)</code> – sikeres,
+<code>cudaSuccess</code>-t ad vissza.</li>
+<li><code>kernel&lt;&lt;&lt;...&gt;&gt;&gt;</code> – a launch
+konfiguráció hibás (pl. 1025 szál blokkonként). A kernel nem indul el; a
+hiba a <code>&lt;&lt;&lt;...&gt;&gt;&gt;</code> feldolgozásakor azonnal
+ismert, és az utolsó hiba változóba kerül.</li>
+<li><code>cudaGetLastError()</code> – visszaadja a
+<code>cudaErrorInvalidConfiguration</code> hibát, és törli az utolsó
+hiba változót. Ez a hiba <strong>nem sticky</strong>, a kontextus
+használható marad.</li>
+<li><code>cudaGetLastError()</code> ismét – most már
+<code>cudaSuccess</code>, mert a hibát töröltük.</li>
+</ol>
+<p>Ha a 3. lépésben <code>cudaPeekAtLastError</code>-t hívtunk volna,
+akkor a 4. lépés ugyanazt a hibát adná vissza, mert a hiba nem
+törlődött. Ezzel szemben egy sticky hiba (pl. illegális címzés a
+kernelben) után a <code>cudaGetLastError</code> kiolvassa a hibát, de a
+következő CUDA-hívások továbbra is ugyanazt a hibát adják vissza.</p>
+<p>Az alábbi ábra a 10.1.7 labor három útvonalán mutatja, melyik hívás
+mikor látja a hibát.</p>
+<figure id="fig-gpu034-error-timeline">
+<div class="fig-interactive"><iframe src="figures/html/gpu034-error-timeline.html" title="A túl nagy blokkméret azonnal az utolsó hiba változóba kerül és törölhető; a túlindexelés csak a szinkronizáláskor jelenik meg, és minden további hívást elront." loading="lazy" style="width:100%;border:0;height:640px"></iframe><noscript><img src="figures/img/gpu034-error-timeline.png" style="width:100.0%"
+alt="A túl nagy blokkméret azonnal az utolsó hiba változóba kerül és törölhető; a túlindexelés csak a szinkronizáláskor jelenik meg, és minden további hívást elront." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu034-error-timeline.png" style="width:100.0%"
+alt="A túl nagy blokkméret azonnal az utolsó hiba változóba kerül és törölhető; a túlindexelés csak a szinkronizáláskor jelenik meg, és minden további hívást elront." /></details></div>
+<figcaption>Launch-hiba és futási hiba megjelenése a hoston: a túl nagy
+blokkméret azonnal az „utolsó hiba” változóba kerül, és a
+<code>cudaGetLastError</code> törli; a túlindexelés csak a
+szinkronizáláskor jelenik meg, és sticky (várt viselkedés a dokumentáció
+szerint)</figcaption>
+</figure>
+<p>Aszinkron hibák esetén a helyzet bonyolultabb. A kernelindítás
+közvetlen utáni <code>cudaGetLastError</code> hívás általában elkapja a
+launch konfigurációs hibákat, mert azok a
+<code>&lt;&lt;&lt;...&gt;&gt;&gt;</code> feldolgozásakor már ismertek. A
+kernel futása közbeni hibák (például
+<code>cudaErrorIllegalAddress</code>) viszont csak akkor jelennek meg,
+amikor a host szinkronizál: <code>cudaDeviceSynchronize()</code>,
+<code>cudaStreamSynchronize()</code> vagy egy szinkronizáló
+<code>cudaMemcpy</code> visszatérési értékében (a
+<code>cudaStreamQuery</code> addig <code>cudaErrorNotReady</code>
+értéket ad). Ezért a megbízható hibaellenőrzési minta a következő:</p>
+<pre class="cuda"><code>kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(args);
+CUDA_CHECK(cudaGetLastError());       // launch hiba
+CUDA_CHECK(cudaDeviceSynchronize());  // futási hiba</code></pre>
+<p>Fejlesztés közben hasznos a <code>CUDA_LAUNCH_BLOCKING=1</code>
+környezeti változó, amely a kernelindításokat szinkronná teszi, így a
+hiba a hibát okozó indításnál jelentkezik. A kernelben használt
+<code>assert</code> és <code>printf</code> szintén a szinkronizációs
+pontnál jelenik meg (az <code>assert</code> hibája
+<code>cudaErrorAssert</code>, sticky). A hibák okának mélyebb
+feltárására a <code>cuda-gdb</code> (a következő alfejezet) és a
+compute-sanitizer (az azt követő alfejezet) szolgál.</p>
+<p>A könyv laborjaiban használt <code>CUDA_CHECK</code> makrót az alábbi
+szakasz részletesen elemzi; itt az a lényeg, hogy mindkét hívás
+hibakódját ellenőrizzük. A <code>cudaDeviceSynchronize</code> ugyan a
+futási hibát adja vissza, de a launch konfigurációs hibát a közvetlen
+<code>cudaGetLastError</code> ellenőrzés a hibás indításhoz köti, ezért
+mindkét ellenőrzés javasolt.</p>
+<h3 data-number="10.1.3"
+id="hibaellenőrző-makró-és-ellenőrző-függvény"><span
+class="header-section-number">10.1.3</span> Hibaellenőrző makró és
+ellenőrző függvény</h3>
+<p>A hibakezelés megkönnyítésére célszerű egy makrót és egy ellenőrző
+függvényt kialakítani, amelyek minden CUDA API-hívást ellenőriznek, és
+hiba esetén értelmes üzenetet adnak. A könyv minden laborja ugyanazt a
+kanonikus <code>CUDA_CHECK</code> makrót használja
+(<code>do { … } while (0)</code>, zárójelezett <code>(call)</code>,
+<code>cudaGetErrorString</code>, <code>exit(EXIT_FAILURE)</code>); a
+bővített diagnosztikához a kifejezés szövegét (<code>#call</code>) is
+kiírhatjuk, ahogy az alábbi változat teszi. Új kódban érdemes egy közös
+<code>cuda_check.h</code> fejlécben tartani.</p>
+<p>Először egy egyszerű makró, amely a hívást argumentumként veszi,
+meghívja, ellenőrzi a visszatérési értéket, és hiba esetén kiírja a
+fájlnevet, a sor számát, a hívás szövegét és a hiba üzenetét, majd
+azonnal leállítja a programot (vagy kivételt dob, ha a kivételdobó
+változatot használjuk).</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#ifndef CUDA_CHECK_H</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUDA_CHECK_H</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string&gt;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sstream&gt;</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="co">// Hibaellenőrző makró: a call kifejezést értékeli ki, ellenőrzi a hibakódot.</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="co">// Hiba esetén kiírja a részleteket és std::exit(EXIT_FAILURE)-t hív.</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUDA_CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp"> </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                          </span><span class="op">\</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="dt">cudaError_t</span><span class="pp"> </span><span class="va">cuda_check_err_</span><span class="pp"> </span><span class="op">=</span><span class="pp"> </span><span class="op">(</span>call<span class="op">);</span><span class="pp">                              </span><span class="op">\</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span><span class="va">cuda_check_err_</span><span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                              </span><span class="op">\</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>ostringstream<span class="pp"> </span>oss<span class="op">;</span><span class="pp">                                        </span><span class="op">\</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span>oss<span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;CUDA error at &quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;:&quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="pp">        </span><span class="op">\</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot; &#39;&quot;</span><span class="pp"> </span><span class="op">#</span>call<span class="pp"> </span><span class="st">&quot;&#39; failed: &quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span>cudaGetErrorString<span class="op">(</span><span class="va">cuda_check_err_</span><span class="op">);</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>cerr<span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span>oss<span class="op">.</span>str<span class="op">()</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="bu">std::</span>endl<span class="op">;</span><span class="pp">                           </span><span class="op">\</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                       </span><span class="op">\</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp">                                                                  </span><span class="op">\</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a><span class="pp">#endif </span><span class="co">// CUDA_CHECK_H</span></span></code></pre></div>
+<p>Ezt a makrót bármely <code>cudaError_t</code>-t visszaadó függvényre
+használhatjuk. Például:</p>
+<pre class="cuda"><code>CUDA_CHECK(cudaMalloc(&amp;d_ptr, size));
+CUDA_CHECK(cudaMemcpy(d_ptr, h_ptr, size, cudaMemcpyHostToDevice));
+CUDA_CHECK(cudaGetLastError()); // kernel launch után
+CUDA_CHECK(cudaDeviceSynchronize());</code></pre>
+<p>A makró előnye, hogy hibamentes futásnál a költsége egyetlen
+összehasonlítás és elágazás (a <code>cudaDeviceSynchronize</code>
+hívások költsége viszont nem elhanyagolható, ezért teljesítménymérés
+közben nem tesszük a belső ciklusba). A hibaüzenet tartalmazza a pontos
+helyet és a hibát okozó kifejezést, ami gyorsítja a hibakeresést.</p>
+<p>A <code>do { ... } while (0)</code> konstrukció biztosítja, hogy a
+makró pontosvesszővel lezárva egyetlen utasításként viselkedjen, így
+<code>if</code>/<code>else</code> ágban is helyesen működik
+(<code>if (x) CUDA_CHECK(f()); else ...</code>). A makró lokális
+változójának neve <code>cuda_check_err_</code>, hogy ne árnyékoljon egy,
+a hívás argumentumában használt <code>err</code> nevű változót.</p>
+<h3 data-number="10.1.4" id="kivételdobó-változat"><span
+class="header-section-number">10.1.4</span> Kivételdobó változat</h3>
+<p>Néha az abortálás nem elfogadható, például egy hosszabb futású
+alkalmazásban, ahol a hibát egy magasabb szintű komponens szeretné
+kezelni. Ebben az esetben a makrót úgy alakíthatjuk, hogy egy kivételt
+dobjon, amelyet a hívó elkaphat. Ehhez egy <code>CudaError</code>
+kivételosztályt és egy ellenőrző függvényt definiálunk:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdexcept&gt;</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> CudaError <span class="op">:</span> <span class="kw">public</span> <span class="bu">std::</span>runtime_error <span class="op">{</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">explicit</span> CudaError<span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> msg<span class="op">)</span> <span class="op">:</span> <span class="bu">std::</span>runtime_error<span class="op">(</span>msg<span class="op">)</span> <span class="op">{}</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="co">// Ellenőrző függvény, amely a hibakódot vizsgálja és kivételt dob.</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="kw">inline</span> <span class="dt">void</span> checkCudaError<span class="op">(</span><span class="dt">cudaError_t</span> err<span class="op">,</span> <span class="at">const</span> <span class="dt">char</span><span class="op">*</span> file<span class="op">,</span> <span class="dt">int</span> line<span class="op">,</span> <span class="at">const</span> <span class="dt">char</span><span class="op">*</span> expr<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>err <span class="op">!=</span> cudaSuccess<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>ostringstream oss<span class="op">;</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>        oss <span class="op">&lt;&lt;</span> <span class="st">&quot;CUDA error at &quot;</span> <span class="op">&lt;&lt;</span> file <span class="op">&lt;&lt;</span> <span class="st">&quot;:&quot;</span> <span class="op">&lt;&lt;</span> line</span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>            <span class="op">&lt;&lt;</span> <span class="st">&quot; &#39;&quot;</span> <span class="op">&lt;&lt;</span> expr <span class="op">&lt;&lt;</span> <span class="st">&quot;&#39; failed: &quot;</span> <span class="op">&lt;&lt;</span> cudaGetErrorString<span class="op">(</span>err<span class="op">);</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>        <span class="cf">throw</span> CudaError<span class="op">(</span>oss<span class="op">.</span>str<span class="op">());</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="co">// Makró, amely az ellenőrző függvényt hívja, így kivételt dob abort helyett.</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUDA_CHECK_OR_THROW</span><span class="op">(</span>call<span class="op">)</span><span class="pp"> </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                 </span><span class="op">\</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="dt">cudaError_t</span><span class="pp"> </span><span class="va">cuda_check_err_</span><span class="pp"> </span><span class="op">=</span><span class="pp"> </span><span class="op">(</span>call<span class="op">);</span><span class="pp">                              </span><span class="op">\</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span>checkCudaError<span class="op">(</span><span class="va">cuda_check_err_</span><span class="op">,</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">,</span><span class="pp"> </span><span class="op">#</span>call<span class="op">);</span><span class="pp">        </span><span class="op">\</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span></code></pre></div>
+<p>Most a hívó elkaphatja a kivételt, például:</p>
+<pre class="cuda"><code>try {
+    CUDA_CHECK_OR_THROW(cudaMalloc(&amp;d_ptr, size));
+} catch (const CudaError&amp; e) {
+    std::cerr &lt;&lt; &quot;Hiba történt: &quot; &lt;&lt; e.what() &lt;&lt; std::endl;
+    // takarítás vagy alternatív útvonal
+}</code></pre>
+<p>Fontos megjegyezni, hogy a makró a <code>call</code> kifejezést
+pontosan egyszer értékeli ki, ami kritikus, mert a CUDA API-hívásoknak
+mellékhatásuk van (memóriafoglalás, másolás, stb.). Az egyszeri
+kiértékelést az biztosítja, hogy a <code>call</code> eredményét egyszer,
+a <code>cuda_check_err_</code> változóba mentjük; a
+<code>do { ... } while (0)</code> itt is az egyetlen utasításként való
+viselkedést adja.</p>
+<p>Mindkét megközelítésnek megvan a maga helye. A laborokban általában
+az abortáló makrót használjuk, mert a hibák korai leállítást igényelnek,
+és a hibaüzenet elegendő a diagnózishoz. A kivételdobó változatot olyan
+könyvtári kódban érdemes használni, ahol a hívó fél kezelheti a
+hibát.</p>
+<h3 data-number="10.1.5"
+id="labor-hibaellenőrző-makró-és-hibatípusok"><span
+class="header-section-number">10.1.5</span> Labor: hibaellenőrző makró
+és hibatípusok</h3>
+<p>Ebben a laborban a fent bemutatott hibaellenőrző makrót
+implementáljuk, majd egy szándékosan hibás CUDA programon teszteljük,
+két hibatípussal: egy nem sticky launch-hibával és egy sticky futási
+hibával. A cél annak megfigyelése, hogy a hibák hogyan jelentkeznek, és
+a makró hogyan segíti a diagnózist.</p>
+<h3 data-number="10.1.6" id="környezet"><span
+class="header-section-number">10.1.6</span> Környezet</h3>
+<p>A labor az alábbi (illeszthető) környezetben futtatható. Az aktuális
+értékeket minden futás előtt rögzíteni kell:</p>
+<ul>
+<li>GPU: <code>[modell]</code> (bármely CUDA-képes GPU)</li>
+<li>Compute capability: <code>[kitöltendő]</code> (a <code>-arch</code>
+ehhez igazítandó)</li>
+<li>Driver verzió: <code>[kitöltendő]</code></li>
+<li>CUDA Toolkit verzió: <code>[kitöltendő]</code>
+(<code>nvcc --version</code>)</li>
+<li>Operációs rendszer: Linux x86_64 vagy Windows (a CUDA Toolkit
+macOS-t már nem támogat)</li>
+<li>Build rendszer: <code>nvcc</code> a CUDA Toolkit része</li>
+</ul>
+<p>A pontos verziószámok a <code>nvidia-smi</code> és
+<code>nvcc --version</code> kimenetéből nyerhetők.</p>
+<h3 data-number="10.1.7" id="kód"><span
+class="header-section-number">10.1.7</span> Kód</h3>
+<p>A következő CUDA C++ forrás (<code>error_check.cu</code>) tartalmazza
+a makrót, a kivételdobó változatot, egy egyszerű kernelt, és három
+futtatási útvonalat: egy helyest, egy nem sticky launch-hibásat (túl
+nagy blokkméret, <code>cudaErrorInvalidConfiguration</code>), és egy
+sticky futási hibásat (kernelen belüli túlindexelés, várhatóan
+<code>cudaErrorIllegalAddress</code>). A példát nem futtattuk; a
+viselkedés a dokumentáció szerinti várt viselkedés. A túlindexelő
+útvonalat csak izolált, saját GPU-n futtasd.</p>
+<pre class="cuda"><code>// error_check.cu
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cstdlib&gt;
+#include &lt;iostream&gt;
+#include &lt;sstream&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+
+// --- Hibaellenőrző makró (exit verzió) ---
+#define CUDA_CHECK(call) do {                                          \
+    cudaError_t cuda_check_err_ = (call);                              \
+    if (cuda_check_err_ != cudaSuccess) {                              \
+        std::ostringstream oss;                                        \
+        oss &lt;&lt; &quot;CUDA error at &quot; &lt;&lt; __FILE__ &lt;&lt; &quot;:&quot; &lt;&lt; __LINE__        \
+            &lt;&lt; &quot; &#39;&quot; #call &quot;&#39; failed: &quot; &lt;&lt; cudaGetErrorString(cuda_check_err_); \
+        std::cerr &lt;&lt; oss.str() &lt;&lt; std::endl;                           \
+        std::exit(EXIT_FAILURE);                                       \
+    }                                                                  \
+} while (0)
+
+// --- Kivételdobó változat ---
+class CudaError : public std::runtime_error {
+public:
+    explicit CudaError(const std::string&amp; msg) : std::runtime_error(msg) {}
+};
+
+inline void checkCudaError(cudaError_t err, const char* file, int line, const char* expr) {
+    if (err != cudaSuccess) {
+        std::ostringstream oss;
+        oss &lt;&lt; &quot;CUDA error at &quot; &lt;&lt; file &lt;&lt; &quot;:&quot; &lt;&lt; line
+            &lt;&lt; &quot; &#39;&quot; &lt;&lt; expr &lt;&lt; &quot;&#39; failed: &quot; &lt;&lt; cudaGetErrorString(err);
+        throw CudaError(oss.str());
+    }
+}
+
+#define CUDA_CHECK_OR_THROW(call) do {                                 \
+    cudaError_t cuda_check_err_ = (call);                              \
+    checkCudaError(cuda_check_err_, __FILE__, __LINE__, #call);        \
+} while (0)
+
+// Egyszerű kernel
+__global__ void addKernel(const float* a, const float* b, float* c, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n) {
+        c[idx] = a[idx] + b[idx];
+    }
+}
+
+// Szándékosan hibás kernel: a tömbön messze kívülre ír (illegális címzés).
+__global__ void oobKernel(float* p, unsigned long long offset) {
+    p[threadIdx.x + offset] = 1.0f;
+}
+
+int main() {
+    const int N = 1 &lt;&lt; 20; // 1M elem
+    size_t size = N * sizeof(float);
+
+    // Host memória foglalás
+    float *h_a = new float[N];
+    float *h_b = new float[N];
+    float *h_c = new float[N];
+    for (int i = 0; i &lt; N; ++i) {
+        h_a[i] = static_cast&lt;float&gt;(i);
+        h_b[i] = static_cast&lt;float&gt;(2 * i);
+    }
+
+    // Device memória foglalás
+    float *d_a, *d_b, *d_c;
+    CUDA_CHECK(cudaMalloc(&amp;d_a, size));
+    CUDA_CHECK(cudaMalloc(&amp;d_b, size));
+    CUDA_CHECK(cudaMalloc(&amp;d_c, size));
+
+    // Másolás host-&gt;device
+    CUDA_CHECK(cudaMemcpy(d_a, h_a, size, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b, size, cudaMemcpyHostToDevice));
+
+    // 1. Helyes kernelindítás
+    int threadsPerBlock = 256;
+    int blocks = (N + threadsPerBlock - 1) / threadsPerBlock;
+    addKernel&lt;&lt;&lt;blocks, threadsPerBlock&gt;&gt;&gt;(d_a, d_b, d_c, N);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Másolás device-&gt;host
+    CUDA_CHECK(cudaMemcpy(h_c, d_c, size, cudaMemcpyDeviceToHost));
+
+    // Ellenőrzés
+    bool correct = true;
+    for (int i = 0; i &lt; N; ++i) {
+        if (h_c[i] != h_a[i] + h_b[i]) {
+            correct = false;
+            break;
+        }
+    }
+    std::cout &lt;&lt; &quot;Helyes kernel futtatás: &quot; &lt;&lt; (correct ? &quot;sikeres&quot; : &quot;hibás&quot;) &lt;&lt; std::endl;
+
+    // 2. Nem sticky launch-hiba: túl nagy blokkméret (max 1024).
+    //    Itt nem abortálunk, hogy megfigyelhessük, hogy a kontextus használható marad.
+    threadsPerBlock = 1025; // szándékos hiba
+    blocks = (N + threadsPerBlock - 1) / threadsPerBlock;
+    addKernel&lt;&lt;&lt;blocks, threadsPerBlock&gt;&gt;&gt;(d_a, d_b, d_c, N);
+    cudaError_t e1 = cudaGetLastError();   // várt: cudaErrorInvalidConfiguration, törli
+    cudaError_t e2 = cudaGetLastError();   // várt: cudaSuccess
+    std::cout &lt;&lt; &quot;Launch-hiba: &quot; &lt;&lt; cudaGetErrorString(e1)
+              &lt;&lt; &quot; | második lekérdezés: &quot; &lt;&lt; cudaGetErrorString(e2) &lt;&lt; std::endl;
+    CUDA_CHECK(cudaDeviceSynchronize());   // a kontextus használható: sikeres
+
+    // 3. Sticky futási hiba: a kernel a tömbön kívülre ír (szándékos, csak izolált GPU-n!).
+    //    A launch után a cudaGetLastError várhatóan még cudaSuccess, a hiba a szinkronizációnál jelenik meg.
+    oobKernel&lt;&lt;&lt;1, 32&gt;&gt;&gt;(d_c, 1ull &lt;&lt; 40);
+    cudaError_t e3 = cudaGetLastError();           // várt: cudaSuccess (a hiba még nem történt meg)
+    cudaError_t e4 = cudaDeviceSynchronize();      // várt: cudaErrorIllegalAddress
+    cudaError_t e5 = cudaMalloc(&amp;d_a, 16);         // várt: sticky, ugyanaz a hiba
+    std::cout &lt;&lt; &quot;launch után: &quot; &lt;&lt; cudaGetErrorString(e3)
+              &lt;&lt; &quot; | sync után: &quot; &lt;&lt; cudaGetErrorString(e4)
+              &lt;&lt; &quot; | következő hívás: &quot; &lt;&lt; cudaGetErrorString(e5) &lt;&lt; std::endl;
+    // A kontextus innen nem használható tovább; a folyamat kilép (nincs cudaFree).
+    // Az operációs rendszer/driver a folyamat végén felszabadítja az erőforrásokat.
+    delete[] h_a;
+    delete[] h_b;
+    delete[] h_c;
+    return 1;
+}</code></pre>
+<p>A program a helyes kernel futtatása után a szándékosan hibás
+blokkmérettel indít egy kernelt (nem sticky hiba, a program
+folytatódik), majd egy túlindexelő kernelt (sticky hiba). Az utóbbi
+tisztítása nem lehetséges: egy sticky hiba után a CUDA-kontextus nem
+állítható vissza, ezért a program kilép.</p>
+<h3 data-number="10.1.8" id="build-parancs"><span
+class="header-section-number">10.1.8</span> Build parancs</h3>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-o</span> error_check error_check.cu <span class="at">-arch</span><span class="op">=</span>sm_86</span></code></pre></div>
+<p>Az <code>-arch=sm_86</code> a GeForce RTX 3080 compute
+capability-jének felel meg. Más GPU esetén az architektúrát a GPU
+specifikációja alapján kell megadni (pl. <code>sm_80</code> A100,
+<code>sm_75</code> RTX 2080).</p>
+<h3 data-number="10.1.9" id="futtatási-parancs"><span
+class="header-section-number">10.1.9</span> Futtatási parancs</h3>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./error_check</span></span></code></pre></div>
+<h3 data-number="10.1.10" id="várt-eredmény"><span
+class="header-section-number">10.1.10</span> Várt eredmény</h3>
+<p>A következő a dokumentáció alapján <strong>várt</strong> viselkedés,
+nem futtatott kimenet. A helyes kernel futása után a program kiírja:</p>
+<pre><code>Helyes kernel futtatás: sikeres</code></pre>
+<p>Ezután a 2. útvonalnál az első <code>cudaGetLastError</code> a
+<code>cudaErrorInvalidConfiguration</code> szövegét
+(<code>invalid configuration argument</code>), a második a
+<code>no error</code> szöveget adja, a program pedig folytatódik. A 3.
+útvonalnál a launch utáni <code>cudaGetLastError</code> várhatóan
+<code>no error</code>, a <code>cudaDeviceSynchronize</code>
+<code>an illegal memory access was encountered</code>
+(<code>cudaErrorIllegalAddress</code>), és a következő
+<code>cudaMalloc</code> ugyanezt a hibát adja vissza (sticky). A program
+kilépési kódja a kódban <code>1</code>.</p>
+<h3 data-number="10.1.11" id="mérési-napló"><span
+class="header-section-number">10.1.11</span> Mérési napló</h3>
+<p>A tényleges eredményt a saját környezetben kell rögzíteni; a „mért”
+oszlopot az olvasó tölti ki, a „várt” oszlop a fenti dokumentáció-alapú
+elvárás.</p>
+<table>
+<colgroup>
+<col style="width: 31%" />
+<col style="width: 34%" />
+<col style="width: 34%" />
+</colgroup>
+<thead>
+<tr>
+<th>Paraméter</th>
+<th>Várt érték</th>
+<th>Mért érték</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Helyes kernel futtatás</td>
+<td><code>Helyes kernel futtatás: sikeres</code></td>
+<td><code>[kitöltendő]</code></td>
+</tr>
+<tr>
+<td><code>cudaGetLastError</code> a túl nagy blokkméret után</td>
+<td><code>cudaErrorInvalidConfiguration</code></td>
+<td><code>[kitöltendő]</code></td>
+</tr>
+<tr>
+<td>Második <code>cudaGetLastError</code></td>
+<td><code>cudaSuccess</code></td>
+<td><code>[kitöltendő]</code></td>
+</tr>
+<tr>
+<td><code>cudaDeviceSynchronize</code> a túlindexelő kernel után</td>
+<td><code>cudaErrorIllegalAddress</code></td>
+<td><code>[kitöltendő]</code></td>
+</tr>
+<tr>
+<td>Következő API-hívás a sticky hiba után</td>
+<td><code>cudaErrorIllegalAddress</code> (sticky)</td>
+<td><code>[kitöltendő]</code></td>
+</tr>
+<tr>
+<td>Program kilépési kódja</td>
+<td><code>1</code></td>
+<td><code>[kitöltendő]</code></td>
+</tr>
+</tbody>
+</table>
+<p>(A <code>CUDA_CHECK</code> 1-es kilépési kóddal áll le;
+<code>std::abort()</code>-os változatnál a kilépés jelzéssel (SIGABRT)
+történik, shellben ez jellemzően 134-es kilépési kód.)</p>
+<h3 data-number="10.1.12" id="összefoglalás"><span
+class="header-section-number">10.1.12</span> Összefoglalás</h3>
+<p>Ebben az alfejezetben megismertük a CUDA futásidejű hibakezelés
+alapjait:</p>
+<ul>
+<li>A CUDA API-hívások <code>cudaError_t</code> hibakódokat adnak
+vissza; a <code>cudaSuccess</code> jelzi a sikert.</li>
+<li>A nem sticky hibákat (pl. érvénytelen konfiguráció) a
+<code>cudaGetLastError</code> kiolvassa és törli; a sticky hibák (pl.
+illegális címzés) a kontextust tartósan érvénytelenítik, minden további
+hívás ugyanazt a hibát adja.</li>
+<li>A <code>cudaPeekAtLastError</code> megőrzi a hibát későbbi
+lekérdezésekre.</li>
+<li>A kernelindítások aszinkron volta miatt a launch hibákat
+<code>cudaGetLastError</code>-rel, a futási hibákat pedig
+<code>cudaDeviceSynchronize</code> után kell ellenőrizni.</li>
+<li>A hibaellenőrző makró és a kivételdobó változat segítségével a
+hibakezelés egységessé és megbízhatóvá tehető.</li>
+<li>A laborban bemutatott példa a két hibatípust (nem sticky
+launch-hiba, sticky futási hiba) külön demonstrálja.</li>
+</ul>
+<p>Ezek az eszközök képezik az alapot a következő két alfejezetben
+tárgyalt <code>cuda-gdb</code> és compute-sanitizer használatához,
+amelyek a hibák mélyebb okainak feltárásában segítenek.</p>
+<p><strong>Önellenőrző kérdés:</strong> Mi a különbség a
+<code>cudaGetLastError</code> és a <code>cudaPeekAtLastError</code>
+között, és miért van szükség <code>cudaDeviceSynchronize</code>-ra a
+kernel futási hibáinak elkapásához?</p>
+<p>Megoldás röviden: a <code>cudaPeekAtLastError</code> nem törli az
+utolsó hibát, a <code>cudaGetLastError</code> igen; a kernel futási
+hibái aszinkron módon, csak a szinkronizációs pontnál (pl.
+<code>cudaDeviceSynchronize</code>) kerülnek elő, mert a
+<code>&lt;&lt;&lt;...&gt;&gt;&gt;</code> visszatér a kernel befejezése
+előtt.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu033.html">← 9.4 Összetett együttműködési minták</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu035.html">10.2 cuda-gdb és kernel-debugging →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

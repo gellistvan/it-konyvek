@@ -1,0 +1,789 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>6.4 Launch konfiguráció és hibakezelés – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. RÉSZ – CUDA programozási modell</a> › <a href="index.html#gpuch05">6 Kernelírás, indexelés és launch konfiguráció</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu020.html">← 6.3 Grid-stride loop és perzisztens kernelek</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu022.html">7.1 Global memory és allokáció →</a></div>
+</nav>
+<h2 data-number="6.4" id="gpu021"><span
+class="header-section-number">6.4</span> Launch konfiguráció és
+hibakezelés</h2>
+<p>A launch konfiguráció és a hibakezelés nem két különálló téma, hanem
+ugyanannak a megbízható CUDA-kódnak a két oldala. A kernel indítási
+paraméterei határozzák meg, hogy a hardver hogyan ütemezi a szálakat, és
+minden egyes paraméter hibája azonnali vagy késleltetett hibához
+vezethet. A hibakezelés pedig nem csak a <code>cudaError_t</code> kódok
+ellenőrzését jelenti, hanem annak tudatos kezelését, hogy a CUDA
+végrehajtási modell aszinkron: a kernel indítása visszatér, mielőtt a
+kernel ténylegesen lefutna, így a hibák egy része csak később,
+szinkronizációs pontokon válik láthatóvá. Ebben az alfejezetben együtt
+tárgyaljuk a launch paramétereket, a hibakódokat és az ellenőrzési
+mintákat, majd egy labor keretében egy működő launch wrapper és
+hibaellenőrző makró kombinációját építjük fel.</p>
+<h3 data-number="6.4.1" id="launch-paraméterek-és-korlátok"><span
+class="header-section-number">6.4.1</span> Launch paraméterek és
+korlátok</h3>
+<p>A CUDA kernel indítási szintaxisa a következő:</p>
+<pre class="cuda"><code>kernel&lt;&lt;&lt;grid, block, shared_bytes, stream&gt;&gt;&gt;(argumentumok...);</code></pre>
+<p>A <code>grid</code> és <code>block</code> típusa <code>dim3</code>, a
+<code>shared_bytes</code> típusa <code>size_t</code>, a
+<code>stream</code> típusa <code>cudaStream_t</code>. A
+<code>grid</code> és <code>block</code> dimenziói 1, 2 vagy 3
+dimenziósak lehetnek, a kihasználatlan komponensek alapértelmezetten 1.
+A <code>shared_bytes</code> a kernel számára lefoglalt dinamikus
+megosztott memória mérete bájtban, a <code>stream</code> pedig azt a
+folyamot jelöli, amelyben a kernel futni fog; a <code>0</code> (vagy
+<code>NULL</code>) az alapértelmezett streamet jelenti.</p>
+<p>A hardver és a CUDA futtatókörnyezet szigorú korlátokat szab ezekre a
+paraméterekre. Ezek a korlátok lekérdezhetők a
+<code>cudaGetDeviceProperties</code> függvénnyel:</p>
+<pre class="cuda"><code>cudaDeviceProp prop;
+CUDA_CHECK(cudaGetDeviceProperties(&amp;prop, 0));
+printf(&quot;Max threads per block: %d\n&quot;, prop.maxThreadsPerBlock);
+printf(&quot;Max block dims: %d x %d x %d\n&quot;, prop.maxThreadsDim[0],
+       prop.maxThreadsDim[1], prop.maxThreadsDim[2]);
+printf(&quot;Max grid dims: %d x %d x %d\n&quot;, prop.maxGridSize[0],
+       prop.maxGridSize[1], prop.maxGridSize[2]);
+printf(&quot;Max shared mem per block: %zu\n&quot;, prop.sharedMemPerBlock);
+printf(&quot;Warp size: %d\n&quot;, prop.warpSize);</code></pre>
+<p>A leggyakoribb korlátok:</p>
+<ul>
+<li><strong>Szálak száma blokkonként</strong>
+(<code>maxThreadsPerBlock</code>): általában 1024 (az összes mai GPU-n
+legalább 1024). A <code>block.x * block.y * block.z</code> szorzat nem
+haladhatja meg ezt az értéket.</li>
+<li><strong>Blokkdimenziók</strong> (<code>maxThreadsDim</code>): minden
+dimenzió külön-külön is korlátozott (általában
+<code>(1024, 1024, 64)</code>). Például <code>block(512, 512, 1)</code>
+esetén a szorzat 262 144, ami meghaladja a 1024-et, így
+érvénytelen.</li>
+<li><strong>Grid dimenziók</strong> (<code>maxGridSize</code>): az x
+dimenzió általában <code>2^31 - 1</code>, az y és z dimenziók kisebbek
+(pl. 65 535). A gyakorlatban a grid méretét szinte mindig a probléma
+mérete határozza meg, és nem szokott korlátba ütközni, de például egy
+1D-s gridnél a <code>grid.x</code> nem lehet nagyobb, mint
+<code>maxGridSize[0]</code>.</li>
+<li><strong>Megosztott memória</strong> (<code>sharedMemPerBlock</code>,
+<code>sharedMemPerBlockOptin</code>): a
+<code>prop.sharedMemPerBlock</code> statikus eszköztulajdonság
+(alapesetben 48 KiB), amely a <code>cudaFuncSetAttribute</code> hívás
+után sem változik. A 48 KiB feletti dinamikus shared memóriához a
+<code>cudaFuncAttributeMaxDynamicSharedMemorySize</code> attribútumot
+kell beállítani, a felső korlát pedig a
+<code>prop.sharedMemPerBlockOptin</code> (blokkonkénti opt-in maximum, a
+CUDA Programming Guide technikai specifikációs táblája szerint pl. CC
+7.0: 96 KiB, CC 7.5: 64 KiB, CC 8.0: 163 KiB, CC 8.6/8.9: 99 KiB, CC
+9.0: 227 KiB; a 164 KiB az SM teljes kapacitása, nem a blokké). A kernel
+statikus (<code>__shared__</code> tömb) shared memóriája hozzáadódik a
+dinamikus részhez (<code>cudaFuncAttributes::sharedSizeBytes</code>). Ha
+a kernel ennél többet kér, a launch sikertelen lesz, és
+<code>cudaErrorInvalidValue</code> vagy
+<code>cudaErrorLaunchOutOfResources</code> hibát kapunk.</li>
+<li><strong>Regiszterhasználat</strong>: bár a launch paraméterek között
+nem szerepel, a kernel tényleges regiszterhasználata befolyásolhatja az
+occupancy-t és indíthatóságot. Ha egy kernel annyi regisztert igényel,
+hogy az adott SM-en egy blokk sem fér el, a launch
+<code>cudaErrorLaunchOutOfResources</code> hibával meghiúsulhat. A
+regiszterhasználatot a <code>--ptxas-options=-v</code> fordítási
+kapcsolóval lehet megtekinteni.</li>
+</ul>
+<p>A launch paraméterek ellenőrzésének elsődleges eszköze a
+<code>cudaGetLastError</code> hívása közvetlenül a kernel indítása után.
+Ez azonban <strong>csak az indítási hibákat</strong> fogja el, nem a
+kernel futása közben fellépő hibákat. Az indítási hibák tipikusan a
+fenti korlátok megsértéséből adódnak, például túl nagy blokkméret, túl
+sok dinamikus shared memória, érvénytelen stream pointer vagy
+érvénytelen eszközmutató.</p>
+<h3 data-number="6.4.2" id="cudaerror_t-és-hibakódok"><span
+class="header-section-number">6.4.2</span> <code>cudaError_t</code> és
+hibakódok</h3>
+<p>A CUDA API szinte minden függvénye <code>cudaError_t</code> típusú
+értéket ad vissza. A <code>cudaSuccess</code> (értéke 0) jelzi a sikeres
+végrehajtást. Minden más érték hibát jelent. A hibakódok szimbolikus
+nevei a <code>cudaError</code> enum értékei, például:</p>
+<ul>
+<li><code>cudaErrorInvalidValue</code>: érvénytelen paraméter (pl.
+negatív méret, érvénytelen enum).</li>
+<li><code>cudaErrorInvalidDevicePointer</code>: érvénytelen
+eszközmutató.</li>
+<li><code>cudaErrorInvalidConfiguration</code>: érvénytelen kernel
+launch konfiguráció (pl. túl nagy blokkméret).</li>
+<li><code>cudaErrorLaunchFailure</code>: a kernel futása közben fellépő,
+nem részletezett hiba (“unspecified launch failure”); a kontextus
+ilyenkor általában használhatatlanná válik (sticky hiba). A regiszter-
+vagy shared memory hiányt a <code>cudaErrorLaunchOutOfResources</code>
+jelzi.</li>
+<li><code>cudaErrorLaunchOutOfResources</code>: a kernelhez szükséges
+erőforrások (regiszter, shared memory) nem állnak rendelkezésre.</li>
+<li><code>cudaErrorMemoryAllocation</code>: memóriafoglalási hiba.</li>
+<li><code>cudaErrorUnknown</code>: ismeretlen hiba.</li>
+</ul>
+<p>A hibakódhoz tartozó szöveges leírás a
+<code>cudaGetErrorString</code> függvénnyel, a hibakód neve pedig a
+<code>cudaGetErrorName</code> függvénnyel kérdezhető le. A hibakódok
+ellenőrzésére érdemes egy makrót bevezetni, amely a hibát kiírja, és
+opcionálisan megszakítja a programot:</p>
+<pre class="cuda"><code>// CUDA C++ (C++17, NVCC 12.6, -std=c++17)
+#define CUDA_CHECK(call) do { \
+    cudaError_t err = (call); \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, &quot;CUDA hiba: %s:%d: %s (%s)\n&quot;, __FILE__, __LINE__, \
+                cudaGetErrorString(err), cudaGetErrorName(err)); \
+        exit(EXIT_FAILURE); \
+    } \
+} while(0)</code></pre>
+<p>A <code>do { ... } while(0)</code> idióma biztosítja, hogy a makró
+egyetlen utasításként viselkedjen bármilyen vezérlési szerkezetben. A
+<code>CUDA_CHECK</code> minden olyan CUDA API hívást körülvesz, amely
+szinkron módon ad vissza hibát: <code>cudaMalloc</code>,
+<code>cudaMemcpy</code>, <code>cudaDeviceSynchronize</code>, stb.</p>
+<p>Fontos megjegyezni, hogy a <code>cudaGetLastError</code> is egy CUDA
+Runtime API hívás, amely a szálhoz tartozó <strong>utolsó</strong> (nem
+sticky) hibát adja vissza, majd törli azt; a
+<code>cudaPeekAtLastError</code> ugyanezt törlés nélkül adja vissza. Ha
+nincs hiba, <code>cudaSuccess</code>-t ad. A kernel indítása után
+közvetlenül <code>cudaGetLastError</code>-t kell hívni, hogy elkapjuk az
+indítási hibát. A <code>CUDA_CHECK</code> makrót nem lehet közvetlenül
+kernel indításra használni, mert a
+<code>kernel&lt;&lt;&lt;...&gt;&gt;&gt;(...)</code> szintaxis nem
+függvényhívás, így nem ad vissza <code>cudaError_t</code> értéket. Ezért
+a kernel indítás után külön kell meghívni a
+<code>cudaGetLastError</code>-t:</p>
+<pre class="cuda"><code>kernel&lt;&lt;&lt;grid, block, shared, stream&gt;&gt;&gt;(args...);
+CUDA_CHECK(cudaGetLastError());</code></pre>
+<p>Ez a két sor együtt alkotja a launch hibakezelés alapját.</p>
+<h3 data-number="6.4.3" id="aszinkron-hiba-és-szinkronizáció"><span
+class="header-section-number">6.4.3</span> Aszinkron hiba és
+szinkronizáció</h3>
+<p>A CUDA végrehajtási modell egyik legfontosabb tulajdonsága, hogy a
+kernel indítása <strong>aszinkron</strong>. Amikor a CPU eléri a
+<code>kernel&lt;&lt;&lt;...&gt;&gt;&gt;(...)</code> sort, a kernel
+indítási parancsot beilleszti a megadott streambe, majd azonnal
+továbblép a következő utasításra, anélkül hogy megvárná a kernel
+befejezését. Ez lehetővé teszi a CPU és a GPU párhuzamos munkáját, de
+egyben azt is jelenti, hogy a kernel futása közben fellépő hibák (pl.
+illegális memória hozzáférés, osztás nullával, túlindexelés) nem
+azonnal, hanem csak egy későbbi szinkronizációs ponton válnak
+láthatóvá.</p>
+<p>Szinkronizációs pontok például:</p>
+<ul>
+<li><code>cudaDeviceSynchronize()</code>: megvárja az összes stream
+összes munkáját.</li>
+<li><code>cudaStreamSynchronize(stream)</code>: megvárja egy adott
+stream munkáját.</li>
+<li><code>cudaEventSynchronize(event)</code>: megvár egy eseményt.</li>
+<li><code>cudaMemcpy</code> (szinkron változat): a
+<code>cudaMemcpy</code> alapértelmezés szerint a hosthoz képest
+szinkron: a másolás befejezése után tér vissza, és mivel az
+alapértelmezett streamben fut, a vele szinkronizáló (blokkoló) streamek
+korábbi munkáját is megvárja; a <code>cudaStreamNonBlocking</code>
+streamek és a per-thread default stream munkáját azonban nem. Nem azonos
+a <code>cudaDeviceSynchronize</code>-zal.</li>
+<li><code>cudaStreamQuery</code> vagy <code>cudaEventQuery</code>: nem
+blokkoló lekérdezés, de hibát jelezhet.</li>
+</ul>
+<p>A gyakorlatban ezért a teljes hibakezelési minta a következő:</p>
+<pre class="cuda"><code>kernel&lt;&lt;&lt;grid, block, shared, stream&gt;&gt;&gt;(args...);
+CUDA_CHECK(cudaGetLastError());          // indítási hiba
+CUDA_CHECK(cudaDeviceSynchronize());     // futási hiba itt derül ki</code></pre>
+<p>A <code>cudaDeviceSynchronize</code> maga is <code>cudaError_t</code>
+értéket ad vissza, és ha a kernel futása közben bármilyen hiba történt,
+akkor ezt a hibát adja vissza (vagy a korábbi, még nem lekérdezett
+hibát). A <code>CUDA_CHECK(cudaDeviceSynchronize())</code> tehát
+elegendő a futási hibák elkapására is.</p>
+<p>Fontos megérteni a <code>cudaGetLastError</code> viselkedését
+aszinkron hibák esetén. Tegyük fel, hogy egy kernel illegális memória
+hozzáférést hajt végre. Az ilyen hiba gyakran nem vált ki azonnali
+megszakítást, hanem a hardver megjelöli a hibát, és a következő
+szinkronizációs pontnál a CUDA futtatókörnyezet
+<code>cudaErrorIllegalAddress</code> vagy
+<code>cudaErrorLaunchFailure</code> hibát ad. Ha közvetlenül a kernel
+indítása után <code>cudaGetLastError</code>-t hívunk, az
+<code>cudaSuccess</code> lesz, mert a hiba még nem vált láthatóvá. Csak
+a <code>cudaDeviceSynchronize</code> után fog a hiba megjelenni. Ezért
+<strong>csak a <code>cudaGetLastError</code> nem elegendő a kernel futás
+közbeni hibáinak elkapására</strong>.</p>
+<p>Az alábbi ábra a host szál és a GPU időbeli viszonyát mutatja a két
+esetben: a futási hiba csak a szinkronizációs ponton látszik, az
+indítási hiba azonnal.</p>
+<figure id="fig-gpu021-async-error">
+<div class="fig-interactive"><iframe src="figures/html/gpu021-async-error.html" title="Fent a kernel futás közben illegális címet ír, a cudaGetLastError még cudaSuccess, a hibát a cudaDeviceSynchronize adja, és minden további hívás is ezt adja; lent a 2048 szálas blokk indítási hibáját a cudaGetLastError azonnal jelzi, a GPU-sáv üres." loading="lazy" style="width:100%;border:0;height:600px"></iframe><noscript><img src="figures/img/gpu021-async-error.png" style="width:100.0%"
+alt="Fent a kernel futás közben illegális címet ír, a cudaGetLastError még cudaSuccess, a hibát a cudaDeviceSynchronize adja, és minden további hívás is ezt adja; lent a 2048 szálas blokk indítási hibáját a cudaGetLastError azonnal jelzi, a GPU-sáv üres." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu021-async-error.png" style="width:100.0%"
+alt="Fent a kernel futás közben illegális címet ír, a cudaGetLastError még cudaSuccess, a hibát a cudaDeviceSynchronize adja, és minden további hívás is ezt adja; lent a 2048 szálas blokk indítási hibáját a cudaGetLastError azonnal jelzi, a GPU-sáv üres." /></details></div>
+<figcaption>Indítási és futási hiba megjelenése: a futási hibát
+(illegális cím) csak a szinkronizáció adja vissza, és sticky; a 2048
+szálas blokk indítási hibáját a <code>cudaGetLastError</code> azonnal
+jelzi</figcaption>
+</figure>
+<p>A következő példa szemlélteti a különbséget:</p>
+<pre class="cuda"><code>// CUDA C++ (C++17, NVCC 12.6) -- szándékosan HIBÁS futási viselkedésű példa
+__global__ void badKernel(int* data) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    data[idx] = idx;   // a hívó nullptr-t ad át: érvénytelen cím írása
+}
+
+int main() {
+    int* d_bad = nullptr;                        // szándékosan érvénytelen mutató
+    badKernel&lt;&lt;&lt;2, 1024&gt;&gt;&gt;(d_bad);               // 2048 szál: a konfiguráció érvényes
+    cudaError_t launchErr = cudaGetLastError();  // várt: cudaSuccess (indítási hiba nincs)
+    cudaError_t runErr = cudaDeviceSynchronize();// várt: cudaErrorIllegalAddress
+    printf(&quot;indítás: %s, futás: %s\n&quot;,
+           cudaGetErrorName(launchErr), cudaGetErrorName(runErr));
+    return 0;
+}</code></pre>
+<p>A példa <strong>várt</strong> viselkedése (nem futtatott, a CUDA
+Runtime API dokumentációja alapján): a
+<code>&lt;&lt;&lt;2, 1024&gt;&gt;&gt;</code> konfiguráció érvényes (1024
+szál/blokk a megengedett maximum), ezért az indítási hiba nem lép fel,
+és a <code>cudaGetLastError</code> <code>cudaSuccess</code>-t ad; az
+érvénytelen cím írását a hardver a futás közben észleli, és a hibát
+(jellemzően <code>cudaErrorIllegalAddress</code>) a
+<code>cudaDeviceSynchronize</code> adja vissza. Fontos, hogy a példa
+szándékosan <code>nullptr</code>-t használ: a csak néhány KiB-nyi
+túlindexelés egy valódi allokáción belül, a <code>cudaMalloc</code>
+allokációs granularitása miatt gyakran nem okoz hibát, így a kimenet nem
+lenne determinisztikus. Ezzel szemben a
+<code>badKernel&lt;&lt;&lt;1, 2048&gt;&gt;&gt;(...)</code> indítás már
+<em>indítási</em> hiba (<code>cudaErrorInvalidConfiguration</code>),
+mert a 2048 meghaladja a blokkonkénti 1024 szálat; a
+<code>cudaGetLastError</code> ezt azonnal jelzi. A kimenetet
+<code>compute-sanitizer</code> alatt érdemes ellenőrizni (futtatás saját
+GPU-n, izolált környezetben, timeouttal).</p>
+<p>A helyes minta tehát:</p>
+<pre class="cuda"><code>#define LAUNCH_AND_CHECK(kernel, grid, block, shm, stream, ...) \
+    do { \
+        kernel&lt;&lt;&lt;grid, block, shm, stream&gt;&gt;&gt;(__VA_ARGS__); \
+        CUDA_CHECK(cudaGetLastError()); \
+        CUDA_CHECK(cudaDeviceSynchronize()); \
+    } while(0)</code></pre>
+<p>Ez a makró azonban <strong>minden kernel indítás után
+szinkronizál</strong>, ami tönkreteszi az aszinkron végrehajtás
+előnyeit, és jelentős teljesítménycsökkenést okozhat. A gyakorlatban a
+szinkronizációt csak ott érdemes elhelyezni, ahol valóban szükség van az
+eredményre vagy a hibák ellenőrzésére. A hibakeresés során azonban
+hasznos lehet egy ilyen szigorú makró.</p>
+<h3 data-number="6.4.4" id="launch-wrapper-tervezése"><span
+class="header-section-number">6.4.4</span> Launch wrapper tervezése</h3>
+<p>A launch wrapper célja, hogy a kernel indítását és a hozzá tartozó
+hibakezelést egységes, újrafelhasználható formába öntse. A legegyszerűbb
+megvalósítás egy makró, amely:</p>
+<ol type="1">
+<li>Ellenőrzi a blokkméretet és a shared memória méretét (opcionálisan a
+grid méretét is).</li>
+<li>Elvégzi a kernel indítást.</li>
+<li>Meghívja a <code>cudaGetLastError</code>-t az indítási hiba
+elkapására.</li>
+</ol>
+<p>Egy ilyen makró például:</p>
+<pre class="cuda"><code>// CUDA C++ (C++17, NVCC 12.6)
+#define LAUNCH_KERNEL(kernel, grid, block, shm, stream, ...) \
+    do { \
+        int _bs = (block).x * (block).y * (block).z; \
+        if (_bs &lt;= 0 || _bs &gt; prop.maxThreadsPerBlock) { \
+            fprintf(stderr, &quot;Hibás blokkméret: %d (max: %d)\n&quot;, _bs, \
+                    prop.maxThreadsPerBlock); \
+            exit(EXIT_FAILURE); \
+        } \
+        /* a statikus __shared__ rész ide nem számít bele; 48 KiB felett */ \
+        /* előbb cudaFuncSetAttribute(MaxDynamicSharedMemorySize) kell */ \
+        if ((shm) &gt; (size_t)prop.sharedMemPerBlockOptin) { \
+            fprintf(stderr, &quot;Túl nagy shared memória: %zu (max: %zu)\n&quot;, \
+                    (size_t)(shm), (size_t)prop.sharedMemPerBlockOptin); \
+            exit(EXIT_FAILURE); \
+        } \
+        kernel&lt;&lt;&lt;grid, block, shm, stream&gt;&gt;&gt;(__VA_ARGS__); \
+        CUDA_CHECK(cudaGetLastError()); \
+    } while(0)</code></pre>
+<p>Itt <code>prop</code> egy korábban lekérdezett
+<code>cudaDeviceProp</code> struktúra. A makró a
+<code>prop.maxThreadsPerBlock</code> és
+<code>prop.sharedMemPerBlockOptin</code> értékeit használja (a
+blokkonkénti opt-in maximum; a 48 KiB feletti használathoz a hívónak
+előbb be kell állítania a
+<code>cudaFuncAttributeMaxDynamicSharedMemorySize</code> attribútumot,
+és a kernel statikus shared memóriáját is le kell számítania), így a
+korlátok hardverfüggők lesznek. Ez különösen hasznos, ha a kód több
+GPU-generáción is futhat.</p>
+<p>A makró előnyei:</p>
+<ul>
+<li><strong>Központosított hibakezelés</strong>: minden indítás ugyanazt
+az ellenőrzést végzi.</li>
+<li><strong>Korai hibafelismerés</strong>: a blokkméret vagy shared
+memória hibája már a kernel indítása előtt kiderül, így a hibaüzenet
+informatívabb lehet, mint a <code>cudaGetLastError</code> általános
+<code>cudaErrorInvalidConfiguration</code> üzenete.</li>
+<li><strong>Naplózás</strong>: a makróba könnyen beilleszthető naplózás
+(pl. <code>fprintf</code> a paraméterekről).</li>
+</ul>
+<p>A makró hátránya, hogy nem tudja ellenőrizni a kernel argumentumainak
+típusát vagy a dimenziók érvényességét (pl. hogy a <code>grid.x</code>
+pozitív-e). Ezeket a hívó félnek kell biztosítania.</p>
+<p>A wrapper lehet függvénysablon is, amely a kernel paramétertípusait
+is ellenőrzi: a <code>&lt;&lt;&lt;&gt;&gt;&gt;</code> szintaxis sablonon
+belül is használható, a paramétercsomag kibontható. Az alábbi vázlatot
+nem fordítottuk le, nvcc-vel ellenőrizendő:</p>
+<pre class="cuda"><code>// CUDA C++ (C++17) – vázlat, nem fordítottuk; nvcc-vel ellenőrizendő
+template &lt;typename... P, typename... A&gt;
+void launch(void (*k)(P...), dim3 g, dim3 b, size_t shm, cudaStream_t s,
+            const cudaDeviceProp&amp; prop, A&amp;&amp;... a) {
+    // ugyanazok a blokkméret- és shared memória-ellenőrzések, mint a makróban
+    k&lt;&lt;&lt;g, b, shm, s&gt;&gt;&gt;(std::forward&lt;A&gt;(a)...);
+    CUDA_CHECK(cudaGetLastError());
+}</code></pre>
+<p>A sablon a hívás típusellenőrzését a fordítóra bízza, és a
+<code>prop</code>-ot paraméterként kapja, nem a hívó hatóköréből veszi.
+A makró előnye csak a hívás helyének (<code>__FILE__</code>,
+<code>__LINE__</code>) automatikus kiírása; ez a sablonnál
+<code>std::source_location</code>-nel (C++20) pótolható. A könyv labora
+az áttekinthetőség kedvéért a makrót használja.</p>
+<h3 data-number="6.4.5"
+id="labor-launch-wrapper-és-hibaellenőrző-makró"><span
+class="header-section-number">6.4.5</span> Labor: launch wrapper és
+hibaellenőrző makró</h3>
+<p>A labor célja, hogy a fenti makrókat egy működő programban
+alkalmazzuk, és méréssel igazoljuk, hogy a hibás indításokat elkapják, a
+helyes indítások pedig sikeresen lefutnak. A labor kódja CUDA C++
+(C++17, NVCC 12.6), és egy egyszerű vektorösszeadást hajt végre.</p>
+<h3 data-number="6.4.6" id="környezet"><span
+class="header-section-number">6.4.6</span> Környezet</h3>
+<ul>
+<li>GPU: NVIDIA GeForce RTX 3090 (Ampere, compute capability 8.6)</li>
+<li>Driver: 550.54.14 (Linux)</li>
+<li>CUDA: 12.6</li>
+<li>OS: Ubuntu 22.04</li>
+<li>Fordító: <code>nvcc</code> 12.6,
+<code>-arch=sm_86 -O3 -std=c++17</code></li>
+<li>Bemenet: <code>N = 1 048 576</code> (2^20) elem, <code>float</code>
+típus (FP32)</li>
+</ul>
+<h3 data-number="6.4.7" id="kód"><span
+class="header-section-number">6.4.7</span> Kód</h3>
+<p>A következő program tartalmazza a <code>CUDA_CHECK</code> makrót, a
+<code>LAUNCH_KERNEL</code> makrót, egy <code>vectorAdd</code> kernelt,
+valamint a mérési logikát. A mérés előtt 5 warm-up, majd 20 mért
+ismétlés, medián és mintaszórás számítása. A <code>--bad</code>
+kapcsolóval a program a mérés után wrapper nélkül indít egy 1025 szálas
+blokkot, és kiírja a CUDA hibakódját (<code>cudaGetLastError</code>). A
+wrapper saját blokkméret-ellenőrzését a kikommentezett
+<code>LAUNCH_KERNEL</code> sor aktiválásával lehet kipróbálni; ekkor a
+program „Hibás blokkméret: 1025 (max: 1024)” üzenettel kilép. A hibás
+indítást külön futásban teszteljük, hogy a mérési naplóban elkülöníthető
+legyen.</p>
+<pre class="cuda"><code>// launch_check.cu
+// CUDA C++ (C++17, NVCC 12.6, -arch=sm_86 -O3)
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;vector&gt;
+#include &lt;cmath&gt;
+#include &lt;cstring&gt;
+#include &lt;algorithm&gt;
+
+// --- Hibaellenőrző makró ---
+#define CUDA_CHECK(call) do { \
+    cudaError_t err = (call); \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, &quot;CUDA hiba: %s:%d: %s (%s)\n&quot;, __FILE__, __LINE__, \
+                cudaGetErrorString(err), cudaGetErrorName(err)); \
+        exit(EXIT_FAILURE); \
+    } \
+} while(0)
+
+// --- Launch wrapper makró ---
+// Feltételezi, hogy a prop változó elérhető a hatókörben.
+#define LAUNCH_KERNEL(kernel, grid, block, shm, stream, ...) \
+    do { \
+        int _bs = (block).x * (block).y * (block).z; \
+        if (_bs &lt;= 0 || _bs &gt; prop.maxThreadsPerBlock) { \
+            fprintf(stderr, &quot;Hibás blokkméret: %d (max: %d)\n&quot;, _bs, \
+                    prop.maxThreadsPerBlock); \
+            exit(EXIT_FAILURE); \
+        } \
+        /* a statikus __shared__ rész ide nem számít bele; 48 KiB felett */ \
+        /* előbb cudaFuncSetAttribute(MaxDynamicSharedMemorySize) kell */ \
+        if ((shm) &gt; (size_t)prop.sharedMemPerBlockOptin) { \
+            fprintf(stderr, &quot;Túl nagy shared memória: %zu (max: %zu)\n&quot;, \
+                    (size_t)(shm), (size_t)prop.sharedMemPerBlockOptin); \
+            exit(EXIT_FAILURE); \
+        } \
+        kernel&lt;&lt;&lt;grid, block, shm, stream&gt;&gt;&gt;(__VA_ARGS__); \
+        CUDA_CHECK(cudaGetLastError()); \
+    } while(0)
+
+// --- Kernel: vektorösszeadás ---
+__global__ void vectorAdd(const float* A, const float* B, float* C, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; N) {
+        C[idx] = A[idx] + B[idx];
+    }
+}
+
+int main(int argc, char** argv) {
+    // Eszköztulajdonságok lekérdezése
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&amp;prop, 0));
+    printf(&quot;GPU: %s, SM: %d, maxThreadsPerBlock: %d, sharedMemPerBlock: %zu, sharedMemPerBlockOptin: %zu\n&quot;,
+           prop.name, prop.multiProcessorCount, prop.maxThreadsPerBlock,
+           prop.sharedMemPerBlock, prop.sharedMemPerBlockOptin);
+
+    const int N = 1 &lt;&lt; 20;  // 1 048 576
+    const size_t size = N * sizeof(float);
+
+    // Host memória inicializálása
+    std::vector&lt;float&gt; h_A(N), h_B(N), h_C(N);
+    for (int i = 0; i &lt; N; ++i) {
+        h_A[i] = 1.0f;
+        h_B[i] = 2.0f;
+    }
+
+    // Eszközmemória foglalása
+    float *d_A, *d_B, *d_C;
+    CUDA_CHECK(cudaMalloc(&amp;d_A, size));
+    CUDA_CHECK(cudaMalloc(&amp;d_B, size));
+    CUDA_CHECK(cudaMalloc(&amp;d_C, size));
+    CUDA_CHECK(cudaMemcpy(d_A, h_A.data(), size, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B, h_B.data(), size, cudaMemcpyHostToDevice));
+
+    // Mérés előkészítése
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&amp;start));
+    CUDA_CHECK(cudaEventCreate(&amp;stop));
+
+    // Tesztelt blokkméretek
+    const int blockSizes[] = {128, 256, 512, 1024};
+    const int numBlockSizes = sizeof(blockSizes) / sizeof(blockSizes[0]);
+
+    constexpr int WARMUP = 5;
+    constexpr int ITERS = 20;
+    printf(&quot;\nMérési eredmények (%d ismétlés, warm-up %d):\n&quot;, ITERS, WARMUP);
+    printf(&quot;blockSize | gridSize | medián (ms) | szórás (ms)\n&quot;);
+
+    for (int b = 0; b &lt; numBlockSizes; ++b) {
+        int blockSize = blockSizes[b];
+        int gridSize = (N + blockSize - 1) / blockSize;
+        dim3 grid(gridSize);
+        dim3 block(blockSize);
+
+        // Warm-up (5 iteráció)
+        for (int w = 0; w &lt; WARMUP; ++w) {
+            LAUNCH_KERNEL(vectorAdd, grid, block, 0, 0, d_A, d_B, d_C, N);
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+
+        // Mérés (20 iteráció)
+        float totalMs = 0.0f;
+        float times[ITERS];
+        for (int r = 0; r &lt; ITERS; ++r) {
+            CUDA_CHECK(cudaEventRecord(start, 0));
+            LAUNCH_KERNEL(vectorAdd, grid, block, 0, 0, d_A, d_B, d_C, N);
+            CUDA_CHECK(cudaEventRecord(stop, 0));
+            CUDA_CHECK(cudaEventSynchronize(stop));
+            float ms;
+            CUDA_CHECK(cudaEventElapsedTime(&amp;ms, start, stop));
+            times[r] = ms;
+            totalMs += ms;
+        }
+        float mean = totalMs / ITERS;
+        float variance = 0.0f;
+        for (int r = 0; r &lt; ITERS; ++r) {
+            variance += (times[r] - mean) * (times[r] - mean);
+        }
+        float stddev = sqrtf(variance / (ITERS - 1));  // minta-szórás (n-1)
+        std::sort(times, times + ITERS);
+        float median = 0.5f * (times[ITERS / 2 - 1] + times[ITERS / 2]);
+
+        // A LAUNCH_KERNEL és a CUDA_CHECK hiba esetén kilép, ezért a sor
+        // kiírásáig minden indítás és szinkronizáció cudaSuccess-t adott.
+        printf(&quot;%9d | %8d | %11.4f | %10.4f\n&quot;,
+               blockSize, gridSize, median, stddev);
+    }
+
+    // Eredmény ellenőrzése (utolsó konfigurációval)
+    int lastBlockSize = blockSizes[numBlockSizes - 1];
+    int lastGridSize = (N + lastBlockSize - 1) / lastBlockSize;
+    LAUNCH_KERNEL(vectorAdd, dim3(lastGridSize), dim3(lastBlockSize), 0, 0,
+                  d_A, d_B, d_C, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_C.data(), d_C, size, cudaMemcpyDeviceToHost));
+    bool ok = true;
+    for (int i = 0; i &lt; N; ++i) {
+        if (h_C[i] != 3.0f) { ok = false; break; }
+    }
+    printf(&quot;\nEredmény ellenőrzése: %s\n&quot;, ok ? &quot;sikeres&quot; : &quot;hibás&quot;);
+
+    // Hibás indítás demonstrálása: ./launch_check --bad (külön futásban)
+    if (argc &gt; 1 &amp;&amp; strcmp(argv[1], &quot;--bad&quot;) == 0) {
+        // 1. ág: a wrapper blokkméret-ellenőrzése kilép (1025 &gt; 1024).
+        //    Kikommentezve, hogy a 2. ág is elérhető legyen:
+        // LAUNCH_KERNEL(vectorAdd, dim3(1), dim3(1025), 0, 0, d_A, d_B, d_C, N);
+        // 2. ág: a wrapper nélküli indítás, a CUDA saját hibakódját kiírva.
+        vectorAdd&lt;&lt;&lt;1, 1025&gt;&gt;&gt;(d_A, d_B, d_C, N);
+        cudaError_t e = cudaGetLastError();
+        printf(&quot;1025 szálas blokk, wrapper nélkül: %s (%s)\n&quot;,
+               cudaGetErrorName(e), cudaGetErrorString(e));
+        // várt: cudaErrorInvalidConfiguration (nem futtatott, dokumentáció alapján)
+    }
+
+    // Takarítás
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaFree(d_A));
+    CUDA_CHECK(cudaFree(d_B));
+    CUDA_CHECK(cudaFree(d_C));
+
+    return 0;
+}</code></pre>
+<h3 data-number="6.4.8" id="build-és-futtatás"><span
+class="header-section-number">6.4.8</span> Build és futtatás</h3>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Build</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-arch</span><span class="op">=</span>sm_86 <span class="at">-O3</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-o</span> launch_check launch_check.cu</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Futtatás</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="ex">./launch_check</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="co"># Hibás indítás (külön futás)</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="ex">./launch_check</span> <span class="at">--bad</span></span></code></pre></div>
+<p>A hibás indítás teszteléséhez a program <code>--bad</code>
+kapcsolóval indítható: ekkor a mérési ciklus után a wrapper nélküli,
+1025 szálas indítás a CUDA saját hibakódját
+(<code>cudaGetErrorName</code>) írja ki. A wrapper
+blokkméret-ellenőrzését a kikommentezett <code>LAUNCH_KERNEL</code> sor
+aktiválja (a program ilyenkor kilép); ez külön futásban próbálható ki. A
+kódot nem fordítottuk és nem futtattuk.</p>
+<h3 data-number="6.4.9" id="mérési-napló"><span
+class="header-section-number">6.4.9</span> Mérési napló</h3>
+<p>Az alábbi táblázat a mérési napló <strong>sablonja</strong>: a
+futásidő oszlopok kitöltendők, mert a programot nem futtattuk, így mért
+érték nem áll rendelkezésre. A „hiba (várt)” oszlop azt tartalmazza,
+amit a hibakezelő mechanizmusnak garantálnia kell; a hibakódot külön
+oszlop nem rögzíti: a program csak akkor jut el a táblázat soráig, ha
+minden indítás és szinkronizáció <code>cudaSuccess</code>-t adott
+(különben a <code>CUDA_CHECK</code> hibaüzenettel kilép). A mért érték a
+medián 20 ismétlésből. A szórás itt minta-szórás (n−1-gyel osztva), a
+4.4-mal egyezően. Környezet: RTX 3090, CC 8.6, CUDA 12.6, FP32.</p>
+<table>
+<colgroup>
+<col style="width: 18%" />
+<col style="width: 16%" />
+<col style="width: 21%" />
+<col style="width: 21%" />
+<col style="width: 21%" />
+</colgroup>
+<thead>
+<tr>
+<th>blockSize</th>
+<th>gridSize</th>
+<th>medián (ms)</th>
+<th>szórás (ms)</th>
+<th>hiba (várt)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>128</td>
+<td>8192</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>cudaSuccess</td>
+</tr>
+<tr>
+<td>256</td>
+<td>4096</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>cudaSuccess</td>
+</tr>
+<tr>
+<td>512</td>
+<td>2048</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>cudaSuccess</td>
+</tr>
+<tr>
+<td>1024</td>
+<td>1024</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>cudaSuccess</td>
+</tr>
+</tbody>
+</table>
+<p>A hibás indítás (blokkméret 1025) esetén, a
+<code>LAUNCH_KERNEL</code> sor aktiválásakor a várt eredmény: a
+<code>LAUNCH_KERNEL</code> makró blokkméret-ellenőrzése aktiválódik, és
+a program <code>Hibás blokkméret: 1025 (max: 1024)</code> üzenettel
+kilép, mielőtt a kernel indításra kerülne. Így a
+<code>cudaGetLastError</code> nem is hívódik meg; a hibát a wrapper
+saját ellenőrzése fogja el. Ha a makró nem ellenőrizné a blokkméretet, a
+kernel indítás után a <code>cudaGetLastError</code>
+<code>cudaErrorInvalidConfiguration</code> hibát adna.</p>
+<h3 data-number="6.4.10" id="értelmezés"><span
+class="header-section-number">6.4.10</span> Értelmezés</h3>
+<p>Mért értékek hiányában a futásidőkről nem vonunk le következtetést. A
+modell szerint a vektorösszeadás memória-sávszélesség-korlátos (3 · 4
+MiB ≈ 12,6 MB forgalom futásonként, azaz kernelhívásonként: két tömb
+olvasása és egy írása), ezért várhatóan a blokkméret csak kis mértékben
+befolyásolja az időt; ezt a kitöltött napló igazolhatja vagy cáfolhatja.
+Ha a program kiírja a táblázat sorait, az azt jelzi, hogy az adott
+konfigurációknál a <code>CUDA_CHECK(cudaGetLastError())</code> nem
+jelzett indítási hibát, a futási hibát pedig a
+<code>CUDA_CHECK(cudaEventSynchronize(stop))</code> és a
+<code>CUDA_CHECK(cudaDeviceSynchronize())</code> hívások fogták volna
+el.</p>
+<p>A hibás indítási teszt (külön futtatva, a <code>LAUNCH_KERNEL</code>
+sor aktiválásakor) a következő kimenetet adná (várt, nem futtatott):</p>
+<pre><code>Hibás blokkméret: 1025 (max: 1024)</code></pre>
+<p>Ez a hibaüzenet a <code>LAUNCH_KERNEL</code> makróból származik, nem
+a CUDA futtatókörnyezetből. A makró a kernel indítása előtt ellenőrizte
+a blokkméretet, és kilépett. Ez a korai ellenőrzés gyorsabb és
+informatívabb, mint a <code>cudaGetLastError</code> által adott
+<code>cudaErrorInvalidConfiguration</code>, mert megadja a konkrét
+határt is.</p>
+<h3 data-number="6.4.11" id="gyakori-hibák-és-elkerülésük"><span
+class="header-section-number">6.4.11</span> Gyakori hibák és
+elkerülésük</h3>
+<p>A launch konfiguráció és a hibakezelés során számos tipikus hiba
+fordulhat elő. Az alábbiakban ezeket tekintjük át.</p>
+<h4 data-number="6.4.11.1" id="blokkméret-túllépése"><span
+class="header-section-number">6.4.11.1</span> Blokkméret túllépése</h4>
+<p>A leggyakoribb hiba, hogy a blokk dimenzióinak szorzata meghaladja a
+<code>maxThreadsPerBlock</code> értéket. Ez gyakran véletlenül történik,
+például amikor egy 2D-s blokkot <code>dim3(32, 32)</code>-ként adunk meg
+(ami 1024 szál, még éppen határon van), de <code>dim3(64, 32)</code>
+(2048 szál) már hibás. A launch wrapper blokkméret-ellenőrzése ezt
+azonnal elkapja.</p>
+<h4 data-number="6.4.11.2" id="dinamikus-shared-memória-túllépése"><span
+class="header-section-number">6.4.11.2</span> Dinamikus shared memória
+túllépése</h4>
+<p>Ha a kernel dinamikus shared memóriát igényel, és a
+<code>shared_bytes</code> paraméter nagyobb, mint a megengedett (opt-in)
+korlát, a launch <code>cudaErrorInvalidValue</code> vagy
+<code>cudaErrorLaunchOutOfResources</code> hibával meghiúsul. A wrapper
+ellenőrzi ezt is. Fontos, hogy a <code>prop.sharedMemPerBlock</code>
+statikus tulajdonság (alapesetben 48 KiB), amely nem változik a
+<code>cudaFuncSetAttribute</code> hívás után; a nagyobb (opt-in) korlát
+a <code>prop.sharedMemPerBlockOptin</code>, amelyet a wrapper használ,
+és amely a statikus <code>__shared__</code> tömbök méretével csökkentett
+dinamikus részre vonatkozik.</p>
+<h4 data-number="6.4.11.3" id="érvénytelen-stream-pointer"><span
+class="header-section-number">6.4.11.3</span> Érvénytelen stream
+pointer</h4>
+<p>Ha a <code>stream</code> paraméter nem érvényes
+<code>cudaStream_t</code> (pl. egy felszabadított streamre mutat), a
+viselkedés nem definiált: kaphatunk
+<code>cudaErrorInvalidResourceHandle</code>-t, de a hívás a folyamatot
+is összeomlaszthatja, ezért erre nem lehet hibakezelést építeni. A
+wrapper nem ellenőrzi a stream érvényességét (a stream lehet 0, ami
+érvényes). A stream élettartamát a hívónak kell kezelnie, például
+RAII-csomagolóval, amely a destruktorban hívja a
+<code>cudaStreamDestroy</code>-t.</p>
+<h4 data-number="6.4.11.4" id="eszközmutató-érvénytelensége"><span
+class="header-section-number">6.4.11.4</span> Eszközmutató
+érvénytelensége</h4>
+<p>Ha a kernel egy érvénytelen eszközmutatót kap (pl.
+<code>nullptr</code>, vagy olyan mutatót, amelyet már felszabadítottak),
+a kernel futása közben <code>cudaErrorIllegalAddress</code> hiba léphet
+fel. Ez a hiba csak szinkronizáció után jelenik meg, ezért a
+<code>cudaDeviceSynchronize</code> utáni <code>cudaGetLastError</code>
+(vagy a <code>CUDA_CHECK(cudaDeviceSynchronize())</code>)
+elengedhetetlen.</p>
+<h4 data-number="6.4.11.5"
+id="aszinkron-hibák-figyelmen-kívül-hagyása"><span
+class="header-section-number">6.4.11.5</span> Aszinkron hibák figyelmen
+kívül hagyása</h4>
+<p>Sok fejlesztő csak a kernel indítás utáni
+<code>cudaGetLastError</code>-t hívja, és elfelejti a szinkronizációt.
+Ez azt eredményezi, hogy a futás közbeni hibák rejtve maradnak, és a
+program hibás eredményt adhat vagy később összeomlik. A helyes minta:
+<code>cudaGetLastError</code> indítás után, majd
+<code>cudaDeviceSynchronize</code> (vagy stream szinkronizáció) és annak
+hibájának ellenőrzése.</p>
+<h4 data-number="6.4.11.6"
+id="a-cudagetlasterror-téves-használata"><span
+class="header-section-number">6.4.11.6</span> A
+<code>cudaGetLastError</code> téves használata</h4>
+<p>A <code>cudaGetLastError</code> az utolsó hibát adja vissza, és törli
+azt. Ha több hiba is történt, csak az utolsó lesz elérhető. Emellett a
+<em>sticky</em> hibák (pl. <code>cudaErrorIllegalAddress</code>,
+<code>cudaErrorLaunchFailure</code>) a kontextust használhatatlanná
+teszik: a <code>cudaGetLastError</code> ezeket nem törli, és minden
+további CUDA-hívás ugyanezt a hibát adja vissza; ilyenkor a folyamatot
+újra kell indítani. A <em>non-sticky</em> hibákat (pl.
+<code>cudaErrorInvalidConfiguration</code>) a
+<code>cudaGetLastError</code> törli. A hiba törlés nélküli
+lekérdezéséhez a <code>cudaPeekAtLastError</code> használható. A hibák
+kivizsgálásához használjunk <code>compute-sanitizer</code>-t (lásd a
+10.3. alfejezet), amely részletes jelentést ad a memória- és
+versenyhibákról.</p>
+<h4 data-number="6.4.11.7"
+id="launch-bounds-figyelmen-kívül-hagyása"><span
+class="header-section-number">6.4.11.7</span> Launch bounds figyelmen
+kívül hagyása</h4>
+<p>A <code>__launch_bounds__(N)</code> specifikáló megígéri a
+fordítónak, hogy a kernelt legfeljebb N szálas blokkal indítjuk, és a
+fordító a regisztereket erre optimalizálja. Ha N-nél több szálas blokkal
+indítjuk, az indítás hibával meghiúsul (a <code>cudaGetLastError</code>
+jelzi; a pontos hibakódot nvcc nélkül nem ellenőriztük, ellenőrzendő).
+Ha a kernel túl sok regisztert igényel, a launch
+<code>cudaErrorLaunchOutOfResources</code> hibával is meghiúsulhat. A
+<code>--maxrregcount</code> fordítási opció a fájl összes kernelére hat,
+a <code>__launch_bounds__</code> kernelenként; a regiszterhasználat
+csökkentése spill-hez vezethet. A wrapper a határt előre ellenőrizheti:
+<code>cudaFuncAttributes fa; CUDA_CHECK(cudaFuncGetAttributes(&amp;fa, kernel)); if (_bs &gt; fa.maxThreadsPerBlock) …</code>.</p>
+<h3 data-number="6.4.12" id="összefoglalás"><span
+class="header-section-number">6.4.12</span> Összefoglalás</h3>
+<p>Ebben az alfejezetben a kernel indítási paramétereit és a
+hibakezelést kapcsoltuk össze. Megismertük a <code>cudaError_t</code>
+hibakódokat, a <code>cudaGetErrorString</code> és
+<code>cudaGetErrorName</code> függvényeket, valamint a
+<code>cudaGetLastError</code> viselkedését. Külön hangsúlyoztuk az
+aszinkron végrehajtásból adódó kihívásokat: a kernel indítása után a
+hibák egy része csak szinkronizációs pontokon válik láthatóvá, ezért a
+teljes hibakezelési minta a <code>cudaGetLastError</code> és a
+<code>cudaDeviceSynchronize</code> együttes használatát igényli.</p>
+<p>A laborban egy működő launch wrapper és hibaellenőrző makró
+kombinációt építettünk, amely a blokkméretet és a shared memória méretét
+már a kernel indítása előtt ellenőrzi, így a hibák egy része korán,
+informatív üzenettel elkapható. A mérési napló sablonja rögzíti, mit
+kell a futtatásnak igazolnia: a helyes indításoknál a
+<code>cudaGetLastError</code> és a <code>cudaDeviceSynchronize</code>
+<code>cudaSuccess</code>-t ad, az 1025 szálas blokkot pedig a wrapper
+saját ellenőrzése, wrapper nélkül a CUDA indítási hibakódja jelzi; a
+tényleges értékeket a saját futtatás adja.</p>
+<p>A következő alfejezet (7.1) a globális memória allokációjával és a
+host–device másolással foglalkozik (a memóriaterek közötti választás a
+7.4 témája), építve az itt bevezetett hibakezelési és launch
+konfigurációs mintákra.</p>
+<h3 data-number="6.4.13" id="önellenőrző-kérdés"><span
+class="header-section-number">6.4.13</span> Önellenőrző kérdés</h3>
+<p>Miért nem elegendő a kernel indítása után közvetlenül
+<code>cudaGetLastError</code>-t hívni az összes hiba elkapásához?
+Válaszát indokolja a CUDA aszinkron végrehajtási modelljével, és adja
+meg a helyes hibakezelési mintát.</p>
+<p><strong>Válasz:</strong> A kernelindítás aszinkron: a
+<code>&lt;&lt;&lt;&gt;&gt;&gt;</code> a parancsot a streambe teszi és
+azonnal visszatér, ezért a közvetlenül utána hívott
+<code>cudaGetLastError</code> csak az indítási (konfigurációs) hibákat
+látja. A futás közbeni hibák (pl. <code>cudaErrorIllegalAddress</code>)
+csak a következő szinkronizáló hívásnál jelennek meg. Helyes minta:
+<code>kernel&lt;&lt;&lt;…&gt;&gt;&gt;(…); CUDA_CHECK(cudaGetLastError());</code>,
+majd ott, ahol az eredményre szükség van,
+<code>CUDA_CHECK(cudaStreamSynchronize(stream))</code> vagy
+<code>CUDA_CHECK(cudaDeviceSynchronize())</code>. A sticky hibák után a
+kontextus használhatatlan, a folyamatot újra kell indítani.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu020.html">← 6.3 Grid-stride loop és perzisztens kernelek</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu022.html">7.1 Global memory és allokáció →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

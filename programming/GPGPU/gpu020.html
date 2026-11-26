@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>6.3 Grid-stride loop és perzisztens kernelek – GPGPU –
+általános célú számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. RÉSZ – CUDA programozási modell</a> › <a href="index.html#gpuch05">6 Kernelírás, indexelés és launch konfiguráció</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu019.html">← 6.2 Többdimenziós indexelés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu021.html">6.4 Launch konfiguráció és hibakezelés →</a></div>
+</nav>
+<h2 data-number="6.3" id="gpu020"><span
+class="header-section-number">6.3</span> Grid-stride loop és perzisztens
+kernelek</h2>
+<p>Az előző alfejezetben (6.2) megismerkedtünk a többdimenziós indexelés
+alapjaival. Láttuk, hogyan képezzük le a logikai adatszerkezeteket a
+hardver által biztosított <code>blockIdx</code>, <code>blockDim</code>
+és <code>threadIdx</code> változókra. Az ott bemutatott minták azonban
+egy kényes feltételezésre épültek: <strong>a rács (grid) mérete pontosan
+illeszkedett az adat méretére</strong>. Ha a vektorunk hossza
+<code>N</code>, akkor <code>ceil(N / blockDim.x)</code> darab blokkot
+indítottunk.</p>
+<p>Ez a megközelítés a legtöbb egyszerű tankönyvi példában tökéletesen
+működik, de a valódi, nagy teljesítményű alkalmazásokban ritkán
+kielégítő. Az adatméret gyakran futásidőben változik, 2D/3D leképezésnél
+meghaladhatja a <code>y</code>/<code>z</code> irányú blokkszám-korlátot,
+vagy éppen ellenkezőleg: olyan kicsi, hogy a hardver erőforrásainak
+túlnyomó része kihasználatlanul marad. A <strong>grid-stride
+loop</strong> (rácslépéses ciklus) mintájával az 5.3 alfejezetben és az
+5.4 alfejezet laborjában már találkoztunk; itt a használatát, a rács
+méretezését és a vele rokon <strong>perzisztens kernel</strong>
+(persistent kernel) koncepcióját dolgozzuk ki, amely a „kevés blokk, sok
+munka” elv mentén tovább növeli a vezérlési rugalmasságot.</p>
+<h3 data-number="6.3.1" id="a-rugalmas-méretű-feldolgozás-mintája"><span
+class="header-section-number">6.3.1</span> A rugalmas méretű feldolgozás
+mintája</h3>
+<p>A GPU programozási modelljének egyik központi kihívása a hardveres
+végrehajtási egységek és a logikai probléma méretének szétválasztása. Ha
+minden egyes adatelemhez egy szálat rendelünk, akkor a kernel
+indításakor ismernünk kell a pontos adatméretet, és a rácsot ahhoz kell
+igazítanunk. Ez a gyakorlatban nem mindig lehetséges vagy hatékony:</p>
+<ol type="1">
+<li><strong>Változó méret:</strong> Egy szimulációban a részecskék
+száma, egy gráfbejárásban a csúcsok száma, vagy egy képfeldolgozó
+pipeline-ban a képméret futásról futásra változhat.</li>
+<li><strong>Rácsméret-korlátok:</strong> <code>x</code> irányban a rács
+legfeljebb
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mn>2</mn><mn>31</mn></msup><mo>−</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">2^{31}-1</annotation></semantics></math>
+blokkból állhat, ami 1D-s tömbnél a GPU memóriájánál jóval nagyobb
+adatot is lefed; a <code>y</code> és <code>z</code> dimenzió viszont
+legfeljebb 65 535 blokk, és a host oldali <code>int</code>
+gridméret-számítás is túlcsordulhat. A grid-stride loop ezektől a
+korlátoktól függetlenné teszi a kernelt.</li>
+<li><strong>Hullámok (waves) és telítettség:</strong> Az SM-ek egyszerre
+csak korlátozott számú blokkot tudnak futtatni. Ha a rezidens
+kapacitásnál több blokkot indítunk, a többi blokk sorban, „hullámokban”
+hajtódik végre. Ha az utolsó hullám csak részben tölti fel az SM-eket,
+akkor teljesítményt veszítünk (tail effect).</li>
+</ol>
+<p>A <strong>grid-stride loop</strong> egy elegáns megoldás az első két
+problémára, és a harmadikat is mérsékelheti. A minta lényege, hogy a
+szálak száma fix (a probléma méretétől függetlenül korlátozott), és
+minden szál egy <strong>ciklusban</strong> lépeget végig az adatokon. Az
+ugrás mérete megegyezik a teljes rácsban lévő összes szál számával:
+<code>blockDim.x * gridDim.x</code>.</p>
+<p>Tekintsük a következő CUDA C++ kódot, amely egy vektorösszeadást
+valósít meg grid-stride loop segítségével. A kódot a szerző nem
+fordította le és nem futtatta; a fordítás és a futtatás az olvasó
+feladata.</p>
+<pre class="cuda"><code>// CUDA C++ (C++17), grid-stride loop példa; nvcc -std=c++17 -O3 -arch=native
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;cuda_runtime.h&gt;
+
+// Hibamakró (a könyv labor-szerződése szerint kötelező)
+#define CUDA_CHECK(call)                                                        \
+  do {                                                                          \
+    cudaError_t err = (call);                                                   \
+    if (err != cudaSuccess) {                                                   \
+      std::fprintf(stderr, &quot;CUDA error %s:%d: %s\n&quot;, __FILE__, __LINE__,       \
+                   cudaGetErrorString(err));                                    \
+      std::exit(EXIT_FAILURE);                                                  \
+    }                                                                           \
+  } while (0)
+
+__global__ void vectorAddGridStride(const float *A, const float *B, float *C,
+                                   long long N) {
+  // A szorzás is 64 biten történik: a (long long) kasztolás a szorzás ELŐTT kell.
+  long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  long long stride = (long long)blockDim.x * gridDim.x;
+
+  for (long long i = idx; i &lt; N; i += stride) {
+    C[i] = A[i] + B[i];
+  }
+}
+
+int main() {
+  const long long N = 1LL &lt;&lt; 28;            // 268 435 456 elem, tömbönként 1 GiB
+  const size_t bytes = (size_t)N * sizeof(float);   // összesen 3 GiB
+  float *d_A, *d_B, *d_C;
+
+  CUDA_CHECK(cudaMalloc(&amp;d_A, bytes));
+  CUDA_CHECK(cudaMalloc(&amp;d_B, bytes));
+  CUDA_CHECK(cudaMalloc(&amp;d_C, bytes));
+  // inicializálás (a lefoglalt memória nem nullázott)
+  CUDA_CHECK(cudaMemset(d_A, 0, bytes));
+  CUDA_CHECK(cudaMemset(d_B, 0, bytes));
+
+  // A rács méretét blokkokban a GPU-hoz igazítjuk, nem N-hez.
+  const int blockSize = 256;
+  int dev = 0, numSMs = 0, blocksPerSM = 0;
+  CUDA_CHECK(cudaGetDevice(&amp;dev));
+  CUDA_CHECK(cudaDeviceGetAttribute(&amp;numSMs, cudaDevAttrMultiProcessorCount, dev));
+  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &amp;blocksPerSM, vectorAddGridStride, blockSize, 0));
+  const int numBlocks = numSMs * blocksPerSM;   // egy hullámnyi rezidens blokk
+
+  vectorAddGridStride&lt;&lt;&lt;numBlocks, blockSize&gt;&gt;&gt;(d_A, d_B, d_C, N);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  CUDA_CHECK(cudaFree(d_A));
+  CUDA_CHECK(cudaFree(d_B));
+  CUDA_CHECK(cudaFree(d_C));
+  return 0;
+}</code></pre>
+<p>A fenti kódban a <code>stride</code> a teljes rács szélessége. A szál
+indexe (<code>idx</code>) határozza meg a kiindulási pozíciót. Ha
+<code>N</code> nagyobb, mint a szálak száma, a szálak egyszerűen
+továbblépnek a következő ciklusiterációban. Ha <code>N</code> kisebb, a
+for ciklus feltétele (<code>i &lt; N</code>) gondoskodik a
+<strong>boundary checkről</strong>, vagyis a szál nem ír a lefoglalt
+tömbön kívülre. A blokkok számát <code>numSMs * blocksPerSM</code> adja,
+ahol a <code>blocksPerSM</code> az occupancy API eredménye (a 256 szálas
+blokk és CC 8.6/8.9 esetén legfeljebb 1536 / 256 = 6, CC 8.0-n
+legfeljebb 2048 / 256 = 8, és a regiszter- vagy shared memory-használat
+ennél kevesebbre is levihet).</p>
+<p>Az alábbi ábra egy kis példán mutatja, melyik szál melyik elemet
+dolgozza fel iterációnként, és mi történik, ha a stride hibásan csak
+<code>blockDim.x</code>.</p>
+<figure id="fig-gpu020-gridstride">
+<div class="fig-interactive"><iframe src="figures/html/gpu020-gridstride.html" title="19 elemű tömb, három iterációban 8 szál dolgozza fel, a harmadik iterációban csak 3 szál aktív; hibás stride esetén a 4–18. elemeket két szál is feldolgozza." loading="lazy" style="width:100%;border:0;height:620px"></iframe><noscript><img src="figures/img/gpu020-gridstride.png" style="width:100.0%"
+alt="19 elemű tömb, három iterációban 8 szál dolgozza fel, a harmadik iterációban csak 3 szál aktív; hibás stride esetén a 4–18. elemeket két szál is feldolgozza." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu020-gridstride.png" style="width:100.0%"
+alt="19 elemű tömb, három iterációban 8 szál dolgozza fel, a harmadik iterációban csak 3 szál aktív; hibás stride esetén a 4–18. elemeket két szál is feldolgozza." /></details></div>
+<figcaption>Grid-stride bejárás 2 blokk × 4 szállal, N = 19 elemen: fent
+a helyes stride = 8 (három iteráció, az utolsóban csak 3 szál aktív),
+lent a hibás stride = 4, amelynél a 4–18. elemet két szál is
+feldolgozza</figcaption>
+</figure>
+<p><strong>Miért rugalmas ez a minta?</strong> Ugyanazt a kernel
+binárist és ugyanazt a launch konfigurációt használhatjuk akár 1
+milliós, akár 1 milliárdos vektorra. A rács mérete csak a GPU hardveres
+képességeitől függ, nem az adat méretétől. Ez lehetővé teszi a kernel
+újrahasznosítását anélkül, hogy a host kódban minden méretváltozásnál
+újra kellene számolni a rácsot. A grid-stride loop nem csökkenti az
+utolsó blokk tétlen szálait, és a coalescinget sem rontja: egy iteráción
+belül a warp szomszédos szálai szomszédos elemeket érnek el (lásd az 5.3
+alfejezetet).</p>
+<h3 data-number="6.3.2" id="kevés-blokk-sok-munka"><span
+class="header-section-number">6.3.2</span> Kevés blokk, sok munka</h3>
+<p>A grid-stride loop hatékonyságának kulcsa a „kevés blokk, sok munka”
+elv. Ez az elv azt mondja ki, hogy a GPU teljesítményének
+maximalizálásához elegendő annyi blokkot indítani, amennyi a hardveres
+erőforrásokat (SM-ek, regiszterek, shared memory) teljesen lefoglalja. A
+többi munkát a szálaknak kell elvégezniük a ciklus ismétlésével.</p>
+<p>A hagyományos, minden elemet külön szállal lefedő megközelítés
+(<strong>elem-per-szál</strong>, naiv kernel) esetén az ütemezőnek
+rengeteg blokkot kell befejeznie és újat indítania. Ez a blokk-indítási
+overhead általában kicsi, de ha a kernel futási ideje maga is nagyon
+rövid, akkor a mérési eredményeket torzíthatja.</p>
+<p>A grid-stride loop esetén a kernel indításakor a hardver az összes
+SM-et feltölti, és a blokkok a teljes futás alatt rezidensek maradnak.
+Ez <strong>csökkentheti</strong> a blokkütemezési többletterhet; modern
+GPU-n ez a hatás gyakran kicsi, ezért előnyként csak mérés alapján
+szabad kezelni. A rezidens kapacitásra méretezett grid statikus
+stride-dal sem szünteti meg a tail effectet: az egyenlőtlen munka vagy
+az utolsó iteráció miatt a blokkok továbbra sem fejeződnek be egyszerre;
+csak a blokkszintű hullámkvantálás szűnik meg.</p>
+<p><strong>Gyakorlati kérdés: hány blokkot indítsunk?</strong> Ha túl
+kevés blokkot indítunk, a GPU nem lesz teljesen telített. Ha túl sokat,
+a grid-stride loop elveszíti az előnyeit. Kiindulópont:
+<code>numSMs * blocksPerSM</code> blokk (egy hullám), amelyet
+kísérletileg egy kis egész szorzóval (pl. 2–4 hullámnyi blokk) lehet
+növelni a terheléskiegyenlítés érdekében; a legjobb szorzót a mérés
+adja. A blokkméret és a launch konfiguráció hibakezelése a 6.4, az
+occupancy részletes számszerűsítése a 12.4 alfejezet témája. Addig is
+elmondható: a grid-stride loop tipikusan akkor hatékony, ha a grid
+mérete a GPU erőforrásaihoz mérten „ésszerűen kicsi”.</p>
+<h3 data-number="6.3.3" id="perzisztens-kernel"><span
+class="header-section-number">6.3.3</span> Perzisztens kernel</h3>
+<p>A grid-stride loop logikai továbbfejlesztése a <strong>perzisztens
+kernel</strong> (persistent kernel). Míg a grid-stride loop esetén a
+szálak statikusan, előre meghatározott lépésközzel haladnak, a
+perzisztens kernelnél a blokkok <strong>dinamikusan</strong> kérnek új
+munkát egy globális munkaszámlálóból (atomi „jegy”, work queue). Ez nem
+munkalopás (<em>work stealing</em>): nincs másik blokk soráról elvett
+munka, csak közös számlálóból kiosztott feladat.</p>
+<p>A perzisztens kernel definíciója: olyan kernel, amely legfeljebb
+annyi blokkot indít, amennyit a hardver egyidejűleg, egy hullámban
+futtatni tud, és a kernel a kilépés előtt egy belső ciklusban, atomi
+műveletek segítségével addig dolgozik, amíg az összes feladat el nem
+készül.</p>
+<p>Ez a megközelítés különösen hasznos, ha a munkaegységek mérete nem
+egyenletes, vagy ha a feldolgozási idő elemektől függően nagyon változó.
+A statikus grid-stride loop esetén előfordulhat, hogy az egyik blokk
+nagyon hosszú ideig dolgozik egy adott adatszeleten, míg a többi blokk
+már végzett.</p>
+<p>Tekintsünk egy példát, ahol egy nagy, <code>numRows × numCols</code>
+méretű mátrix sorait kell feldolgozni, de a feldolgozási idő soronként
+nagyon eltérő lehet (pl. ritka mátrixok). A <strong>blokk</strong> kér
+új sort, nem az egyes szálak: a sorindexet egyetlen szál szerzi meg és
+osztja meg shared memory-n keresztül, a sor elemeit a blokk szálai
+közösen összegzik, és a blokkon belüli redukció után a 0. szál írja ki
+az eredményt. A kódot a szerző nem fordította le és nem futtatta.</p>
+<pre class="cuda"><code>// CUDA C++ (C++17), perzisztens kernel dinamikus munkakiosztással
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;cuda_runtime.h&gt;
+
+#define CUDA_CHECK(call)                                                        \
+  do {                                                                          \
+    cudaError_t err = (call);                                                   \
+    if (err != cudaSuccess) {                                                   \
+      std::fprintf(stderr, &quot;CUDA error %s:%d: %s\n&quot;, __FILE__, __LINE__,       \
+                   cudaGetErrorString(err));                                    \
+      std::exit(EXIT_FAILURE);                                                  \
+    }                                                                           \
+  } while (0)
+
+constexpr int BLOCK = 256;                 // kettő hatványa (a redukció miatt)
+__device__ unsigned int globalWorkCounter = 0;   // globális munkaszámláló
+
+// Feladat: minden sorra kiszámoljuk a sorösszeget.
+__global__ void processRowsDynamically(const float *matrix, float *output,
+                                       unsigned int numRows, int numCols) {
+  __shared__ unsigned int row;             // a blokk aktuális sora
+  __shared__ float sdata[BLOCK];
+
+  while (true) {
+    if (threadIdx.x == 0) {
+      row = atomicAdd(&amp;globalWorkCounter, 1u);   // egy sor a blokknak
+    }
+    __syncthreads();                       // minden szál lássa a `row` értékét
+    if (row &gt;= numRows) {
+      break;                               // blokk-uniform feltétel: nincs több munka
+    }
+
+    const float *rowPtr = matrix + (size_t)row * numCols;
+    float sum = 0.0f;
+    for (int col = threadIdx.x; col &lt; numCols; col += blockDim.x) {
+      sum += rowPtr[col];
+    }
+
+    // Blokkon belüli fa-redukció shared memory-ban
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s &gt; 0; s &gt;&gt;= 1) {
+      if (threadIdx.x &lt; s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      output[row] = sdata[0];
+    }
+    __syncthreads();   // a következő iteráció `row`-írása és `sdata`-használata előtt
+  }
+}
+
+int main() {
+  const unsigned int numRows = 10000;
+  const int numCols = 512;
+  float *d_matrix = nullptr, *d_output = nullptr;
+  CUDA_CHECK(cudaMalloc(&amp;d_matrix, (size_t)numRows * numCols * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&amp;d_output, numRows * sizeof(float)));
+  CUDA_CHECK(cudaMemset(d_matrix, 0, (size_t)numRows * numCols * sizeof(float)));
+
+  // Blokkszám: egy hullám a GPU-hoz igazítva (occupancy API), nem kitalált konstans
+  int dev = 0, numSMs = 0, blocksPerSM = 0;
+  CUDA_CHECK(cudaGetDevice(&amp;dev));
+  CUDA_CHECK(cudaDeviceGetAttribute(&amp;numSMs, cudaDevAttrMultiProcessorCount, dev));
+  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &amp;blocksPerSM, processRowsDynamically, BLOCK, 0));
+  const int numBlocks = numSMs * blocksPerSM;
+
+  // A munkaszámláló nullázása MINDEN indítás előtt
+  const unsigned int init = 0;
+  CUDA_CHECK(cudaMemcpyToSymbol(globalWorkCounter, &amp;init, sizeof(unsigned int)));
+
+  processRowsDynamically&lt;&lt;&lt;numBlocks, BLOCK&gt;&gt;&gt;(d_matrix, d_output, numRows, numCols);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  CUDA_CHECK(cudaFree(d_matrix));
+  CUDA_CHECK(cudaFree(d_output));
+  return 0;
+}</code></pre>
+<p><strong>A perzisztens kernel működési elve:</strong> 1.
+<strong>Inicializálás:</strong> A kernel indítása előtt a globális
+<code>globalWorkCounter</code> értékét nullára állítjuk (minden indítás
+előtt újra). 2. <strong>Lefoglalás:</strong> A blokk 0. szála az
+<code>atomicAdd</code> utasítással egyedi értéket szerez a számlálóból,
+és shared memory-ba írja; a <code>__syncthreads()</code> után a blokk
+minden szála ezt a sort dolgozza fel. (Ha az <code>atomicAdd</code>
+minden szálban lefutna, minden szál más sort kapna, és az eredmények
+elvesznének.) 3. <strong>Feldolgozás:</strong> A blokk szálai közösen
+összegzik a sor elemeit, majd blokkon belüli redukcióval egyetlen
+értéket írnak ki. 4. <strong>Újrapróbálkozás:</strong> A ciklus addig
+ismétlődik, amíg a megszerzett azonosító el nem éri a sorok számát
+(<code>numRows</code>). Ekkor a blokk kilép.</p>
+<p><strong>Miért előnyös ez a minta?</strong> * <strong>Automatikus
+terheléselosztás:</strong> Ha az egyik sor feldolgozása 10-szer annyi
+ideig tart, mint a többi soré, a többi blokk nem vár rá a statikus
+elosztás miatt. Amint végeznek, automatikusan lekérnek egy újabb sort a
+közös számlálóból. A terhelés így dinamikusan kiegyenlítődik. *
+<strong>Csökkentett indítási overhead:</strong> A kernel egyetlen
+hullámnyi blokkal fut végig; a „blokk soronként” változattal szemben
+(ahol 10 000 blokk indul és ér véget) nincs blokkonkénti indítás és
+leállítás. Többfázisú feladatoknál, ahol egyébként fázisonként külön
+kernelt indítanánk, a perzisztens kernel a kernelindítások számát is
+csökkentheti; mindkét hatás feladatfüggő, mérni kell. *
+<strong>Lehetséges cache-előnyök:</strong> Bizonyos feladatoknál a
+hosszú életű blokkok a kernel élettartama alatt újrahasznosíthatnak
+shared memory-ba töltött adatot; ez feladatfüggő, és mérni kell.</p>
+<p>Az alábbi ábra modellidőben veti össze a statikus és a dinamikus
+kiosztást egy olyan esetre, amelyben az egyik sor tízszer annyi ideig
+tart, mint a többi.</p>
+<figure id="fig-gpu020-persistent">
+<div class="fig-interactive"><iframe src="figures/html/gpu020-persistent.html" title="Statikus kiosztásnál a 2. blokk 12 egységig dolgozik, a többi 3 egység után tétlen; dinamikus kiosztásnál a teljes idő 10 egység." loading="lazy" style="width:100%;border:0;height:640px"></iframe><noscript><img src="figures/img/gpu020-persistent.png" style="width:100.0%"
+alt="Statikus kiosztásnál a 2. blokk 12 egységig dolgozik, a többi 3 egység után tétlen; dinamikus kiosztásnál a teljes idő 10 egység." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu020-persistent.png" style="width:100.0%"
+alt="Statikus kiosztásnál a 2. blokk 12 egységig dolgozik, a többi 3 egység után tétlen; dinamikus kiosztásnál a teljes idő 10 egység." /></details></div>
+<figcaption>Statikus és dinamikus munkakiosztás 3 blokkal és 9 sorral,
+ahol a 2. sor 10 időegység: statikus kiosztásnál a teljes idő 12, a
+dinamikus számlálóval 10 egység (modellidő, nem mérés)</figcaption>
+</figure>
+<p><strong>Korlátok és buktatók:</strong> A perzisztens kernel egyik
+legnagyobb veszélye a <strong>deadlock</strong> (holtpont). Ha a GPU-n
+nem fér el az összes blokk egyidejűleg, az ütemező csak akkor indítja el
+a következő blokkot, ha egy korábbi már befejeződött. Ha egy perzisztens
+kernelben a blokk egy olyan globális szinkronizációra vár (pl.
+<code>grid.sync()</code> a cooperative groups használatával), amelyet az
+összes blokknak el kellene érnie, de néhány blokk még el sem indult,
+mert a hardver nem tudta ütemezni őket, a rendszer örökre várni fog.</p>
+<p>Ezért a perzisztens kernel indításakor <strong>szigorúan garantálni
+kell</strong>, hogy a megadott blokkok száma nem haladja meg a hardver
+által egyidejűleg futtatható blokkok számát
+(<code>numSMs * blocksPerSM</code>). Az occupancy-számítást a 12.4
+alfejezet részletezi. Emellett a perzisztens kernelek nem használhatják
+a blokkok közötti szinkronizációt anélkül, hogy megbizonyosodnánk a
+teljes foglaltságról; grid-szintű szinkronizációhoz cooperative launch
+szükséges (9.3 alfejezet).</p>
+<p>A grid-stride loop és a perzisztens kernel közötti választás gyakran
+a feladat természetétől függ. Szabályos, jól kiegyensúlyozott
+feladatoknál (pl. vektorösszeadás, képkonvolúció) a statikus grid-stride
+loop egyszerűbb, és jó választás. Erősen szabálytalan, változó költségű
+feladatoknál (pl. ritka lineáris algebra, gráfbejárás, változó
+hosszúságú részecskeszimuláció) a perzisztens kernel dinamikus
+munkakiosztása teljesítménynövekedést hozhat, ennek mértékét azonban
+mérni kell.</p>
+<h3 data-number="6.3.4" id="labor-grid-stride-loop-implementálása"><span
+class="header-section-number">6.3.4</span> Labor: grid-stride loop
+implementálása</h3>
+<p>A labor célja a grid-stride loop gyakorlati elsajátítása és a „kevés
+blokk, sok munka” elv mérése. Ugyanazt a feladatot két módon oldjuk meg:
+elem-per-szál (direct) és grid-stride kernellel, <strong>azonos
+memória-hozzáférési mintával</strong> (mindkettőben egy warp szomszédos
+szálai szomszédos elemeket érnek el). A különbség tehát kizárólag a rács
+méretezése és a blokkok élettartama, a coalescing nem változik. A labor
+célja vizsgálat, nem előre eldöntött eredmény.</p>
+<p><strong>Környezet (helyőrző, a saját gépen rögzítendő):</strong> *
+<strong>GPU:</strong> <code>&lt;kitöltendő&gt;</code> *
+<strong>Driver:</strong> <code>&lt;kitöltendő&gt;</code> *
+<strong>CUDA:</strong> <code>&lt;kitöltendő, 12.x&gt;</code>;
+<strong>compute capability:</strong> <code>&lt;kitöltendő&gt;</code> *
+<strong>OS:</strong> <code>&lt;kitöltendő&gt;</code> *
+<strong>Pontosság:</strong> FP32; ismétlés: a könyv mérési protokollja
+szerint (≥ 5 warm-up, ≥ 20 mért futás, medián és IQR)</p>
+<p><strong>Feladat:</strong> Írjon CUDA C++ kernelt, amely egy
+<code>N = 2^26</code> elemű <code>float</code> tömb minden elemének
+négyzetét számítja ki (<code>out[i] = in[i] * in[i]</code>)! Készítse el
+az elem-per-szál változatot (<code>ceil(N / blockSize)</code> blokk) és
+a grid-stride változatot (<code>numSMs * blocksPerSM</code> blokk)!
+Mérje meg mindkettőt <code>cudaEvent_t</code>-vel 5 warm-up futással és
+20 mért ismétléssel (medián és IQR), és számítsa ki a hatékony
+sávszélességet a ténylegesen mozgatott adatból (<code>2 · 4 · N</code>
+bájt: egy olvasás és egy írás elemenként)! Kiegészítő feladat: valósítsa
+meg a sorösszeg feladatot (<code>N = 2^20</code> sor,
+<code>M = 128</code> oszlop; a blokkméret legyen 128
+(<code>BLOCK = 128</code>), vagy rendeljen egy sort egy warphoz –
+jegyezze fel, hogy a 256 szálas blokk fele tétlen lenne) a fenti
+perzisztens kernellel és egy „egy blokk soronként” kernellel, és
+hasonlítsa össze őket; ez a feladat külön tanulság, mert itt a
+memóriaelérés és a munkaelosztás is változik.</p>
+<p><strong>Várt eredmény (modell, nem mérés):</strong> A négyzetelés
+memóriakorlátos, mindkét kernel azonos mennyiségű adatot mozgat azonos
+hozzáférési mintával, ezért a futásidő alsó korlátja
+<code>2 · 4 · 2^26</code> bájt (≈ 537 MB) / (az eszköz legnagyobb
+elérhető memória-sávszélessége); a két változat ideje várhatóan közel
+esik egymáshoz, és a különbség nagyságát (akár előjelét is) a mérés
+dönti el. Nem állítjuk előre, hogy a grid-stride változat gyorsabb. Ha a
+különbség elhanyagolható, az is érvényes tanulság: ilyen feladatnál a
+grid-stride loop fő előnye a rugalmasság, nem a sebesség.</p>
+<p><strong>CUDA C++ kód:</strong></p>
+<pre class="cuda"><code>// CUDA C++ (C++17), labor: direct vs. grid-stride; nvcc -std=c++17 -O3 -arch=native
+#include &lt;algorithm&gt;
+#include &lt;cmath&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;vector&gt;
+#include &lt;cuda_runtime.h&gt;
+
+#define CUDA_CHECK(call)                                                        \
+  do {                                                                          \
+    cudaError_t err = (call);                                                   \
+    if (err != cudaSuccess) {                                                   \
+      std::fprintf(stderr, &quot;CUDA error %s:%d: %s\n&quot;, __FILE__, __LINE__,       \
+                   cudaGetErrorString(err));                                    \
+      std::exit(EXIT_FAILURE);                                                  \
+    }                                                                           \
+  } while (0)
+
+__global__ void squareDirect(const float *in, float *out, long long n) {
+  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i &lt; n) out[i] = in[i] * in[i];
+}
+
+__global__ void squareGridStride(const float *in, float *out, long long n) {
+  long long stride = (long long)blockDim.x * gridDim.x;
+  for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i &lt; n; i += stride)
+    out[i] = in[i] * in[i];
+}
+
+template &lt;typename K&gt;
+static void bench(K k, const float *in, float *out, long long n, int grid, int block,
+                  double *med, double *iqr) {
+  cudaEvent_t t0, t1;
+  CUDA_CHECK(cudaEventCreate(&amp;t0));
+  CUDA_CHECK(cudaEventCreate(&amp;t1));
+  for (int w = 0; w &lt; 5; ++w) {                   // warm-up
+    k&lt;&lt;&lt;grid, block&gt;&gt;&gt;(in, out, n);
+    CUDA_CHECK(cudaGetLastError());
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+  const int iters = 20;
+  std::vector&lt;float&gt; t(iters);
+  for (int r = 0; r &lt; iters; ++r) {
+    CUDA_CHECK(cudaEventRecord(t0));
+    k&lt;&lt;&lt;grid, block&gt;&gt;&gt;(in, out, n);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(t1));
+    CUDA_CHECK(cudaEventSynchronize(t1));
+    CUDA_CHECK(cudaEventElapsedTime(&amp;t[r], t0, t1));
+  }
+  std::sort(t.begin(), t.end());
+  *med = t[iters / 2];
+  *iqr = t[(3 * iters) / 4] - t[iters / 4];
+  CUDA_CHECK(cudaEventDestroy(t0));
+  CUDA_CHECK(cudaEventDestroy(t1));
+}
+
+// Ellenőrzés: out[i] == in[i] * in[i] (azonos IEEE szorzás, pontos egyezés)
+static bool check(const std::vector&lt;float&gt; &amp;h_in, const float *d_out, long long n,
+                  const char *name) {
+  std::vector&lt;float&gt; h_out((size_t)n);
+  CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, (size_t)n * sizeof(float),
+                        cudaMemcpyDeviceToHost));
+  for (long long i = 0; i &lt; n; ++i) {
+    if (h_out[i] != h_in[i] * h_in[i]) {
+      std::printf(&quot;%s: HIBA i=%lld\n&quot;, name, i);
+      return false;
+    }
+  }
+  std::printf(&quot;%s: OK\n&quot;, name);
+  return true;
+}
+
+int main() {
+  const long long n = 1LL &lt;&lt; 26;
+  const size_t bytes = (size_t)n * sizeof(float);
+  std::vector&lt;float&gt; h_in((size_t)n);
+  for (long long i = 0; i &lt; n; ++i) h_in[i] = (float)(i % 1000) * 0.001f;
+  float *d_in, *d_out;
+  CUDA_CHECK(cudaMalloc(&amp;d_in, bytes));
+  CUDA_CHECK(cudaMalloc(&amp;d_out, bytes));
+  CUDA_CHECK(cudaMemcpy(d_in, h_in.data(), bytes, cudaMemcpyHostToDevice));
+
+  const int block = 256;
+  int dev = 0, numSMs = 0, blocksPerSM = 0;
+  CUDA_CHECK(cudaGetDevice(&amp;dev));
+  CUDA_CHECK(cudaDeviceGetAttribute(&amp;numSMs, cudaDevAttrMultiProcessorCount, dev));
+  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &amp;blocksPerSM, squareGridStride, block, 0));
+
+  const int gridDirect = (int)((n + block - 1) / block);
+  const int gridStride = numSMs * blocksPerSM;
+  double m1, s1, m2, s2;
+  // minden kernel előtt a kimenet jelölése, hogy a régi eredmény ne takarja a hibát
+  CUDA_CHECK(cudaMemset(d_out, 0xFF, bytes));
+  bench(squareDirect, d_in, d_out, n, gridDirect, block, &amp;m1, &amp;s1);
+  bool ok1 = check(h_in, d_out, n, &quot;Direct&quot;);
+  CUDA_CHECK(cudaMemset(d_out, 0xFF, bytes));
+  bench(squareGridStride, d_in, d_out, n, gridStride, block, &amp;m2, &amp;s2);
+  bool ok2 = check(h_in, d_out, n, &quot;GridStride&quot;);
+
+  const double traffic = 2.0 * bytes;             // 1 olvasás + 1 írás
+  std::printf(&quot;Direct:     grid=%d  median %.4f ms (IQR %.4f)  %.1f GB/s\n&quot;,
+              gridDirect, m1, s1, traffic / (m1 * 1e6));
+  std::printf(&quot;GridStride: grid=%d  median %.4f ms (IQR %.4f)  %.1f GB/s\n&quot;,
+              gridStride, m2, s2, traffic / (m2 * 1e6));
+
+  CUDA_CHECK(cudaFree(d_in));
+  CUDA_CHECK(cudaFree(d_out));
+  return (ok1 &amp;&amp; ok2) ? 0 : 1;
+}</code></pre>
+<p><strong>Mérési napló (kitöltendő, nem futtatott mérés).</strong> A
+táblázatban a futásidő a mért medián és IQR; a mezőket a saját
+futtatásból kell kitölteni.</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th style="text-align: left;">Módszer</th>
+<th style="text-align: left;">Blokkok száma</th>
+<th style="text-align: left;">Futásidő (ms), medián [IQR]</th>
+<th style="text-align: left;">Hatékony sávszélesség (GB/s)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">Elem-per-szál (direct)</td>
+<td style="text-align: left;">262 144 (= 2^26 / 256)</td>
+<td style="text-align: left;">&lt;mért – kitöltendő&gt;</td>
+<td style="text-align: left;">&lt;mért – kitöltendő&gt;</td>
+</tr>
+<tr>
+<td style="text-align: left;">Grid-stride loop</td>
+<td style="text-align: left;"><code>numSMs * blocksPerSM</code></td>
+<td style="text-align: left;">&lt;mért – kitöltendő&gt;</td>
+<td style="text-align: left;">&lt;mért – kitöltendő&gt;</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Önellenőrző kérdés:</strong> Mi történik, ha a grid-stride
+loopban az <code>N</code> értéke 0? Válasz: A grid-stride változatnál a
+rács mérete nem függ N-től, ezért N = 0 esetén is érvényes indítás
+történik, és a ciklusfeltétel (<code>i &lt; N</code>) miatt nincs
+memóriahozzáférés. Az elem-per-szál változatnál viszont
+<code>ceil(0/256) = 0</code> blokk adódik, és 0 méretű grid indítása
+indítási hibát ad (a <code>cudaGetLastError()</code> jelzi); ott a
+hostnak kell az <code>n == 0</code> esetet kiszűrnie.</p>
+<h3 data-number="6.3.5" id="tipikus-hibák-és-a-helyes-megoldások"><span
+class="header-section-number">6.3.5</span> Tipikus hibák és a helyes
+megoldások</h3>
+<p>A grid-stride loop és a perzisztens kernelek használata során a kezdő
+fejlesztők gyakran elkövetnek néhány jellegzetes hibát. Az alábbiakban
+ezeket vesszük sorra, és megadjuk a helyes megoldást.</p>
+<p><strong>1. hiba: Helytelen stride használata</strong> Sokan a
+stride-ot <code>blockDim.x</code>-re állítják a
+<code>gridDim.x * blockDim.x</code> helyett. Ez akkor működik, ha a
+kernel indítása pontosan egy blokkal történik, de több blokk esetén a
+szálak átfedésben dolgoznak, vagyis ugyanazokat az adatokat írják és
+olvassák. <em>Helyes megoldás:</em> A stride mindig a teljes rács
+szélessége: <code>stride = (long long)blockDim.x * gridDim.x</code>.</p>
+<p><strong>2. hiba: Túlcsorduló integer típus használata</strong> Nagy
+méretű adatoknál (pl.
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mn>2</mn><mn>31</mn></msup><annotation encoding="application/x-tex">2^{31}</annotation></semantics></math>
+feletti elemszám) a <code>int</code> típusú indexelés túlcsordul.
+Fontos, hogy a <code>blockIdx.x</code>, <code>blockDim.x</code> és
+<code>gridDim.x</code> mind <code>unsigned int</code>, ezért a
+<code>(long long)(blockIdx.x * blockDim.x)</code> alak még 32 biten
+szoroz, és a kasztolás már későn jön; a helyes alak a
+<code>(long long)blockIdx.x * blockDim.x + threadIdx.x</code> (ahogy az
+első példakódban és a 6.1 alfejezetben a
+<code>static_cast&lt;size_t&gt;(blockIdx.x) * blockDim.x</code> minta is
+mutatja). <em>Helyes megoldás:</em> Az indexeket és a stride-ot a
+szorzás előtt kell 64 bitesre kasztolni, és a ciklusváltozó is 64 bites
+(<code>long long</code> vagy <code>size_t</code>).</p>
+<p><strong>3. hiba: A rács méretének helytelen megválasztása</strong> Ha
+a rács mérete túl nagy (pl. a naiv kernelhez hasonlóan minden
+adatelemhez egy szálat rendelünk), a grid-stride loop elveszíti az
+előnyét. Ha túl kicsi, akkor az SM-ek nem lesznek telítve. <em>Helyes
+megoldás:</em> A rács méretét a GPU hardveres jellemzőihez kell
+igazítani: <code>numSMs * blocksPerSM</code>, ahol a
+<code>blocksPerSM</code> a
+<code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code>
+eredménye.</p>
+<p><strong>4. hiba: Perzisztens kernel holtpontja (deadlock)</strong> Ha
+a perzisztens kernelben a blokkok száma meghaladja a hardver által
+egyidejűleg futtatható blokkok számát, és a kernelben blokkok közötti
+szinkronizációt alkalmazunk, a kernel soha nem fog befejeződni. Az SM-ek
+nem tudják elindítani a maradék blokkokat, mert a futó blokkok a
+szinkronizációs ponton várnak. Az ilyen kísérletet csak timeouttal,
+izolált környezetben szabad kipróbálni. <em>Helyes megoldás:</em> A
+perzisztens kernel indításakor soha ne lépjük túl a foglaltsági limitet.
+Ha lehetséges, kerüljük a blokkok közötti szinkronizációt ebben a
+mintában, vagy használjunk cooperative groups-ot (lásd a 9.3
+alfejezetet), amely a hardveres képességet explicit módon ellenőrzi.</p>
+<hr />
+<p>A grid-stride loop egy olyan alapvető építőelem, amely lehetővé
+teszi, hogy a kerneleink méretfüggetlenek és hardverbarátok legyenek. A
+következő alfejezetben (6.4) a launch konfiguráció hibakezelésének
+mélyebb rétegeivel foglalkozunk, és megvizsgáljuk, hogyan kezeljük a
+kernelindítási hibákat és az aszinkron végrehajtás buktatóit. A
+perzisztens kernelek és a dinamikus munkakiosztás fogalmai a későbbi
+fejezetekben, a ritka mátrixok és a gráfalgoritmusok esetében
+kulcsfontosságú szerepet fognak játszani.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu019.html">← 6.2 Többdimenziós indexelés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu021.html">6.4 Launch konfiguráció és hibakezelés →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

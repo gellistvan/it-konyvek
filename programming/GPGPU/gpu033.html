@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>9.4 Összetett együttműködési minták – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. RÉSZ – CUDA programozási modell</a> › <a href="index.html#gpuch08">9 Cooperative groups, thread block clusters és grid sync</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu032.html">← 9.3 Grid-szintű szinkronizáció</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu034.html">10.1 CUDA-hibakódok és ellenőrzés →</a></div>
+</nav>
+<h2 data-number="9.4" id="gpu033"><span
+class="header-section-number">9.4</span> Összetett együttműködési
+minták</h2>
+<p>A thread block, a cluster és a grid együttműködési szintjei
+külön-külön is hatékony eszközöket adnak, de a valódi erejüket akkor
+mutatják meg, amikor egyetlen kernelben kombináljuk őket. Ez az
+alfejezet azt a gyakorlati mintát tárgyalja, amelyben egy többlépcsős
+számítás egyidejűleg támaszkodik blokkszintű szinkronizációra,
+klaszteren belüli megosztott memóriára, valamint grid-szintű barrierre.
+A cél nem az egyes csoporttípusok újbóli bemutatása – azokat a megelőző
+alfejezetek tárgyalták –, hanem azok összehangolt alkalmazása, a belőlük
+adódó teljesítmény-, hordozhatósági és helyességi kérdésekkel
+együtt.</p>
+<h3 data-number="9.4.1"
+id="miért-van-szükség-kombinált-együttműködésre"><span
+class="header-section-number">9.4.1</span> Miért van szükség kombinált
+együttműködésre?</h3>
+<p>A GPU programozási modellje hierarchikus. Egy tipikus, adatpárhuzamos
+kernel esetében a gridben lévő blokkok egymástól függetlenül, a hardver
+által meghatározott ütemezésben futnak. Ez a laza csatolás egyszerűvé és
+skálázhatóvá teszi a végrehajtást, ugyanakkor korlátozza azokat az
+algoritmusokat, amelyekben a blokkoknak részeredményeket kell
+kicserélniük anélkül, hogy a globális memórián keresztül drága, kétszeri
+adatmozgatást (írás, majd újraolvasás) végeznének.</p>
+<p>A Cooperative Groups API három szinten vezetett be finomabb
+vezérlést:</p>
+<ol type="1">
+<li><strong>Blokkszintű csoportok</strong> (<code>thread_block</code>,
+<code>tiled_partition</code>): a hagyományos
+<code>__syncthreads()</code> általánosítása, amely lehetővé teszi
+alcsoportok explicit szinkronizálását és kollektív műveletek
+használatát.</li>
+<li><strong>Klaszterek</strong> (<code>cluster_group</code>): a Hopper
+(CC 9.0) és újabb architektúrákon a hardver lehetővé teszi blokkok egy
+csoportjának szoros együttműködését, klaszterszintű barrierrel
+(<code>cluster.sync()</code>) és klaszteren belüli megosztott memóriával
+(Distributed Shared Memory, DSM). A blokkok így közvetlenül olvashatják
+egymás shared memóriáját, anélkül hogy a globális memórián keresztül
+kellene kommunikálniuk.</li>
+<li><strong>Grid-szintű csoport</strong> (<code>grid_group</code>): a
+<code>this_grid().sync()</code> olyan barrier, amelyet a grid minden
+blokkjának el kell érnie. Ez kizárólag kooperatív kernelindítás
+(<code>cudaLaunchCooperativeKernel</code>) esetén garantálható, amikor a
+futtatókörnyezet biztosítja, hogy az összes blokk egyidejűleg rezidens
+legyen az SM-eken.</li>
+</ol>
+<p>A három szint kombinálása lehetővé teszi olyan algoritmusok hatékony
+megvalósítását, amelyek korábban csak többszöri kernelindítással,
+globális memórián keresztüli kommunikációval vagy atomi műveletekkel
+voltak megoldhatók. A tipikus alkalmazási területek közé tartoznak az
+iteratív megoldók (például Jacobi-típusú stencilek; a Gauss–Seidel
+red-black rendezést igényel), a többszintű redukciók, a szemcsés
+részecskeszimulációk, valamint a mélytanulási kernelek bizonyos rétegei,
+ahol a blokk és a grid közötti finom adatcsere elengedhetetlen. (A
+kombináció támogatottsága és az indítás módja a klaszter + kooperatív
+indítás esetén külön ellenőrzendő; lásd alább.)</p>
+<h3 data-number="9.4.2"
+id="a-kombinált-minta-általános-szerkezete"><span
+class="header-section-number">9.4.2</span> A kombinált minta általános
+szerkezete</h3>
+<p>Egy összetett, többlépcsős kernel általában a következő fázisokra
+bontható:</p>
+<ol type="1">
+<li><strong>Lokális számítás</strong>: minden blokk a saját, globális
+memóriából beolvasott adattartományán dolgozik, és az eredményt a saját
+shared memóriájában vagy regisztereiben tartja.</li>
+<li><strong>Klaszterszintű együttműködés</strong>: a klaszter blokkjai
+kicserélik a szükséges részeredményeket a DSM-en keresztül, majd
+<code>cluster.sync()</code>-kel biztosítják, hogy minden blokk befejezte
+az írást, mielőtt bármelyikük olvasna.</li>
+<li><strong>Grid-szintű szinkronizáció</strong>: amikor a klaszterek
+közötti adatcsere is szükséges – például egy újabb iteráció megkezdése
+előtt – a kernel eléri a <code>this_grid().sync()</code> pontot. Ez
+biztosítja, hogy az előző fázis minden klaszterben befejeződött.</li>
+<li><strong>Második számítási fázis</strong>: a kernel a frissen
+elérhető adatokkal folytatja a munkát, például egy korrekciós lépést
+hajt végre, vagy egy következő időlépést számol.</li>
+</ol>
+<p>Ez a minta akkor előnyös, ha a fázisok közötti adatmennyiség kicsi a
+számítási munkához képest, és ha a grid-szintű szinkronizáció ritkán
+következik be – tipikusan egy-egy iteráció végén. Ellenkező esetben a
+globális barrier miatt kialakuló várakozás felemésztheti a
+nyereséget.</p>
+<p>A következő kódvázlat egy ilyen mintát mutat be. A példa nem egy
+teljes alkalmazás, hanem a szerkezet illusztrálására szolgál; a hiányzó
+részeket <code>...</code> jelzi, nem futtatott és nem fordított
+vázlat.</p>
+<pre class="cuda"><code>// CUDA C++ (illusztráció, nem teljes kernel; nem fordított)
+#include &lt;cooperative_groups.h&gt;
+namespace cg = cooperative_groups;
+
+__global__ void __cluster_dims__(4, 1, 1)
+combined_pattern_kernel(float* partial, float* result, int n) {
+    cg::thread_block block   = cg::this_thread_block();
+    cg::cluster_group cluster = cg::this_cluster();   // CC 9.0+
+    extern __shared__ float smem[];
+
+    // Lokális számítás: minden blokk kiszámítja a saját részeredményét.
+    float local_sum = 0.0f;
+    // ... adatbetöltés, számítás ...
+
+    if (block.thread_rank() == 0) {
+        smem[0] = local_sum;      // a blokk részösszege a saját shared memóriájában
+    }
+    // A klaszter-barrier a blokkon belüli szálakat is összehangolja,
+    // külön block.sync() nem kell.
+    cluster.sync();
+
+    // Klaszterszintű redukció: minden blokk kiolvassa a klasztertársak részösszegét.
+    float cluster_sum = 0.0f;
+    for (unsigned int i = 0; i &lt; cluster.num_blocks(); ++i) {
+        const float* remote_smem = cluster.map_shared_rank(smem, i);
+        cluster_sum += remote_smem[0];
+    }
+    // A távoli olvasások után egy második klaszter-barrier kell, hogy egyik
+    // blokk se léphessen ki, amíg a többi még az ő shared memóriáját olvassa.
+    cluster.sync();
+
+    if (cluster.block_rank() == 0 &amp;&amp; block.thread_rank() == 0) {
+        partial[blockIdx.x / cluster.num_blocks()] = cluster_sum;
+    }
+
+    // Grid-szintű szinkronizáció a klaszterek közötti adatcsere előtt.
+    // (Csak kooperatív indítással érvényes.)
+    cg::grid_group grid = cg::this_grid();
+    grid.sync();
+
+    // Második fázis: a friss globális adatok alapján folytatódik a munka,
+    // például a klaszterösszegek normalizálása.
+    // ...
+}</code></pre>
+<p><strong>A kombinált indítás megjegyzése.</strong> A
+<code>cudaLaunchCooperativeKernel</code> híváshoz nem adható
+klaszterdimenzió-paraméter; a klaszter a kernel
+<code>__cluster_dims__</code> attribútumával, vagy
+<code>cudaLaunchKernelEx</code>-szel adható meg
+(<code>cudaLaunchAttributeClusterDimension</code>), a kooperatív indítás
+pedig <code>cudaLaunchAttributeCooperative</code> attribútummal kérhető.
+Hogy a két attribútum együtt támogatott-e, és milyen gridméret-korlát
+érvényes ilyenkor (a <code>cudaOccupancyMaxActiveClusters</code>
+klaszterek számát ad, nem blokk/SM-et), a használt CUDA Programming
+Guide kiadásában ellenőrizendő; <strong>a szerzők ezt nem fordították és
+nem futtatták.</strong> A fenti vázlat a szerkezetet mutatja, nem
+igazolt indítási receptet.</p>
+<p>Ebben a vázlatban látható a három szint kombinációja: a blokkszint
+(<code>thread_block</code>, a részösszeg a blokk saját shared
+memóriájában), a klaszterszint (<code>cluster.sync()</code>, amely a
+blokkon belüli szinkronizációt is magában foglalja, és a DSM-olvasás) és
+a gridszint (a klaszterek közötti <code>grid.sync()</code>).</p>
+<h3 data-number="9.4.3" id="munkaelosztás-a-kombinált-kernelben"><span
+class="header-section-number">9.4.3</span> Munkaelosztás a kombinált
+kernelben</h3>
+<p>A többlépcsős kernel egyik legfontosabb tervezési döntése, hogy a
+számítási munkát miként osztjuk fel a grid, a klaszter és a blokk
+szintjei között. A helyes felosztás határozza meg, hogy a
+szinkronizációs pontokon mennyi időt kell várakozni, és mennyire
+használjuk ki az SM-ek erőforrásait.</p>
+<h4 data-number="9.4.3.1" id="hierarchikus-tiling"><span
+class="header-section-number">9.4.3.1</span> Hierarchikus tiling</h4>
+<p>A leggyakoribb megközelítés a hierarchikus csempézés (tiling). A
+globális adattartományt négy szintre bonthatjuk:</p>
+<ul>
+<li><strong>Grid-szint</strong>: a grid felel az adatok nagy, diszjunkt
+tartományaiért. Kooperatív indítás esetén a grid mérete nem lehet
+nagyobb annál, amennyi blokk egyidejűleg rezidens az összes SM-en, ezért
+a tartományok száma korlátozott. Emiatt gyakran érdemes perzisztens
+kernel stílust használni: minden blokk egy <code>for</code> ciklusban
+több kisebb tartományt dolgoz fel (grid-stride loop), ahelyett hogy a
+grid mérete egyenlő lenne a feldolgozandó részek számával.</li>
+<li><strong>Klaszter-szint</strong>: a klaszter a blokkok egy közeli
+csoportját fogja össze. A klaszteren belül a blokkok közösen fednek le
+egy nagyobb, összefüggő adatterületet, és a szomszédos határokon átnyúló
+adatcserét a gyors DSM-mel oldják meg. A klaszter méretét a
+hardverkorlát (hordozhatóan legfeljebb 8 blokk, Hopperen nem hordozható
+módon 16; lásd az előző alfejezetet) és a feladat szomszédsági
+szerkezete határozza meg.</li>
+<li><strong>Blokk-szint</strong>: egy blokk a klaszter által lefedett
+tartomány egy részét (csempéjét) kapja. A blokkméretet a
+memória-hozzáférési minták, a szükséges shared memory és a
+regiszterhasználat együttesen befolyásolják.</li>
+<li><strong>Warp- és szál-szint</strong>: a blokkon belül a warpok és
+szálak végeznek vektorizált betöltést és számítást. A
+<code>cg::tiled_partition</code> segítségével a blokkot kisebb, önállóan
+szinkronizálható csoportokra oszthatjuk.</li>
+</ul>
+<p>A hierarchikus felosztás előnye, hogy minden szinten a lehető
+legkisebb kommunikációs távolságot használjuk: a leggyakoribb adatcsere
+a blokkon belül shared memórián, a ritkább klaszteren belül DSM-en, a
+legritkább pedig grid-szinten, globális memórián keresztül történik.</p>
+<h3 data-number="9.4.4" id="példa-stencil-iteratív-megoldó"><span
+class="header-section-number">9.4.4</span> Példa: stencil iteratív
+megoldó</h3>
+<p>Vegyünk egy 2D stencilt Jacobi-iterációval: minden belső cella új
+értéke a négy szomszéd átlaga, a határ rögzített (Dirichlet-feltétel).
+Ez a Laplace-egyenlet Jacobi-iterációja; a hővezetési egyenlet explicit
+Euler-lépése <code>u + r·(Σszomszéd − 4u)</code> alakú
+(<code>r = αΔt/h²</code>), ami <code>r = 1/4</code> esetén egyezik meg a
+Jacobi-lépéssel. A párhuzamosítás során a tartományt csempékre osztjuk,
+és minden csempe szélén egy halo-réteget kell cserélni a szomszédos
+csempékkel. (A Gauss–Seidel-iteráció párhuzamosításához red-black
+rendezés kell; az itteni minta Jacobi-típusú.)</p>
+<p>Kombinált együttműködéssel ez a következőképpen valósítható meg:</p>
+<ol type="1">
+<li>Minden blokk betölti a saját csempéjét a globális memóriából a
+shared memóriába. A klaszteren <strong>belüli</strong> szomszédos
+blokkok közötti halo-cellákat ekkor nem a globális memóriából, hanem a
+szomszéd blokk shared memóriájából (DSM) olvassuk, a klaszter külső
+határán lévő halót viszont a globális memóriából.</li>
+<li>A DSM-halo olvasása előtt <code>cluster.sync()</code> biztosítja,
+hogy minden blokk befejezte a shared memóriájának írását; a távoli
+olvasások után újabb <code>cluster.sync()</code> kell.</li>
+<li>Minden blokk kiszámítja a következő iterációs értékeket a saját
+belső celláira.</li>
+<li>A klaszterek közötti határokon a halo-csere globális memórián
+keresztül zajlik: miután minden blokk kiírta a szélső celláit a globális
+memóriába, a <code>grid.sync()</code> biztosítja, hogy minden klaszter
+befejezte az írást, és a következő iteráció elején minden blokk
+biztonságosan beolvashatja a globális halót.</li>
+<li>A ciklus a következő iterációval folytatódik.</li>
+</ol>
+<figure id="fig-gpu033-stencil-halo">
+<div class="fig-interactive"><iframe src="figures/html/gpu033-stencil-halo.html" title="8 csempe két 4 blokkos klaszterben; a klaszteren belüli halo DSM-ből, a klaszterek közötti globális memóriából érkezik grid.sync után." loading="lazy" style="width:100%;border:0;height:640px"></iframe><noscript><img src="figures/img/gpu033-stencil-halo.png" style="width:100.0%"
+alt="8 csempe két 4 blokkos klaszterben; a klaszteren belüli halo DSM-ből, a klaszterek közötti globális memóriából érkezik grid.sync után." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu033-stencil-halo.png" style="width:100.0%"
+alt="8 csempe két 4 blokkos klaszterben; a klaszteren belüli halo DSM-ből, a klaszterek közötti globális memóriából érkezik grid.sync után." /></details></div>
+<figcaption>Hierarchikus csempézés és halo-csere a kombinált stencilben:
+a klaszteren belüli halo DSM-ből, a klaszterek közötti globális
+memóriából érkezik; iterációnként két <code>cluster.sync()</code> és egy
+<code>grid.sync()</code> (szemléltetés)</figcaption>
+</figure>
+<p>Ez a felépítés a klaszteren belüli határokon megspórolja a globális
+memória forgalmát, csak a klaszterek közötti határokon használjuk a
+lassú utat. A grid-szinkronizáció iterációnként egyszer következik
+be.</p>
+<h3 data-number="9.4.5"
+id="perzisztens-kernelek-és-grid-stride-loop"><span
+class="header-section-number">9.4.5</span> Perzisztens kernelek és
+grid-stride loop</h3>
+<p>A kooperatív indítás egyik következménye, hogy a grid mérete
+legfeljebb annyi blokk lehet, amennyi egyidejűleg rezidens. Ha egy
+problémához több független tartomány tartozik, mint amennyi blokk elfér,
+akkor a blokkoknak több tartományt kell feldolgozniuk. Ezt a
+gyakorlatban grid-stride loop segítségével érjük el:</p>
+<pre class="cuda"><code>// Grid-stride loop perzisztens kernelben (vázlat)
+__global__ void persistent_kernel(float* data, int n, int phases) {
+    cg::grid_group grid = cg::this_grid();
+    for (int phase = 0; phase &lt; phases; ++phase) {   // phases minden szálon azonos
+        for (int tid = blockIdx.x * blockDim.x + threadIdx.x; tid &lt; n;
+             tid += gridDim.x * blockDim.x) {
+            // feldolgozás
+        }
+        grid.sync();   // minden szál eléri, a ciklus uniform
+    }
+}</code></pre>
+<p>Ez lehetővé teszi, hogy a kernel a teljes futás alatt az eszközön
+maradjon, és a globális barrierrel szabályozza a fázisokat. A
+<code>grid.sync()</code> hívásnak minden szálra nézve uniform helyen és
+(ha ciklusban van) azonos számú alkalommal kell lennie, mert különben
+holtpont alakul ki; a fenti <code>phases</code> ezért minden szálon
+ugyanaz az érték.</p>
+<h3 data-number="9.4.6"
+id="szinkronizációs-szabályok-és-gyakori-hibák"><span
+class="header-section-number">9.4.6</span> Szinkronizációs szabályok és
+gyakori hibák</h3>
+<p>A kombinált minta helyessége szempontjából a legfontosabb, hogy
+minden szinten betartsuk a csoportokra vonatkozó kollektív hívások
+szabályait. A leggyakoribb hibák a következők:</p>
+<h4 data-number="9.4.6.1" id="hiányzó-vagy-nem-kollektív-sync"><span
+class="header-section-number">9.4.6.1</span> Hiányzó vagy nem kollektív
+sync</h4>
+<p>A <code>cluster.sync()</code> és a <code>grid.sync()</code> kollektív
+művelet: a csoport minden szálának meg kell hívnia, uniform vezérlési
+úton. Ha egy szál (vagy blokk) egy <code>if</code> feltétel miatt
+kihagyja a hívást, a hívó szálak örökre várakoznak.</p>
+<p><strong>Hibás minta:</strong></p>
+<pre class="cuda"><code>// HIBÁS: a sync feltételes ágban van, nem minden szál éri el
+__global__ void bad_cluster_sync(float* data) {
+    cg::cluster_group cluster = cg::this_cluster();
+    if (threadIdx.x == 0) {
+        // ...
+        cluster.sync(); // HIBA: a cluster.sync() a klaszter összes szálának kollektív hívása;
+                        // a többi szál kihagyja az if-et és befejezi a kernelt,
+                        // a hívó szálak örökre várnak
+    }
+}</code></pre>
+<p><strong>Helyes megoldás:</strong> a szinkronizálást a csoport minden
+tagjának, minden feltételtől függetlenül el kell érnie, vagy a feltételt
+úgy kell megfogalmazni, hogy a csoport minden tagja azonos döntést
+hozzon (uniform feltétel, pl. kernelparaméter).</p>
+<h4 data-number="9.4.6.2"
+id="a-grid-szinkronizáció-nem-kooperatív-indítással"><span
+class="header-section-number">9.4.6.2</span> A grid-szinkronizáció nem
+kooperatív indítással</h4>
+<p>A <code>cg::this_grid().sync()</code> csak akkor érvényes, ha a
+kernelt kooperatív indítással futtattuk, és a grid minden blokkja
+egyszerre rezidens. Egyszerű
+<code>&lt;&lt;&lt;grid, block&gt;&gt;&gt;</code> indítással a
+<code>grid.sync()</code> nem támogatott: a mai (CUDA 11+) toolkitekben a
+kernel megszakad, és a következő szinkronizáló hívás
+<code>cudaErrorLaunchFailure</code> hibát ad (sticky hiba; a lektor
+NVRTC/RTX-es ellenőrzése szerint, a pontos viselkedés
+Toolkit-verziófüggő lehet). A kernelben a <code>grid.is_valid()</code>
+lekérdezhető, ha a kód mindkét indítási módot el akarja viselni.</p>
+<p><strong>Hibás minta:</strong></p>
+<pre class="cuda"><code>// HIBÁS: grid.sync() normál &lt;&lt;&lt; &gt;&gt;&gt; indítással
+__global__ void bad_grid_sync() {
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+    grid.sync(); // NEM TÁMOGATOTT normál indításnál
+}
+
+// hívás:
+// bad_grid_sync&lt;&lt;&lt;num_blocks, block_size&gt;&gt;&gt;();</code></pre>
+<p><strong>Helyes megoldás:</strong> a kernelt
+<code>cudaLaunchCooperativeKernel</code> függvénnyel kell indítani, és
+előtte ellenőrizni kell, hogy a kívánt blokkszám és egyéb erőforrások
+lehetővé teszik-e a kooperatív futást. A
+<code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code> segítségével
+meghatározható, hogy hány blokk lehet rezidens egy SM-en, és ebből a
+maximális gridméret.</p>
+<pre class="cuda"><code>// Helyes vázlat: kooperatív indítás
+int numBlocksPerSm = 0;
+CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&amp;numBlocksPerSm, kernel, blockSize, smemSize));
+int maxBlocks = numBlocksPerSm * numSMs;
+if (gridBlocks &gt; maxBlocks) {
+    // csökkenteni kell a grid méretét vagy más stratégiát használni
+}
+void* args[] = { /* a kernelparaméterek címei */ };
+CUDA_CHECK(cudaLaunchCooperativeKernel((void*)kernel, dim3(gridBlocks), dim3(blockSize), args, smemSize, stream));</code></pre>
+<p>A grid méretének ellenőrzése kötelező, mert a hardver
+erőforrás-korlátai miatt előfordulhat, hogy a kért blokkszám nem fér el
+egyszerre. A túl nagy gridet a <code>cudaLaunchCooperativeKernel</code>
+a <code>cudaErrorCooperativeLaunchTooLarge</code> hibakóddal elutasítja,
+a kernel nem indul el (lásd az előző alfejezetet).</p>
+<h4 data-number="9.4.6.3" id="dsm-hozzáférés-cluster.sync-nélkül"><span
+class="header-section-number">9.4.6.3</span> DSM hozzáférés cluster.sync
+nélkül</h4>
+<p>A Distributed Shared Memory lehetővé teszi, hogy egy blokk olvassa
+egy másik, ugyanabban a klaszterben lévő blokk shared memóriáját. Az
+olvasás előtt azonban biztosítani kell, hogy a forrásblokk befejezte az
+írást. Ezt a <code>cluster.sync()</code> hívás garantálja, amely a
+klaszter összes blokkját szinkronizálja.</p>
+<p><strong>Hibás minta:</strong></p>
+<pre class="cuda"><code>// HIBÁS: DSM olvasás cluster.sync() nélkül
+__global__ void __cluster_dims__(2, 1, 1) bad_dsm_access(float* data) {
+    cg::cluster_group cluster = cg::this_cluster();
+    extern __shared__ float smem[];
+
+    if (cluster.block_rank() == 0) {
+        smem[0] = 1.0f; // 0. blokk ír
+    }
+    // HIÁNYZIK a cluster.sync()
+
+    float* remote = cluster.map_shared_rank(smem, 0);
+    float val = remote[0]; // versenyhelyzet: lehet, hogy az írás még nem történt meg
+}</code></pre>
+<p><strong>Helyes megoldás:</strong> a DSM írás után, de még a DSM
+olvasás előtt hívjuk meg a <code>cluster.sync()</code>-et, az olvasások
+után pedig még egyszer, hogy a tulajdonos blokk ne léphessen ki idő
+előtt. A <code>block.sync()</code> nem elegendő, mert az csak a blokkon
+belül szinkronizál.</p>
+<h4 data-number="9.4.6.4"
+id="a-klaszterméret-és-a-hardverkorlát-figyelmen-kívül-hagyása"><span
+class="header-section-number">9.4.6.4</span> A klaszterméret és a
+hardverkorlát figyelmen kívül hagyása</h4>
+<p>A klaszterek mérete architektúrafüggő. A hordozható klaszterméret
+legfeljebb 8 blokk; Hopperen nem hordozható módon 16 is engedélyezhető
+(lásd az előző alfejezetet). A klaszter dimenzióit a
+<code>__cluster_dims__</code> attribútummal vagy
+<code>cudaLaunchKernelEx</code>-szel kell megadni, és a kernelben a
+<code>this_cluster()</code> által visszaadott csoport dimenziói a
+ténylegesen elindított értéket tükrözik. Ha a kód feltételezi, hogy a
+klaszter mindig egy bizonyos méretű, a hordozhatóság sérül.</p>
+<p><strong>Helyes megoldás:</strong> a kernelben dinamikusan kérdezzük
+le a klaszter méretét (<code>cluster.num_blocks()</code>), és a kódot
+úgy írjuk meg, hogy bármilyen támogatott méretre működjön, vagy
+fordítási időben <code>static_assert</code>-tel szűrjük ki a nem
+támogatott eseteket.</p>
+<h3 data-number="9.4.7" id="teljesítmény-és-hordozhatóság"><span
+class="header-section-number">9.4.7</span> Teljesítmény és
+hordozhatóság</h3>
+<p>A kombinált együttműködési minták teljesítménye erősen függ attól,
+hogy a szinkronizációs pontok mennyire ritkák, és hogy a DSM-mel
+kiváltott globális memóriaforgalom mekkora megtakarítást eredményez.</p>
+<h4 data-number="9.4.7.1" id="klaszter-előnyei"><span
+class="header-section-number">9.4.7.1</span> Klaszter előnyei</h4>
+<p>A klaszter használatának legnagyobb előnye a blokkok közötti
+kommunikáció felgyorsítása. A DSM hozzáférés késleltetése alacsonyabb,
+mint a globális memória elérése, ezért az olyan minták, amelyek gyakori
+szomszédos blokkok közötti adatcserét igényelnek,
+sávszélesség-megtakarítást érhetnek el. A klaszter emellett lehetővé
+teszi a shared memória együttes kihasználását: a klaszter blokkjainak
+shared memóriája együtt nagyobb, összefüggő csempék kezelését teszi
+lehetővé anélkül, hogy az adatot a globális memórián keresztül kellene
+mozgatni.</p>
+<p>Ugyanakkor a klaszterindítás klaszterszintű rezidencia-feltétellel
+jár: egy klaszter blokkjait együtt kell elhelyezni (a klaszter blokkjai
+egy GPC-n belül futnak), ami korlátozhatja az occupancyt. A
+<code>cluster.sync()</code> hívás is többletköltséggel jár, ezért
+érdemes megfontolni, hogy egy adott feladatban tényleg szükség van-e
+klaszterre, vagy a hagyományos blokkszintű megoldás is elegendő.</p>
+<h4 data-number="9.4.7.2" id="grid-szinkronizáció-költsége"><span
+class="header-section-number">9.4.7.2</span> Grid-szinkronizáció
+költsége</h4>
+<p>A <code>grid.sync()</code> a teljes gridet szinkronizálja, ami azt
+jelenti, hogy a leglassabb blokk befejeződéséig minden más blokk
+várakozik. A várakozási idő a blokkok munkamennyiségének
+kiegyensúlyozatlanságától függ. Ezért a grid-szintű szinkronizációt
+lehetőleg ritkán, és csak akkor érdemes használni, ha a fázisok közötti
+adatfüggőség valóban megköveteli.</p>
+<p>Ráadásul a kooperatív indítás korlátozza a grid méretét, ami
+csökkentheti az occupancy-t, ha a kernel egyébként sok blokkal jobban
+skálázna. A perzisztens kernelek és a grid-stride loop ezt a korlátot
+enyhítik, de a tervezés során mindig mérni kell, hogy a
+grid-szinkronizációból származó nyereség ellensúlyozza-e a kisebb grid
+miatti veszteséget.</p>
+<h4 data-number="9.4.7.3" id="hordozhatósági-megfontolások"><span
+class="header-section-number">9.4.7.3</span> Hordozhatósági
+megfontolások</h4>
+<p>A kombinált minták hordozhatósága két szinten korlátozott:</p>
+<ul>
+<li><strong>Hardver-szint</strong>: a klaszterek csak a Hopper (CC 9.0)
+és újabb architektúrákon érhetők el. A grid-szinkronizáció (kooperatív
+indítás) CC 6.0-tól jellemzően támogatott, de a pontos feltételt
+(<code>cudaDevAttrCooperativeLaunch</code>, maximális gridméret)
+futásidőben kell lekérdezni. A klasztert igénylő részeket ezért érdemes
+feltételes fordítás és futásidejű ellenőrzés mögé tenni.</li>
+<li><strong>Szoftver-szint</strong>: a Cooperative Groups API a CUDA 9.0
+óta elérhető; a klaszter-API (<code>cluster_group</code>, DSM,
+<code>__cluster_dims__</code>) a CUDA 12.0-tól érhető el,
+Hopper-támogatással együtt. A pontos verziókat a használt toolkit
+dokumentációjában ellenőrizd.</li>
+</ul>
+<p>A gyakorlatban a hordozhatóság érdekében a következő stratégiát
+érdemes követni:</p>
+<ol type="1">
+<li>A kernel magját úgy írjuk meg, hogy a <code>thread_block</code> és
+<code>tiled_partition</code> szintű együttműködés mindig elérhető
+legyen, mert ezek a legszélesebb körben támogatottak.</li>
+<li>A klasztert használó kódot külön függvénybe vagy fordítási egységbe
+szervezzük, és <code>#ifdef</code>-fel vagy futásidejű
+<code>cudaDeviceGetAttribute</code> ellenőrzéssel kapcsoljuk be, ha az
+eszköz támogatja.</li>
+<li>A grid-szinkronizációt igénylő részt úgy tervezzük, hogy alternatív,
+többszöri kernelindításon alapuló megoldás is létezzen azokra az
+eszközökre, ahol a kooperatív indítás nem elérhető vagy nem
+hatékony.</li>
+</ol>
+<p>OpenCL-ben a munkacsoportok (work-group) közötti közvetlen
+szinkronizáció és megosztott memória nem része a hordozható mag
+szabványnak; a hasonló mintát általában több kernelindítással vagy atomi
+műveletekkel kell megvalósítani. JAX/XLA esetében a magas szintű, gráf
+alapú modell elrejti a blokkok közötti kommunikációt, így az ilyen
+finomhangolású együttműködés nem közvetlenül alkalmazható.</p>
+<h3 data-number="9.4.8"
+id="labor-grid-szintű-jacobi-stencil-kooperatív-indítással"><span
+class="header-section-number">9.4.8</span> Labor: grid-szintű
+Jacobi-stencil kooperatív indítással</h3>
+<p>A labor célja, hogy a grid-szintű együttműködést egy mérhető,
+ellenőrizhető példán gyakorolja: egy Jacobi-iterációt futtatunk egyetlen
+kooperatív kernelben (<code>grid.sync()</code> iterációnként), és
+összevetjük egy iterációnként külön kernelt indító baseline-nal és egy
+CPU-referenciával. A klaszteres DSM-halo változat a végén
+<strong>feladat</strong>, nem kész megoldás (lásd a kombinált indítás
+megjegyzését).</p>
+<h4 data-number="9.4.8.1" id="feladatleírás"><span
+class="header-section-number">9.4.8.1</span> Feladatleírás</h4>
+<ul>
+<li>A tartomány <code>N×N</code> cellából álló hálópontos grid, minden
+cella egy <code>float</code>; a határcellák rögzítettek (felső sor 1,0,
+a többi határcella 0,0), a belső cellák kezdetben 0,0.</li>
+<li>Minden iterációban egy belső cella új értéke a négy szomszéd átlaga:
+<code>u_new[i][j] = 0.25f * (u[i-1][j] + u[i+1][j] + u[i][j-1] + u[i][j+1])</code>.</li>
+<li>A kooperatív kernel <code>T</code> iterációt futtat egyetlen
+indítással, két pufferrel (ping-pong), <code>grid.sync()</code>
+iterációnként.</li>
+<li>Ellenőrzés: maximális abszolút eltérés a CPU-referenciától.</li>
+</ul>
+<h4 data-number="9.4.8.2" id="labor-kód"><span
+class="header-section-number">9.4.8.2</span> Labor kód</h4>
+<pre class="cuda"><code>// stencil_lab.cu  (CUDA C++17, nvcc 12.x; nem futtatott és nem fordított példa)
+#include &lt;cooperative_groups.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;algorithm&gt;
+#include &lt;cmath&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;vector&gt;
+namespace cg = cooperative_groups;
+
+#define CUDA_CHECK(call)                                                   \
+    do {                                                                   \
+        cudaError_t err_ = (call);                                         \
+        if (err_ != cudaSuccess) {                                         \
+            std::fprintf(stderr, &quot;CUDA hiba %s:%d: %s\n&quot;, __FILE__,        \
+                         __LINE__, cudaGetErrorString(err_));              \
+            std::exit(EXIT_FAILURE);                                       \
+        }                                                                  \
+    } while (0)
+
+__device__ __forceinline__ void update_cell(const float* src, float* dst,
+                                            long long k, int N) {
+    const int i = (int)(k / N), j = (int)(k % N);
+    if (i &gt; 0 &amp;&amp; i &lt; N - 1 &amp;&amp; j &gt; 0 &amp;&amp; j &lt; N - 1)
+        dst[k] = 0.25f * (src[k - N] + src[k + N] + src[k - 1] + src[k + 1]);
+    else
+        dst[k] = src[k];                       // rögzített határ
+}
+
+// Kooperatív változat: T iteráció egyetlen kernelben.
+__global__ void jacobi_coop(float* a, float* b, int N, int T) {
+    cg::grid_group grid = cg::this_grid();
+    const long long total  = (long long)N * N;
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    for (int it = 0; it &lt; T; ++it) {           // T minden szálon azonos
+        const float* src = (it % 2 == 0) ? a : b;
+        float*       dst = (it % 2 == 0) ? b : a;
+        for (long long k = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+             k &lt; total; k += stride)
+            update_cell(src, dst, k, N);
+        grid.sync();                           // minden szál eléri
+    }
+}
+
+// Baseline: egyetlen iteráció, a host ciklusban indítja.
+__global__ void jacobi_step(const float* src, float* dst, int N) {
+    const long long total  = (long long)N * N;
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long k = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         k &lt; total; k += stride)
+        update_cell(src, dst, k, N);
+}
+
+static void cpu_reference(std::vector&lt;float&gt;&amp; u, int N, int T) {
+    std::vector&lt;float&gt; v(u);
+    for (int it = 0; it &lt; T; ++it) {
+        for (int i = 0; i &lt; N; ++i)
+            for (int j = 0; j &lt; N; ++j) {
+                const int k = i * N + j;
+                v[k] = (i &gt; 0 &amp;&amp; i &lt; N - 1 &amp;&amp; j &gt; 0 &amp;&amp; j &lt; N - 1)
+                     ? 0.25f * (u[k - N] + u[k + N] + u[k - 1] + u[k + 1]) : u[k];
+            }
+        u.swap(v);
+    }
+}
+
+int main(int argc, char** argv) {
+    const int N = (argc &gt; 1) ? std::atoi(argv[1]) : 512;
+    const int T = (argc &gt; 2) ? std::atoi(argv[2]) : 100;
+    const int block = 256, warmup = 5, reps = 20;
+    const size_t bytes = (size_t)N * N * sizeof(float);
+
+    int dev = 0, coop = 0, sms = 0, per_sm = 0;
+    CUDA_CHECK(cudaSetDevice(dev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&amp;coop, cudaDevAttrCooperativeLaunch, dev));
+    if (!coop) { std::fprintf(stderr, &quot;Nincs kooperatív indítás.\n&quot;); return 1; }
+    CUDA_CHECK(cudaDeviceGetAttribute(&amp;sms, cudaDevAttrMultiProcessorCount, dev));
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&amp;per_sm, jacobi_coop, block, 0));
+    const int coop_blocks = std::min(sms * per_sm,
+                                     (int)(((long long)N * N + block - 1) / block));
+    if (coop_blocks == 0) { std::fprintf(stderr, &quot;Nem fér el blokk.\n&quot;); return 1; }
+
+    std::vector&lt;float&gt; init((size_t)N * N, 0.0f);
+    for (int j = 0; j &lt; N; ++j) init[j] = 1.0f;          // felső sor = 1,0
+
+    float *d_a = nullptr, *d_b = nullptr;
+    CUDA_CHECK(cudaMalloc(&amp;d_a, bytes));
+    CUDA_CHECK(cudaMalloc(&amp;d_b, bytes));
+
+    cudaEvent_t t0, t1;
+    CUDA_CHECK(cudaEventCreate(&amp;t0));
+    CUDA_CHECK(cudaEventCreate(&amp;t1));
+    float ms_coop[reps], ms_base[reps];
+    const long long total = (long long)N * N;
+    const int base_blocks = (int)std::min&lt;long long&gt;((total + block - 1) / block, 1 &lt;&lt; 20);
+
+    for (int r = -warmup; r &lt; reps; ++r) {                // r &lt; 0: warm-up (5)
+        CUDA_CHECK(cudaMemcpy(d_a, init.data(), bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_b, init.data(), bytes, cudaMemcpyHostToDevice));
+        int n = N, t = T;
+        void* args[] = { &amp;d_a, &amp;d_b, &amp;n, &amp;t };
+        CUDA_CHECK(cudaEventRecord(t0));
+        CUDA_CHECK(cudaLaunchCooperativeKernel((void*)jacobi_coop, dim3(coop_blocks),
+                                               dim3(block), args, 0, 0));
+        CUDA_CHECK(cudaEventRecord(t1));
+        CUDA_CHECK(cudaEventSynchronize(t1));
+        CUDA_CHECK(cudaGetLastError());
+        if (r &gt;= 0) CUDA_CHECK(cudaEventElapsedTime(&amp;ms_coop[r], t0, t1));
+    }
+    // Eredmény a kooperatív futásból: T páros -&gt; d_a, páratlan -&gt; d_b.
+    std::vector&lt;float&gt; gpu((size_t)N * N);
+    CUDA_CHECK(cudaMemcpy(gpu.data(), (T % 2 == 0) ? d_a : d_b, bytes, cudaMemcpyDeviceToHost));
+
+    for (int r = -warmup; r &lt; reps; ++r) {
+        CUDA_CHECK(cudaMemcpy(d_a, init.data(), bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_b, init.data(), bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaEventRecord(t0));
+        for (int it = 0; it &lt; T; ++it) {
+            float* src = (it % 2 == 0) ? d_a : d_b;
+            float* dst = (it % 2 == 0) ? d_b : d_a;
+            jacobi_step&lt;&lt;&lt;base_blocks, block&gt;&gt;&gt;(src, dst, N);
+        }
+        CUDA_CHECK(cudaEventRecord(t1));
+        CUDA_CHECK(cudaEventSynchronize(t1));
+        CUDA_CHECK(cudaGetLastError());
+        if (r &gt;= 0) CUDA_CHECK(cudaEventElapsedTime(&amp;ms_base[r], t0, t1));
+    }
+
+    std::vector&lt;float&gt; ref(init);
+    cpu_reference(ref, N, T);
+    float max_err = 0.0f;
+    for (size_t k = 0; k &lt; ref.size(); ++k)
+        max_err = std::max(max_err, std::fabs(ref[k] - gpu[k]));
+
+    auto stats = [&amp;](const float* x, float&amp; med, float&amp; iqr) {
+        std::vector&lt;float&gt; sorted(x, x + reps);
+        std::sort(sorted.begin(), sorted.end());
+        med = 0.5f * (sorted[reps / 2 - 1] + sorted[reps / 2]);   // reps páros
+        iqr = sorted[3 * reps / 4] - sorted[reps / 4];
+    };
+    float mc, sc, mb, sb;
+    stats(ms_coop, mc, sc);
+    stats(ms_base, mb, sb);
+    std::printf(&quot;N=%d T=%d coop_blocks=%d max_abs_err=%g\n&quot;, N, T, coop_blocks, max_err);
+    std::printf(&quot;kooperativ: median %.3f ms (IQR %.3f)\nbaseline  : median %.3f ms (IQR %.3f)\n&quot;,
+                mc, sc, mb, sb);
+
+    CUDA_CHECK(cudaEventDestroy(t0));
+    CUDA_CHECK(cudaEventDestroy(t1));
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    return 0;
+}</code></pre>
+<p>A kód megjegyzései szerint a kooperatív kernelben <code>T</code> és a
+ciklusszerkezet minden szálon azonos, ezért a <code>grid.sync()</code>
+uniform. A baseline a <code>T</code> darab kernelindítás költségét is
+tartalmazza, ami éppen a kooperatív változattal szemben
+összehasonlítandó tényező.</p>
+<h4 data-number="9.4.8.3" id="build-és-futtatási-környezet"><span
+class="header-section-number">9.4.8.3</span> Build és futtatási
+környezet</h4>
+<p>A méréshez rögzítendő (a példa értékei helyőrzők, nem mértek):</p>
+<ul>
+<li>GPU: <code>[modell, CC]</code></li>
+<li>Driver: <code>[kitöltendő]</code></li>
+<li>CUDA / nvcc: <code>[kitöltendő]</code></li>
+<li>Operációs rendszer: <code>[kitöltendő]</code></li>
+</ul>
+<p>Build parancs (az <code>-arch</code> a saját GPU-hoz igazítandó):</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-arch</span><span class="op">=</span>sm_90 <span class="at">-O3</span> <span class="at">-o</span> stencil_lab stencil_lab.cu</span></code></pre></div>
+<p>Futtatás:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu">timeout</span> 120 ./stencil_lab 512 100</span></code></pre></div>
+<p>A CUDA 11.0 előtti toolkitekben a <code>grid.sync()</code>
+fordításához <code>-rdc=true</code> kellett; a CUDA 11+ toolkitekben a
+fenti parancs elegendő (a verzióhatárt a kiadási jegyzetből rögzítendő,
+ellenőrzendő; a példát nem futtattuk).</p>
+<h4 data-number="9.4.8.4" id="mérési-napló-és-kiértékelés"><span
+class="header-section-number">9.4.8.4</span> Mérési napló és
+kiértékelés</h4>
+<p>A mérés a kódban: 5 warm-up, majd 20 ismétlés, medián és IQR; a mért
+oszlopot az olvasó tölti ki.</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+</colgroup>
+<thead>
+<tr>
+<th>Verzió</th>
+<th>Blokkszám</th>
+<th>Blokkméret</th>
+<th>Várt (modellből)</th>
+<th>Mért medián (ms)</th>
+<th>IQR (ms)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Baseline (külön kernelek)</td>
+<td><code>ceil(N²/256)</code></td>
+<td>256</td>
+<td>nincs számolt várt érték</td>
+<td><code>[mért – kitöltendő]</code></td>
+<td><code>[mért – kitöltendő]</code></td>
+</tr>
+<tr>
+<td>Kooperatív, <code>grid.sync()</code></td>
+<td><code>min(SM·blokk/SM, ceil(N²/256))</code></td>
+<td>256</td>
+<td>max_abs_err = 0 (azonos float-műveletek)</td>
+<td><code>[mért – kitöltendő]</code></td>
+<td><code>[mért – kitöltendő]</code></td>
+</tr>
+</tbody>
+</table>
+<p>A GPU és a CPU ugyanazt a műveletsort végzi (balról jobbra összegzett
+szomszédok, majd egy szorzás); FMA-ra összevonható művelet nincs, ezért
+a várt eltérés 0. Ha nem nulla, ellenőrizd a ping-pong pufferválasztást
+és a fordítási kapcsolókat (<code>--use_fast_math</code>, host
+<code>-ffast-math</code>). A mérési naplóban tüntesd fel a GPU órajelét,
+a power limitet, az ECC állapotát és a háttérterhelést.</p>
+<h4 data-number="9.4.8.5" id="feladat-klaszteres-dsm-halo-bővítés"><span
+class="header-section-number">9.4.8.5</span> Feladat: klaszteres
+DSM-halo bővítés</h4>
+<p>Bővítsd a kernelt úgy, hogy a blokkok csempéket (pl. 16×16)
+dolgozzanak fel, és a klaszteren belüli szomszéd csempék halo-celláit
+DSM-ből (<code>cluster.map_shared_rank</code>) olvassák, a klaszterek
+közötti halo-t pedig a globális memóriából, <code>grid.sync()</code>
+után. Ehhez nem a <code>cudaLaunchCooperativeKernel</code>, hanem
+<code>cudaLaunchKernelEx</code> kell a kooperatív és a
+klaszter-attribútummal; az együttes támogatást először a dokumentációban
+és a célhardveren ellenőrizd. A DSM-olvasások után mindig legyen záró
+<code>cluster.sync()</code>.</p>
+<h4 data-number="9.4.8.6" id="ellenőrző-kérdés"><span
+class="header-section-number">9.4.8.6</span> Ellenőrző kérdés</h4>
+<p>A fejezet lezárásaként válaszold meg a következő kérdést:</p>
+<p><strong>Milyen feltételek mellett biztonságos a
+<code>this_grid().sync()</code> hívása egy kernelben, és mi történik, ha
+a grid egyik szála nem éri el ezt a hívást?</strong></p>
+<p>A helyes válasznak tartalmaznia kell, hogy a kernelnek kooperatív
+indítással kell futnia, a grid minden blokkjának egyidejűleg rezidensnek
+kell lennie, és a szinkronizálási hívásnak minden szálon ugyanazon a
+vezérlési úton kell elhelyezkednie. Ha egy szál nem éri el a hívást, a
+többi szál örökre várakozik, ami holtponthoz vezet.</p>
+<h3 data-number="9.4.9" id="összegzés"><span
+class="header-section-number">9.4.9</span> Összegzés</h3>
+<p>A Cooperative Groups eszköztárának kombinált használata lehetővé
+teszi olyan összetett, többlépcsős kernelek írását, amelyek a
+blokkszintű finom szinkronizációt, a klaszteren belüli gyors adatcserét
+és a grid-szintű fázisvezérlést egyetlen kernelben egyesítik. A minta
+hatékonysága azon múlik, hogy a munkaelosztást hierarchikusan
+tervezzük-e, a szinkronizációs pontokat ritkán és szabályosan
+helyezzük-e el, valamint hogy tiszteletben tartjuk-e a hardver- és
+szoftverkorlátokat. A kooperatív indítással elkerülhető a többszöri
+kernelindítás overheadje, a klaszterekkel támogatott DSM pedig
+csökkentheti a globális memóriaforgalmat, de a pontos nyereség erősen
+függ a probléma méretétől és a GPU architektúrájától; ezt a labor mérési
+táblázatának kitöltésével kell az olvasónak igazolnia. A következő
+alfejezet a CUDA hibakezelésével és hibakeresésével foglalkozik, amely a
+kombinált minták helyességének ellenőrzéséhez is elengedhetetlen.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu032.html">← 9.3 Grid-szintű szinkronizáció</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu034.html">10.1 CUDA-hibakódok és ellenőrzés →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

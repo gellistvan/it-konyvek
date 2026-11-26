@@ -1,0 +1,750 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>19.1 Dense GEMM – GPGPU – általános célú számítások
+GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Párhuzamos algoritmusok</a> › <a href="index.html#gpuch18">19 Sparse és dense lineáris algebra</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu069.html">← 18.4 Stencil-optimalizálás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu071.html">19.2 Sparse mátrixreprezentációk →</a></div>
+</nav>
+<h2 data-number="19.1" id="gpu070"><span
+class="header-section-number">19.1</span> Dense GEMM</h2>
+<p>A sűrű mátrixszorzás (dense GEMM) a tudományos számítás, a gépi
+tanulás és a jelfeldolgozás egyik legalapvetőbb építőköve. A
+<code>C = alpha * A * B + beta * C</code> alakú művelet a BLAS (Basic
+Linear Algebra Subprograms) szabvány szerint <code>GEMM</code> néven
+ismert, ahol <code>A</code> mérete <code>M × K</code>, <code>B</code>
+mérete <code>K × N</code>, <code>C</code> mérete pedig
+<code>M × N</code>. A GPU-k ezen a területen kiválóan teljesítenek, mert
+a GEMM számítási intenzitása (compute intensity) magas, és a
+párhuzamosság könnyen kihasználható. Ebben az alfejezetben felépítjük a
+naiv kerneltől a shared memory tilingon és a register tilingon át a
+gyakorlatban használt, rendkívül optimalizált könyvtárakig: a
+<strong>cuBLAS</strong>-ig és a <strong>CUTLASS</strong>-ig.</p>
+<figure>
+<img src="assets/gpu070-diagram-1.png"
+alt="GEMM: A x B = C - Az M x K és K x N mátrix szorzata M x N kimenetet ad; a tile-ok a K dimenzió mentén haladnak, és a részösszegeket a regiszterekben tartják." />
+<figcaption aria-hidden="true">GEMM: A x B = C - Az M x K és K x N
+mátrix szorzata M x N kimenetet ad; a tile-ok a K dimenzió mentén
+haladnak, és a részösszegeket a regiszterekben tartják.</figcaption>
+</figure>
+<h3 data-number="19.1.1" id="a-naiv-gemm-kernel"><span
+class="header-section-number">19.1.1</span> A naiv GEMM kernel</h3>
+<p>A legegyszerűbb CUDA implementációban minden szál a <code>C</code>
+mátrix egyetlen elemét számítja ki. A szál a saját
+<code>(row, col)</code> indexét a block- és thread-indexekből számítja,
+majd egy belső ciklusban végigfut a <code>K</code> dimenzión, és
+összegzi a szorzatokat. A tárolás sor-fő (row-major), tehát
+<code>A[row * K + k]</code> és <code>B[k * N + col]</code> formában
+címezzük az elemeket.</p>
+<pre class="cuda"><code>// CUDA C++ (C++17), nvcc (verzió ellenőrizendő)
+// Naiv GEMM: minden szál egy kimeneti elemet számol
+__global__ void naive_gemm(const float* A, const float* B, float* C,
+                           int M, int N, int K) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row &lt; M &amp;&amp; col &lt; N) {
+        float sum = 0.0f;
+        for (int k = 0; k &lt; K; ++k) {
+            sum += A[row * K + k] * B[k * N + col];
+        }
+        C[row * N + col] = sum;
+    }
+}</code></pre>
+<p>A kernel elindítása előtt a gridet és a blockot úgy választjuk meg,
+hogy lefedjék a kimeneti mátrixot. Például
+<code>blockDim = (16, 16)</code> esetén
+<code>gridDim = ((N + 15) / 16, (M + 15) / 16)</code>.</p>
+<p>A naiv implementáció működik, de teljesítménye messze elmarad a
+hardver lehetőségeitől. Ennek fő oka a globális memória túlzott
+forgalma: minden kimeneti elem kiszámításához a szál <code>K</code>
+darab <code>A</code>- és <code>K</code> darab <code>B</code>-elemet
+olvas. Összesen tehát <code>2 * M * N * K</code> globális olvasás
+történik, miközben a számítási munka is <code>2 * M * N * K</code>
+lebegőpontos művelet (FLOP). A compute-to-global-memory arány tehát
+pontosan 1 FLOP/elem (0,25 FLOP/bájt FP32-nél), ami rendkívül alacsony,
+és a kernelt a memória sávszélessége korlátozza. A hozzáférések
+koaleszkálása itt nem a gond: a <code>B[k * N + col]</code> olvasásnál a
+warp szomszédos szálai szomszédos <code>col</code> értéket kapnak, tehát
+folytonos, koaleszkált hozzáférést végeznek, az
+<code>A[row * K + k]</code> pedig a warp szálai között (azonos
+<code>row</code>-nál) broadcast. A valódi probléma az ismételt olvasás
+(ugyanazt az <code>A</code>- és <code>B</code>-elemet sok szál olvassa
+újra a L1/L2-ből vagy a DRAM-ból) és az alacsony aritmetikai intenzitás;
+ezt Nsight Compute-ban a <code>dram__bytes_read</code> és az
+<code>l1tex__t_bytes</code> metrikák összevetésével lehet
+ellenőrizni.</p>
+<h3 data-number="19.1.2" id="shared-memory-tiling-block-tiling"><span
+class="header-section-number">19.1.2</span> Shared memory tiling: block
+tiling</h3>
+<p>A hatékonyság drasztikusan javítható, ha a mátrixokat kisebb
+<strong>tile</strong>-okra (csempékre) bontjuk, és ezeket a gyors shared
+memory-ba töltjük. A <strong>block tiling</strong> alapötlete: minden
+block egy <code>BM × BN</code> méretű <code>C</code>-tile-t számol ki. A
+<code>K</code> dimenzió mentén <code>BK</code> szélességű lépésekben
+haladunk, minden lépésben betöltünk egy <code>BM × BK</code> méretű
+<code>A</code>-tile-t és egy <code>BK × BN</code> méretű
+<code>B</code>-tile-t a block shared memory-jába, majd a tile-ok
+felhasználásával részszorzatokat számolunk. A <code>K</code> ciklus
+végére a szálban felhalmozott részösszeg adja a kimeneti elemet.</p>
+<p>A tiling előnye, hogy a globális memória olvasások száma erősen
+csökken. Egy <code>K</code>-iteráció során
+<code>BM * BK + BK * BN</code> elemet olvasunk globálisan, miközben
+<code>2 * BM * BN * BK</code> FLOP-ot végzünk. A
+compute-to-global-memory arány így:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mfrac><mrow><mn>2</mn><mo>⋅</mo><mi>B</mi><mi>M</mi><mo>⋅</mo><mi>B</mi><mi>N</mi><mo>⋅</mo><mi>B</mi><mi>K</mi></mrow><mrow><mi>B</mi><mi>M</mi><mo>⋅</mo><mi>B</mi><mi>K</mi><mo>+</mo><mi>B</mi><mi>K</mi><mo>⋅</mo><mi>B</mi><mi>N</mi></mrow></mfrac><mo>=</mo><mfrac><mrow><mn>2</mn><mo>⋅</mo><mi>B</mi><mi>M</mi><mo>⋅</mo><mi>B</mi><mi>N</mi></mrow><mrow><mi>B</mi><mi>M</mi><mo>+</mo><mi>B</mi><mi>N</mi></mrow></mfrac><mo>,</mo></mrow><annotation encoding="application/x-tex">
+\frac{2 \cdot BM \cdot BN \cdot BK}{BM \cdot BK + BK \cdot BN} = \frac{2 \cdot BM \cdot BN}{BM + BN},
+</annotation></semantics></math></p>
+<p>ami független <code>BK</code>-tól, és <code>BM</code> illetve
+<code>BN</code> növelésével növekszik. Ha például
+<code>BM = BN = 16</code>, az arány
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mo>⋅</mo><mn>16</mn><mo>⋅</mo><mn>16</mn><mi>/</mi><mo stretchy="false" form="prefix">(</mo><mn>16</mn><mo>+</mo><mn>16</mn><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mn>16</mn></mrow><annotation encoding="application/x-tex">2 \cdot 16 \cdot 16 / (16 + 16) = 16</annotation></semantics></math>
+FLOP/elem, tehát 16-szor nagyobb, mint a naiv kernelnél (1 FLOP/elem).
+Ennyivel kevesebb globális (L1/L2/DRAM) olvasási kérés jut egy FLOP-ra;
+a tényleges gyorsulás ennél kisebb, mert a naiv kernel olvasásainak nagy
+részét a cache szolgálja ki – ezt a labor méri.</p>
+<p>A következő kernel egy 16×16-os blockkal, 16×16-os shared memory
+tile-okkal dolgozik. A block dimenziója <code>(16, 16)</code>, így a 256
+szál pontosan lefedi mindkét tile-t.</p>
+<pre class="cuda"><code>// CUDA C++ (C++17), nvcc (verzió ellenőrizendő)
+// Tiled GEMM: shared memory + block tiling, sor-fő tárolás
+#define BM 16
+#define BN 16
+#define BK 16
+
+__global__ void tiled_gemm_naive(const float* A, const float* B, float* C,
+                                  int M, int N, int K) {
+    __shared__ float As[BM][BK];
+    __shared__ float Bs[BK][BN];
+
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int tx = threadIdx.x;   // 0..BN-1
+    int ty = threadIdx.y;   // 0..BM-1
+
+    // A C-tile elemének globális koordinátája
+    int row = by * BM + ty;
+    int col = bx * BN + tx;
+
+    float sum = 0.0f;
+
+    // A K dimenzió bejárása BK méretű lépésekkel
+    for (int k0 = 0; k0 &lt; K; k0 += BK) {
+        // Betöltés shared memory-ba
+        // Feltételezzük, hogy a tile-ok nem lógnak túl a mátrix határain
+        As[ty][tx] = A[(by * BM + ty) * K + (k0 + tx)];
+        Bs[ty][tx] = B[(k0 + ty) * N + (bx * BN + tx)];
+
+        __syncthreads();  // biztosítjuk, hogy minden szál betöltött
+
+        // Részszorzat számítása a shared memory-ból
+        for (int k = 0; k &lt; BK; ++k) {
+            sum += As[ty][k] * Bs[k][tx];
+        }
+
+        __syncthreads();  // megvárjuk, amíg minden szál befejezi az olvasást
+                          // a következő iteráció felülírása előtt
+    }
+
+    C[row * N + col] = sum;
+}</code></pre>
+<p>Az alábbi ábra a kernel <code>k0</code> ciklusát követi egy kiemelt
+blokkra és szálra, alul pedig a következő szakasz 2×2-es
+regiszter-tile-jának egy <code>k</code>-lépését mutatja.</p>
+<figure id="fig-gpu070-block-tiling">
+<div class="fig-interactive"><iframe src="figures/html/gpu070-block-tiling.html" title="Felül négy panel k0 = 0, 16, 32, 48 értékre: az A mátrix 16–31. sorsávjában és a B mátrix 32–47. oszlopsávjában lépésenként egy-egy csempe aktív, a korábbiak feldolgozottak; a (3, 5) szál k0 = 32-ben az A[19][37] és a B[35][37] elemet tölti be, kimenete C[19][37]. Alul a (1, 3) szál két As- és két Bs-elemet olvas regiszterbe, és ebből 4 FMA-val frissíti 2×2-es akkumulátorát." loading="lazy" style="width:100%;border:0;height:820px"></iframe><noscript><img src="figures/img/gpu070-block-tiling.png" style="width:100.0%"
+alt="Felül négy panel k0 = 0, 16, 32, 48 értékre: az A mátrix 16–31. sorsávjában és a B mátrix 32–47. oszlopsávjában lépésenként egy-egy csempe aktív, a korábbiak feldolgozottak; a (3, 5) szál k0 = 32-ben az A[19][37] és a B[35][37] elemet tölti be, kimenete C[19][37]. Alul a (1, 3) szál két As- és két Bs-elemet olvas regiszterbe, és ebből 4 FMA-val frissíti 2×2-es akkumulátorát." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu070-block-tiling.png" style="width:100.0%"
+alt="Felül négy panel k0 = 0, 16, 32, 48 értékre: az A mátrix 16–31. sorsávjában és a B mátrix 32–47. oszlopsávjában lépésenként egy-egy csempe aktív, a korábbiak feldolgozottak; a (3, 5) szál k0 = 32-ben az A[19][37] és a B[35][37] elemet tölti be, kimenete C[19][37]. Alul a (1, 3) szál két As- és két Bs-elemet olvas regiszterbe, és ebből 4 FMA-val frissíti 2×2-es akkumulátorát." /></details></div>
+<figcaption>A block tiling K-irányú lépései
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>M</mi><mo>=</mo><mi>N</mi><mo>=</mo><mi>K</mi><mo>=</mo><mn>64</mn></mrow><annotation encoding="application/x-tex">M = N = K = 64</annotation></semantics></math>,
+blokk (1, 2)) és a 2×2-es regiszter-tile egy k-lépése</figcaption>
+</figure>
+<p>A fenti kernelben a shared memory hozzáférések bank-konfliktus
+szempontjából meglehetősen kedvezőek. A <code>BK = 16</code> választás
+miatt a <code>As[ty][k]</code> hozzáférésnél a warp két különböző
+<code>ty</code> értéke két különböző, 16 banknyi távolságra lévő címet
+eredményez, így nincs ütközés. A <code>Bs[k][tx]</code> hozzáférésnél a
+<code>tx</code> folytonos, ami szintén multicast, nem conflict. Bank
+conflict nem a tile szélességétől, hanem a hozzáférési lépésköztől függ:
+ha egy warp szálai egy sorhossznyi (32 szó vagy többszöröse) lépéssel
+haladnak, ugyanazon bank különböző szavait érik el. Ebben a kernelben ez
+nem fordul elő; a 19.1.3 vázlatában igen, ott a padding
+(<code>As[BM][BK + 1]</code>) a megoldás. A padding általános tárgyalása
+a 11.2. alfejezetben található.</p>
+<p>A kernel fejlesztésekor ügyelni kell arra, hogy a mátrixdimenziók
+oszthatók legyenek a tile méretekkel, vagy kezelni kell a határokat. A
+laborban a teljes mátrixméretet a tile-ok többszörösére választjuk.</p>
+<h3 data-number="19.1.3" id="register-tiling-a-következő-szint"><span
+class="header-section-number">19.1.3</span> Register tiling: a következő
+szint</h3>
+<p>A shared memory tiling már jelentős javulást hoz, de a modern GPU-kon
+a ténylegesen nagy teljesítményhez <strong>register tilingre</strong>
+van szükség. Ebben a technikában minden szál nem egyetlen
+<code>C</code>-elemet, hanem egy kis <strong>regiszter-tile</strong>-t
+(például <code>TM × TN</code>) számol. Így minden szál a belső ciklusban
+több részösszeget tart nyilván regiszterekben, és a shared memory-ból
+való olvasások száma tovább csökken. A regiszterekhez való hozzáférés
+sokkal gyorsabb, mint a shared memory elérése, és a több független
+részösszeg lehetővé teszi az utasítás-szintű párhuzamosság (ILP)
+kihasználását, ami elrejti a memória-késleltetést.</p>
+<p>A register tiling gondolata: minden szál a <code>C</code>-tile egy
+<code>TM × TN</code> méretű al-tile-jáért felel. A számítás során
+először betölti a megfelelő <code>A</code>- és <code>B</code>-szeleteket
+regiszterekbe, majd egy szorzat-összegző ciklusban frissíti a
+részösszegeket. Ezt a módszert alkalmazzák a GPU-gyártók által
+szállított GEMM könyvtárak (például a cuBLAS) és a
+<strong>CUTLASS</strong> is.</p>
+<p>Egy egyszerű, 2×2-es regiszter-tile-t használó kernel vázlatát
+mutatjuk be (nem fordított, nem futtatott kód). A blokk
+<code>BM × BN = 16 × 16</code> méretű <code>C</code>-tile-t számol,
+minden szál <code>TM × TN = 2 × 2</code> elemet, így a blokk mérete
+<code>(BN/TN, BM/TM) = (8, 8)</code>, azaz 64 szál; a 16×16-os
+<code>As</code>/<code>Bs</code> tile-okat a 64 szál együtt, ciklusban
+tölti be. A belső ciklus lényege a regiszter-fragmentek
+(<code>a_frag</code>, <code>b_frag</code>) egyszeri betöltése és
+újrafelhasználása: 4 FMA-hoz 2 + 2 = 4 shared memory olvasás kell,
+szemben a fragmentek nélküli 8-cal.</p>
+<pre class="cuda"><code>// CUDA C++ (C++17), nvcc 12.x; sor-fő tárolás; M, N, K a BM, BN, BK többszöröse
+// Register tiling vázlat: minden szál 2x2-es C-tile-t számol
+#define BM 16
+#define BN 16
+#define BK 16
+#define TM 2
+#define TN 2
+
+// Indítás: dim3 block(BN / TN, BM / TM);  dim3 grid(N / BN, M / BM);
+__global__ void register_tiled_gemm(const float* A, const float* B, float* C,
+                                     int M, int N, int K) {
+    __shared__ float As[BM][BK];
+    __shared__ float Bs[BK][BN];
+
+    const int tx = threadIdx.x;                    // 0..BN/TN-1
+    const int ty = threadIdx.y;                    // 0..BM/TM-1
+    const int tid = ty * blockDim.x + tx;
+    const int nthreads = blockDim.x * blockDim.y;  // 64
+    const int rowBase = blockIdx.y * BM;
+    const int colBase = blockIdx.x * BN;
+
+    float c[TM][TN] = {};                          // regiszter-akkumulátorok
+    float a_frag[TM], b_frag[TN];                  // regiszter-fragmentek
+
+    for (int k0 = 0; k0 &lt; K; k0 += BK) {
+        // Együttes betöltés: a 64 szál bejárja a 16x16-os tile-okat
+        for (int idx = tid; idx &lt; BM * BK; idx += nthreads) {
+            int r = idx / BK, kk = idx % BK;
+            As[r][kk] = A[(rowBase + r) * K + (k0 + kk)];
+        }
+        for (int idx = tid; idx &lt; BK * BN; idx += nthreads) {
+            int kk = idx / BN, cc = idx % BN;
+            Bs[kk][cc] = B[(k0 + kk) * N + (colBase + cc)];
+        }
+        __syncthreads();
+
+        for (int k = 0; k &lt; BK; ++k) {
+            for (int i = 0; i &lt; TM; ++i) a_frag[i] = As[ty * TM + i][k];
+            for (int j = 0; j &lt; TN; ++j) b_frag[j] = Bs[k][tx * TN + j];
+            for (int i = 0; i &lt; TM; ++i)
+                for (int j = 0; j &lt; TN; ++j)
+                    c[i][j] += a_frag[i] * b_frag[j];
+        }
+        __syncthreads();
+    }
+
+    for (int i = 0; i &lt; TM; ++i)
+        for (int j = 0; j &lt; TN; ++j)
+            C[(rowBase + ty * TM + i) * N + (colBase + tx * TN + j)] = c[i][j];
+}</code></pre>
+<p>A vázlat <code>As[ty * TM + i][k]</code> olvasása 4-utas bankütközést
+okoz (a címek <code>(2·ty + i)·16 + k</code> alakúak, egy warp négy
+<code>ty</code> sora 32 szónyira van egymástól); az
+<code>As[BM][BK + 1]</code> padding ezt megszünteti (kézi levezetés, nem
+futtatott), ami Nsight Compute-ban a
+<code>l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld</code>
+metrikával ellenőrizhető (a metrikanév ellenőrzendő a telepített
+verzióban).</p>
+<h3 data-number="19.1.4" id="cublas-a-gyakorlati-megoldás"><span
+class="header-section-number">19.1.4</span> cuBLAS: a gyakorlati
+megoldás</h3>
+<p>A gyakorlati projektekben ritkán érdemes saját GEMM kernelt írni,
+mert a <strong>cuBLAS</strong> könyvtár rendkívül optimalizált, az adott
+GPU-architektúrára hangolt implementációkat tartalmaz, beleértve a
+tensor core-okat és a mixed precision módokat is. A cuBLAS a BLAS
+szabványt követi, de <strong>column-major</strong> (Fortran) tárolást
+használ, ami eltér a C/C++-ban megszokott sor-fő tárolástól. Ez a
+leggyakoribb hibaforrás.</p>
+<p>A <code>cublasSgemm</code> szignatúrája:</p>
+<pre class="cuda"><code>cublasStatus_t cublasSgemm(cublasHandle_t handle,
+                           cublasOperation_t transa, cublasOperation_t transb,
+                           int m, int n, int k,
+                           const float *alpha,
+                           const float *A, int lda,
+                           const float *B, int ldb,
+                           const float *beta,
+                           float *C, int ldc);</code></pre>
+<p><code>transa = transb = CUBLAS_OP_N</code> esetén a művelet
+<code>C = alpha * A * B + beta * C</code>, ahol (column-major nézetben)
+<code>A</code> mérete <code>m × k</code>, <code>B</code> mérete
+<code>k × n</code>, <code>C</code> mérete <code>m × n</code>; a leading
+dimension az oszlop hossza: <code>lda = m</code>, <code>ldb = k</code>,
+<code>ldc = m</code>.</p>
+<p><strong>1. eset: column-major tárolás</strong> (a labor ezt
+használja). A logikai <code>A</code> (M×K), <code>B</code> (K×N),
+<code>C</code> (M×N) mátrixokra:</p>
+<pre class="cuda"><code>// A (MxK): lda = M;  B (KxN): ldb = K;  C (MxN): ldc = M
+cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+            M, N, K,
+            &amp;alpha, d_A, M, d_B, K, &amp;beta, d_C, M);</code></pre>
+<p><strong>2. eset: sor-fő tárolás</strong> (C/C++ szokás). Egy sor-fő
+<code>M×N</code> mátrix memóriaképe megegyezik a column-major
+<code>N×M</code> transzponáltjáéval. A <code>C = A * B</code> sor-fő
+szorzat tehát a column-major nézetben a <code>C^T = B^T * A^T</code>
+szorzatnak felel meg, ezért az operandusokat felcseréljük, és nincs
+szükség transzponálásra:</p>
+<pre class="cuda"><code>// Sor-fő A (MxK), B (KxN), C (MxN):
+// column-major nézetben B^T (NxK), A^T (KxM), C^T (NxM): m = N, n = M, k = K
+// ldb = N (B sor-fő sorhossza), lda = K (A sor-fő sorhossza), ldc = N (C sor-fő sorhossza)
+cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+            N, M, K,
+            &amp;alpha, d_B, N, d_A, K, &amp;beta, d_C, N);</code></pre>
+<p>Az alábbi ábra a kis
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>M</mi><mo>=</mo><mn>2</mn><mo>,</mo><mi>K</mi><mo>=</mo><mn>3</mn><mo>,</mo><mi>N</mi><mo>=</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">M=2, K=3, N=4</annotation></semantics></math>
+példán mutatja, hogy ugyanaz a lineáris tömb sor-fő és column-major
+nézetben a mátrix, illetve a transzponáltja, és hogy ebből miért
+következik az operanduscsere és a vezető dimenziók választása.</p>
+<figure id="fig-gpu070-cublas-rowmajor">
+<div class="fig-interactive"><iframe src="figures/html/gpu070-cublas-rowmajor.html" title="A d_A, d_B és d_C lineáris tömb két nézetben: sor-fő A, B, C és column-major transzponáltjuk. A helyes hívás (m = 4, n = 2, k = 3, d_B ldb 4, d_A lda 3, d_C ldc 4) eredménye 38 44 50 56 83 98 113 128, egyezik a CPU-referenciával; a szándékosan hibás hívás lda = 2-vel az (1 2), (3 4), (5 6) oszlopokat olvassa, eredménye 22 28 49 64 76 100 103 136." loading="lazy" style="width:100%;border:0;height:700px"></iframe><noscript><img src="figures/img/gpu070-cublas-rowmajor.png" style="width:100.0%"
+alt="A d_A, d_B és d_C lineáris tömb két nézetben: sor-fő A, B, C és column-major transzponáltjuk. A helyes hívás (m = 4, n = 2, k = 3, d_B ldb 4, d_A lda 3, d_C ldc 4) eredménye 38 44 50 56 83 98 113 128, egyezik a CPU-referenciával; a szándékosan hibás hívás lda = 2-vel az (1 2), (3 4), (5 6) oszlopokat olvassa, eredménye 22 28 49 64 76 100 103 136." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu070-cublas-rowmajor.png" style="width:100.0%"
+alt="A d_A, d_B és d_C lineáris tömb két nézetben: sor-fő A, B, C és column-major transzponáltjuk. A helyes hívás (m = 4, n = 2, k = 3, d_B ldb 4, d_A lda 3, d_C ldc 4) eredménye 38 44 50 56 83 98 113 128, egyezik a CPU-referenciával; a szándékosan hibás hívás lda = 2-vel az (1 2), (3 4), (5 6) oszlopokat olvassa, eredménye 22 28 49 64 76 100 103 136." /></details></div>
+<figcaption>Sor-fő tárolás column-major nézetben és a cuBLAS
+operanduscseréje
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>M</mi><mo>=</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">M = 2</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>=</mo><mn>3</mn></mrow><annotation encoding="application/x-tex">K = 3</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>=</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">N = 4</annotation></semantics></math>)</figcaption>
+</figure>
+<p><strong>Szándékosan hibás példa (ne használd).</strong> A
+leggyakoribb tévedés, hogy sor-fő adatokkal a column-major hívást
+másoljuk le (<code>M, N, K, d_A, M, d_B, K, d_C, M</code>): a
+<code>lda = M</code> nem egyezik az <code>A</code> sor-fő sorhosszával
+(<code>K</code>), ezért a hívás rossz elemeket olvas. A hívás a
+tömbhatárokon belül marad, és <code>CUBLAS_STATUS_SUCCESS</code>-szel
+tér vissza, ezért sem a státusz, sem a compute-sanitizer nem jelez
+hibát: csendben rossz eredményt kapunk. A hibát kis példán
+(<code>M=2, K=3, N=4</code>) CPU-referenciával lehet leleplezni; a
+helyes receptek fent a két esetre.</p>
+<h3 data-number="19.1.5" id="cutlass-a-testreszabható-gemm"><span
+class="header-section-number">19.1.5</span> CUTLASS: a testreszabható
+GEMM</h3>
+<p>A <strong>CUTLASS</strong> (CUDA Templates for Linear Algebra
+Subroutines) egy nyílt forráskódú C++ template könyvtár, amely a GEMM és
+más lineáris algebrai műveletek hatékony implementálásához biztosít
+építőelemeket. A CUTLASS segítségével a fejlesztő explicit módon
+megadhatja a tiling stratégiát (threadblock tile, warp tile,
+instruction-level tile), az adattípusokat, a számítási pontosságot, és a
+hardveres gyorsítókat (például tensor core-ok). A cuBLAS belső
+megvalósítása zárt; hogy milyen technikákat használ, azt itt nem
+állítjuk.</p>
+<p>Egy minimális CUTLASS-hívás az alapértelmezett konfigurációval (nem
+fordított, nem futtatott vázlat; a pontos API és a verzió ellenőrizendő
+a CUTLASS dokumentációjában, a CUTLASS 2.x stílusú
+<code>device::Gemm</code> felület alapján):</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">// C++17, CUTLASS 2.x/3.x kompatibilis device::Gemm (verzió ellenőrizendő)</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cutlass/gemm/device/gemm.h&gt;</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> Gemm <span class="op">=</span> cutlass<span class="op">::</span>gemm<span class="op">::</span>device<span class="op">::</span>Gemm<span class="op">&lt;</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">,</span> cutlass<span class="op">::</span>layout<span class="op">::</span>ColumnMajor<span class="op">,</span>    <span class="co">// A</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">,</span> cutlass<span class="op">::</span>layout<span class="op">::</span>ColumnMajor<span class="op">,</span>    <span class="co">// B</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">,</span> cutlass<span class="op">::</span>layout<span class="op">::</span>ColumnMajor<span class="op">&gt;;</span>   <span class="co">// C</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>cutlass<span class="op">::</span>Status run_cutlass_gemm<span class="op">(</span><span class="dt">int</span> M<span class="op">,</span> <span class="dt">int</span> N<span class="op">,</span> <span class="dt">int</span> K<span class="op">,</span> <span class="dt">float</span> alpha<span class="op">,</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>                                 <span class="at">const</span> <span class="dt">float</span><span class="op">*</span> d_A<span class="op">,</span> <span class="dt">int</span> lda<span class="op">,</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>                                 <span class="at">const</span> <span class="dt">float</span><span class="op">*</span> d_B<span class="op">,</span> <span class="dt">int</span> ldb<span class="op">,</span> <span class="dt">float</span> beta<span class="op">,</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>                                 <span class="dt">float</span><span class="op">*</span> d_C<span class="op">,</span> <span class="dt">int</span> ldc<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>    Gemm gemm_op<span class="op">;</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>    Gemm<span class="op">::</span>Arguments args<span class="op">({</span>M<span class="op">,</span> N<span class="op">,</span> K<span class="op">},</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>                         <span class="op">{</span>d_A<span class="op">,</span> lda<span class="op">},</span> <span class="op">{</span>d_B<span class="op">,</span> ldb<span class="op">},</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>                         <span class="op">{</span>d_C<span class="op">,</span> ldc<span class="op">},</span> <span class="op">{</span>d_C<span class="op">,</span> ldc<span class="op">},</span>   <span class="co">// C bemenet és D kimenet</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>                         <span class="op">{</span>alpha<span class="op">,</span> beta<span class="op">});</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> gemm_op<span class="op">(</span>args<span class="op">);</span>                        <span class="co">// a státuszt ellenőrizni kell</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A threadblock- és warp-tile méreteket a sablon további paraméterei
+adják (alapértelmezésük architektúra- és típusfüggő, a CUTLASS
+<code>default_gemm_configuration.h</code> fájljában ellenőrizendő); a
+fenti példa ezeket nem állítja. A tensor core-ok (TF32/FP16/BF16)
+használata a <code>cublasGemmEx</code>/<code>cublasLt</code> hívásokkal
+vagy megfelelő CUTLASS-konfigurációval lehetséges; ezt, valamint a
+teljesítménymérést (FLOP/s a GPU csúcsához viszonyítva) a könyv későbbi
+fejezete (23.1–23.4) tárgyalja.</p>
+<h3 data-number="19.1.6" id="tipikus-hibák-és-megoldásuk"><span
+class="header-section-number">19.1.6</span> Tipikus hibák és
+megoldásuk</h3>
+<ol type="1">
+<li><p><strong>Column-major vs. row-major keverés.</strong> A cuBLAS
+column-major tárolást vár, míg a legtöbb házilag írt CUDA kernel sor-főt
+feltételez. Ha a mátrixokat nem megfelelően adjuk át, a művelet a
+transzponált mátrixok szorzatát számítja ki, vagy akár memóriahibához
+vezet. Megoldás: mindig rögzítsük a tárolási formátumot, és a hívásnál
+használjuk a megfelelő <code>transa</code>/<code>transb</code> opciókat
+vagy <code>lda</code>/<code>ldb</code> értékeket.</p></li>
+<li><p><strong>Nem megfelelő tile méret.</strong> Ha a tile túl nagy, a
+shared memory kihasználtsága csökkenti az occupancyt, mert kevesebb
+block fér el egy SM-en. Ha túl kicsi, a globális memória forgalom
+csökkentése elmarad. A tapasztalat szerint a <code>BM = BN = 16</code>
+vagy <code>32</code> jó kiindulópont, de az optimális érték
+architektúrafüggő, ezért mindig mérni kell.</p></li>
+<li><p><strong>Hiányzó <code>__syncthreads()</code>.</strong> A shared
+memory-ba való betöltés után minden szálnak várnia kell, mielőtt a tile
+elemeit olvasná. Hasonlóképpen a számítás után szinkronizálni kell,
+mielőtt a következő iteráció felülírná a tile-t. A hiányzó
+szinkronizáció versenyhelyzethez és helytelen eredményhez
+vezet.</p></li>
+<li><p><strong>Határok kezelése.</strong> Ha a mátrixdimenziók nem
+oszthatók a tile méretekkel, a kernelnek ellenőriznie kell a globális
+indexeket, és a betöltésnél is figyelni kell arra, hogy ne lépjen túl a
+mátrix határain. A laborban ezért olyan dimenziókat választunk, amelyek
+a tile méretek többszörösei.</p></li>
+<li><p><strong>Bank conflict a shared memory-ban.</strong> Ütközés akkor
+lép fel, ha egy warp szálai ugyanazon bank különböző szavait olvassák,
+például ha a szálak egy sorhossznyi (32 szó vagy annak többszöröse)
+lépéssel haladnak. A 19.1.2 kernelében ez nem fordul elő, a 19.1.3
+vázlatában igen: az <code>As[ty * TM + i][k]</code> olvasás 4-utas
+ütközést okoz, amelyet az <code>__shared__ float As[BM][BK + 1];</code>
+padding megszüntet.</p></li>
+<li><p><strong>Elmaradt hibakezelés.</strong> A CUDA API-hívások után
+mindig ellenőrizni kell a <code>cudaGetLastError()</code> vagy a saját
+<code>CUDA_CHECK</code> makró visszatérési értékét, különösen a
+kernelindítás után.</p></li>
+</ol>
+<h3 data-number="19.1.7"
+id="labor-egyszerű-és-tiled-gemm-implementálása"><span
+class="header-section-number">19.1.7</span> Labor: egyszerű és tiled
+GEMM implementálása</h3>
+<p>A labor célja, hogy a hallgató saját kezűleg valósítson meg egy naiv
+és egy tiled GEMM kernelt, és mérje a teljesítményüket a cuBLAS-hoz
+képest. Az alábbi protokoll követendő.</p>
+<p><strong>Követelmények:</strong> - CUDA C++ kód (C++17),
+<code>nvcc</code> fordító (a mérési naplóban rögzítve: verzió, GPU,
+compute capability). - A mátrixok FP32 típusúak,
+<code>M = N = K = 1024</code> (a tile méretek többszöröse). - A tárolás
+<strong>column-major</strong>, hogy a cuBLAS hívás natív legyen (a
+sor-fő eset receptje fent, a 19.4 sor-fő labort használ). - A saját
+kernelek is column-major indexelést használjanak, hogy az
+összehasonlítás igazságos legyen. - Minden API-hívás és kernelindítás
+után hibaellenőrzés (<code>CUDA_CHECK</code>,
+<code>cudaGetLastError</code>).</p>
+<p><strong>A megvalósítandó kernelek:</strong> 1.
+<code>naive_gemm_colmajor</code> – minden szál egy kimeneti elemet
+számol, nincs tiling. 2. <code>tiled_gemm_colmajor</code> – shared
+memory tiling, <code>BM=16, BN=16, BK=16</code>, blockdim
+<code>(16,16)</code>. 3. cuBLAS <code>cublasSgemm</code> hívás
+(column-major recept, lásd fent).</p>
+<p><strong>Mérési protokoll:</strong> - Rögzítse a környezetet: GPU
+modell, driver verzió, CUDA verzió, OS, compute capability. - Végezzen
+legalább 5 warm-up futtatást minden kernelből. - Minden kernelt
+futtasson legalább 20 alkalommal, mérje a futásidőt
+<code>cudaEvent</code> segítségével. - A mérési naplóban adja meg a
+medián futásidőt és a szórást (vagy az IQR-t). - Számítsa ki az elért
+számítási teljesítményt:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">GFLOP/s</mtext><mo>=</mo><mn>2</mn><mi>M</mi><mi>N</mi><mi>K</mi><mi>/</mi><mo stretchy="false" form="prefix">(</mo><mi>t</mi><mo>⋅</mo><msup><mn>10</mn><mn>6</mn></msup><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">\text{GFLOP/s} = 2MNK / (t \cdot 10^{6})</annotation></semantics></math>
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>t</mi><annotation encoding="application/x-tex">t</annotation></semantics></math>
+ms-ban), és adja meg a cuBLAS-hoz viszonyított százalékát (a GEMM-nél a
+FLOP/s és az arány informatív, a puszta sávszélesség nem). - Ellenőrizze
+az eredményt: kis példán (<code>M=2, K=3, N=4</code>, a
+<code>check_small()</code> függvény, várt C sor-főben: 38 44 50 56 / 83
+98 113 128) CPU-referenciával, nagy méretnél a cuBLAS eredményéhez
+viszonyított legnagyobb relatív eltéréssel. - A várható sorrend (naiv
+lassabb, tiled gyorsabb, cuBLAS a leggyorsabb) hipotézis; a mért
+értékeket külön tüntesse fel, és csak azokat jelölje ellenőrzöttként,
+amelyeket valóban lefuttatott.</p>
+<p>A mérési naplóhoz egy sablon:</p>
+<table>
+<colgroup>
+<col style="width: 8%" />
+<col style="width: 17%" />
+<col style="width: 14%" />
+<col style="width: 16%" />
+<col style="width: 30%" />
+<col style="width: 13%" />
+</colgroup>
+<thead>
+<tr>
+<th>Kernel</th>
+<th>Medián idő (ms)</th>
+<th>Szórás (ms)</th>
+<th>Elért GFLOP/s</th>
+<th>cuBLAS-hoz viszonyítva (%)</th>
+<th>Megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Naiv</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;számolt&gt;</td>
+<td>&lt;számolt&gt;</td>
+<td></td>
+</tr>
+<tr>
+<td>Tiled</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;számolt&gt;</td>
+<td>&lt;számolt&gt;</td>
+<td></td>
+</tr>
+<tr>
+<td>cuBLAS</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;számolt&gt;</td>
+<td>100</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p>A laborban <strong>nem</strong> adunk előre konkrét mért értékeket,
+mert azok hardverfüggőek; a hallgatónak saját környezetben kell mérnie.
+Az alábbi kód a labor kiinduló mérőprogramja (nem fordított, nem
+futtatott vázlat).</p>
+<p><strong>Kiinduló kód (column-major kernelek, cuBLAS-hívás,
+mérés):</strong></p>
+<pre class="cuda"><code>// CUDA C++ (C++17), nvcc 12.x; build: nvcc -std=c++17 -O3 -Xcompiler -Wall,-Wextra
+// -arch=sm_80 gemm_lab.cu -lcublas -o gemm_lab
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;cmath&gt;
+#include &lt;vector&gt;
+#include &lt;algorithm&gt;
+#include &lt;cublas_v2.h&gt;
+
+// a könyv kanonikus hibamakrói (1.2)
+#define CUDA_CHECK(call) do { cudaError_t e = (call); if (e != cudaSuccess) { \
+    fprintf(stderr, &quot;CUDA hiba %s:%d: %s\n&quot;, __FILE__, __LINE__, cudaGetErrorString(e)); \
+    exit(EXIT_FAILURE); } } while (0)
+#define CUBLAS_CHECK(call) do { cublasStatus_t s_ = (call); \
+    if (s_ != CUBLAS_STATUS_SUCCESS) { \
+    fprintf(stderr, &quot;cuBLAS hiba %s:%d: %d\n&quot;, __FILE__, __LINE__, (int)s_); \
+    exit(EXIT_FAILURE); } } while (0)
+
+#define BM 16
+#define BN 16
+#define BK 16
+
+// Column-major: A[row + k*M], B[k + col*K], C[row + col*M]; a warp szálai (tx) a sorokon
+// haladnak -&gt; koaleszkált
+__global__ void naive_gemm_colmajor(const float* A, const float* B, float* C, int M, int N,
+    int K) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int col = blockIdx.y * blockDim.y + threadIdx.y;
+    if (row &lt; M &amp;&amp; col &lt; N) {
+        float sum = 0.0f;
+        for (int k = 0; k &lt; K; ++k) sum += A[row + (size_t)k * M] * B[k + (size_t)col * K];
+        C[row + (size_t)col * M] = sum;
+    }
+}
+
+// blockDim = (BM, BN); grid = (ceil(M/BM), ceil(N/BN))
+__global__ void tiled_gemm_colmajor(const float* A, const float* B, float* C, int M, int N,
+    int K) {
+    __shared__ float As[BK][BM];   // As[k][r]
+    __shared__ float Bs[BN][BK];   // Bs[c][k]
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int row = blockIdx.x * BM + tx;
+    const int col = blockIdx.y * BN + ty;
+    float sum = 0.0f;
+    for (int k0 = 0; k0 &lt; K; k0 += BK) {
+        // A: a (k0+ty). oszlop, tx. sor -&gt; folytonos tx szerint
+        As[ty][tx] = (row &lt; M &amp;&amp; k0 + ty &lt; K) ? A[row + (size_t)(k0 + ty) * M] : 0.0f;
+        // B: a col. oszlop (blokkon belül ty), (k0+tx). elem -&gt; folytonos tx szerint
+        int bcol = blockIdx.y * BN + ty;
+        Bs[ty][tx] = (bcol &lt; N &amp;&amp; k0 + tx &lt; K) ? B[(k0 + tx) + (size_t)bcol * K] : 0.0f;
+        __syncthreads();
+        for (int k = 0; k &lt; BK; ++k) sum += As[k][tx] * Bs[ty][k];
+        __syncthreads();
+    }
+    if (row &lt; M &amp;&amp; col &lt; N) C[row + (size_t)col * M] = sum;
+}
+
+// Kis példa (M=2, K=3, N=4): a column-major leképezést a cuBLAS-tól független CPU-referencia
+// ellenőrzi.
+// A = [[1,2,3],[4,5,6]], B = 1..12 sor-fő; várt C (sor-főben): 38 44 50 56 / 83 98 113 128
+static bool check_small(cublasHandle_t h) {
+    const int M = 2, K = 3, N = 4;
+    const float alpha = 1.0f, beta = 0.0f;
+    std::vector&lt;float&gt; A(M * K), B(K * N), expected(M * N, 0.0f), out(M * N);
+    for (int i = 0; i &lt; M; ++i)
+        for (int j = 0; j &lt; K; ++j) A[i + j * M] = (float)(i * K + j + 1);
+    for (int i = 0; i &lt; K; ++i)
+        for (int j = 0; j &lt; N; ++j) B[i + j * K] = (float)(i * N + j + 1);
+    for (int i = 0; i &lt; M; ++i) for (int j = 0; j &lt; N; ++j) for (int k = 0; k &lt; K; ++k)
+        expected[i + j * M] += A[i + k * M] * B[k + j * K];
+    float *dA, *dB, *dC;
+    CUDA_CHECK(cudaMalloc(&amp;dA, A.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;dB, B.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;dC, out.size() * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(dA, A.data(), A.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dB, B.data(), B.size() * sizeof(float), cudaMemcpyHostToDevice));
+    dim3 block(BM, BN), grid((M + BM - 1) / BM, (N + BN - 1) / BN);
+    bool ok = true;
+    auto verify = [&amp;](const char* name) {
+        CUDA_CHECK(cudaMemcpy(out.data(), dC, out.size() * sizeof(float),
+            cudaMemcpyDeviceToHost));
+        bool good = true;
+        for (size_t i = 0; i &lt; out.size(); ++i)
+            if (std::fabs(out[i] - expected[i]) &gt; 1e-5f) good = false;
+        std::printf(&quot;kis példa, %-7s: %s\n&quot;, name, good ? &quot;egyezik&quot; : &quot;ELTÉR&quot;);
+        ok = ok &amp;&amp; good;
+    };
+    naive_gemm_colmajor&lt;&lt;&lt;grid, block&gt;&gt;&gt;(dA, dB, dC, M, N, K);
+    CUDA_CHECK(cudaGetLastError()); CUDA_CHECK(cudaDeviceSynchronize()); verify(&quot;naiv&quot;);
+    tiled_gemm_colmajor&lt;&lt;&lt;grid, block&gt;&gt;&gt;(dA, dB, dC, M, N, K);
+    CUDA_CHECK(cudaGetLastError()); CUDA_CHECK(cudaDeviceSynchronize()); verify(&quot;tiled&quot;);
+    CUBLAS_CHECK(cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K, &amp;alpha, dA, M, dB, K,
+        &amp;beta, dC, M));
+    CUDA_CHECK(cudaDeviceSynchronize()); verify(&quot;cuBLAS&quot;);
+    CUDA_CHECK(cudaFree(dA)); CUDA_CHECK(cudaFree(dB)); CUDA_CHECK(cudaFree(dC));
+    return ok;
+}
+
+// Időmérés: 5 warm-up + reps mért futás, ismétlésenként saját eseménypár; medián és
+// mintaszórás ms-ban
+template &lt;typename F&gt;
+static void time_ms(F launch, int reps, double&amp; med, double&amp; sd) {
+    cudaEvent_t t0, t1;
+    CUDA_CHECK(cudaEventCreate(&amp;t0)); CUDA_CHECK(cudaEventCreate(&amp;t1));
+    for (int w = 0; w &lt; 5; ++w) launch();                 // warm-up
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector&lt;float&gt; t(reps);
+    for (int r = 0; r &lt; reps; ++r) {
+        CUDA_CHECK(cudaEventRecord(t0)); launch(); CUDA_CHECK(cudaEventRecord(t1));
+        CUDA_CHECK(cudaEventSynchronize(t1));
+        CUDA_CHECK(cudaEventElapsedTime(&amp;t[r], t0, t1));
+    }
+    double mean = 0.0, ss = 0.0;                          // szórás két menetben
+    for (float x : t) mean += x;
+    mean /= reps;
+    for (float x : t) ss += (x - mean) * (x - mean);
+    sd = std::sqrt(ss / (reps - 1));
+    std::sort(t.begin(), t.end());
+    med = 0.5 * (t[reps / 2 - 1] + t[reps / 2]);          // reps páros
+    CUDA_CHECK(cudaEventDestroy(t0)); CUDA_CHECK(cudaEventDestroy(t1));
+}
+
+int main() {
+    const int M = 1024, N = 1024, K = 1024, REPS = 20;
+    const float alpha = 1.0f, beta = 0.0f;
+    std::vector&lt;float&gt; hA((size_t)M * K), hB((size_t)K * N), hC((size_t)M * N),
+        hRef((size_t)M * N);
+    srand(12345);
+    for (auto&amp; x : hA) x = (float)rand() / RAND_MAX;
+    for (auto&amp; x : hB) x = (float)rand() / RAND_MAX;
+
+    float *dA, *dB, *dC, *dRef;
+    CUDA_CHECK(cudaMalloc(&amp;dA, hA.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;dB, hB.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;dC, hC.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;dRef, hRef.size() * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(dA, hA.data(), hA.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dB, hB.data(), hB.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+    cublasHandle_t h; CUBLAS_CHECK(cublasCreate(&amp;h));
+    if (!check_small(h)) { std::fprintf(stderr,
+        &quot;a kis példa ellenőrzése sikertelen\n&quot;); return 1; }
+    auto run_cublas = [&amp;] {
+        CUBLAS_CHECK(cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K, &amp;alpha, dA, M, dB, K,
+            &amp;beta, dRef, M));
+    };
+    dim3 block(BM, BN), grid((M + BM - 1) / BM, (N + BN - 1) / BN);
+    auto run_naive = [&amp;] { naive_gemm_colmajor&lt;&lt;&lt;grid, block&gt;&gt;&gt;(dA, dB, dC, M, N,
+        K); CUDA_CHECK(cudaGetLastError()); };
+    auto run_tiled = [&amp;] { tiled_gemm_colmajor&lt;&lt;&lt;grid, block&gt;&gt;&gt;(dA, dB, dC, M, N,
+        K); CUDA_CHECK(cudaGetLastError()); };
+
+    run_cublas(); CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(hRef.data(), dRef, hRef.size() * sizeof(float),
+        cudaMemcpyDeviceToHost));
+
+    struct Case { const char* name; int id; } cases[] = {{&quot;naiv&quot;, 0}, {&quot;tiled&quot;, 1}, {&quot;cuBLAS&quot;,
+        2}};
+    for (auto&amp; c : cases) {
+        double med, sd;
+        if (c.id == 0) time_ms(run_naive, REPS, med, sd);
+        else if (c.id == 1) time_ms(run_tiled, REPS, med, sd);
+        else time_ms(run_cublas, REPS, med, sd);
+        double gflops = 2.0 * M * N * K / (med * 1e6);
+        double maxrel = 0.0;
+        if (c.id != 2) {
+            CUDA_CHECK(cudaMemcpy(hC.data(), dC, hC.size() * sizeof(float),
+                cudaMemcpyDeviceToHost));
+            for (size_t i = 0; i &lt; hC.size(); ++i)
+                maxrel = std::max(maxrel, (double)std::fabs(hC[i] - hRef[i]) / std::max(1.0,
+                    (double)std::fabs(hRef[i])));
+        }
+        printf(&quot;%-7s medián %.4f ms, szórás %.4f ms, %.1f GFLOP/s, &quot;
+               &quot;max rel. eltérés a cuBLAS-hoz: %.2e\n&quot;,
+               c.name, med, sd, gflops, maxrel);
+    }
+    CUBLAS_CHECK(cublasDestroy(h));
+    CUDA_CHECK(cudaFree(dA)); CUDA_CHECK(cudaFree(dB));
+    CUDA_CHECK(cudaFree(dC)); CUDA_CHECK(cudaFree(dRef));
+    return 0;
+}</code></pre>
+<p>A hallgató feladata a kód lefordítása, futtatása és a mérési napló
+kitöltése a saját környezetében; a <code>sm_80</code> a saját compute
+capability-re cserélendő.</p>
+<h3 data-number="19.1.8" id="összefoglalás-és-ellenőrző-kérdések"><span
+class="header-section-number">19.1.8</span> Összefoglalás és ellenőrző
+kérdések</h3>
+<p>A dense GEMM a GPU-számítás egyik legjobban tanulmányozott
+problémája. A naiv implementáció memória-korlátos, ezért a hatékonyság
+eléréséhez elengedhetetlen a <strong>shared memory tiling</strong>. A
+block tiling csökkenti a globális memória forgalmat, a <strong>register
+tiling</strong> pedig tovább növeli a számítási intenzitást és az
+utasítás-szintű párhuzamosságot. A gyakorlatban a
+<strong>cuBLAS</strong> könyvtár a legjobb választás, mert a gyártó
+által optimalizált implementációkat tartalmaz, beleértve a tensor
+core-okat is. A <strong>CUTLASS</strong> lehetővé teszi az egyedi GEMM
+kernelek rugalmas felépítését.</p>
+<p><strong>Önellenőrző kérdések:</strong> 1. Miért korlátozza a memória
+sávszélesség a naiv GEMM kernelt? Számítsa ki a compute-to-global-memory
+arányt a naiv és a tiled esetben. 2. Magyarázza el a
+<code>__syncthreads()</code> szerepét a tiled kernel két helyén. Mi
+történne, ha elhagynánk valamelyiket? 3. Hogyan befolyásolja a tile
+méret (BM, BN, BK) az occupancyt és a shared memory bank conflictokat?
+4. Miért használ a cuBLAS column-major tárolást, és hogyan kezeljük a
+sor-fő mátrixokat? 5. Mi a register tiling előnye a pusztán shared
+memory tilinghez képest?</p>
+<p><strong>Megoldások:</strong></p>
+<ol type="1">
+<li>A naiv kernel 2MNK olvasásra 2MNK FLOP-ot végez, vagyis 1 FLOP/elem
+(0,25 FLOP/bájt FP32-nél); a tiled kernelnél
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mo>⋅</mo><mi>B</mi><mi>M</mi><mo>⋅</mo><mi>B</mi><mi>N</mi><mi>/</mi><mo stretchy="false" form="prefix">(</mo><mi>B</mi><mi>M</mi><mo>+</mo><mi>B</mi><mi>N</mi><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mn>16</mn></mrow><annotation encoding="application/x-tex">2 \cdot BM \cdot BN/(BM+BN) = 16</annotation></semantics></math>
+FLOP/elem (BM = BN = 16).</li>
+<li>Az első <code>__syncthreads()</code> nélkül a szál még be nem
+töltött tile-elemet olvashat, a második nélkül egy gyorsabb szál
+felülírja a tile-t, mielőtt a többi kiolvasta.</li>
+<li>Nagyobb BM/BN több shared memóriát (<code>(BM+BN)·BK·4</code> bájt)
+és szálat igényel blokkonként, így kevesebb rezidens blokk fér az SM-re;
+bankütközést nem a szélesség, hanem a lépésköz okoz (lásd 19.1.6).</li>
+<li>A cuBLAS a Fortran-örökség miatt column-major; sor-fő mátrixoknál
+<code>C^T = B^T A^T</code>, azaz
+<code>cublasSgemm(h, N, N, N, M, K, …, d_B, N, d_A, K, …, d_C, N)</code>.</li>
+<li>Egy shared-olvasásra több FMA jut (2×2-es tile-nál 4 FMA / 4 olvasás
+8 helyett), és a független akkumulátorok utasításszintű párhuzamosságot
+adnak.</li>
+</ol>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu069.html">← 18.4 Stencil-optimalizálás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu071.html">19.2 Sparse mátrixreprezentációk →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

@@ -1,0 +1,833 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>14.3 Double buffering és pipeline – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz3">III. RÉSZ – Teljesítmény és memória</a> › <a href="index.html#gpuch13">14 Shared memory tiling, async copy és pipelining</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu051.html">← 14.2 Aszinkron másolás (cp.async)</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu053.html">14.4 Tiling és pipeline mérése →</a></div>
+</nav>
+<h2 data-number="14.3" id="gpu052"><span
+class="header-section-number">14.3</span> Double buffering és
+pipeline</h2>
+<p>A dupla pufferelés és a pipeline nem csupán egy újabb optimalizálási
+trükk, hanem a GPU-programozás egyik központi gondolata: a memória és a
+számítás valójában két, egymástól részben független erőforrás, amelyeket
+akkor használunk ki jól, ha egyszerre dolgoztatjuk őket. A 14.2
+alfejezetben megismert <code>cp.async</code> lehetővé tette, hogy a
+globális memóriából a shared memoryba irányuló másolást anélkül indítsuk
+el, hogy a szálnak várnia kellene a befejezésre. Ebben az alfejezetben
+ezt az aszinkron másolást többszintű csővezetékké szervezzük, és
+megnézzük, hogyan lehet a másolási késleltetést a számítás mögé
+rejteni.</p>
+<figure>
+<img src="assets/gpu052-diagram-1.png"
+alt="Kétfokozatú pipeline - A következő tile betöltése egy időben fut a jelenlegi tile számításával; a dupla buffer teszi lehetővé az átfedést." />
+<figcaption aria-hidden="true">Kétfokozatú pipeline - A következő tile
+betöltése egy időben fut a jelenlegi tile számításával; a dupla buffer
+teszi lehetővé az átfedést.</figcaption>
+</figure>
+<h3 data-number="14.3.1"
+id="miért-van-szükség-a-számítás-és-az-adatmozgatás-átfedésére"><span
+class="header-section-number">14.3.1</span> Miért van szükség a számítás
+és az adatmozgatás átfedésére?</h3>
+<p>A GPU végrehajtási modelljében a memóriaműveletek és az aritmetikai
+utasítások más-más hardveregységeken futnak. A globális memóriából a
+shared memoryba irányuló másolás tipikusan több száz órajelciklusig is
+eltart, miközben az SM számítási egységei eközben üresen járhatnak, ha a
+kernel szinkron módon vár. Ez a latencia-elrejtés alapkérdése: nem a
+memória műveletet kell gyorsabbá tenni önmagában, hanem a várakozási
+időt hasznos számítással kell kitölteni.</p>
+<p>A hagyományos, szinkron tilingnél a blokk életciklusa ismétlődő
+szakaszokból áll:</p>
+<ol type="1">
+<li>minden szál kiszámítja a következő csempe globális indexeit,</li>
+<li>betölti az adatokat a shared memoryba,</li>
+<li><code>__syncthreads()</code> biztosítja, hogy a teljes csempe
+rendelkezésre álljon,</li>
+<li>a szálak feldolgozzák a csempét,</li>
+<li><code>__syncthreads()</code> biztosítja, hogy a shared memory már
+nem kell, mielőtt a következő csempe felülírná.</li>
+</ol>
+<p>Ebben a menetrendben a másolás és a számítás soha nem fut egy időben.
+A második lépés alatt az SM számítási egységei többnyire tétlenek, míg a
+negyedik lépés alatt a memória-útvonalak nem dolgoznak. A pipeline célja
+az, hogy a következő csempe másolása már akkor folyamatban legyen,
+amikor az aktuális csempe feldolgozása még tart.</p>
+<p>A dupla pufferelés ennek a legegyszerűbb megvalósítása. Két shared
+memory puffert tartunk fenn; amíg az egyikből számolunk, a másikba
+töltjük a következő adagot. A csere nem adatot mozgat, hanem csak a
+pufferszerepeket cseréli fel. A megfelelő szinkronizációval elérhető,
+hogy a másolási késleltetés egy része vagy egésze a számítási idő alá
+kerüljön.</p>
+<p>A „stage” kifejezés a pipeline egy szakaszát jelöli. A legegyszerűbb
+esetben két szakasz van:</p>
+<ul>
+<li>egy <strong>producer</strong> szakasz, amely a globális memóriából a
+shared memoryba másol,</li>
+<li>egy <strong>consumer</strong> szakasz, amely a shared memoryból
+olvas, és valamilyen számítást végez.</li>
+</ul>
+<p>A két szakasz között egy szinkronizációs pont, azaz
+<strong>barrier</strong> biztosítja, hogy a consumer csak akkor kezdje
+el a puffert olvasni, ha a producer már befejezte a feltöltését, és hogy
+a producer ne írja felül a puffert addig, amíg a consumer még
+olvassa.</p>
+<h3 data-number="14.3.2" id="stage-buffer-és-barrier-fogalma"><span
+class="header-section-number">14.3.2</span> Stage, buffer és barrier
+fogalma</h3>
+<p>A pipeline mélysége azt mondja meg, hogy hány csempe feldolgozása
+lehet egyszerre folyamatban a különböző fázisokban. A kétfokozatú
+pipeline két puffert használ, és egyszerre legfeljebb két csempe van
+jelen: az egyik már betöltve, a másik éppen töltődik vagy feldolgozás
+alatt áll. A háromfokozatú pipeline három puffert használ, és így
+tovább.</p>
+<p>Fontos megkülönböztetni a pufferek számát a pipeline tényleges
+mélységétől. A kétpufferes séma általában egy csempe számítását és a
+következő csempe másolását fedi át, ezért két szakasz mélységű. A
+hárompufferes sémában a másolási, az esetleges előkészítő és a számítási
+fázisok jobban szétválaszthatók.</p>
+<p>A barrier itt nemcsak a <code>__syncthreads()</code> hívást jelenti,
+hanem a csővezeték szakaszainak találkozási pontját is. A CUDA aszinkron
+másolási modelljében kétféle várakozásra van szükség:</p>
+<ul>
+<li><strong>Másolás befejezésére várás</strong>: a <code>cp.async</code>
+csoportokhoz tartozó <code>wait_group</code> (C++-ban
+<code>__pipeline_wait_prior</code>) a másolás hardveres állapotát
+figyeli. Ez nem blokkolja a teljes blokkot, csak az adott szálat, és nem
+garantálja a shared memory láthatóságát a többi szál számára.</li>
+<li><strong>Blokk-szintű szinkronizáció</strong>: a
+<code>__syncthreads()</code> a blokk összes szálát egy pontra hozza, és
+memória-akadályt is jelent. Erre azért van szükség, mert a másolást több
+szál együtt végzi (mindegyik a csempe egy-egy 16 bájtos darabját), és a
+consumer szakasz csak akkor olvashat, ha minden producer szál
+végzett.</li>
+</ul>
+<p>A helyes minta tehát az, hogy a másolás befejezésére várunk, majd
+<code>__syncthreads()</code>-et hívunk, és csak utána engedjük a
+fogyasztói fázist a pufferhez. Ha a sorrend megfordul, versenyhelyzet
+keletkezik: a szál elérheti a <code>__syncthreads()</code>-et, mielőtt a
+saját másolási csoportja befejeződött volna, és így a többi szál olyan
+memóriát olvashat, amelyet még nem írt fel mindenki.</p>
+<p>A gyakorlatban a CUDA C++ a következő hívásokat biztosítja a
+<code>&lt;cuda_pipeline.h&gt;</code> fejlécben:</p>
+<ul>
+<li><code>__pipeline_memcpy_async(dst_smem, src_gmem, bytes)</code>
+elindít egy aszinkron másolást,</li>
+<li><code>__pipeline_commit()</code> a megelőző másolásokat egy
+csoportba zárja,</li>
+<li><code>__pipeline_wait_prior(n)</code> várakoztatja a hívó szálat,
+amíg a folyamatban lévő csoportok közül a legutóbbi <code>n</code>
+kivételével mindegyik be nem fejeződik.</li>
+</ul>
+<p>A <code>wait_prior</code> finomabb vezérlést ad, mint az egyszerű
+<code>wait_group 0</code>. Az <code>n</code> paraméter azt szabályozza,
+hogy hány befejezetlen másoláscsoport maradhat még folyamatban. Ez a
+többszintű pipeline kulcsa: ahelyett, hogy megvárnánk az összes
+másolást, csak a legkorábbi csoportokat várjuk meg, így a későbbi
+csoportok még közben tölthetik a saját puffereiket. A
+<code>__pipeline_wait_prior(0)</code> megvárja az összes elkötelezett
+csoportot. Fontos: a <code>__pipeline_memcpy_async</code> szál-szintű
+hívás, amely egyszerre csak 4, 8 vagy 16 bájtot másol; egy teljes
+csempét ezért a blokk szálai osztják fel egymás között (például
+szálanként egy-egy <code>float4</code>, ciklusban).</p>
+<p>Alacsonyabb szinten a PTX utasítások a következők:</p>
+<ul>
+<li><code>cp.async.ca.shared.global [dst], [src], 16;</code></li>
+<li><code>cp.async.commit_group;</code></li>
+<li><code>cp.async.wait_group 0;</code></li>
+</ul>
+<p>A PTX-szintű kiírás akkor hasznos, ha valaki saját absztrakciót épít,
+vagy ha a CUDA C++ burkoló hívás viselkedését akarja pontosan
+ellenőrizni. Ebben a könyvben a hordozható CUDA C++ réteget részesítjük
+előnyben, de a PTX-formát is bemutatjuk, hogy a mögöttes hardveres
+viselkedés ne maradjon homályban.</p>
+<h3 data-number="14.3.3" id="kétfokozatú-pipeline-az-alapminta"><span
+class="header-section-number">14.3.3</span> Kétfokozatú pipeline: az
+alapminta</h3>
+<p>Tekintsünk egy egyszerű, mégis jól mérhető feladatot: egy blokk egy
+nagy, egydimenziós bemeneti tömb egymást követő csempéit dolgozza fel,
+és minden csempére egy állítható költségű transzformációt alkalmaz. A
+transzformáció legyen elég egyszerű ahhoz, hogy a kódot könnyen
+ellenőrizhessük, de legyen benne egy mesterséges számítási ciklus,
+amellyel a memória és a számítás arányát hangolni tudjuk.</p>
+<p>A csempéket a blokkok grid-stride módon osztják szét: a blokk
+<code>t</code>-edik csempéje a <code>blockIdx.x + t * gridDim.x</code>
+indexű, így minden csempét pontosan egy blokk dolgoz fel. A kernel
+sablonparamétere a pufferek (stage-ek) száma; a <code>STAGES = 2</code>
+a kétfokozatú, a <code>STAGES = 3</code> a háromfokozatú eset:</p>
+<pre class="cuda"><code>// CUDA C++17 (nem futtatott kód; a launch paramétereket és az sm_80+ viselkedést a laborban
+// ellenőrizni kell)
+#include &lt;cuda_pipeline.h&gt;
+
+constexpr int kTile = 2048;     // float/csempe (8 KiB); 3 stage esetén 24 KiB statikus shared
+constexpr int kThreads = 256;
+
+// Egy csempe aszinkron másolása: a szálak 16 B-os (float4) darabokat osztanak fel.
+// Feltétel: n % 4 == 0, a bemenet 16 B-ra igazított (cudaMalloc és a kTile*4 B eltolás ezt
+// teljesíti).
+__device__ __forceinline__ void issue_tile(float* dst, const float* in, int n, int tile) {
+    long long base = (long long)tile * kTile;
+    int valid = (int)min((long long)kTile, (long long)n - base);
+    for (int i = threadIdx.x * 4; i &lt; valid; i += blockDim.x * 4)
+        __pipeline_memcpy_async(dst + i, in + base + i, 16);
+}
+
+template &lt;int STAGES&gt;
+__global__ void pipelined_transform(const float* __restrict__ input,
+                                    float* __restrict__ output,
+                                    int n, int work_per_element)
+{
+    static_assert(STAGES &gt;= 2, &quot;legalább két puffer kell&quot;);
+    __shared__ __align__(16) float buf[STAGES][kTile];
+
+    const int total_tiles = (n + kTile - 1) / kTile;
+    if (blockIdx.x &gt;= total_tiles) return;           // blokkszinten egységes, barrier előtt
+    const int my_tiles = (total_tiles - blockIdx.x + gridDim.x - 1) / gridDim.x;
+
+    // Előtöltés: az első STAGES-1 csempe másolása; minden csoportot lezárunk
+    // (üres csoport is), hogy a csoportszámlálás egységes maradjon.
+    for (int p = 0; p &lt; STAGES - 1; ++p) {
+        if (p &lt; my_tiles) issue_tile(buf[p], input, n, blockIdx.x + p * gridDim.x);
+        __pipeline_commit();
+    }
+
+    for (int t = 0; t &lt; my_tiles; ++t) {
+        // 1. A t. csempe csoportja kész (legfeljebb STAGES-2 újabb csoport maradhat
+        // folyamatban).
+        __pipeline_wait_prior(STAGES - 2);
+        // 2. Minden szál másolata kész és látható; egyben mindenki végzett a t-1. csempével,
+        //    így a (t-1)%STAGES puffer újra írható.
+        __syncthreads();
+
+        // 3. A t+STAGES-1. csempe másolásának indítása a felszabadult pufferbe: ez fut
+        //    a t. csempe feldolgozásával egy időben.
+        int nt = t + STAGES - 1;
+        if (nt &lt; my_tiles) issue_tile(buf[nt % STAGES], input, n, blockIdx.x + nt * gridDim.x);
+        __pipeline_commit();
+
+        // 4. A t. csempe feldolgozása.
+        long long base = (long long)(blockIdx.x + t * gridDim.x) * kTile;
+        int valid = (int)min((long long)kTile, (long long)n - base);
+        for (int i = threadIdx.x; i &lt; valid; i += blockDim.x) {
+            float val = buf[t % STAGES][i];
+            for (int w = 0; w &lt; work_per_element; ++w) val = fmaf(0.999f, val, 0.001f);
+            output[base + i] = val;
+        }
+
+        // 5. Ebben a sorrendben ez a barrier redundáns (a következő iteráció eleji barrier
+        //    már biztosítja, hogy mindenki végzett); megtartjuk, mert kötelező lenne, ha a
+        //    másolást a wait ELŐTT indítanánk (mint a 14.4 transzponáló kernelében).
+        __syncthreads();
+    }
+}</code></pre>
+<p>A kód működése <code>STAGES = 2</code> esetén: az előtöltés a 0.
+csempét indítja; az iteráció elején a <code>wait_prior(0)</code>
+megvárja a t. csempét (ekkor a t+1. még nincs elindítva), a barrier után
+indul a t+1. csempe másolása a másik pufferbe, és ugyanekkor a szálak a
+t. csempét dolgozzák fel. A másolás és a számítás tehát valóban átfed. A
+barrierek szerepe: az első a másolások láthatóságát és – mivel a
+következő másolás csak utána indul – az előző puffer felszabadulását is
+biztosítja. Az iteráció végi második barrier ebben a sorrendben
+elhagyható; akkor kötelező, ha a következő csempe másolását a wait ELŐTT
+indítjuk (így tesz a 14.4 transzponáló kernele).</p>
+<p>A <code>wait_prior</code> argumentuma levezetve: az iteráció elején
+<code>STAGES - 1 + t</code> csoport van lezárva, a t. csempe a t.
+csoport, ezért az utolsó <code>STAGES - 2</code> csoportot hagyhatjuk
+folyamatban. A <code>__pipeline_wait_prior</code> és a
+<code>__syncthreads</code> sorrendje kritikus: a wait csak a hívó szál
+saját másolataira vonatkozik, ezért a barrier előtt kell lennie, hogy a
+barrier után minden szál másolata kész legyen. A kód nem ad hibát a
+csonka utolsó csempére sem: a <code>valid</code> mérettel csak az
+érvényes, 4-gyel osztható darabokat másoljuk, ezért az
+<code>n % 4 == 0</code> feltétel kötelező.</p>
+<p>A kétpufferes változat a szinkron változathoz képest akkor hoz
+jelentős gyorsulást, ha a másolási idő és a számítási idő összemérhető.
+Ha a számítási idő nagyon kicsi, a pipeline nem sokat segít, mert a
+blokk akkor is a memóriára vár. Ha a számítási idő nagyon nagy, a
+másolási idő eltörpül, és a pipeline szintén nem látszik jelentősnek. Az
+optimális tartomány az, amikor a másolás és a számítás időigénye hasonló
+nagyságrendű.</p>
+<h3 data-number="14.3.4"
+id="a-pipeline-mélysége-és-a-többszintű-szervezés"><span
+class="header-section-number">14.3.4</span> A pipeline mélysége és a
+többszintű szervezés</h3>
+<p>A kétpufferes pipeline egyszerre egy csempe másolását és egy csempe
+feldolgozását engedi. A hárompufferes pipeline tovább mélyíti az
+átfedést: miközben az egyik csempét feldolgozzuk, a következő már
+töltődik, a harmadik puffer pedig már fogadhatja az azt követő másolási
+kérelmet, vagy éppen előkészítés alatt áll.</p>
+<p>A mélyebb pipeline előnye, hogy a memória-alrendszer hosszabb ideig
+telítve marad. A <code>cp.async</code> másolások indítása nem blokkoló,
+ezért a szál gyorsan több másolási csoportot is elkötelezhet. A
+hardveres várakozási mechanizmusok pontosan ezt a több befejezetlen
+csoportot kezelik. A <code>wait_prior(n)</code> paramétere így a
+pipeline mélységét szabályozza: ha az iteráció elején a feldolgozandó
+csempe csoportja után még <code>D</code> újabb csoportnak szabad
+folyamatban lennie, akkor <code>wait_prior(D)</code>-t hívunk. A fenti
+kernelben ez <code>D = STAGES - 2</code>, mert a legfrissebb csoportnak
+még futnia kell.</p>
+<p>A háromfokozatú változat ugyanaz a sablon <code>STAGES = 3</code>
+értékkel: az előtöltés két csempét indít, és az iterációnként
+folyamatban hagyható csoportok száma <code>STAGES - 2 = 1</code>, vagyis
+a t+1. csempe másolása még fut, amikor a t. csempét feldolgozzuk. A
+puffer-újrahasznosítás biztonságát itt is az iteráció eleji barrier
+adja: az új másolás a <code>(t-1) % STAGES</code> pufferbe indul,
+amelyet az előző iteráció feldolgozása már befejezett (mindenki átlépte
+a barriert). A hiba, amelyet el kell kerülni, ha a másolást a barrier
+<em>előtt</em> indítjuk, és az iteráció végi barrier hiányzik: a
+gyorsabb szálak felülírhatják azt a puffert, amelyet a lassabbak még
+olvasnak.</p>
+<p>A mélység növelése nem korlátlanul kifizetődő. Minden újabb puffer
+shared memoryt foglal, és minden újabb szint szinkronizációs költséget,
+valamint regiszternyomást is jelenthet. A túl mély pipeline emellett
+csökkentheti az occupancy-t, mert a megnövekedett shared memoryigény
+miatt kevesebb blokk fér el egy SM-en. A legtöbb gyakorlati kernelben a
+2–4 szint a jellemző; a nagyobb mélység csak akkor indokolt, ha a
+másolási késleltetés nagyon nagy, vagy ha a számítási fázis rövid, de
+sűrűn ismétlődik.</p>
+<h3 data-number="14.3.5"
+id="hogyan-rejti-el-a-pipeline-az-adatmozgatást"><span
+class="header-section-number">14.3.5</span> Hogyan rejti el a pipeline
+az adatmozgatást?</h3>
+<p>A pipeline akkor működik jól, ha a fogyasztói fázis időtartama
+nagyobb vagy egyenlő a producer fázis időtartamánál. Ha a számítási idő
+<code>T_c</code>, a másolási idő <code>T_m</code>, és a szinkronizációs
+overhead <code>T_s</code>, akkor a kétpufferes változat egy csempére eső
+ideje közelítőleg:</p>
+<p><code>T_pipe ≈ max(T_c, T_m) + T_s</code></p>
+<p>A szinkron verzióban viszont:</p>
+<p><code>T_sync ≈ T_c + T_m + T_s</code></p>
+<p>Ez az idealizált modell azt mutatja, hogy a pipeline a két idő közül
+a nagyobbikra csökkenti a feldolgozási időt. Ha <code>T_c</code> és
+<code>T_m</code> egyenlő, a gyorsulás közel kétszeres. Ha az egyik
+sokkal nagyobb a másiknál, a gyorsulás elhanyagolható, mert a
+<code>max</code> értékét a nagyobb idő határozza meg.</p>
+<figure id="fig-gpu052-pipeline-gantt">
+<div class="fig-interactive"><iframe src="figures/html/gpu052-pipeline-gantt.html" title="Gantt-diagram: a szinkron változatban a másolás és a számítás váltakozik, a pipeline-ban a következő csempe másolása az aktuális számítással egy időben fut." loading="lazy" style="width:100%;border:0;height:600px"></iframe><noscript><img src="figures/img/gpu052-pipeline-gantt.png" style="width:100.0%"
+alt="Gantt-diagram: a szinkron változatban a másolás és a számítás váltakozik, a pipeline-ban a következő csempe másolása az aktuális számítással egy időben fut." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu052-pipeline-gantt.png" style="width:100.0%"
+alt="Gantt-diagram: a szinkron változatban a másolás és a számítás váltakozik, a pipeline-ban a következő csempe másolása az aktuális számítással egy időben fut." /></details></div>
+<figcaption>Szinkron, kétfokozatú és háromfokozatú feldolgozás idővonala
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi>m</mi></msub><mo>=</mo><mn>3</mn></mrow><annotation encoding="application/x-tex">T_m = 3</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi>c</mi></msub><mo>=</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">T_c = 2</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi>s</mi></msub><mo>=</mo><mn>0</mn><mo>,</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">T_s = 0{,}5</annotation></semantics></math>
+egység barrierenként, 5 csempe; sematikus eseménymodell a fejezet
+kernelének lépéseiből, nem mérés). A kétfokozatú változatban a következő
+csempe másolása az aktuális csempe számításával egy időben fut, a
+csempénkénti idő
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mi>max</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><msub><mi>T</mi><mi>c</mi></msub><mo>,</mo><msub><mi>T</mi><mi>m</mi></msub><mo stretchy="false" form="postfix">)</mo><mo>+</mo><msub><mi>T</mi><mi>s</mi></msub><mo>=</mo><mn>3</mn><mo>,</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">\max(T_c, T_m) + T_s = 3{,}5</annotation></semantics></math>;
+a háromfokozatú változatban a másolási csatorna folyamatosan foglalt. A
+blokkokon a csempe és a puffer sorszáma áll.</figcaption>
+</figure>
+<p>A valóságban a <code>T_m</code> és a <code>T_c</code> nem mindig
+független. A memória-sávszélességen több blokk osztozik, és a számítási
+egységek is versenyeznek a regiszterekért, a shared memoryért és a
+kibocsátási sávszélességért. Ezért a fenti formula inkább gondolati
+keret, mint pontos előrejelzés.</p>
+<p>A dupla pufferelés különösen akkor hatékony, ha a másolás időben
+elnyúlik, és közben a számítás nem szorul ugyanarra az erőforrásra. A
+<code>cp.async</code> utasítások a globális memória és a shared memory
+közötti útvonalat használják, míg az aritmetikai utasítások a
+regiszterfájlhoz és a végrehajtó egységekhez kötődnek. Ezért a két
+tevékenység nagyobb valószínűséggel futhat párhuzamosan.</p>
+<h3 data-number="14.3.6" id="tipikus-hibák-és-javításuk"><span
+class="header-section-number">14.3.6</span> Tipikus hibák és
+javításuk</h3>
+<p>Az alábbi hibák a leggyakrabban fordulnak elő a double buffering és
+pipeline implementációkban:</p>
+<ol type="1">
+<li><p><strong>A puffer felülírása a fogyasztás befejezése
+előtt.</strong><br />
+Ha a másolást a wait/barrier előtt indítjuk (a 14.4 mintája), és az
+iteráció végi <code>__syncthreads()</code> hiányzik, a gyors szálak
+elkezdhetik a következő csempe másolását abba a pufferbe, amelyet a
+lassú szálak még olvasnak. A tünet nem determinisztikus: időnként helyes
+eredmény, időnként eltérés, és a hiba a mérési körülményektől függően
+eltűnhet vagy előjöhet. A megoldás az, hogy a puffer újrahasznosítása
+előtt mindig barrier áll: a bemutatott sorrendben az iteráció eleji, a
+másolás-előbb sorrendben az iteráció végi
+<code>__syncthreads()</code>.</p></li>
+<li><p><strong>A <code>wait_prior</code> és a
+<code>__syncthreads()</code> sorrendjének felcserélése.</strong><br />
+A <code>__syncthreads()</code> nem várja meg a folyamatban lévő
+aszinkron másolásokat. Ha valaki <code>__syncthreads()</code>-et hív a
+<code>wait_prior</code> elé, a blokk szálai átléphetnek a fogyasztói
+fázisba, miközben a saját másolási csoportjuk még nem fejeződött be. Ez
+versenyhelyzet, ezért a <code>wait_prior</code>-t mindig a
+<code>__syncthreads()</code> elé kell tenni.</p></li>
+<li><p><strong>Rossz <code>wait_prior</code> érték
+használata.</strong><br />
+A <code>wait_prior(0)</code> minden befejezetlen csoportot bevár; ha ezt
+azután hívjuk, hogy a következő csempe másolását már elindítottuk, az
+átfedés elvész. A túl nagy érték viszont megengedi, hogy a fogyasztó a
+még befejezetlen puffert olvassa. Az értéket a tényleges pipeline
+mélységhez kell igazítani, és az éles kódban érdemes fordítási idejű
+konstansként vagy jól dokumentált futtatási paraméterként
+kezelni.</p></li>
+<li><p><strong>Az első csempe másolásának elhagyása a ciklus
+előtt.</strong><br />
+Ha a pipeline az első iterációban nem talál betöltött csempét, a
+fogyasztó szakasz az inicializálatlan shared memoryból olvas. Ez gyakran
+NaN-ekben vagy nagy számértékekben jelentkezik, különösen FP32 esetén. A
+helyes minta az, hogy a belépés előtt legalább az első csempét
+elindítjuk.</p></li>
+<li><p><strong>A határok és az üres csempék kezelésének
+hibája.</strong><br />
+A <code>my_tiles</code>, az <code>nt &lt; my_tiles</code> feltétel és az
+előtöltés logikája gyakran hibás, ha a tömb mérete nem osztható a
+csempemérettel. A kernelnek pontosan kell kezelnie a hiányos utolsó
+csempét, és az írást globális indexellenőrzéssel kell védenie. A
+laborban érdemes többféle <code>n</code> értékkel futtatni, beleértve a
+<code>kTile - 4</code>, <code>kTile</code>, <code>kTile + 4</code> és
+<code>STAGES * kTile ± 4</code> méreteket is (az <code>n</code> 4-gyel
+osztható marad).</p></li>
+<li><p><strong>A túlzott mélység miatti
+occupancy-csökkenés.</strong><br />
+A mélyebb pipeline nagyobb shared memóriát foglal, ezért kevesebb blokk
+fér el SM-en. Ha a fogyasztói szakasz amúgy is sok szálat és regisztert
+használ, a mélység növelése akár lassulást is okozhat. A mérési naplóban
+ezért érdemes az occupancy, a shared memory és a regiszterhasználat
+értékeit is rögzíteni.</p></li>
+</ol>
+<h3 data-number="14.3.7"
+id="labor-két--és-többszintű-pipeline-mérése"><span
+class="header-section-number">14.3.7</span> Labor: két- és többszintű
+pipeline mérése</h3>
+<p>A labor célja, hogy a fenti mintát saját környezetben, ellenőrzött
+módon mérje. A teljes forrás három kernelt tartalmaz: egy szinkron
+baseline-t, valamint a fent bemutatott
+<code>pipelined_transform&lt;2&gt;</code> és
+<code>pipelined_transform&lt;3&gt;</code> példányt, CUDA event alapú
+időméréssel és CPU-referenciával. A programot a könyv írásakor nem
+fordítottuk és nem futtattuk. A kód nem tartalmaz valós hitelesítő
+adatot, és a futtatáshoz csak saját vagy engedélyezett GPU
+használható.</p>
+<pre class="cuda"><code>// pipeline_lab.cu  (CUDA C++17; nem futtatott kód)
+// Fordítás: nvcc -std=c++17 -O3 -arch=sm_&lt;CC&gt; -o pipeline_lab pipeline_lab.cu   (CC &gt;= 80)
+// Futtatás: timeout 300 ./pipeline_lab
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cuda_pipeline.h&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;cmath&gt;
+#include &lt;vector&gt;
+#include &lt;algorithm&gt;
+
+#define CUDA_CHECK(call)                                                      \
+    do {                                                                      \
+        cudaError_t err_ = (call);                                            \
+        if (err_ != cudaSuccess) {                                            \
+            std::fprintf(stderr, &quot;CUDA hiba %s:%d: %s\n&quot;, __FILE__, __LINE__,  \
+                         cudaGetErrorString(err_));                           \
+            std::exit(EXIT_FAILURE);                                          \
+        }                                                                     \
+    } while (0)
+
+constexpr int kTile = 2048;
+constexpr int kThreads = 256;
+
+__device__ __forceinline__ void issue_tile(float* dst, const float* in, int n, int tile) {
+    long long base = (long long)tile * kTile;
+    int valid = (int)min((long long)kTile, (long long)n - base);
+    for (int i = threadIdx.x * 4; i &lt; valid; i += blockDim.x * 4)
+        __pipeline_memcpy_async(dst + i, in + base + i, 16);
+}
+
+// Baseline: szinkron betöltés (global -&gt; regiszter -&gt; shared), grid-stride csempék
+__global__ void sync_transform(const float* __restrict__ input, float* __restrict__ output,
+                               int n, int work_per_element) {
+    __shared__ float buf[kTile];
+    const int total_tiles = (n + kTile - 1) / kTile;
+    for (int tile = blockIdx.x; tile &lt; total_tiles; tile += gridDim.x) {
+        long long base = (long long)tile * kTile;
+        int valid = (int)min((long long)kTile, (long long)n - base);
+        for (int i = threadIdx.x; i &lt; valid; i += blockDim.x) buf[i] = input[base + i];
+        __syncthreads();
+        for (int i = threadIdx.x; i &lt; valid; i += blockDim.x) {
+            float val = buf[i];
+            for (int w = 0; w &lt; work_per_element; ++w) val = fmaf(0.999f, val, 0.001f);
+            output[base + i] = val;
+        }
+        __syncthreads();
+    }
+}
+
+// Pipeline kernel: megegyezik a fenti szakaszban bemutatott sablonnal (STAGES = 2 és 3
+// példány).
+template &lt;int STAGES&gt;
+__global__ void pipelined_transform(const float* __restrict__ input,
+    float* __restrict__ output,
+                                    int n, int work_per_element) {
+    static_assert(STAGES &gt;= 2, &quot;legalább két puffer kell&quot;);
+    __shared__ __align__(16) float buf[STAGES][kTile];
+    const int total_tiles = (n + kTile - 1) / kTile;
+    if (blockIdx.x &gt;= total_tiles) return;
+    const int my_tiles = (total_tiles - blockIdx.x + gridDim.x - 1) / gridDim.x;
+    for (int p = 0; p &lt; STAGES - 1; ++p) {
+        if (p &lt; my_tiles) issue_tile(buf[p], input, n, blockIdx.x + p * gridDim.x);
+        __pipeline_commit();
+    }
+    for (int t = 0; t &lt; my_tiles; ++t) {
+        __pipeline_wait_prior(STAGES - 2);
+        __syncthreads();
+        int nt = t + STAGES - 1;
+        if (nt &lt; my_tiles) issue_tile(buf[nt % STAGES], input, n, blockIdx.x + nt * gridDim.x);
+        __pipeline_commit();
+        long long base = (long long)(blockIdx.x + t * gridDim.x) * kTile;
+        int valid = (int)min((long long)kTile, (long long)n - base);
+        for (int i = threadIdx.x; i &lt; valid; i += blockDim.x) {
+            float val = buf[t % STAGES][i];
+            for (int w = 0; w &lt; work_per_element; ++w) val = fmaf(0.999f, val, 0.001f);
+            output[base + i] = val;
+        }
+        __syncthreads();
+    }
+}
+
+using KernelFn = void (*)(const float*, float*, int, int);
+
+struct Case { const char* name; KernelFn fn; };
+
+float run_once(KernelFn fn, int grid, const float* d_in, float* d_out, int n, int w) {
+    fn&lt;&lt;&lt;grid, kThreads&gt;&gt;&gt;(d_in, d_out, n, w);
+    CUDA_CHECK(cudaGetLastError());
+    return 0.0f;
+}
+
+bool validate(const Case&amp; c, const std::vector&lt;float&gt;&amp; h_in, const float* d_in, float* d_out,
+              int n, int w, int grid) {
+    // NaN: a ki nem írt elem hibát ad
+    CUDA_CHECK(cudaMemset(d_out, 0xFF, (size_t)n * sizeof(float)));
+    run_once(c.fn, grid, d_in, d_out, n, w);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector&lt;float&gt; h_out(n);
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, (size_t)n * sizeof(float),
+        cudaMemcpyDeviceToHost));
+    for (int i = 0; i &lt; n; ++i) {
+        float ref = h_in[i];
+        for (int k = 0; k &lt; w; ++k) ref = std::fmaf(0.999f, ref, 0.001f);
+        if (!(std::fabs(h_out[i] - ref) &lt;= 1e-6f * std::max(1.0f, std::fabs(ref)))) {
+            std::fprintf(stderr, &quot;HIBA: %s n=%d i=%d: %g != %g\n&quot;, c.name, n, i, h_out[i],
+                ref);
+            return false;
+        }
+    }
+    return true;
+}
+
+int main() {
+    int dev = 0;
+    CUDA_CHECK(cudaGetDevice(&amp;dev));
+    cudaDeviceProp prop{};
+    CUDA_CHECK(cudaGetDeviceProperties(&amp;prop, dev));
+    std::printf(&quot;GPU: %s, cc %d.%d, SM: %d\n&quot;, prop.name, prop.major, prop.minor,
+        prop.multiProcessorCount);
+
+    const Case cases[] = {{&quot;sync&quot;, sync_transform},
+                          {&quot;2-stage&quot;, pipelined_transform&lt;2&gt;},
+                          {&quot;3-stage&quot;, pipelined_transform&lt;3&gt;}};
+
+    // 1. Helyesség: határesetek (n % 4 == 0), kis rács, hogy a blokkok több csempét is
+    // kapjanak
+    const int sizes[] = {4, kTile - 4, kTile, kTile + 4, 3 * kTile - 4, 3 * kTile,
+        3 * kTile + 4, 7 * kTile + 8};
+    const int max_n = 1 &lt;&lt; 23;                    // 32 MiB float
+    float *d_in, *d_out;
+    CUDA_CHECK(cudaMalloc(&amp;d_in, (size_t)max_n * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;d_out, (size_t)max_n * sizeof(float)));
+    std::vector&lt;float&gt; h_in(max_n);
+    for (int i = 0; i &lt; max_n; ++i) h_in[i] = (float)(i % 1000) * 0.001f;
+    CUDA_CHECK(cudaMemcpy(d_in, h_in.data(), (size_t)max_n * sizeof(float),
+        cudaMemcpyHostToDevice));
+    for (int n : sizes)
+        for (const Case&amp; c : cases)
+            if (!validate(c, h_in, d_in, d_out, n, 4, 3)) return EXIT_FAILURE;
+    std::printf(&quot;Helyesség: OK (%zu méret x %zu kernel)\n&quot;, sizeof(sizes) / sizeof(int),
+        sizeof(cases) / sizeof(Case));
+
+    // 2. Mérés: n = 2^23, work_per_element = 1, 16, 64, 256, 1024; warm-up 10, mérés 20
+    const int n = max_n;
+    const int grid = std::min((n + kTile - 1) / kTile, 4 * prop.multiProcessorCount);
+    for (int w : {1, 16, 64, 256, 1024}) {
+        for (const Case&amp; c : cases) {
+            cudaEvent_t a, b;
+            CUDA_CHECK(cudaEventCreate(&amp;a));
+            CUDA_CHECK(cudaEventCreate(&amp;b));
+            for (int i = 0; i &lt; 10; ++i) run_once(c.fn, grid, d_in, d_out, n, w);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            constexpr int kReps = 20;
+            double t[kReps], mean = 0.0, var = 0.0;
+            for (int i = 0; i &lt; kReps; ++i) {
+                CUDA_CHECK(cudaEventRecord(a));
+                run_once(c.fn, grid, d_in, d_out, n, w);
+                CUDA_CHECK(cudaEventRecord(b));
+                CUDA_CHECK(cudaEventSynchronize(b));
+                float ms = 0.0f;
+                CUDA_CHECK(cudaEventElapsedTime(&amp;ms, a, b));
+                t[i] = ms;
+                mean += ms;
+            }
+            mean /= kReps;
+            for (double x : t) var += (x - mean) * (x - mean);
+            std::vector&lt;double&gt; sorted(t, t + kReps);
+            std::sort(sorted.begin(), sorted.end());
+            double med = 0.5 * (sorted[kReps / 2 - 1] + sorted[kReps / 2]);
+            std::printf(&quot;work=%4d %-8s median=%.4f ms mean=%.4f ms std=%.4f ms &quot;
+                        &quot;BW(median)=%.1f GB/s\n&quot;, w, c.name, med, mean,
+                        std::sqrt(var / (kReps - 1)),
+                        2.0 * n * sizeof(float) / (med * 1e-3) / 1e9);
+            CUDA_CHECK(cudaEventDestroy(a));
+            CUDA_CHECK(cudaEventDestroy(b));
+        }
+    }
+    CUDA_CHECK(cudaFree(d_in));
+    CUDA_CHECK(cudaFree(d_out));
+    return 0;
+}</code></pre>
+<p>A mintakód a <code>pipelined_transform</code> kernelt is tartalmazza,
+hogy a fájl önállóan fordítható legyen; a helyességi tesztet
+(<code>validate</code>) a mérés előtt a program lefuttatja, a hibás
+kernel a mérés előtt leállítja a programot. A hozzáférés-ellenőrzéshez
+érdemes a <code>compute-sanitizer --tool racecheck</code> és
+<code>--tool memcheck</code> futtatása is a kis (n = 4 … 7·kTile+8)
+méretekre.</p>
+<h3 data-number="14.3.8" id="build-és-futtatás"><span
+class="header-section-number">14.3.8</span> Build és futtatás</h3>
+<p>A laborhoz CUDA 12.x toolkit és Compute Capability 8.0 vagy újabb GPU
+szükséges (sm_80 alatt a <code>cuda_pipeline.h</code> primitívek
+szinkron másolásra esnek vissza, így az átfedés nem mérhető). A
+fordítási parancs:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># pl. sm_80 (A100), sm_89 (RTX 4070)</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_<span class="op">&lt;</span>CC<span class="op">&gt;</span> pipeline_lab.cu <span class="at">-o</span> pipeline_lab</span></code></pre></div>
+<p>A futtatás előtt a GPU-t ellenőrizni kell:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> <span class="at">--query-gpu</span><span class="op">=</span>name,driver_version,power.limit <span class="at">--format</span><span class="op">=</span>csv</span></code></pre></div>
+<p>A program 10 bemelegítő iterációt, majd 20 mért ismétlést futtat, és
+a medián mellett az átlagot és a szórást is kiírja. A hibás vagy túl
+hosszú kernel futtatásához timeout-ot
+(<code>timeout 300 ./pipeline_lab</code>) és izolált környezetet kell
+biztosítani.</p>
+<h3 data-number="14.3.9" id="a-mérési-napló-sablonja"><span
+class="header-section-number">14.3.9</span> A mérési napló sablonja</h3>
+<p>Az alábbi napló kitöltendő sablon: a környezeti paramétereket a
+futtatáskor kell beírni.</p>
+<table>
+<thead>
+<tr>
+<th>Paraméter</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU</td>
+<td><code>&lt;kitöltendő&gt;</code></td>
+</tr>
+<tr>
+<td>Compute capability</td>
+<td><code>&lt;kitöltendő&gt;</code></td>
+</tr>
+<tr>
+<td>CUDA</td>
+<td><code>&lt;nvcc --version&gt;</code></td>
+</tr>
+<tr>
+<td>Driver</td>
+<td><code>&lt;nvidia-smi&gt;</code></td>
+</tr>
+<tr>
+<td>OS</td>
+<td><code>&lt;kitöltendő&gt;</code></td>
+</tr>
+<tr>
+<td>Power limit</td>
+<td><code>&lt;nvidia-smi&gt;</code></td>
+</tr>
+<tr>
+<td>ECC / MIG</td>
+<td><code>&lt;kitöltendő&gt;</code></td>
+</tr>
+<tr>
+<td>n</td>
+<td>2^23 float (32 MiB)</td>
+</tr>
+<tr>
+<td>kTile</td>
+<td>2048 float</td>
+</tr>
+<tr>
+<td>kThreads</td>
+<td>256</td>
+</tr>
+<tr>
+<td>work_per_element</td>
+<td>1, 16, 64, 256, 1024</td>
+</tr>
+<tr>
+<td>Ismétlések / warm-up</td>
+<td>20 / 10</td>
+</tr>
+</tbody>
+</table>
+<p>Várt (modellből számolt) alsó korlát: a kernel 32 MiB-ot olvas és
+ugyanennyit ír, azaz 64 MiB forgalmat mozgat, így a futásidő legalább
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>64</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">MiB</mtext><mi>/</mi><msub><mi>B</mi><mtext mathvariant="normal">peak</mtext></msub></mrow><annotation encoding="application/x-tex">64\ \text{MiB} / B_{\text{peak}}</annotation></semantics></math>;
+például ~504 GB/s adatlapi sávszélességnél
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>≈</mo><mn>0</mn><mo>,</mo><mn>13</mn></mrow><annotation encoding="application/x-tex">\approx 0{,}13</annotation></semantics></math>
+ms. Ennél gyorsabb mért idő mérési hibára utal.</p>
+<p><strong>Mért eredmények (kitöltendő; nem futtattuk):</strong></p>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr>
+<th style="text-align: right;">work_per_element</th>
+<th style="text-align: right;">Sync (ms, medián ± szórás)</th>
+<th style="text-align: right;">2-stage (ms, medián ± szórás)</th>
+<th style="text-align: right;">3-stage (ms, medián ± szórás)</th>
+<th style="text-align: right;">Effektív sávszélesség (GB/s) sync / 2 /
+3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">&lt;mért&gt;</td>
+<td style="text-align: right;">&lt;mért&gt;</td>
+<td style="text-align: right;">&lt;mért&gt;</td>
+<td style="text-align: right;">&lt;számolt&gt;</td>
+</tr>
+<tr>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">&lt;mért&gt;</td>
+<td style="text-align: right;">&lt;mért&gt;</td>
+<td style="text-align: right;">&lt;mért&gt;</td>
+<td style="text-align: right;">&lt;számolt&gt;</td>
+</tr>
+<tr>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">&lt;mért&gt;</td>
+<td style="text-align: right;">&lt;mért&gt;</td>
+<td style="text-align: right;">&lt;mért&gt;</td>
+<td style="text-align: right;">&lt;számolt&gt;</td>
+</tr>
+<tr>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">&lt;mért&gt;</td>
+<td style="text-align: right;">&lt;mért&gt;</td>
+<td style="text-align: right;">&lt;mért&gt;</td>
+<td style="text-align: right;">&lt;számolt&gt;</td>
+</tr>
+<tr>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">&lt;mért&gt;</td>
+<td style="text-align: right;">&lt;mért&gt;</td>
+<td style="text-align: right;">&lt;mért&gt;</td>
+<td style="text-align: right;">&lt;számolt&gt;</td>
+</tr>
+</tbody>
+</table>
+<p>A <strong>várt</strong> trend (nem mért): az aritmetikai intenzitás
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>I</mi><mo>=</mo><mi>w</mi><mi>/</mi><mn>4</mn></mrow><annotation encoding="application/x-tex">I = w/4</annotation></semantics></math>
+FLOP/bájt (elemenként 8 B forgalom és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mi>w</mi></mrow><annotation encoding="application/x-tex">2w</annotation></semantics></math>
+FLOP). A ridge point alatt (pl. A100-on
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>w</mi><mo>≲</mo><mn>50</mn></mrow><annotation encoding="application/x-tex">w \lesssim 50</annotation></semantics></math>,
+az adatlapból levezetett becslés, ellenőrzendő) a kernel DRAM-korlátos,
+a pipeline hatása kicsi vagy nincs; a ridge point környékén
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi>c</mi></msub><mo>≈</mo><msub><mi>T</mi><mi>m</mi></msub></mrow><annotation encoding="application/x-tex">T_c \approx T_m</annotation></semantics></math>)
+a legnagyobb; jóval felette a futásidőt a számítás határozza meg, így a
+pipeline kevésbé látszik. A ridge pointot a saját GPU adatlapjából kell
+kiszámolni. A mérési naplóban a mért és a várt eredményt külön kell
+jelölni.</p>
+<h3 data-number="14.3.10" id="a-mérés-értelmezése"><span
+class="header-section-number">14.3.10</span> A mérés értelmezése</h3>
+<p>A 2-stage változat az egyszerű szinkronhoz képest akkor gyorsul, ha a
+másolási időt sikerül a számítás alá rejteni. A 3-stage változat további
+kis gyorsulást adhat, de a nyereség csökkenő. A mérés során érdemes az
+<code>n</code> méretét is változtatni, mert kis méretnél a
+kernelindítási overhead dominál, nagy méretnél pedig a
+memória-sávszélesség telítődhet.</p>
+<p>A <code>cp.async</code> másolásoknak van egy minimális hasznos
+mérete. Kis csempéknél a másolásindítás és a szinkronizáció költsége
+nagyobb lehet, mint a megtakarított idő. A laborban érdemes a
+<code>kTile</code> értékét 256 és 4096 float között is változtatni (3
+stage esetén a statikus shared memória 48 KiB-os korlátját nem szabad
+túllépni), és a legjobb beállítást megkeresni.</p>
+<h3 data-number="14.3.11" id="opencl-és-jax-kitekintés"><span
+class="header-section-number">14.3.11</span> OpenCL és JAX
+kitekintés</h3>
+<p>A double buffering nem csak CUDA-specifikus. OpenCL C-ben a
+<code>async_work_group_copy</code> aszinkron másolást indít a global és
+a local memória között; a befejezést a visszaadott eseményre a
+<code>wait_group_events</code> hívással kell megvárni (a
+<code>barrier(CLK_LOCAL_MEM_FENCE)</code> a munkacsoport szinkronjához
+kiegészítésként kell, nem a másolás befejezését várja meg). A
+host-oldalon a <code>clEnqueueCopyBuffer</code> és a kernelek
+eseményekkel összekapcsolt parancssora a másolás és a kernel host-szintű
+átfedését teszi lehetővé; ez nem a munkacsoporton belüli pufferelés,
+hanem a parancsok közötti átfedés.</p>
+<p>JAX-ban a pipeline-t jellemzően az XLA fordító alakítja ki a fúziók
+és az ütemezés révén. Haladó esetben a
+<code>jax.experimental.pallas</code> explicit, kernel-szintű blokkolt
+hozzáférést (<code>BlockSpec</code>) és pipeline-t kínál; ennek
+részletei túlmutatnak ezen alfejezet keretein (a <code>jax.remat</code>
+/ <code>jax.checkpoint</code> nem pipeline, hanem memória és
+újraszámítás közötti kompromisszumot ad). A TPU/OpenCL példáknál fel
+kell tüntetni, ha a kód csak fordítási ellenőrzésen esett át, és nem
+futott valódi hardveren; ebben az alfejezetben OpenCL- és JAX-kód nem
+szerepel, csak dokumentációs szintű kitekintés.</p>
+<h3 data-number="14.3.12" id="ellenőrző-kérdések"><span
+class="header-section-number">14.3.12</span> Ellenőrző kérdések</h3>
+<ol type="1">
+<li>Melyik szinkronizációs pont mit véd egy kétpufferes pipeline
+iterációban, és mikor hagyható el a második?</li>
+<li>A 14.4 transzponáló kernele a következő csempe másolását a wait
+ELŐTT indítja, és <code>__pipeline_wait_prior(1)</code>-et hív. Miért 1
+ott, és miért 0 a 14.3.3 kétfokozatú kernelében? Mi történne, ha ott is
+0-t hívnánk?</li>
+<li>Hogyan változik a pipeline haszna, ha a számítási idő sokkal
+nagyobb, mint a másolási idő? Indokolja válaszát a
+<code>T_pipe ≈ max(T_c, T_m) + T_s</code> összefüggéssel.</li>
+</ol>
+<p>A válaszok ellenőrzéséhez a következő gondolatmenet használható. Az
+1. kérdésnél az első <code>__syncthreads()</code> (a
+<code>wait_prior</code> után) a másolások láthatóságát és – mivel a
+következő másolás csak utána indul – az előző puffer felszabadulását
+adja; az iteráció végi második ebben a sorrendben elhagyható, de
+kötelező, ha a következő csempe másolását a wait előtt indítjuk. A 2.
+kérdésnél a 14.4 kernelében a wait előtt már két csoport van lezárva (az
+aktuális és a frissen indított csempéé), ezért az 1 hagyja futni az
+újat; a 14.3.3 kernelében a wait az új másolás indítása előtt áll, ezért
+<code>STAGES - 2 = 0</code> a helyes érték. Ha a 14.4 kernelében is 0-t
+hívnánk, a <code>wait_prior(0)</code> minden befejezetlen másolást bevár
+(a frissen elindítottat is), ezért a másolás nem folyik a számítás
+alatt, és a pipeline elveszti az átfedési előnyét. A 3. kérdésnél a
+<code>max(T_c, T_m)</code> értékét a nagy számítási idő határozza meg,
+ezért a csővezeték nem tudja csökkenteni a teljes időt, mert a
+memóriaidő eltörpül a számítás mellett.</p>
+<h3 data-number="14.3.13" id="a-következő-lépés"><span
+class="header-section-number">14.3.13</span> A következő lépés</h3>
+<p>A 14.4 alfejezet a tiling és a pipeline hatását mérési protokollal és
+Nsight-metrikákkal vizsgálja egy mátrixtranszponálás naiv, csempézett és
+kétpufferes <code>cp.async</code> változatán, valamint a csempeméret
+hangolásával.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu051.html">← 14.2 Aszinkron másolás (cp.async)</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu053.html">14.4 Tiling és pipeline mérése →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

@@ -1,0 +1,983 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>26.1 Több GPU és peer access – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – CUDA-ökoszisztéma és mélytanulás</a> › <a href="index.html#gpuch25">26 Multi-GPU, NCCL, NVLink és unified memory</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu097.html">← 25.4 Aszinkron tervezési minták</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu099.html">26.2 NCCL és kollektív műveletek →</a></div>
+</nav>
+<h2 data-number="26.1" id="gpu098"><span
+class="header-section-number">26.1</span> Több GPU és peer access</h2>
+<p>Több GPU használata logikailag egyszerű lépésnek tűnik: „adok neki
+még egy eszközt, és kétszer gyorsabb leszek”. A gyakorlatban azonban a
+több GPU-s programozás első szintje a <em>per-device kontextus</em>, a
+<em>PCIe/NVLink topológia</em> és a <em>peer access</em> kérdése. Ha
+ezeket nem értjük pontosan, a második GPU hozzáadása akár lassulást is
+hozhat, mert a memóriamásolások rossz irányba mennek, vagy a kernelek
+egy nem kívánt eszközön futnak le.</p>
+<p>Ez az alfejezet a több GPU-s végrehajtás alapjait tanítja meg.
+Megismerjük a <code>cudaSetDevice</code> és a
+<code>cudaMemcpyPeer</code> alacsony szintű eszközeit, a peer access
+engedélyezésének feltételeit, valamint a topológia szerepét a másolási
+utak kiválasztásában. A fejezet zárásaként egy olyan labort építünk,
+amely két GPU-n peer-to-peer (P2P) másolást végez, összehasonlítja a P2P
+és a host-memórián keresztüli másolás sávszélességét, és mérési naplóban
+rögzíti az eredményt. A labor nem méri a több-GPU skálázást; a két GPU-s
+adatfelosztás kernelindítási mintáját a 26.1.1 vázlata mutatja, a
+kollektív műveleteket a következő alfejezet (26.2) tárgyalja.</p>
+<hr />
+<figure>
+<img src="assets/gpu098-diagram-1.png"
+alt="Négy GPU NVSwitch-en keresztül - Az NVLink/NVSwitch topológia nagy sávszélességű GPU-GPU kommunikációt ad; a peer access és a NCCL kollektívák ezt használják. A GPU-k a hosthoz kártyánként PCIe-n csatlakoznak, nem az NVSwitchen keresztül." />
+<figcaption aria-hidden="true">Négy GPU NVSwitch-en keresztül - Az
+NVLink/NVSwitch topológia nagy sávszélességű GPU-GPU kommunikációt ad; a
+peer access és a NCCL kollektívák ezt használják. A GPU-k a hosthoz
+kártyánként PCIe-n csatlakoznak, nem az NVSwitchen
+keresztül.</figcaption>
+</figure>
+<h3 data-number="26.1.1" id="a-több-gpu-s-végrehajtás-alapjai"><span
+class="header-section-number">26.1.1</span> A több GPU-s végrehajtás
+alapjai</h3>
+<p>A CUDA programozási modellben a host CPU egy vagy több
+CUDA-<em>eszközzel</em> rendelkezhet. Minden eszköznek saját globális
+memóriája, saját streamjei, saját kontextusa és saját hibaállapota van.
+A host oldali CUDA API hívások mindig egy <em>aktuális eszközre</em>
+vonatkoznak. Az aktuális eszköz kezdetben a <code>0</code> indexű
+eszköz, de bármikor átválthatunk egy másikra a
+<code>cudaSetDevice</code> hívással.</p>
+<p>A több GPU-s programok esetében három alapvető kérdést kell
+megválaszolni:</p>
+<ol type="1">
+<li><strong>Melyik eszközön fut a kernel?</strong> A kernel indítása
+mindig az aktuális eszközre vonatkozik.</li>
+<li><strong>Hol lakik a memória?</strong> A <code>cudaMalloc</code>
+mindig az aktuális eszközön foglal.</li>
+<li><strong>Hogyan mozgatunk adatot két eszköz között?</strong> Erre
+szolgál a <code>cudaMemcpyPeer</code>, amennyiben a peer access
+engedélyezett.</li>
+</ol>
+<p>Egy több GPU-s program váza a következő:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Fordító: nvcc -arch=native -std=c++20 multi_gpu_basic.cu -o multi_gpu_basic</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> deviceCount <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    cudaGetDeviceCount<span class="op">(&amp;</span>deviceCount<span class="op">);</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;CUDA devices: </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> deviceCount<span class="op">);</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. eszköz kiválasztása</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    cudaSetDevice<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ... itt minden a 0. eszközre vonatkozik</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. eszköz kiválasztása</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>    cudaSetDevice<span class="op">(</span><span class="dv">1</span><span class="op">);</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ... itt minden az 1. eszközre vonatkozik</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>cudaSetDevice</code> hívás hatása <em>azonnali</em> a host
+oldali API hívásokra. A már folyamatban lévő aszinkron műveletek a
+korábban kiválasztott eszközön folytatódnak, de a <em>következő</em> API
+hívás már az új eszközre vonatkozik.</p>
+<p>Egy kétGPU-s adatfelosztás kernelindítási mintája (vázlat, nem
+fordítva): a stream és az event ahhoz az eszközhöz tartozik, amelyen
+létrehoztuk, ezért a hozzájuk tartozó műveletek előtt a megfelelő
+eszközt kell aktuálissá tenni; egy másik eszköz streamjébe indított
+kernel hibát ad.</p>
+<pre class="cuda"><code>cudaStream_t st[2]; float *d_a[2], *d_b[2];
+const size_t half = n / 2;
+for (int d = 0; d &lt; 2; ++d) {
+    CUDA_CHECK(cudaSetDevice(d));               // minden eszközspecifikus hívás előtt
+    CUDA_CHECK(cudaStreamCreate(&amp;st[d]));       // a stream a d. eszközhöz tartozik
+    CUDA_CHECK(cudaMalloc(&amp;d_a[d], half * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;d_b[d], half * sizeof(float)));
+    CUDA_CHECK(cudaMemcpyAsync(d_a[d], h_a + d * half, half * sizeof(float),
+                               cudaMemcpyHostToDevice, st[d]));   // h_a: pinned
+    // ... kernel&lt;&lt;&lt;grid, block, 0, st[d]&gt;&gt;&gt;(d_a[d], d_b[d], half); ...
+}
+for (int d = 0; d &lt; 2; ++d) {
+    CUDA_CHECK(cudaSetDevice(d));
+    CUDA_CHECK(cudaStreamSynchronize(st[d]));
+}</code></pre>
+<p>Fontos különbség, hogy egy host szálon belül egyszerre csak egy
+aktuális eszköz van. Több host szál használata esetén minden szál a
+saját aktuális eszközével dolgozhat, de a CUDA API szálbiztonságosságára
+ügyelni kell: az egyes eszközök állapotai függetlenek, de a
+<code>cudaSetDevice</code> hívás egy host szálra érvényes, nem processz
+szintű.</p>
+<hr />
+<h3 data-number="26.1.2"
+id="eszközök-felderítése-és-tulajdonságaik"><span
+class="header-section-number">26.1.2</span> Eszközök felderítése és
+tulajdonságaik</h3>
+<p>Mielőtt peer access-t próbálunk engedélyezni, tudnunk kell, milyen
+eszközök állnak rendelkezésre, és milyen topológiában kapcsolódnak
+egymáshoz. A CUDA API erre két fontos eszközt ad: a
+<code>cudaGetDeviceProperties</code> és a
+<code>cudaDeviceGetP2PAttribute</code> hívásokat.</p>
+<p>A <code>cudaGetDeviceProperties</code> a <code>cudaDeviceProp</code>
+struktúrát tölti ki, amely tartalmazza az eszköz nevét, compute
+capability verzióját, órajelét, memóriaméretét, valamint a
+PCI-azonosítókat (<code>pciBusID</code>, <code>pciDeviceID</code>,
+<code>pciDomainID</code>). NVLink-kapcsolódási adatot a struktúra nem
+tartalmaz; ezt az <code>nvidia-smi topo -m</code> és az NVML (például
+<code>nvmlDeviceGetNvLinkState</code>,
+<code>nvmlDeviceGetTopologyCommonAncestor</code>) adja. A
+<code>cudaDeviceGetP2PAttribute</code> ezzel szemben konkrét P2P
+képességeket vizsgál:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string&gt;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUDA_CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp">                                                    </span><span class="op">\</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                                                    </span><span class="op">\</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span><span class="op">(</span>call<span class="op">);</span><span class="pp">                                           </span><span class="op">\</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                           </span><span class="op">\</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA error </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">,</span><span class="pp">   </span><span class="op">\</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="pp">                    </span>cudaGetErrorString<span class="op">(</span>err<span class="op">));</span><span class="pp">                               </span><span class="op">\</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                             </span><span class="op">\</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="op">}</span><span class="pp">                                                                   </span><span class="op">\</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> count <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaGetDeviceCount<span class="op">(&amp;</span>count<span class="op">));</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Eszkozok szama: </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> count<span class="op">);</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> count<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>        cudaDeviceProp prop<span class="op">{};</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaGetDeviceProperties<span class="op">(&amp;</span>prop<span class="op">,</span> i<span class="op">));</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;[</span><span class="sc">%d</span><span class="st">] </span><span class="sc">%s</span><span class="st"> | CC </span><span class="sc">%d</span><span class="st">.</span><span class="sc">%d</span><span class="st"> | PCIe bus=</span><span class="sc">%02x</span><span class="st"> device=</span><span class="sc">%02x\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>               i<span class="op">,</span> prop<span class="op">.</span>name<span class="op">,</span> prop<span class="op">.</span>major<span class="op">,</span> prop<span class="op">.</span>minor<span class="op">,</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>               prop<span class="op">.</span>pciBusID<span class="op">,</span> prop<span class="op">.</span>pciDeviceID<span class="op">);</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Peer access vizsgálat minden rendezett párra</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> count<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> j <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> j <span class="op">&lt;</span> count<span class="op">;</span> <span class="op">++</span>j<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>i <span class="op">==</span> j<span class="op">)</span> <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>            <span class="dt">int</span> canAccessPeer <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>            CUDA_CHECK<span class="op">(</span>cudaDeviceCanAccessPeer<span class="op">(&amp;</span>canAccessPeer<span class="op">,</span> i<span class="op">,</span> j<span class="op">));</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>            printf<span class="op">(</span><span class="st">&quot;P2P access </span><span class="sc">%d</span><span class="st"> -&gt; </span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> i<span class="op">,</span> j<span class="op">,</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a>                   canAccessPeer <span class="op">?</span> <span class="st">&quot;igen&quot;</span> <span class="op">:</span> <span class="st">&quot;nem&quot;</span><span class="op">);</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>cudaDeviceCanAccessPeer</code> a legegyszerűbb módja annak
+megállapítására, hogy két eszköz között lehetséges-e peer access. Ez
+azonban csak a <em>lehetőséget</em> vizsgálja, nem az aktuális
+engedélyezettséget. Az engedélyezéshez a
+<code>cudaDeviceEnablePeerAccess</code> API hívás szükséges.</p>
+<p>A peer access feltételei jellemzően a következők:</p>
+<p>A peer access nem a compute capability családtól függ, hanem a
+platformtól és a topológiától: a <code>cudaDeviceCanAccessPeer</code>
+(illetve a <code>cudaDeviceGetP2PAttribute</code>
+<code>cudaDevP2PAttrAccessSupported</code> attribútuma) adja meg, hogy
+az adott eszközpár között támogatott-e. A támogatást jellemzően
+befolyásoló tényezők (a pontos feltételeket a CUDA Programming Guide
+„Peer-to-Peer Memory Access” szakasza rögzíti):</p>
+<ol type="1">
+<li><strong>Fizikai topológia</strong>: közös PCIe switch/root complex
+vagy NVLink/NVSwitch kapcsolat; különböző host-hidak mögött lévő
+eszközökön a peer access gyakran nem támogatott.</li>
+<li><strong>Platformbeállítások</strong>: PCIe ACS, IOMMU/VT-d
+beállítások és a BIOS gyakran letiltják a P2P-t.</li>
+<li><strong>Virtualizáció és MIG</strong>: virtuális gépben,
+MIG-példányok között a peer access korlátozott vagy tiltott.</li>
+<li><strong>Operációs rendszer és driver</strong>: támogatnia kell a
+peer mappinget (Linux/Windows eltérések lehetségesek).</li>
+<li><strong>Eszközpár</strong>: nem minden GPU-kombináció támogatja; ezt
+mindig lekérdezéssel kell eldönteni, nem az azonos CC-család
+feltételezésével.</li>
+</ol>
+<p>A teljesítményre vonatkozó jellemzőt a
+<code>cudaDeviceGetP2PAttribute</code> adja:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> supported <span class="op">=</span> <span class="dv">0</span><span class="op">,</span> rank <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>CUDA_CHECK<span class="op">(</span>cudaDeviceGetP2PAttribute<span class="op">(&amp;</span>supported<span class="op">,</span> cudaDevP2PAttrAccessSupported<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">1</span><span class="op">));</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="co">// kisebb = jobb</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>CUDA_CHECK<span class="op">(</span>cudaDeviceGetP2PAttribute<span class="op">(&amp;</span>rank<span class="op">,</span> cudaDevP2PAttrPerformanceRank<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">1</span><span class="op">));</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>printf<span class="op">(</span><span class="st">&quot;0 -&gt; 1: access supported=</span><span class="sc">%d</span><span class="st">, performance rank=</span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> supported<span class="op">,</span> rank<span class="op">);</span></span></code></pre></div>
+<hr />
+<h3 data-number="26.1.3"
+id="a-cudamemcpypeer-és-a-peer-access-engedélyezése"><span
+class="header-section-number">26.1.3</span> A
+<code>cudaMemcpyPeer</code> és a peer access engedélyezése</h3>
+<p>A <code>cudaMemcpyPeer</code> két eszköz közötti közvetlen
+memóriamasolást végez. Alakja a következő:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="dt">cudaError_t</span> cudaMemcpyPeer<span class="op">(</span><span class="dt">void</span><span class="op">*</span> dst<span class="op">,</span> <span class="dt">int</span> dstDevice<span class="op">,</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>                           <span class="at">const</span> <span class="dt">void</span><span class="op">*</span> src<span class="op">,</span> <span class="dt">int</span> srcDevice<span class="op">,</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>                           <span class="dt">size_t</span> count<span class="op">);</span></span></code></pre></div>
+<p>A <code>dst</code> és <code>src</code> mutatók a megfelelő eszközök
+globális memóriájában érvényes <em>device pointerek</em>. A
+<code>count</code> bájtban értendő. A CUDA Runtime API leírása szerint a
+hívás a hosthoz képest aszinkron lehet, de sorosított az aktuális, a
+forrás- és a cél-eszközön kiadott összes függő és későbbi aszinkron
+munkával (a <code>cudaMemcpyPeerAsync</code> ezt a sorosítást elkerüli).
+Ha a hostnak biztosan meg kell várnia a másolást, szinkronizálni kell
+(<code>cudaDeviceSynchronize</code> mindkét érintett eszközön, vagy
+stream-szinkronizáció). A pontos dokumentációs megfogalmazást a használt
+CUDA-verzió leírásából kell ellenőrizni.</p>
+<p>Példa két eszköz közötti másolásra:</p>
+<pre class="cuda"><code>#include &lt;cuda_runtime.h&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;vector&gt;
+
+#define CUDA_CHECK(call)                                                    \
+    do {                                                                    \
+        cudaError_t err = (call);                                           \
+        if (err != cudaSuccess) {                                           \
+            fprintf(stderr, &quot;CUDA error %s:%d: %s\n&quot;, __FILE__, __LINE__,   \
+                    cudaGetErrorString(err));                               \
+            exit(EXIT_FAILURE);                                             \
+        }                                                                   \
+    } while (0)
+
+// Peer access engedélyezése: az ismételt engedélyezés cudaErrorPeerAccessAlreadyEnabled
+// hibát ad, amit nem kezelünk hibaként.
+static void enable_peer(int device, int peer) {
+    CUDA_CHECK(cudaSetDevice(device));
+    cudaError_t e = cudaDeviceEnablePeerAccess(peer, 0);
+    if (e == cudaErrorPeerAccessAlreadyEnabled) {
+        (void)cudaGetLastError();   // a hibaállapot törlése
+    } else {
+        CUDA_CHECK(e);
+    }
+}
+
+int main() {
+    const size_t N = 1 &lt;&lt; 22; // 4M float
+    const size_t bytes = N * sizeof(float);
+
+    // 0. eszköz allokáció
+    CUDA_CHECK(cudaSetDevice(0));
+    float* d0 = nullptr;
+    CUDA_CHECK(cudaMalloc(&amp;d0, bytes));
+    CUDA_CHECK(cudaMemset(d0, 0, bytes)); // inicializálás
+
+    // 1. eszköz allokáció
+    CUDA_CHECK(cudaSetDevice(1));
+    float* d1 = nullptr;
+    CUDA_CHECK(cudaMalloc(&amp;d1, bytes));
+    CUDA_CHECK(cudaMemset(d1, 0, bytes));
+
+    // Peer access engedélyezése 1 -&gt; 0 irányban (az 1. eszköz fér hozzá a 0. memóriájához).
+    // A cudaMemcpyPeer-hez ez NEM szükséges; a közvetlen kernelhozzáféréshez igen (lásd
+    // 26.1.4).
+    int canAccess = 0;
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&amp;canAccess, 1, 0));
+    if (canAccess) {
+        enable_peer(1, 0);
+        printf(&quot;Peer access 1 -&gt; 0 engedelyezve\n&quot;);
+    } else {
+        printf(&quot;Peer access 1 -&gt; 0 nem engedelyezheto\n&quot;);
+    }
+
+    // Másolás 0 -&gt; 1 (d0-ból d1-be)
+    CUDA_CHECK(cudaMemcpyPeer(d1, 1, d0, 0, bytes));
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    printf(&quot;Peer masolas kesz: %zu bájt\n&quot;, bytes);
+
+    CUDA_CHECK(cudaFree(d0));
+    CUDA_CHECK(cudaFree(d1));
+    return 0;
+}</code></pre>
+<p>A <code>cudaDeviceEnablePeerAccess</code> szignatúrája:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="dt">cudaError_t</span> cudaDeviceEnablePeerAccess<span class="op">(</span><span class="dt">int</span> peerDevice<span class="op">,</span> <span class="dt">unsigned</span> <span class="dt">int</span> flags<span class="op">);</span></span></code></pre></div>
+<p>A <code>peerDevice</code> annak az eszköznek az indexe, amelyikhez
+hozzáférést akarunk engedélyezni az aktuális eszközről. A
+<code>flags</code> jelenleg kötelezően <code>0</code>. A hívás előtt
+<code>cudaSetDevice</code>-szel ki kell választani azt az eszközt, amely
+<em>kezdeményezi</em> a hozzáférést. A fenti példában az 1. eszközről
+akarunk hozzáférni a 0. eszközhöz, ezért <code>cudaSetDevice(1)</code>
+után hívjuk meg a <code>cudaDeviceEnablePeerAccess(0, 0)</code>-t.</p>
+<p>Fontos aszimmetria: a peer access <em>engedélyezés</em> irányonként
+külön történik. Ha a 0. eszközről is hozzá akarunk férni az 1.
+eszközhöz, akkor <code>cudaSetDevice(0)</code> után
+<code>cudaDeviceEnablePeerAccess(1, 0)</code> is szükséges. Ez az
+aszimmetria gyakori hibaforrás.</p>
+<p>A <code>cudaMemcpyPeer</code> nem igényel peer access-t a
+<em>másolás</em> elvégzéséhez, csak a <em>közvetlen</em> P2P-másoláshoz.
+Ha a peer access nincs engedélyezve, a másolás akkor is lefut, de a
+driver a host memóriáján keresztül <em>staged copy</em>-ként hajtja
+végre (device→host→device), ami jelentős többletterheléssel jár. A
+<code>cudaMemcpyPeerAsync</code> streamhez kötött változat, amely
+lehetővé teszi a másolás és a kernel-végrehajtás átfedését.</p>
+<figure id="fig-gpu098-p2p-paths">
+<div class="fig-interactive"><iframe src="figures/html/gpu098-p2p-paths.html" title="Három azonos elrendezésű panel: felül CPU és host-memória, középen PCIe switch, alul GPU 0 és GPU 1 egy-egy 256 MiB-os pufferrel. (a) Egy számozott folytonos nyíl GPU 0-tól a switchen át GPU 1-ig, felirat: 1 átvitel, a PCIe 4.0 ×16 31,5 GB/s-ának 60–80%-a, 256 MiB körülbelül 11–14 ms. (b) Vastag NVLink-él közvetlenül a két GPU között, 12 link × 25 GB/s irányonként, körülbelül 0,9 ms. (c) Két számozott szaggatott nyíl: 1. GPU 0-tól a host-memóriába, 2. a host-memóriából GPU 1-be, felirat: 2 átvitel, körülbelül kétszeres idő. Alul: az 1 → 0 irány a cudaSetDevice(1) és cudaDeviceEnablePeerAccess(0, 0) hívással engedélyezhető, ekkor az 1. eszköz kernelje olvashatja a d0-t; a 0 → 1 irányhoz a cudaSetDevice(0) és cudaDeviceEnablePeerAccess(1, 0) kell." loading="lazy" style="width:100%;border:0;height:560px"></iframe><noscript><img src="figures/img/gpu098-p2p-paths.png" style="width:100.0%"
+alt="Három azonos elrendezésű panel: felül CPU és host-memória, középen PCIe switch, alul GPU 0 és GPU 1 egy-egy 256 MiB-os pufferrel. (a) Egy számozott folytonos nyíl GPU 0-tól a switchen át GPU 1-ig, felirat: 1 átvitel, a PCIe 4.0 ×16 31,5 GB/s-ának 60–80%-a, 256 MiB körülbelül 11–14 ms. (b) Vastag NVLink-él közvetlenül a két GPU között, 12 link × 25 GB/s irányonként, körülbelül 0,9 ms. (c) Két számozott szaggatott nyíl: 1. GPU 0-tól a host-memóriába, 2. a host-memóriából GPU 1-be, felirat: 2 átvitel, körülbelül kétszeres idő. Alul: az 1 → 0 irány a cudaSetDevice(1) és cudaDeviceEnablePeerAccess(0, 0) hívással engedélyezhető, ekkor az 1. eszköz kernelje olvashatja a d0-t; a 0 → 1 irányhoz a cudaSetDevice(0) és cudaDeviceEnablePeerAccess(1, 0) kell." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu098-p2p-paths.png" style="width:100.0%"
+alt="Három azonos elrendezésű panel: felül CPU és host-memória, középen PCIe switch, alul GPU 0 és GPU 1 egy-egy 256 MiB-os pufferrel. (a) Egy számozott folytonos nyíl GPU 0-tól a switchen át GPU 1-ig, felirat: 1 átvitel, a PCIe 4.0 ×16 31,5 GB/s-ának 60–80%-a, 256 MiB körülbelül 11–14 ms. (b) Vastag NVLink-él közvetlenül a két GPU között, 12 link × 25 GB/s irányonként, körülbelül 0,9 ms. (c) Két számozott szaggatott nyíl: 1. GPU 0-tól a host-memóriába, 2. a host-memóriából GPU 1-be, felirat: 2 átvitel, körülbelül kétszeres idő. Alul: az 1 → 0 irány a cudaSetDevice(1) és cudaDeviceEnablePeerAccess(0, 0) hívással engedélyezhető, ekkor az 1. eszköz kernelje olvashatja a d0-t; a 0 → 1 irányhoz a cudaSetDevice(0) és cudaDeviceEnablePeerAccess(1, 0) kell." /></details></div>
+<figcaption>A <code>cudaMemcpyPeer</code> adatútja: (a) engedélyezett
+peer access mellett közös PCIe switchen át egy átvitel, (b) NVLinken
+közvetlenül, (c) peer access nélkül a host-memórián át két átvitel (D2H,
+majd H2D), ezért nagyjából kétszeres idő; alul az irányonkénti
+engedélyezés. A sávszélességek elméleti/adatlap értékek, nem
+mérések.</figcaption>
+</figure>
+<hr />
+<h3 data-number="26.1.4"
+id="peer-access-kernelből-közvetlen-eszközhozzáférés"><span
+class="header-section-number">26.1.4</span> Peer access kernelből:
+közvetlen eszközhozzáférés</h3>
+<p>A peer access igazi ereje nem a <code>cudaMemcpyPeer</code>
+egyszerűbb hívásában van, hanem abban, hogy egy kernel <em>közvetlenül
+olvashat és írhat</em> egy másik eszköz globális memóriáját. Ezt a
+mechanizmust <em>peer device memory access</em>nek nevezzük. Ehhez a
+peer access-t előzetesen engedélyezni kell, a kernel pedig normál device
+pointerrel dolgozik, amelyet a másik eszközön foglaltunk le.</p>
+<p>Példa: az 1. eszközön futó kernel hozzáadja a 0. eszköz memóriájában
+lévő tömböt az 1. eszközön lévő tömbhöz.</p>
+<pre class="cuda"><code>__global__ void add_peer_kernel(const float* srcPeer, float* dstLocal, size_t n) {
+    size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx &lt; n) {
+        dstLocal[idx] += srcPeer[idx];
+    }
+}
+
+int main() {
+    const size_t N = 1 &lt;&lt; 20;
+    const size_t bytes = N * sizeof(float);
+
+    CUDA_CHECK(cudaSetDevice(0));
+    float* d0 = nullptr;
+    CUDA_CHECK(cudaMalloc(&amp;d0, bytes));
+    CUDA_CHECK(cudaMemset(d0, 1, bytes)); // minden byte 1, float érték itt nem fontos
+
+    CUDA_CHECK(cudaSetDevice(1));
+    float* d1 = nullptr;
+    CUDA_CHECK(cudaMalloc(&amp;d1, bytes));
+    CUDA_CHECK(cudaMemset(d1, 2, bytes));
+
+    // Peer access 1 -&gt; 0
+    int canAccess = 0;
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&amp;canAccess, 1, 0));
+    if (canAccess) {
+        // az 1. eszköz kernelje eléri a 0. eszköz memóriáját (enable_peer: 26.1.3)
+        enable_peer(1, 0);
+
+        // Kernel az 1. eszközön, de d0 a 0. eszközön van
+        int threads = 256;
+        int blocks = (N + threads - 1) / threads;
+        add_peer_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(d0, d1, N);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        printf(&quot;Peer kernel kesz\n&quot;);
+    } else {
+        printf(&quot;Peer access nem engedelyezheto, kernel nem indithato\n&quot;);
+    }
+
+    CUDA_CHECK(cudaFree(d0));
+    CUDA_CHECK(cudaFree(d1));
+    return 0;
+}</code></pre>
+<p>Ha a peer access nincs engedélyezve, a kernelből való közvetlen
+hozzáférés érvénytelen címre hivatkozik, és jellemzően hibával (például
+<code>cudaErrorIllegalAddress</code>) végződik. A
+<code>cudaDeviceCanAccessPeer</code> csak a képességet adja meg, a
+hozzáférést nem engedélyezi: a kernel indítása előtt a képességet le
+kell kérdezni, és a <code>cudaDeviceEnablePeerAccess</code>-t (a fenti
+<code>enable_peer</code> segédfüggvénnyel) meg kell hívni.</p>
+<hr />
+<h3 data-number="26.1.5" id="topológia-és-a-p2p-sávszélesség"><span
+class="header-section-number">26.1.5</span> Topológia és a
+P2P-sávszélesség</h3>
+<p>A peer access teljesítményét a két eszköz közötti fizikai kapcsolat
+határozza meg. A leggyakoribb topológiák:</p>
+<ol type="1">
+<li><p><strong>PCIe switch alatt közvetlenül</strong>: az eszközök
+ugyanazon PCIe switch alatt helyezkednek el. A P2P-másolás ilyenkor a
+switch-en keresztül történik, a host memória érintése nélkül. A
+sávszélesség a PCIe generációtól függ (PCIe 4.0 x16 ≈ 31,5 GB/s elméleti
+irányonként, de a gyakorlati P2P sávszélesség ennek 60–80%-a).</p></li>
+<li><p><strong>NVLink</strong>: bizonyos GPU-k (A100, H100, stb.)
+NVLink-kapcsolattal rendelkeznek, amely jóval nagyobb sávszélességet
+biztosít (az alábbi értékek a NVIDIA adatlapjai szerintiek,
+ellenőrizendők):</p>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr>
+<th>Generáció</th>
+<th>GPU</th>
+<th>Linkek száma</th>
+<th>GB/s linkenként, irányonként</th>
+<th>Összesen (kétirányú)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NVLink 3.0</td>
+<td>A100</td>
+<td>12</td>
+<td>25</td>
+<td>600 GB/s</td>
+</tr>
+<tr>
+<td>NVLink 4.0</td>
+<td>H100</td>
+<td>18</td>
+<td>25</td>
+<td>900 GB/s</td>
+</tr>
+</tbody>
+</table>
+<p>(A „link” nem azonos a „lane”-nel: a generációk közötti növekedést az
+NVLink 4.0-nál elsősorban a nagyobb linkszám adja.). Az NVLink
+P2P-másolás lényegesen gyorsabb, mint a PCIe-alapú.</p></li>
+<li><p><strong>Host bridge-en keresztül</strong>: ha a két eszköz
+különböző PCIe host bridge-en ül, a peer access gyakran nem
+engedélyezhető, vagy csak nagyon alacsony sávszélességgel működik.
+Ilyenkor a driver a host memórián keresztüli másolásra esik
+vissza.</p></li>
+<li><p><strong>NVSwitch</strong>: nagyobb rendszerekben (DGX, HGX) az
+összes GPU-t egy NVSwitch hálózat köti össze, ami teljes all-to-all
+NVLink sávszélességet biztosít.</p></li>
+</ol>
+<p>A teljes topológia lekérdezésére nincs egyetlen CUDA API; a
+parancssori <code>nvidia-smi topo -m</code> mátrix (PIX, PXB, PHB, NODE,
+SYS, NV# jelölésekkel) és az NVML adja a kapcsolatokat, a
+<code>cudaDeviceGetP2PAttribute</code> pedig az eszközpár P2P-jellemzőit
+(támogatás, teljesítmény-rang, atomi műveletek). A mátrix értelmezése:
+<code>NV#</code> NVLink-kapcsolat (a # a linkek száma), <code>PIX</code>
+közös PCIe switch, <code>PHB</code> közös host bridge, <code>SYS</code>
+a CPU-k közötti összeköttetésen átmenő út. A gyakorlatban a
+legegyszerűbb módszer egy benchmark futtatása: mérjük meg a P2P-másolás
+sávszélességét <code>cudaMemcpyPeer</code> hívással, és hasonlítsuk
+össze a host-memórián keresztüli másolás sávszélességével.</p>
+<p>Egy gyors P2P benchmark vázlata:</p>
+<pre class="cuda"><code>#include &lt;cuda_runtime.h&gt;
+#include &lt;algorithm&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;vector&gt;
+
+#define CUDA_CHECK(call)                                                    \
+    do {                                                                    \
+        cudaError_t err = (call);                                           \
+        if (err != cudaSuccess) {                                           \
+            fprintf(stderr, &quot;CUDA error %s:%d: %s\n&quot;, __FILE__, __LINE__,   \
+                    cudaGetErrorString(err));                               \
+            exit(EXIT_FAILURE);                                             \
+        }                                                                   \
+    } while (0)
+
+// Peer access engedélyezése (azonos a 26.1.3-ban megadottal): az ismételt
+// engedélyezés cudaErrorPeerAccessAlreadyEnabled hibáját nem kezeljük hibaként.
+static void enable_peer(int device, int peer) {
+    CUDA_CHECK(cudaSetDevice(device));
+    cudaError_t e = cudaDeviceEnablePeerAccess(peer, 0);
+    if (e == cudaErrorPeerAccessAlreadyEnabled) {
+        (void)cudaGetLastError();   // a hibaállapot törlése
+    } else {
+        CUDA_CHECK(e);
+    }
+}
+
+int main() {
+    const size_t N = 1 &lt;&lt; 26; // 64M float ≈ 256 MB
+    const size_t bytes = N * sizeof(float);
+    const int repeat = 20;
+
+    CUDA_CHECK(cudaSetDevice(0));
+    float* d0 = nullptr;
+    CUDA_CHECK(cudaMalloc(&amp;d0, bytes));
+    CUDA_CHECK(cudaMemset(d0, 0, bytes));
+
+    CUDA_CHECK(cudaSetDevice(1));
+    float* d1 = nullptr;
+    CUDA_CHECK(cudaMalloc(&amp;d1, bytes));
+    CUDA_CHECK(cudaMemset(d1, 0, bytes));
+
+    // Peer access engedélyezése mindkét irányban (enable_peer: lásd 26.1.3;
+    // az ismételt engedélyezés cudaErrorPeerAccessAlreadyEnabled hibáját kezeli)
+    int canAccess01 = 0, canAccess10 = 0;
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&amp;canAccess01, 0, 1));
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&amp;canAccess10, 1, 0));
+    if (canAccess01) enable_peer(0, 1);
+    if (canAccess10) enable_peer(1, 0);
+
+    // Másolás a célon létrehozott streamen, ugyanott rögzített eseménypárral
+    CUDA_CHECK(cudaSetDevice(1));
+    cudaStream_t s;
+    cudaEvent_t e0, e1;
+    CUDA_CHECK(cudaStreamCreate(&amp;s));
+    CUDA_CHECK(cudaEventCreate(&amp;e0));
+    CUDA_CHECK(cudaEventCreate(&amp;e1));
+
+    // Warm-up: 5 másolás
+    for (int i = 0; i &lt; 5; ++i) {
+        CUDA_CHECK(cudaMemcpyPeerAsync(d1, 1, d0, 0, bytes, s));
+        CUDA_CHECK(cudaStreamSynchronize(s));
+    }
+
+    // Mérés: ismétlésenként külön eseménypár, a medián és az IQR kerül kiírásra
+    std::vector&lt;float&gt; t(repeat);
+    for (int i = 0; i &lt; repeat; ++i) {
+        CUDA_CHECK(cudaEventRecord(e0, s));
+        CUDA_CHECK(cudaMemcpyPeerAsync(d1, 1, d0, 0, bytes, s));
+        CUDA_CHECK(cudaEventRecord(e1, s));
+        CUDA_CHECK(cudaEventSynchronize(e1));
+        CUDA_CHECK(cudaEventElapsedTime(&amp;t[i], e0, e1));
+    }
+    std::sort(t.begin(), t.end());
+    double medMs = 0.5 * (t[repeat / 2 - 1] + t[repeat / 2]);
+    double iqrMs = t[3 * repeat / 4] - t[repeat / 4];
+    double bw = (bytes / 1.0e9) / (medMs * 1e-3); // GB/s
+
+    printf(&quot;P2P masolas: %zu bájt, median ido: %.3f ms (IQR %.3f ms), &quot;
+           &quot;savszelesseg: %.2f GB/s\n&quot;,
+           bytes, medMs, iqrMs, bw);
+
+    CUDA_CHECK(cudaEventDestroy(e0));
+    CUDA_CHECK(cudaEventDestroy(e1));
+    CUDA_CHECK(cudaStreamDestroy(s));
+    CUDA_CHECK(cudaFree(d0));
+    CUDA_CHECK(cudaFree(d1));
+    return 0;
+}</code></pre>
+<p>Ez a benchmark a P2P-sávszélességet méri (a
+<code>cudaMemcpyPeer</code> a peer access engedélyezése nélkül is lefut,
+ezért a kimenet értelmezéséhez tudni kell, hogy a peer access
+engedélyezett-e). Ha a peer access nem engedélyezhető, a
+<code>cudaMemcpyPeer</code> automatikusan a host memóriáján keresztül
+másol, ami lényegesen alacsonyabb sávszélességet ad. A mért értékekből
+egyértelműen azonosítható, hogy a rendszer valódi P2P-t vagy visszaeső
+másolást végez-e.</p>
+<hr />
+<h3 data-number="26.1.6" id="labor-peer-access-és-p2p-másolás"><span
+class="header-section-number">26.1.6</span> Labor: peer access és P2P
+másolás</h3>
+<p>A labor célja egy teljes, futtatható CUDA program létrehozása, amely
+két GPU-n peer access-t engedélyez, P2P-másolást végez, valamint
+összehasonlítja a P2P-másolás és a host-memórián keresztüli másolás
+sávszélességét. A labor a korábbi ismeretekre épít, de nem igényel
+NCCL-t vagy kollektív műveleteket.</p>
+<h3 data-number="26.1.7" id="laborfeladat"><span
+class="header-section-number">26.1.7</span> Laborfeladat</h3>
+<p>Két GPU-t tartalmazó, MIG nélküli fizikai rendszeren (virtuális
+környezetben a P2P általában nem érhető el) írjunk CUDA C++ programot,
+amely:</p>
+<ol type="1">
+<li>Felderíti az eszközöket és a P2P-képességeiket.</li>
+<li>Engedélyezi a peer access-t minden lehetséges irányban.</li>
+<li>Lefoglal egy <code>float</code> tömböt mindkét eszközön.</li>
+<li>Végrehajt egy P2P-másolást <code>cudaMemcpyPeer</code>-rel, és méri
+a sávszélességet.</li>
+<li>Végrehajt egy host-memórián keresztüli másolást (Manuálisan:
+device→host→device) és méri annak sávszélességét.</li>
+<li>Összehasonlítja a két sávszélességet, és megállapítja, hogy a P2P
+valódi gyorsulást hoz-e.</li>
+</ol>
+<h3 data-number="26.1.8" id="a-teljes-laborprogram"><span
+class="header-section-number">26.1.8</span> A teljes laborprogram</h3>
+<pre class="cuda"><code>// File: p2p_lab.cu
+// Fordító: nvcc -arch=native -std=c++20 -O3 p2p_lab.cu -o p2p_lab
+// Futtatás: ./p2p_lab
+
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cstdio&gt;
+#include &lt;algorithm&gt;
+#include &lt;cstdlib&gt;
+#include &lt;vector&gt;
+
+#define CUDA_CHECK(call)                                                    \
+    do {                                                                    \
+        cudaError_t err = (call);                                           \
+        if (err != cudaSuccess) {                                           \
+            fprintf(stderr, &quot;CUDA error %s:%d: %s\n&quot;, __FILE__, __LINE__,   \
+                    cudaGetErrorString(err));                               \
+            exit(EXIT_FAILURE);                                             \
+        }                                                                   \
+    } while (0)
+
+// Peer access engedélyezése; az ismételt engedélyezés hibáját
+// (cudaErrorPeerAccessAlreadyEnabled) nem kezeljük hibaként
+static void enable_peer(int device, int peer) {
+    CUDA_CHECK(cudaSetDevice(device));
+    cudaError_t e = cudaDeviceEnablePeerAccess(peer, 0);
+    if (e == cudaErrorPeerAccessAlreadyEnabled) { (void)cudaGetLastError(); }
+    else { CUDA_CHECK(e); }
+}
+
+static void sync_both(int a, int b) {
+    CUDA_CHECK(cudaSetDevice(a)); CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaSetDevice(b)); CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+// Mérési segéd: a mintákból medián és IQR (ms)
+static void median_iqr(std::vector&lt;float&gt;&amp; t, double&amp; med, double&amp; iqr) {
+    std::sort(t.begin(), t.end());
+    size_t n = t.size();
+    med = 0.5 * (t[n / 2 - 1] + t[n / 2]);
+    iqr = t[3 * n / 4] - t[n / 4];
+}
+
+// P2P másolás benchmark: a célon létrehozott streamen, ugyanott rögzített eseménypárral
+void benchmark_p2p_copy(int srcDevice, int dstDevice, void* src, void* dst,
+                        size_t bytes, int repeat, double&amp; med, double&amp; iqr) {
+    CUDA_CHECK(cudaSetDevice(dstDevice));
+    cudaStream_t s;
+    cudaEvent_t e0, e1;
+    CUDA_CHECK(cudaStreamCreate(&amp;s));
+    CUDA_CHECK(cudaEventCreate(&amp;e0));
+    CUDA_CHECK(cudaEventCreate(&amp;e1));
+    for (int i = 0; i &lt; 5; ++i) { // warm-up
+        CUDA_CHECK(cudaMemcpyPeerAsync(dst, dstDevice, src, srcDevice, bytes, s));
+        CUDA_CHECK(cudaStreamSynchronize(s));
+    }
+    std::vector&lt;float&gt; t(repeat);
+    for (int i = 0; i &lt; repeat; ++i) {
+        CUDA_CHECK(cudaEventRecord(e0, s));
+        CUDA_CHECK(cudaMemcpyPeerAsync(dst, dstDevice, src, srcDevice, bytes, s));
+        CUDA_CHECK(cudaEventRecord(e1, s));
+        CUDA_CHECK(cudaEventSynchronize(e1));
+        CUDA_CHECK(cudaEventElapsedTime(&amp;t[i], e0, e1));
+    }
+    CUDA_CHECK(cudaEventDestroy(e0));
+    CUDA_CHECK(cudaEventDestroy(e1));
+    CUDA_CHECK(cudaStreamDestroy(s));
+    median_iqr(t, med, iqr);
+}
+
+// Host-stage másolás benchmark: d_src -&gt; h_stage (PINNED) -&gt; d_dst.
+// Pinned staging puffer: így a mért különbség a P2P és a host-úton történő másolás között
+// nem a lapozható memória driver-oldali többletmásolásából adódik.
+// A két aszinkron másolás ugyanazon a pinned pufferen fut: a D2H a forrás-, a H2D a
+// céleszköz streamjén, a kettőt egy esemény köti össze. A cudaEventElapsedTime csak
+// azonos eszközön rögzített események között értelmezett, ezért az eseménypár a
+// célstreamen van: e0 közvetlenül a D2H kiadása előtt, e1 a H2D után.
+void benchmark_host_stage_copy(int srcDevice, int dstDevice,
+                               void* d_src, void* d_dst, size_t bytes,
+                               int repeat, double&amp; med, double&amp; iqr) {
+    char* stage = nullptr;
+    CUDA_CHECK(cudaMallocHost(&amp;stage, bytes));
+    cudaStream_t sSrc, sDst;
+    cudaEvent_t eSrc, e0, e1;
+    CUDA_CHECK(cudaSetDevice(srcDevice));
+    CUDA_CHECK(cudaStreamCreate(&amp;sSrc));
+    CUDA_CHECK(cudaEventCreate(&amp;eSrc));
+    CUDA_CHECK(cudaSetDevice(dstDevice));
+    CUDA_CHECK(cudaStreamCreate(&amp;sDst));
+    CUDA_CHECK(cudaEventCreate(&amp;e0));
+    CUDA_CHECK(cudaEventCreate(&amp;e1));
+
+    auto once = [&amp;](bool timed) {
+        if (timed) CUDA_CHECK(cudaEventRecord(e0, sDst));
+        CUDA_CHECK(cudaMemcpyAsync(stage, d_src, bytes, cudaMemcpyDeviceToHost, sSrc));
+        CUDA_CHECK(cudaEventRecord(eSrc, sSrc));
+        CUDA_CHECK(cudaStreamWaitEvent(sDst, eSrc, 0));
+        CUDA_CHECK(cudaMemcpyAsync(d_dst, stage, bytes, cudaMemcpyHostToDevice, sDst));
+        if (timed) CUDA_CHECK(cudaEventRecord(e1, sDst));
+        CUDA_CHECK(cudaStreamSynchronize(sDst));
+    };
+
+    for (int i = 0; i &lt; 5; ++i) once(false);   // warm-up
+    std::vector&lt;float&gt; t(repeat);
+    for (int i = 0; i &lt; repeat; ++i) {
+        once(true);
+        CUDA_CHECK(cudaEventElapsedTime(&amp;t[i], e0, e1));
+    }
+
+    CUDA_CHECK(cudaEventDestroy(e0));
+    CUDA_CHECK(cudaEventDestroy(e1));
+    CUDA_CHECK(cudaStreamDestroy(sDst));
+    CUDA_CHECK(cudaSetDevice(srcDevice));
+    CUDA_CHECK(cudaEventDestroy(eSrc));
+    CUDA_CHECK(cudaStreamDestroy(sSrc));
+    CUDA_CHECK(cudaFreeHost(stage));
+    median_iqr(t, med, iqr);
+}
+
+int main() {
+    const size_t N = 1 &lt;&lt; 26;    // 64M float
+    const size_t bytes = N * sizeof(float);
+    const int repeat = 20;
+
+    // 1. Eszközök felderítése
+    int deviceCount = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&amp;deviceCount));
+    if (deviceCount &lt; 2) {
+        fprintf(stderr, &quot;Legalább 2 CUDA eszköz szükséges!\n&quot;);
+        return EXIT_FAILURE;
+    }
+    printf(&quot;Eszkozok szama: %d\n&quot;, deviceCount);
+
+    for (int i = 0; i &lt; deviceCount; ++i) {
+        cudaDeviceProp prop{};
+        CUDA_CHECK(cudaGetDeviceProperties(&amp;prop, i));
+        printf(&quot;[%d] %s | CC %d.%d | PCIe bus=%02x device=%02x\n&quot;,
+               i, prop.name, prop.major, prop.minor,
+               prop.pciBusID, prop.pciDeviceID);
+    }
+
+    // 2. P2P képesség vizsgálat
+    for (int i = 0; i &lt; deviceCount; ++i) {
+        for (int j = 0; j &lt; deviceCount; ++j) {
+            if (i == j) continue;
+            int canAccess = 0;
+            CUDA_CHECK(cudaDeviceCanAccessPeer(&amp;canAccess, i, j));
+            printf(&quot;P2P access %d -&gt; %d: %s\n&quot;, i, j,
+                   canAccess ? &quot;igen&quot; : &quot;nem&quot;);
+        }
+    }
+
+    // 3. Allokáció mindkét eszközön
+    CUDA_CHECK(cudaSetDevice(0));
+    float* d0 = nullptr;
+    CUDA_CHECK(cudaMalloc(&amp;d0, bytes));
+    // bájtonkénti inicializálás (a másolás sávszélességéhez az érték érdektelen)
+    CUDA_CHECK(cudaMemset(d0, 0, bytes));
+
+    CUDA_CHECK(cudaSetDevice(1));
+    float* d1 = nullptr;
+    CUDA_CHECK(cudaMalloc(&amp;d1, bytes));
+    CUDA_CHECK(cudaMemset(d1, 0, bytes));
+
+    // 4. Peer access engedélyezése
+    int canAccess01 = 0, canAccess10 = 0;
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&amp;canAccess01, 0, 1));
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&amp;canAccess10, 1, 0));
+
+    if (canAccess01) {
+        enable_peer(0, 1);
+        printf(&quot;Peer access 0 -&gt; 1 engedelyezve\n&quot;);
+    }
+    if (canAccess10) {
+        enable_peer(1, 0);
+        printf(&quot;Peer access 1 -&gt; 0 engedelyezve\n&quot;);
+    }
+
+    // 5. P2P benchmark. A cudaMemcpyPeer peer access nélkül is lefut (host-úton), ezért mindig
+    //    mérjük, de csak engedélyezett peer access esetén tekinthető közvetlen P2P-nek.
+    bool direct = canAccess01 &amp;&amp; canAccess10;
+    double p2pMs, p2pIqr;
+    benchmark_p2p_copy(0, 1, d0, d1, bytes, repeat, p2pMs, p2pIqr);
+    double p2pBw = (bytes / 1.0e9) / (p2pMs * 1e-3);
+    printf(&quot;\n%s masolas (cudaMemcpyPeerAsync): median %.3f ms (IQR %.3f ms), &quot;
+           &quot;savszelesseg: %.2f GB/s\n&quot;,
+           direct ? &quot;P2P&quot; : &quot;Nem kozvetlen (staged)&quot;, p2pMs, p2pIqr, p2pBw);
+
+    // 6. Host-stage benchmark
+    double hostMs, hostIqr;
+    benchmark_host_stage_copy(0, 1, d0, d1, bytes, repeat, hostMs, hostIqr);
+    double hostStageBw = (bytes / 1.0e9) / (hostMs * 1e-3);
+    printf(&quot;Host-stage masolas: median %.3f ms (IQR %.3f ms), savszelesseg: %.2f GB/s\n&quot;,
+           hostMs, hostIqr, hostStageBw);
+
+    // 7. Összehasonlítás
+    if (direct) {
+        double speedup = hostMs / p2pMs;
+        printf(&quot;\nP2P / host-stage gyorsulas: %.2fx\n&quot;, speedup);
+    }
+
+    CUDA_CHECK(cudaFree(d0));
+    CUDA_CHECK(cudaFree(d1));
+    return 0;
+}</code></pre>
+<h3 data-number="26.1.9" id="build-és-futtatás"><span
+class="header-section-number">26.1.9</span> Build és futtatás</h3>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Build (nvcc verziótól függően -arch=native vagy -arch=sm_80)</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-arch</span><span class="op">=</span>native <span class="at">-std</span><span class="op">=</span>c++20 <span class="at">-O3</span> p2p_lab.cu <span class="at">-o</span> p2p_lab</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Futtatás</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="ex">./p2p_lab</span></span></code></pre></div>
+<h3 data-number="26.1.10" id="mérési-napló-kitöltendő"><span
+class="header-section-number">26.1.10</span> Mérési napló
+(kitöltendő)</h3>
+<p>A labor nem került futtatásra, ezért a napló mért értéket nem
+tartalmaz; az alábbi minta a program kimenetének formátumát és a
+rögzítendő környezetet mutatja. A környezeti adatokat a hallgató a saját
+rendszeréről tölti ki (<code>nvidia-smi -q</code>,
+<code>nvidia-smi topo -m</code>).</p>
+<ul>
+<li>GPU: &lt;kitöltendő: modell és darabszám; példa: 2 × NVIDIA A10,
+compute capability 8.6, TDP 150 W&gt;</li>
+<li>Driver: &lt;kitöltendő&gt;</li>
+<li>CUDA: &lt;kitöltendő&gt;</li>
+<li>Operációs rendszer: &lt;kitöltendő&gt;</li>
+<li>PCIe/NVLink topológia: &lt;kitöltendő:
+<code>nvidia-smi topo -m</code> kimenete&gt;</li>
+<li>ECC: &lt;kitöltendő&gt;, MIG: &lt;kitöltendő&gt;, power limit:
+&lt;kitöltendő: <code>nvidia-smi -q -d POWER</code>&gt;</li>
+</ul>
+<p><strong>Kimenet (formátumminta, értékek kitöltendők):</strong></p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">Eszkozok</span> szama: 2</span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">[0]</span> <span class="op">&lt;</span>modell<span class="op">&gt;</span> <span class="kw">|</span> <span class="ex">CC</span> <span class="op">&lt;</span>x.y<span class="op">&gt;</span> <span class="kw">|</span> <span class="ex">PCIe</span> bus=<span class="op">&lt;</span>hex<span class="op">&gt;</span> device=<span class="op">&lt;</span>hex<span class="op">&gt;</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="ex">[1]</span> <span class="op">&lt;</span>modell<span class="op">&gt;</span> <span class="kw">|</span> <span class="ex">CC</span> <span class="op">&lt;</span>x.y<span class="op">&gt;</span> <span class="kw">|</span> <span class="ex">PCIe</span> bus=<span class="op">&lt;</span>hex<span class="op">&gt;</span> device=<span class="op">&lt;</span>hex<span class="op">&gt;</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="ex">P2P</span> access 0 <span class="at">-</span><span class="op">&gt;</span> 1: <span class="op">&lt;</span>igen/nem<span class="op">&gt;</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="ex">P2P</span> access 1 <span class="at">-</span><span class="op">&gt;</span> 0: <span class="op">&lt;</span>igen/nem<span class="op">&gt;</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="ex">Peer</span> access 0 <span class="at">-</span><span class="op">&gt;</span> 1 engedelyezve</span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="ex">Peer</span> access 1 <span class="at">-</span><span class="op">&gt;</span> 0 engedelyezve</span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="ex">P2P</span> masolas <span class="er">(</span><span class="ex">cudaMemcpyPeerAsync</span><span class="kw">)</span><span class="bu">:</span> median <span class="op">&lt;</span>mért<span class="op">&gt;</span> ms <span class="er">(</span><span class="ex">IQR</span> <span class="op">&lt;</span>kitöltendő<span class="op">&gt;</span> ms<span class="kw">)</span><span class="ex">,</span> sav: <span class="op">&lt;</span>mért<span class="op">&gt;</span> GB/s</span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a><span class="ex">Host-stage</span> masolas: median <span class="op">&lt;</span>mért<span class="op">&gt;</span> ms <span class="er">(</span><span class="ex">IQR</span> <span class="op">&lt;</span>kitöltendő<span class="op">&gt;</span> ms<span class="kw">)</span><span class="ex">,</span> sav: <span class="op">&lt;</span>mért<span class="op">&gt;</span> GB/s</span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a><span class="ex">P2P</span> / host-stage gyorsulas: <span class="op">&lt;</span>mért – kitöltendő<span class="op">&gt;</span>x</span></code></pre></div>
+<p>A sávszélességet a program <code>bytes / 1e9 / idő</code> képlettel
+számolja, ahol <code>bytes = 256 MiB ≈ 268,4 MB</code>; a naplóban
+szereplő értékeknek ezzel összhangban kell lenniük (például 268,4 MB 15
+ms alatt ≈ 17,9 GB/s).</p>
+<p><strong>Várt viselkedés (nem mérés):</strong></p>
+<p>A host-stage másolás két egymás utáni átvitelt jelent (D2H, majd
+H2D), ezért ugyanazon a PCIe-útvonalon a P2P-másoláshoz képest
+nagyságrendileg kétszeres idő várható (várt gyorsulás ≈ 2×, ha a P2P
+eléri a PCIe sávszélességét; ezt a hallgató méri). Mindkét útban a PCIe
+4.0 x16 elméleti sávszélessége ≈ 31,5 GB/s irányonként, a gyakorlati
+érték ennek 60–80%-a; NVLink esetén a P2P sávszélesség ennél lényegesen
+nagyobb lehet. A mérésben a staging puffer pinned, így a különbség a két
+útvonalból adódik, nem a lapozható memória többletmásolásából; érdemes
+külön sorban lapozható pufferrel is mérni.</p>
+<hr />
+<h3 data-number="26.1.11" id="tipikus-hibák-és-megoldásuk"><span
+class="header-section-number">26.1.11</span> Tipikus hibák és
+megoldásuk</h3>
+<p>A több GPU-s programozásban a leggyakoribb hibák a következők:</p>
+<ol type="1">
+<li><p><strong>Elfelejtett <code>cudaSetDevice</code> a
+<code>cudaMalloc</code> előtt.</strong> A <code>cudaMalloc</code> mindig
+a <em>aktuális</em> eszközön foglal. Ha a program az 1. eszközön akar
+foglalni, de a 0. eszköz van kiválasztva, a foglalás rossz eszközre
+kerül. <strong>Megoldás</strong>: minden eszközspecifikus API hívás
+előtt explicit <code>cudaSetDevice</code>.</p></li>
+<li><p><strong>Aszimmetrikus peer access engedélyezés.</strong> Ha a 0.
+eszközről az 1. eszközre akarunk másolni, de csak az 1. eszközről a 0.
+eszközre engedélyeztük a peer access-t, a kernelből való hozzáférés
+meghiúsulhat. <strong>Megoldás</strong>: mindkét irányban engedélyezzük
+a peer access-t, ha mindkét irányú hozzáférést használunk.</p></li>
+<li><p><strong>Peer access használata MIG esetén.</strong> MIG-példányok
+esetén a peer access gyakran nem támogatott, mert a memória izolált.
+<strong>Megoldás</strong>: ellenőrizzük a
+<code>cudaDeviceCanAccessPeer</code>-t, és a programot ennek megfelelően
+ágaztassuk.</p></li>
+<li><p><strong>Staged copy figyelmen kívül hagyása.</strong> Ha a peer
+access nem engedélyezett, a <code>cudaMemcpyPeer</code> továbbra is
+működik, de a host memóriáján keresztül. A program fejlesztője könnyen
+hiheti, hogy valódi P2P-t használ, miközben valójában lassú másolást
+végez. <strong>Megoldás</strong>: mindig mérjük a sávszélességet, és
+hasonlítsuk össze a várható P2P-sávszélességgel.</p></li>
+<li><p><strong>Kernelből való peer hozzáférés engedélyezés
+nélkül.</strong> A <code>cudaDeviceCanAccessPeer</code> csak a
+képességet adja meg, nem véd; engedélyezés nélkül a kernel érvénytelen
+címhez fér hozzá (jellemzően <code>cudaErrorIllegalAddress</code>).
+<strong>Megoldás</strong>: a képesség lekérdezése után a
+<code>cudaDeviceEnablePeerAccess</code> hívása (az
+<code>cudaErrorPeerAccessAlreadyEnabled</code> kezelésével).</p></li>
+</ol>
+<hr />
+<h3 data-number="26.1.12" id="gyakorlati-ellenőrzőlista"><span
+class="header-section-number">26.1.12</span> Gyakorlati
+ellenőrzőlista</h3>
+<p>Mielőtt egy több GPU-s programot éles környezetben futtatnánk,
+érdemes a következő lépéseket végigjárni:</p>
+<ol type="1">
+<li><strong>Eszközök száma és típusa</strong>:
+<code>cudaGetDeviceCount</code> és <code>cudaGetDeviceProperties</code>
+lekérdezés.</li>
+<li><strong>P2P képesség</strong>: <code>cudaDeviceCanAccessPeer</code>
+minden irányban.</li>
+<li><strong>Peer access engedélyezés</strong>:
+<code>cudaSetDevice</code> + <code>cudaDeviceEnablePeerAccess</code>
+minden szükséges irányban.</li>
+<li><strong>Allokációk ellenőrzése</strong>: minden
+<code>cudaMalloc</code> előtt <code>cudaSetDevice</code> a megfelelő
+eszközre.</li>
+<li><strong>Másolási stratégia</strong>: P2P használata, ha lehetséges;
+különben host-stage copy.</li>
+<li><strong>Sávszélesség mérése</strong>: P2P és host-stage
+összehasonlítása a tényleges nyereség igazolására.</li>
+<li><strong>Hibakezelés</strong>: minden API hívás ellenőrzése
+<code>CUDA_CHECK</code> makróval.</li>
+<li><strong>Izolált környezet és hibaellenőrzés</strong>: a hibás
+P2P-használat a kernel futását hibával állíthatja le, ezért a
+kernelindítás után <code>cudaGetLastError</code>, a szinkronizálás után
+(az érintett eszközökön) <code>cudaDeviceSynchronize</code> visszatérési
+értékének ellenőrzése kötelező.</li>
+</ol>
+<hr />
+<h3 data-number="26.1.13" id="összefoglalás"><span
+class="header-section-number">26.1.13</span> Összefoglalás</h3>
+<p>A több GPU-s végrehajtás alapja a <em>per-device kontextus</em>:
+minden API hívás az aktuális eszközre vonatkozik, amit
+<code>cudaSetDevice</code>-szel választhatunk meg. A két eszköz közötti
+adatmozgatásra a <code>cudaMemcpyPeer</code> szolgál, amely valódi
+P2P-másolást végez, ha a peer access engedélyezett. A peer access
+engedélyezése a <code>cudaDeviceEnablePeerAccess</code> hívással
+történik, irányonként külön-külön. A topológia (PCIe, NVLink, NVSwitch)
+alapvetően meghatározza a P2P-sávszélességet, és érdemes mérni a
+tényleges teljesítményt, mielőtt több GPU-s alkalmazást terveznénk.</p>
+<p>A következő alfejezet (26.2) erre az alapra épít, és bemutatja az
+NCCL-könyvtárat, amely a kollektív műveletek (allreduce, broadcast,
+allgather) hatékony, topológia-tudatos megvalósítását biztosítja több
+GPU között. Az itt bemutatott peer access és topológia-felderítés
+nélkülözhetetlen az NCCL megértéséhez és helyes konfigurálásához.</p>
+<hr />
+<h3 data-number="26.1.14" id="ellenőrző-kérdések"><span
+class="header-section-number">26.1.14</span> Ellenőrző kérdések</h3>
+<ol type="1">
+<li>Mi a különbség a <code>cudaMemcpyPeer</code> és a
+<code>cudaMemcpy</code> viselkedése között, ha a peer access nincs
+engedélyezve?</li>
+<li>Miért kell <code>cudaSetDevice</code>-t hívni a
+<code>cudaMalloc</code> előtt, és mi történik, ha elmarad?</li>
+<li>Hogyan befolyásolja a topológia (PCIe vs. NVLink) a P2P-másolás
+sávszélességét?</li>
+<li>Miért aszimmetrikus a <code>cudaDeviceEnablePeerAccess</code>
+hatása, és hogyan kell kezelni ezt a programban?</li>
+<li>Milyen kockázata van annak, ha kernelből peer hozzáférést használunk
+a <code>cudaDeviceCanAccessPeer</code> ellenőrzése és a
+<code>cudaDeviceEnablePeerAccess</code> hívása nélkül?</li>
+</ol>
+<p>Megoldókulcs (röviden):</p>
+<ol type="1">
+<li>Peer access nélkül a <code>cudaMemcpyPeer</code> is lefut, de a
+driver a host memóriáján keresztül másol (staged); a
+<code>cudaMemcpy</code> ezzel szemben a pointerekből (UVA,
+<code>cudaMemcpyDefault</code>) következtethet az irányra, de a két
+eszköz közötti másolásnál a <code>cudaMemcpyPeer</code> explicit
+eszközazonosítókat vár. Unified Virtual Addressing esetén a
+<code>cudaMemcpyDefault</code> is képes eszközök közötti másolásra.</li>
+<li>A <code>cudaMalloc</code> az aktuális eszközön foglal;
+<code>cudaSetDevice</code> nélkül a puffer a 0. (vagy a legutóbb
+kiválasztott) eszközre kerül, és a későbbi kernel- vagy másolási hívás
+hibás vagy lassú lesz.</li>
+<li>PCIe-n a P2P sávszélesség a PCIe-generációtól és -szélességtől függ
+(PCIe 4.0 x16 ≈ 31,5 GB/s irányonként), NVLink-en lényegesen nagyobb
+(A100: 12 link × 25 GB/s irányonként); NVSwitch teljes all-to-all
+kapcsolatot ad.</li>
+<li>Az engedélyezés irányonként külön hívás (az aktuális eszköz kap
+hozzáférést a peerhez); mindkét irányú hozzáféréshez mindkét irányban
+meg kell hívni.</li>
+<li>Érvénytelen címhivatkozás, kernelhiba
+(<code>cudaErrorIllegalAddress</code>), a program leállása; a képesség
+lekérdezése nélkül ráadásul a kód nem támogatott eszközpáron nem
+hordozható.</li>
+</ol>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu097.html">← 25.4 Aszinkron tervezési minták</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu099.html">26.2 NCCL és kollektív műveletek →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

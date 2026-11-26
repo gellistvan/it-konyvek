@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>26.4 Unified memory és MIG – GPGPU – általános célú számítások
+GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – CUDA-ökoszisztéma és mélytanulás</a> › <a href="index.html#gpuch25">26 Multi-GPU, NCCL, NVLink és unified memory</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu100.html">← 26.3 NVLink, NVSwitch és GPUDirect</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu102.html">27.1 TPU-architektúra →</a></div>
+</nav>
+<h2 data-number="26.4" id="gpu101"><span
+class="header-section-number">26.4</span> Unified memory és MIG</h2>
+<p>A 26.3-ban megismert több GPU-s adatcsere, NVLink és GPUDirect után
+most egy másik fajta absztrakció felé fordulunk: az egységes memória
+(unified memory, UM) és a többpéldányos GPU (Multi-Instance GPU, MIG)
+felé. Mindkettő a memóriakezelés, illetve az erőforrások felosztásának
+kérdését helyezi más megvilágításba. Az UM azt a célt szolgálja, hogy a
+CPU és a GPU ugyanazt a pointert használhassa anélkül, hogy explicit
+<code>cudaMemcpy</code> hívásokat kellene írni. A MIG pedig azt teszi
+lehetővé, hogy egyetlen fizikai GPU több, hardveresen izolált, önálló
+CUDA-eszközként megjelenő részre legyen osztva. Ebben az alfejezetben a
+két fogalmat a gyakorlati oldalról is megvizsgáljuk, és egy olyan labort
+építünk, amely a managed memória migrációs viselkedését méri.</p>
+<p>A CUDA C++ példák C++17 szabvány szerint íródnak. A bemutatott API-k
+verziófüggők, ezért éles környezetben mindig ellenőrizni kell a CUDA
+Toolkit, a driver és a hardver dokumentációját. A laborban a környezetet
+rögzíteni kell, ahogyan azt a könyv mérési szerződése előírja.</p>
+<h3 data-number="26.4.1" id="a-managed-memória-alapjai"><span
+class="header-section-number">26.4.1</span> A managed memória
+alapjai</h3>
+<p>A klasszikus CUDA-programozásban a host és a device memóriája
+fizikailag különálló. A host oldalon <code>malloc</code> vagy
+<code>new</code> által lefoglalt memóriát előbb
+<code>cudaMemcpy</code>-vel át kell másolni a <code>cudaMalloc</code>
+által lefoglalt device-oldalra, majd a kernel futtatása után vissza. Ez
+a modell rendkívül hatékony, ha a másolásokat tudatosan tervezzük,
+ugyanakkor megnehezíti a bonyolult adatszerkezetek, pointereket
+tartalmazó gráfok vagy ritkán hozzáfért adatok kezelését.</p>
+<p>A CUDA 6 óta elérhető <em>managed memory</em> – gyakran <em>unified
+memory</em> néven is emlegetve – ezt a határt próbálja eltüntetni. A
+<code>cudaMallocManaged</code> által visszaadott pointer a CPU és a GPU
+számára is érvényes. Ugyanazt a pointert használhatjuk host-oldali
+inicializálásra és kernelbeli olvasásra:</p>
+<pre class="cuda"><code>float *a, *b, *c;
+size_t bytes = n * sizeof(float);
+
+CUDA_CHECK(cudaMallocManaged(&amp;a, bytes));
+CUDA_CHECK(cudaMallocManaged(&amp;b, bytes));
+CUDA_CHECK(cudaMallocManaged(&amp;c, bytes));
+
+for (int i = 0; i &lt; n; ++i) {
+    a[i] = 1.0f;
+    b[i] = 2.0f;
+}
+
+vectorAdd&lt;&lt;&lt;grid, block&gt;&gt;&gt;(a, b, c, n);
+CUDA_CHECK(cudaDeviceSynchronize());</code></pre>
+<p>A fenti kódban nincs explicit <code>cudaMemcpy</code>. A host
+inicializálja az <code>a</code> és <code>b</code> tömböket, a kernel
+pedig ugyanezekkel a pointerekkel számol. A látszólagos egyszerűség
+mögött egy lapalapú (page-based) migrációs mechanizmus dolgozik.</p>
+<p>Fontos megkülönböztetni a managed memoryt a <em>zero-copy</em> vagy
+<em>pinned mapped</em> memóriától. A zero-copy memória a host memóriában
+marad, és a kernel minden hozzáférésnél a PCIe/NVLink sávon keresztül
+olvas, ami nagy adatmennyiségnél jelentős késleltetést okoz. A managed
+memory ezzel szemben fizikailag a host vagy a device memóriájában is
+lehet, és a futásidő a hozzáféréstől függően migráltatja a lapokat. A
+cél az, hogy az adat éppen ott legyen, ahol a számítás történik.</p>
+<p>A managed memory előnyei tehát a következők:</p>
+<ul>
+<li>egyszerűbb programozási modell, nincs szükség kézi másolásra;</li>
+<li>a CUDA runtime kezeli az adatmozgatást;</li>
+<li>pointereket tartalmazó adatszerkezetek, linked listák, fák és gráfok
+esetén ugyanaz a pointer érvényes a host és a device oldalon, így nem
+kell a pointereket átfordítani (a migráció lapalapú, a pointereket nem
+„követi”);</li>
+<li>a GPU-memória túlfoglalása (oversubscription) támogatott: a managed
+allokáció nagyobb lehet a GPU fizikai memóriájánál (Pascal, CC ≥ 6.0,
+Linux);</li>
+<li>a kód könnyebben portolható a CPU-s és GPU-s verziók között.</li>
+</ul>
+<p>A hátrányai sem elhanyagolhatók. Az automatikus migráció láthatatlan
+költségeket vezet be: ha a kernel olyan laphoz fér hozzá, amely éppen a
+host memóriában van, a hibázó warp(ok) várakoznak, amíg a driver
+átmásolja a lapot a device memóriába, majd a végrehajtás folytatódik. Ez
+a <em>page fault</em> mechanizmus sok apró másolást eredményezhet, ami
+különösen a kernel első futtatásakor, illetve szabálytalan hozzáférési
+mintáknál lassíthat. A lapmigrációk nyomon követése és optimalizálása a
+fejlesztő feladata.</p>
+<h3 data-number="26.4.2" id="page-fault-prefetch-és-migration"><span
+class="header-section-number">26.4.2</span> Page fault, prefetch és
+migration</h3>
+<p>A managed memory működésének megértéséhez a virtual memory és a page
+fault fogalmából kell kiindulni. A CUDA managed memory esetében az
+operációs rendszer és a driver közösen kezeli a virtuális címtartományt.
+Amikor a CPU vagy a GPU hozzáfér egy olyan memórialaphoz, amely nincs a
+megfelelő fizikai memóriában, a hardver page faultot vált ki. A driver
+ezt elkapja, és a lapot átmásolja a hozzáférő processzorhoz tartozó
+memóriába. A kernel futása ezalatt szünetel, majd a hozzáférés
+újraindul.</p>
+<p>Ez a mechanizmus két dolgot jelent. Egyrészt a managed memory
+<em>kényelmes</em>, mert a hozzáférés oldala és a fizikai elhelyezés
+közötti eltérést a rendszer automatikusan kezeli. Másrészt a page
+faultok <em>költségesek</em>, mert minden egyes lapmigráció során a
+streaming multiprocessorok várakoznak, és a PCIe vagy NVLink
+sávszélessége nem használható ki hatékonyan, ha kis méretű, szétszórt
+lapokat kell mozgatni.</p>
+<p>A legfontosabb optimalizáló eszköz a
+<code>cudaMemPrefetchAsync</code>. Ez a hívás előre jelzi a futásidőnek,
+hogy egy adott tartomány melyik eszköz memóriájában legyen elérhető. A
+tipikus minta az, hogy a kernel indítása előtt a bemeneti adatokat a
+GPU-ra, a kernel után pedig a kimenetet vissza a CPU-ra
+prefetch-eljük:</p>
+<pre class="cuda"><code>CUDA_CHECK(cudaMemPrefetchAsync(a, bytes, device, 0));
+CUDA_CHECK(cudaMemPrefetchAsync(b, bytes, device, 0));
+CUDA_CHECK(cudaMemPrefetchAsync(c, bytes, device, 0));
+vectorAdd&lt;&lt;&lt;grid, block&gt;&gt;&gt;(a, b, c, n);
+CUDA_CHECK(cudaDeviceSynchronize());
+CUDA_CHECK(cudaMemPrefetchAsync(c, bytes, cudaCpuDeviceId, 0));
+CUDA_CHECK(cudaDeviceSynchronize());</code></pre>
+<p>A <code>device</code> a GPU device ID, a <code>cudaCpuDeviceId</code>
+pedig a CPU-t jelöli. A hívás aszinkron, ezért megfelelő stream esetén
+átfedhető a számítással, de itt az egyszerűség kedvéért
+szinkronizálunk.</p>
+<p>A prefetch mellett a <code>cudaMemAdvise</code> is fontos szerepet
+játszik. Ez nem mozgat adatot, hanem tanácsokat ad a futásidőnek a
+hozzáférési mintáról. Például:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>CUDA_CHECK<span class="op">(</span>cudaMemAdvise<span class="op">(</span>a<span class="op">,</span> bytes<span class="op">,</span> cudaMemAdviseSetReadMostly<span class="op">,</span> device<span class="op">));</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>CUDA_CHECK<span class="op">(</span>cudaMemAdvise<span class="op">(</span>b<span class="op">,</span> bytes<span class="op">,</span> cudaMemAdviseSetPreferredLocation<span class="op">,</span> device<span class="op">));</span></span></code></pre></div>
+<p>A <code>cudaMemAdviseSetReadMostly</code> azt jelzi, hogy az adatot
+többnyire olvassák: olvasáskor a driver a hozzáférő processzoron csak
+olvasható másolatot hoz létre, így több eszközön is lehet egy-egy
+példány. Ha bármelyik processzor ír a tartományba, az összes többi
+másolat érvénytelenítődik, ezért gyakran írt adatra a tanács káros. A
+<code>cudaMemAdviseSetPreferredLocation</code> azt mondja, hogy az adat
+ideális esetben melyik eszközön legyen. A
+<code>cudaMemAdviseSetAccessedBy</code> azt jelzi, hogy egy adott eszköz
+hozzá fog férni az adathoz, ezért a rendszer előre beállítja annak
+címtér-leképezését (mapping), így az eszköz page fault nélkül, távolról
+(peer/host felől) is elérheti az adatot; másolatot a
+<code>SetReadMostly</code> hoz létre. Ezek a tanácsok optimalizálási
+lehetőséget adnak, de nem garantálják a pontos viselkedést.</p>
+<p><strong>Előfeltételek.</strong> A lapalapú, igény szerinti migráció
+és a túlfoglalás Pascal (CC ≥ 6.0) vagy újabb GPU-n és Linuxon érhető
+el; régebbi GPU-n vagy Windowson a teljes allokáció migrál a
+kernelindításkor. Ezt a <code>cudaDevAttrConcurrentManagedAccess</code>
+attribútum lekérdezésével lehet ellenőrizni. CUDA 12.2-től, megfelelő
+rendszeren (HMM) a rendszer által allokált memória (<code>malloc</code>)
+is használható a GPU-n; ez a fejezet a <code>cudaMallocManaged</code>-re
+koncentrál. A <code>cudaMemPrefetchAsync</code> szignatúrája CUDA 13-ban
+megváltozott (<code>cudaMemLocation</code> paraméter); az itt bemutatott
+alak a CUDA 12.x API-t követi.</p>
+<p>A managed memory migrációjának mérésekor fontos megkülönböztetni a
+<em>hideg</em> és a <em>meleg</em> hozzáférést. A hideg hozzáférés az,
+amikor a lap még soha nem volt a device memóriában, így az első
+kernelindítás során a teljes adatmennyiséget át kell másolni. A meleg
+hozzáférés esetén a lap már a device memóriában van, így a kernel csak a
+tényleges számítást végzi. A prefetch célja éppen az, hogy a hideg
+hozzáférést a kernel előtt hajtsa végre, és a kernel már meleg adaton
+dolgozhasson.</p>
+<figure id="fig-gpu101-um-lapok">
+<div class="fig-interactive"><iframe src="figures/html/gpu101-um-lapok.html" title="Öt panel, mindegyikben CPU- és GPU-oszlop, az a, b, c tömbök 8 darab 2 MiB-os blokkjával. 1. host init: a és b a CPU-n, c-nek nincs lapja. 2. hideg kernel: a és b blokkjai page faulttal a GPU-ra kerülnek, c a GPU-n jön létre. 3. host ellenőrzés: c faultokkal a CPU-ra kerül. 4. prefetch: a és b fault nélkül a GPU-n, c a CPU-n marad. 5. meleg kernel: c blokkjai faulttal visszavándorolnak a GPU-ra. Alul szemléltető idővonal." loading="lazy" style="width:100%;border:0;height:640px"></iframe><noscript><img src="figures/img/gpu101-um-lapok.png" style="width:100.0%"
+alt="Öt panel, mindegyikben CPU- és GPU-oszlop, az a, b, c tömbök 8 darab 2 MiB-os blokkjával. 1. host init: a és b a CPU-n, c-nek nincs lapja. 2. hideg kernel: a és b blokkjai page faulttal a GPU-ra kerülnek, c a GPU-n jön létre. 3. host ellenőrzés: c faultokkal a CPU-ra kerül. 4. prefetch: a és b fault nélkül a GPU-n, c a CPU-n marad. 5. meleg kernel: c blokkjai faulttal visszavándorolnak a GPU-ra. Alul szemléltető idővonal." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu101-um-lapok.png" style="width:100.0%"
+alt="Öt panel, mindegyikben CPU- és GPU-oszlop, az a, b, c tömbök 8 darab 2 MiB-os blokkjával. 1. host init: a és b a CPU-n, c-nek nincs lapja. 2. hideg kernel: a és b blokkjai page faulttal a GPU-ra kerülnek, c a GPU-n jön létre. 3. host ellenőrzés: c faultokkal a CPU-ra kerül. 4. prefetch: a és b fault nélkül a GPU-n, c a CPU-n marad. 5. meleg kernel: c blokkjai faulttal visszavándorolnak a GPU-ra. Alul szemléltető idővonal." /></details></div>
+<figcaption>Lapok helye és page faultok a UM-labor egy iterációjában
+(első iteráció; a <code>c</code> prefetch nélküli változat, a tipikus
+hiba szemléltetése: a labor végleges kódja a <code>c</code>-t is a
+GPU-ra prefetch-eli, ezért ott a meleg kernel nem faultol rajta);
+szemléltető modell, nem mérés</figcaption>
+</figure>
+<p>A mérési laborban ezt a különbséget fogjuk számszerűsíteni.</p>
+<h3 data-number="26.4.3" id="mig-többpéldányos-gpu-és-izoláció"><span
+class="header-section-number">26.4.3</span> MIG: többpéldányos GPU és
+izoláció</h3>
+<p>A Multi-Instance GPU (MIG) egy hardveres particionálási technológia,
+amelyet először a NVIDIA A100 hozott el, majd a H100 és az újabb
+adatközponti GPU-k is támogatnak. A MIG lehetővé teszi, hogy egyetlen
+fizikai GPU több, egymástól izolált <em>GPU instance-re</em> (GI) legyen
+osztva. Minden instance saját streaming multiprocesszorokkal, L2
+cache-szelettel, memóriavezérlőkkel és DRAM-szelettel rendelkezik. A
+CUDA programok számára minden instance külön CUDA-eszközként jelenik
+meg, saját device ID-val, saját memóriával és saját kontextussal.</p>
+<p>A MIG legfontosabb tulajdonsága a <em>hardveres izoláció</em>. A
+hagyományos időosztásos megosztásnál (time-slicing) több processz
+osztozik ugyanazon a GPU-n, és a futásidő-környezet váltogatja a
+hozzáférést. Ez csökkentheti az erőforrás-konfliktusokat, de nem ad
+szigorú teljesítmény- vagy hibahatár-elkülönítést. Egy hibás kernel vagy
+egy rosszindulatú processz befolyásolhatja a többi processz futását. A
+MIG ezzel szemben fizikailag szétválasztja a számítási és
+memória-erőforrásokat, így az egyik instance-ben futó feladat nem látja
+és nem zavarja a másik instance erőforrásait. Ez különösen fontos
+többfelhasználós felhőkörnyezetekben, ahol a szolgáltató garantált
+teljesítményt és adatizolációt akar nyújtani.</p>
+<p>A MIG konfigurációja két szinten történik. Először a GPU-t <em>GPU
+instance-ekre</em> (GI) osztjuk, amelyekhez egy-egy profilt rendelünk. A
+profil neve például <code>1g.5gb</code>, <code>2g.10gb</code>,
+<code>3g.20gb</code> vagy <code>7g.40gb</code> lehet (az A100 40 GB-os
+változatán; az 80 GB-os változaton ezek <code>1g.10gb</code>,
+<code>2g.20gb</code>, <code>3g.40gb</code>, <code>7g.80gb</code>). A
+pontos lista a <code>nvidia-smi mig -lgip</code> kimenetéből olvasható
+ki. Az első szám a számítási kapacitást jelöli (hány streaming
+multiprocesszor-csoportot kap), a második a memóriamennyiséget. A GI-ken
+belül további <em>compute instance-eket</em> (CI) lehet létrehozni,
+amelyek a GI számítási erőforrásait osztják tovább, de a memórián
+osztoznak.</p>
+<figure id="fig-gpu101-mig">
+<div class="fig-interactive"><iframe src="figures/html/gpu101-mig.html" title="Az A100 hét számítási szelete felül, nyolc memóriaszelete (5 GB és L2-szelet) alul. GI 0: C0–C2 és M0–M3, benne két compute instance (1c és 2c) szaggatott kerettel; GI 1: C3–C5 és M4–M7. C6 kihasználatlan. Az nvidia-smi -L két sora (MIG 3g.20gb Device 0 és 1) a két GI-re mutat. Egy harmadik 3g.20gb nem fér el, mert nincs szabad memóriaszelet." loading="lazy" style="width:100%;border:0;height:480px"></iframe><noscript><img src="figures/img/gpu101-mig.png" style="width:90.0%"
+alt="Az A100 hét számítási szelete felül, nyolc memóriaszelete (5 GB és L2-szelet) alul. GI 0: C0–C2 és M0–M3, benne két compute instance (1c és 2c) szaggatott kerettel; GI 1: C3–C5 és M4–M7. C6 kihasználatlan. Az nvidia-smi -L két sora (MIG 3g.20gb Device 0 és 1) a két GI-re mutat. Egy harmadik 3g.20gb nem fér el, mert nincs szabad memóriaszelet." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu101-mig.png" style="width:90.0%"
+alt="Az A100 hét számítási szelete felül, nyolc memóriaszelete (5 GB és L2-szelet) alul. GI 0: C0–C2 és M0–M3, benne két compute instance (1c és 2c) szaggatott kerettel; GI 1: C3–C5 és M4–M7. C6 kihasználatlan. Az nvidia-smi -L két sora (MIG 3g.20gb Device 0 és 1) a két GI-re mutat. Egy harmadik 3g.20gb nem fér el, mert nincs szabad memóriaszelet." /></details></div>
+<figcaption>MIG-felosztás A100 40 GB-on: két <code>3g.20gb</code> GPU
+instance (3 + 3 számítási és 4 + 4 memóriaszelet), egy számítási szelet
+szabadon marad; a GI-n belül a compute instance-ek a számítási
+szeleteket osztják, a memórián osztoznak</figcaption>
+</figure>
+<p>A MIG konfigurálása az <code>nvidia-smi</code> segítségével
+lehetséges. Egy példa a létrehozásra:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> nvidia-smi <span class="at">-i</span> 0 <span class="at">-mig</span> 1                    <span class="co"># MIG mód bekapcsolása (GPU reset kellhet)</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> mig <span class="at">-lgip</span>                           <span class="co"># a rendelkezésre álló profilok</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="co"># két GPU instance + alapértelmezett compute instance:</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> nvidia-smi mig <span class="at">-i</span> 0 <span class="at">-cgi</span> 3g.20gb,3g.20gb <span class="at">-C</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> <span class="at">-L</span>                                  <span class="co"># az instance-ek és UUID-jaik</span></span></code></pre></div>
+<p>Az <code>nvidia-smi mig -cgi</code> a megadott profilok mindegyikéhez
+egy GPU instance-t hoz létre (itt kettőt; az A100 hét számítási
+szeletéből a <code>3g</code> profil háromat használ, ezért legfeljebb
+két ilyen példány fér el: 3 · 3 = 9 &gt; 7, és a memóriából is 4 + 4 = 8
+szelet fogy el), a <code>-C</code> pedig mindegyik GI-n létrehoz egy
+teljes méretű compute instance-t. A profilok és a szintaxis driver- és
+hardverfüggők, ezért mindig a hivatalos NVIDIA MIG User Guide-ot kell
+ellenőrizni. A konfiguráció után az <code>nvidia-smi -L</code> az
+instance-eket UUID-jukkal mutatja; a kimenet formája (a pontos szöveg
+verziófüggő) a következő:</p>
+<pre class="text"><code>GPU 0: NVIDIA A100-SXM4-40GB (UUID: GPU-...)
+  MIG 3g.20gb     Device  0: (UUID: MIG-...)
+  MIG 3g.20gb     Device  1: (UUID: MIG-...)</code></pre>
+<p>A CUDA-program szempontjából egy MIG instance külön CUDA-eszközként
+jelenik meg, de egy CUDA-folyamat legfeljebb egy MIG-eszközt lát és
+használ: a kiválasztás a
+<code>CUDA_VISIBLE_DEVICES=MIG-&lt;UUID&gt;</code> (vagy
+<code>MIG-&lt;GPU-UUID&gt;/&lt;GI&gt;/&lt;CI&gt;</code>) környezeti
+változóval történik, és ha több UUID-t adunk meg, a CUDA csak az elsőt
+enumerálja. A <code>cudaGetDeviceCount</code> tehát 1-et ad, és a
+<code>cudaSetDevice</code> hívással instance-t váltani nem lehet. Több
+instance kihasználásához több folyamatot indítunk, mindegyiket saját
+<code>CUDA_VISIBLE_DEVICES</code> értékkel.</p>
+<p>A MIG és a managed memory kapcsolata fontos. Egy MIG instance saját
+memóriatartománnyal rendelkezik, és a managed memory ezen belül működik.
+Mivel egy folyamat csak egy instance-t lát, a managed memory pointerek
+nem oszthatók meg az instance-ek (folyamatok) között, mert azok
+hardveresen izolált memóriacímtereket jelentenek. A
+<code>cudaMemPrefetchAsync</code> destination device paramétere csak a
+látott instance-re vagy a CPU-ra mutathat. A page fault mechanizmus
+tehát az instance határain belül marad, ami biztonsági és teljesítmény
+szempontból egyaránt fontos.</p>
+<p>MIG módban a GPU–GPU peer-to-peer hozzáférés (PCIe és NVLink) nem
+támogatott (NVIDIA MIG User Guide; ellenőrzendő). A 26.3-ban látott
+GPUDirect és peer access több GPU esetén teljesen más modellt követ,
+mint a MIG-izoláció. A MIG nem a GPU-k közötti kommunikáció
+gyorsítására, hanem az erőforrások biztonságos és determinisztikus
+felosztására szolgál.</p>
+<h3 data-number="26.4.4"
+id="labor-unified-memory-és-migration-mérése"><span
+class="header-section-number">26.4.4</span> Labor: unified memory és
+migration mérése</h3>
+<p>A következő labor a managed memory oldalvándorlásának mérését tűzi ki
+célul. A mérési összeállításban egyetlen vektorösszeadás-kernelt
+futtatunk, és összehasonlítjuk a futásidőt két esetben:</p>
+<ol type="1">
+<li><strong>Prefetch nélkül:</strong> az adatokat a host inicializálja,
+majd a kernel azonnal hozzáfér. Az első futtatás során a page faultok
+miatt a rendszernek át kell másolnia az összes lapot a device
+memóriába.</li>
+<li><strong>Prefetch-csel:</strong> a kernel előtt a
+<code>cudaMemPrefetchAsync</code> hívásokkal a teljes adatmennyiséget a
+GPU-ra mozgatjuk, így a kernel már meleg adaton dolgozik. (A tömbök
+lapjainak helyét lépésenként a 26.4.2 ábrája mutatja.)</li>
+</ol>
+<p>A laborban használt hardver és szoftververziók rögzítése kötelező. Az
+alábbi példa egy reprezentatív környezetet mutat; a saját futtatás előtt
+ezeket az értékeket frissíteni kell.</p>
+<p><strong>Környezet (példa):</strong></p>
+<ul>
+<li>GPU: NVIDIA A100-SXM4-40GB, compute capability 8.0</li>
+<li>CUDA Toolkit: 12.2 (ellenőrizendő)</li>
+<li>Driver: 535.54.03 (ellenőrizendő)</li>
+<li>Operációs rendszer: Linux x86_64</li>
+<li>Fordító: nvcc, C++17</li>
+<li>Mérési módszer: CUDA Event, 5 meleg warm-up indítás a mért meleg
+kernel előtt, 20 ismétlés, medián és IQR</li>
+<li>A kódot nem futtattuk; a mérési eredmények a laborban töltendők
+ki</li>
+</ul>
+<p>A kód a következő:</p>
+<pre class="cuda"><code>#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;cuda_runtime.h&gt;
+
+#define CUDA_CHECK(call) do {                                          \
+    cudaError_t err = (call);                                         \
+    if (err != cudaSuccess) {                                         \
+        std::fprintf(stderr, &quot;CUDA error %s:%d: %s\n&quot;, __FILE__,      \
+                     __LINE__, cudaGetErrorString(err));               \
+        std::exit(EXIT_FAILURE);                                      \
+    }                                                                 \
+} while (0)
+
+__global__ void vectorAdd(const float* __restrict__ a,
+                          const float* __restrict__ b,
+                          float* __restrict__ c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n) c[i] = a[i] + b[i];
+}
+
+int main() {
+    constexpr int n = 1 &lt;&lt; 22; // 4 Mi float elem = 16 MiB tömbönként
+    const size_t bytes = static_cast&lt;size_t&gt;(n) * sizeof(float);
+    float *a, *b, *c;
+
+    CUDA_CHECK(cudaMallocManaged(&amp;a, bytes));
+    CUDA_CHECK(cudaMallocManaged(&amp;b, bytes));
+    CUDA_CHECK(cudaMallocManaged(&amp;c, bytes));
+
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&amp;device));
+
+    // Warm-up: a vectorAdd-ot magát indítjuk egy nem managed pufferen. Lazy
+    // loadingnál (CUDA 12.2-től alapértelmezett) minden kernel az első saját
+    // indításakor töltődik be; ez nem kerülhet a mért intervallumba.
+    float* tmp;
+    CUDA_CHECK(cudaMalloc(&amp;tmp, 3 * sizeof(float) * block));
+    vectorAdd&lt;&lt;&lt;1, block&gt;&gt;&gt;(tmp, tmp + block, tmp + 2 * block, block);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaFree(tmp));
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&amp;start));
+    CUDA_CHECK(cudaEventCreate(&amp;stop));
+
+    constexpr int reps = 20;
+    float msNoPrefetch[reps], msPrefetch[reps], msKernelWarm[reps];
+    bool ok = true;
+
+    for (int r = 0; r &lt; reps; ++r) {
+        // Host oldali inicializálás: a lapok a host oldalon jönnek létre.
+        for (int i = 0; i &lt; n; ++i) { a[i] = 1.0f; b[i] = 2.0f; }
+
+        // 1. fázis: prefetch nélkül (hideg).
+        CUDA_CHECK(cudaEventRecord(start));
+        vectorAdd&lt;&lt;&lt;grid, block&gt;&gt;&gt;(a, b, c, n);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventElapsedTime(&amp;msNoPrefetch[r], start, stop));
+        for (int i = 0; i &lt; n; ++i) if (c[i] != 3.0f) { ok = false; break; }
+
+        // 2. fázis: az a, b és c visszavitele a host oldalra, majd prefetch a
+        // GPU-ra. A prefetch idejét külön eseményekkel mérjük.
+        CUDA_CHECK(cudaMemPrefetchAsync(a, bytes, cudaCpuDeviceId, 0));
+        CUDA_CHECK(cudaMemPrefetchAsync(b, bytes, cudaCpuDeviceId, 0));
+        CUDA_CHECK(cudaMemPrefetchAsync(c, bytes, cudaCpuDeviceId, 0));
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        CUDA_CHECK(cudaEventRecord(start));
+        CUDA_CHECK(cudaMemPrefetchAsync(a, bytes, device, 0));  // CUDA 12.x szignatúra
+        CUDA_CHECK(cudaMemPrefetchAsync(b, bytes, device, 0));
+        // A c a host-oldali ellenőrzés miatt a hoston van; a meleg méréshez
+        // ezt is a GPU-ra visszük.
+        CUDA_CHECK(cudaMemPrefetchAsync(c, bytes, device, 0));
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&amp;msPrefetch[r], start, stop));
+
+        // 5 meleg warm-up indítás (nem mért), majd a mért meleg kernel.
+        for (int w = 0; w &lt; 5; ++w) vectorAdd&lt;&lt;&lt;grid, block&gt;&gt;&gt;(a, b, c, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        CUDA_CHECK(cudaEventRecord(start));
+        vectorAdd&lt;&lt;&lt;grid, block&gt;&gt;&gt;(a, b, c, n);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventElapsedTime(&amp;msKernelWarm[r], start, stop));
+
+        // A következő iteráció hideg állapotból indul: a, b visszakerül a hostra
+        // (a host oldali inicializálás ezt úgyis kikényszeríti).
+    }
+
+    std::printf(&quot;check=%s\n&quot;, ok ? &quot;OK&quot; : &quot;FAIL&quot;);
+    for (int r = 0; r &lt; reps; ++r) {
+        std::printf(&quot;iter %d: no-prefetch kernel %.3f ms | &quot;, r, msNoPrefetch[r]);
+        std::printf(&quot;prefetch %.3f ms + kernel %.3f ms\n&quot;,
+                    msPrefetch[r], msKernelWarm[r]);
+    }
+    // A mediánt és az IQR-t a laborban számítsuk ki a kimenetből.
+
+    CUDA_CHECK(cudaFree(a));
+    CUDA_CHECK(cudaFree(b));
+    CUDA_CHECK(cudaFree(c));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return 0;
+}</code></pre>
+<p>A kód 20 ismétlést futtat, külön méri a prefetch nélküli (hideg)
+kernelt, a prefetch idejét és a prefetch utáni (meleg) kernelt. A
+warm-up maga a <code>vectorAdd</code> egy nem managed pufferen, mert
+lazy loadingnál minden kernel az első saját indításakor töltődik be
+(egyébként a futtatás <code>CUDA_MODULE_LOADING=EAGER</code> környezeti
+változóval is kényszeríthető). A <code>c</code> tömböt is prefetch-eljük
+a GPU-ra: a host-oldali ellenőrzés után lapjai a CPU-n vannak, és
+prefetch nélkül a »meleg« kernel a kimenet írásakor page faultokat
+okozna, ideje a hideg kernelhez közelítene. A három idősorból a mediánt
+és az IQR-t számítjuk (a könyv protokollja); a hideg mérés
+ismétlésenként újra hideg állapotból indul, a warm-up protokoll a meleg
+kernelre és a prefetchre vonatkozik.</p>
+<p>A mért értékek helyén a mérési napló csak a szerkezetet adja meg; a
+számokat a saját futtatásból kell kitölteni.</p>
+<p><strong>Mérési napló (kitöltendő, nem futtatott):</strong></p>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 35%" />
+<col style="width: 18%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th style="text-align: right;">Iteráció</th>
+<th style="text-align: right;">Prefetch nélkül, kernel (ms)</th>
+<th style="text-align: right;">Prefetch (ms)</th>
+<th style="text-align: right;">Kernel prefetch után (ms)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">&lt;mért – kitöltendő&gt;</td>
+<td style="text-align: right;">&lt;mért – kitöltendő&gt;</td>
+<td style="text-align: right;">&lt;mért – kitöltendő&gt;</td>
+</tr>
+<tr>
+<td style="text-align: right;">…</td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td style="text-align: right;">20</td>
+<td style="text-align: right;">&lt;mért – kitöltendő&gt;</td>
+<td style="text-align: right;">&lt;mért – kitöltendő&gt;</td>
+<td style="text-align: right;">&lt;mért – kitöltendő&gt;</td>
+</tr>
+<tr>
+<td style="text-align: right;">Medián</td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+</tr>
+<tr>
+<td style="text-align: right;">IQR</td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Várt (modellből levezetett) érték a meleg kernelre.</strong>
+A kernel 3 × 16 MiB = 48 MiB forgalmat mozgat. Egy A100-40GB nominális
+1,555 TB/s memória-sávszélességén ez legalább 48 MiB / 1,555 TB/s ≈
+0,032 ms; a gyakorlati értékek ennél nagyobbak (nagyságrendileg
+0,03–0,05 ms), mert a sávszélesség csúcsértéke nem érhető el teljesen. A
+kernelindítás költsége néhány mikroszekundum, ezért a meleg kernel
+idejének a modell szerint ennek közelében kell lennie; ha a mért érték
+ezt jelentősen meghaladja, a lapok még nem a device memóriában vannak. A
+hideg kernel ideje a lapmigráció miatt ennél nagyságrendekkel nagyobb; a
+pontos érték a rendszertől függ, és csak méréssel adható meg.</p>
+<p>A várt tendencia az, hogy a prefetch nélküli futásidő magasabb, mert
+a kernel futás közben fizeti meg a lapmigráció árát, míg a prefetch-csel
+a migráció a kernelen kívül történik, de önálló időt vesz igénybe.</p>
+<p>A mérésből levonható következtetés: ha managed memoryt használunk, a
+kernel futásideje önmagában nem elegendő a teljesítmény megítélésére; a
+migrációt külön kell kezelni. A <code>cudaMemPrefetchAsync</code>
+használatával a kernel futásideje stabilizálható, de a prefetch művelet
+maga is időt és sávszélességet fogyaszt. A mérési naplóban ezért a
+prefetch idejét is rögzíteni kell, és a teljes végrehajtási időt
+(prefetch + kernel + szinkronizáció) kell összehasonlítani. A MIG-hez
+ebben a fejezetben nincs mérés; a MIG-szakasz leírása a dokumentációra
+és a fogalmi modellre épül, nem saját mérésre.</p>
+<h3 data-number="26.4.5" id="tipikus-hibák-és-helyes-megoldás"><span
+class="header-section-number">26.4.5</span> Tipikus hibák és helyes
+megoldás</h3>
+<p>A managed memory és a MIG használata során számos jellegzetes hiba
+fordul elő. Az alábbiakban ezek közül tekintjük át a
+leggyakoribbakat.</p>
+<p><strong>1. A hideg kernel futásidejét tekintjük a valódi
+teljesítménynek.</strong><br />
+A legelső kernelindítás managed memory esetén rendszerint sokkal
+lassabb, mint a későbbiek, mert a lapok ekkor vándorolnak át a CPU-ról a
+GPU-ra. Ha a mérési protokoll nem különbözteti meg a hideg és a meleg
+futtatást, a teljesítménykép torz lesz. A helyes megoldás az, hogy a
+mérés előtt egy warm-up futtatást végzünk, vagy a mérési tervben
+explicit módon kezeljük a migrációs fázist. A laborban ezért a hideg
+futtatást is rögzítjük, és a prefetch-csel elért meleg időt külön
+mérjük.</p>
+<p><strong>2. A <code>cudaMemPrefetchAsync</code>
+elhagyása.</strong><br />
+Ha a prefetch hiányzik, a kernel futása közben történik a lapmigráció,
+ami a fenti mérésben is látható lassulást okoz. A helyes minta az, hogy
+a kernel előtt a bemeneti adatokat a GPU-ra, a kernel után a kimeneti
+adatokat a CPU-ra prefetch-eljük. A prefetch aszinkron hívás, ezért a
+streamhez kötött sorrendre ügyelni kell. Ha a prefetch-et rossz streamre
+adjuk ki, vagy nem szinkronizálunk, a kernelindítás előtti adatátvitel
+nem feltétlenül fejeződik be.</p>
+<p><strong>3. A managed memory túlzott használata.</strong><br />
+A managed memory nem csodaszer. Ha az adatokat nagy méretben, szabályos
+mintával kell mozgatni, a hagyományos explicit <code>cudaMemcpy</code>
+gyakran jobb, mert a programozó pontosan tudja, mikor és mekkora átvitel
+történik. A managed memory előnye a kényelem és a ritkán hozzáfért
+adatszerkezetek kezelése, nem a nagy, folytonos tömbök másolásának
+optimalizálása. A helyes megoldás az, ha a teljesítménykritikus
+szakaszokban explicit memóriakezelést használunk, a managed memoryt
+pedig a prototípusokban és a bonyolult adatszerkezeteknél
+alkalmazzuk.</p>
+<p><strong>4. A <code>cudaMemAdvise</code> hiánya vagy helytelen
+használata.</strong><br />
+A <code>cudaMemAdvise</code> tanácsokkal a runtime jobban
+optimalizálhatja a migrációt. Ha például egy tömböt a CPU és a GPU is
+csak olvas, a <code>cudaMemAdviseSetReadMostly</code> megakadályozza a
+felesleges visszamásolásokat. Ha a tanács hiányzik, a rendszer
+konzervatív módon minden hozzáférést kezel, ami többletmozgást okozhat.
+A helyes megoldás az, ha a hozzáférési mintát ismerve megfelelő
+tanácsokat adunk, és a hatást méréssel ellenőrizzük.</p>
+<p><strong>5. MIG esetén a rossz device kiválasztása.</strong><br />
+Ha a rendszerben MIG instance-ek vannak, a folyamat a
+<code>CUDA_VISIBLE_DEVICES</code>-ben megadott (első) instance-t látja,
+és <code>cudaSetDevice</code>-szal nem vált át másikra. A managed memory
+pointer ehhez az instance-hez tartozik, és nem vihető át másik
+folyamatba. A helyes megoldás: instance-enként külön folyamat, külön
+<code>CUDA_VISIBLE_DEVICES=MIG-&lt;UUID&gt;</code> értékkel és saját
+managed allokációkkal; a <code>cudaMemPrefetchAsync</code> célja csak ez
+az instance vagy a CPU lehet.</p>
+<p><strong>6. MIG kapacitás túllépése.</strong><br />
+A MIG instance-ek memóriája kisebb, mint a teljes GPU memóriája. Ha a
+program a teljes GPU memóriájára méretezett kódot futtat egy MIG
+instance-en, az allokáció <code>cudaErrorMemoryAllocation</code> hibával
+tér vissza. A helyes megoldás az, ha a
+<code>cudaGetDeviceProperties</code> hívásból kiolvassuk az aktuális
+instance memóriaméretét, és a puffereket ehhez igazítjuk. A mérési
+környezetet is ennek megfelelően kell dokumentálni.</p>
+<p><strong>7. A MIG és a peer access összekeverése.</strong><br />
+Egy folyamat csak egy MIG-instance-ot lát, így instance-ok között a
+<code>cudaDeviceEnablePeerAccess</code> nem is hívható; MIG módban a
+fizikai GPU-k közötti P2P sem támogatott. A helyes megoldás az, ha a
+MIG-et kizárólag a feladatok elszigetelésére használjuk, és az
+együttműködő GPU-k közötti kommunikációt MIG nélküli fizikai GPU-kon,
+NVLinkkel és NCCL-lel valósítjuk meg.</p>
+<p><strong>8. A MIG konfiguráció elvesztése.</strong><br />
+A MIG beállítását az <code>nvidia-smi</code> parancsokkal lehet megadni,
+de a konfiguráció nem minden környezetben perzisztens. Ha a rendszer
+újraindul, vagy a driver frissül, a MIG instance-ek eltűnhetnek. A labor
+előtt ellenőrizni kell az <code>nvidia-smi -L</code> kimenetét, és
+szükség esetén újra létre kell hozni a kívánt instance-eket. A pontos
+parancsok és a rendelkezésre álló profilok a driver verziójától
+függenek, ezért a hivatalos dokumentációt kell követni.</p>
+<h3 data-number="26.4.6" id="önellenőrző-kérdés"><span
+class="header-section-number">26.4.6</span> Önellenőrző kérdés</h3>
+<p>Egy fejlesztő egy managed memoryval dolgozó CUDA-programot mér. A
+kernel első futtatása 8,2 ms-ig tart, a második futtatása ugyanazon az
+adaton 0,41 ms-ig. A programban nincs <code>cudaMemPrefetchAsync</code>
+hívás. Magyarázza meg a jelenséget, és adjon legalább két olyan
+módosítást, amely a teljes végrehajtási időt csökkentené anélkül, hogy a
+managed memoryt elhagyná.</p>
+<p><strong>Válaszvázlat</strong> (a feladat ellenőrzése után olvasandó):
+a válasz a fejezetben tárgyalt fogalmakra épül: az első futtatás során a
+page faultok miatt a lapok a CPU-ról a GPU-ra vándorolnak, ami jelentős
+időt emészt fel; a második futtatás már meleg adaton dolgozik. A
+javítási lehetőségek közé tartozik a <code>cudaMemPrefetchAsync</code>
+használata a kernel előtt, illetve a <code>cudaMemAdvise</code> tanácsok
+alkalmazása a hozzáférési mintának megfelelően. A válaszban azt is ki
+kell fejteni, hogy a prefetch művelet időt vesz igénybe, ezért a teljes
+végrehajtási időt (prefetch + kernel) kell optimalizálni.</p>
+<p>A következő alfejezet (27.1) a TPU-architektúrával és az XLA-val
+foglalkozik. Az itt bevezetett oldalvándorlási és erőforrás-izolációs
+fogalmak segítenek majd megérteni, hogy a TPU hogyan kezeli a
+memória-hozzáférést és a processzorszintű párhuzamosságot egy teljesen
+más hardvermodellben.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu100.html">← 26.3 NVLink, NVSwitch és GPUDirect</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu102.html">27.1 TPU-architektúra →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

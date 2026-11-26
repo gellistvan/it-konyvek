@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>25.2 Adatmozgatás és számítás átfedése – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – CUDA-ökoszisztéma és mélytanulás</a> › <a href="index.html#gpuch24">25 Streams, events, CUDA graphs és aszinkron végrehajtás</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu094.html">← 25.1 Streamek és események</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu096.html">25.3 CUDA graphs →</a></div>
+</nav>
+<h2 data-number="25.2" id="gpu095"><span
+class="header-section-number">25.2</span> Adatmozgatás és számítás
+átfedése</h2>
+<p>A streamek bevezetése után (25.1) a következő logikus lépés annak
+megértése, hogyan lehet az adatmozgatást és a számítást időben átfedni.
+A GPU-k egyik legnagyobb erőssége, hogy a memóriamásolásokat és a
+kernelvégrehajtást egymástól független hardveregységek végzik. Ha ezt a
+párhuzamosságot nem használjuk ki, akkor a GPU számítási kapacitásának
+jelentős része kihasználatlan marad, miközben a PCIe busz vagy a memória
+másolások tétlenül várnak. Ez az alfejezet a copy és a kernel
+átfedésének elméleti alapjait, gyakorlati megvalósítását és mérését
+tárgyalja.</p>
+<h3 data-number="25.2.1"
+id="a-copy-engine-és-a-compute-engine-elkülönülése"><span
+class="header-section-number">25.2.1</span> A copy engine és a compute
+engine elkülönülése</h3>
+<p>A modern NVIDIA GPU-kon a memóriamásolások és a kernelvégrehajtás
+külön hardveregységeken futnak. A <strong>copy engine</strong> (DMA –
+Direct Memory Access) felel a host és a device közötti, valamint a
+device-on belüli adatmozgatásért, míg a <strong>compute engine</strong>
+(a streaming multiprocessorok, SM-ek) a kerneleket hajtja végre. Ez a
+szétválasztás teszi lehetővé, hogy egy másolás és egy kernel időben
+párhuzamosan fusson, feltéve, hogy független streamekben indítjuk
+őket.</p>
+<p>A <code>cudaMemcpy</code> szinkron hívás blokkolja a CPU-t, és a
+GPU-n belül is szekvenciálisan hajtódik végre: a másolás befejezéséig a
+későbbi kernelek nem indulnak. Ezzel szemben a
+<code>cudaMemcpyAsync</code> <strong>aszinkron</strong> másolást indít
+egy adott streamben, és a CPU azonnal továbblép. A GPU ütemezője ezután
+a streamek sorrendjét és a hardver erőforrásait figyelembe véve dönti
+el, mi futhat párhuzamosan.</p>
+<p>Az átfedés alapfeltétele azonban a <strong>pinned (page-locked) host
+memória</strong> használata. A hagyományos, lapozható (pageable) host
+memória esetében az operációs rendszer bármikor kilapozhatja az
+oldalakat, ezért a DMA-vezérlő nem tudja közvetlenül elérni őket. A CUDA
+futási ideje ilyenkor egy köztes pinned puffert használ, ami rejtett,
+részben szinkron másolást eredményez – a <code>cudaMemcpyAsync</code>
+host-oldalon részben blokkolóvá válik, és az átfedés nem megbízható.
+Pinned memóriát a <code>cudaMallocHost</code> vagy a
+<code>cudaHostAlloc</code> hívással foglalhatunk:</p>
+<pre class="cuda"><code>float *h_a, *h_b, *h_c;
+size_t bytes = N * sizeof(float);
+CUDA_CHECK(cudaMallocHost(&amp;h_a, bytes));
+CUDA_CHECK(cudaMallocHost(&amp;h_b, bytes));
+CUDA_CHECK(cudaMallocHost(&amp;h_c, bytes));</code></pre>
+<p>A pinned memória hátránya, hogy a fizikai lapok lefoglalása csökkenti
+a rendelkezésre álló host memóriát, és a foglalás lassabb lehet; ezért
+csak akkor érdemes használni, ha ténylegesen szükség van az aszinkron
+másolásra.</p>
+<h3 data-number="25.2.2" id="stream-alapú-átfedés"><span
+class="header-section-number">25.2.2</span> Stream alapú átfedés</h3>
+<p>Egy stream egy parancssorozat, amelyben a műveletek sorrendben
+hajtódnak végre. Ugyanabban a streamben egy <code>cudaMemcpyAsync</code>
+és egy kernel nem fedheti át egymást, mert a stream sorrendje garantálja
+a szekvenciális végrehajtást. Az átfedéshez <strong>különböző
+streamekbe</strong> kell helyezni a másolást és a számítást, de ez
+önmagában még nem elég: a streameknek nem lehet függőségük.</p>
+<p>A legegyszerűbb átfedési minta az, amikor egy nagy adathalmazt
+<strong>független darabokra</strong> osztunk, és minden darabhoz egy
+stream tartozik. A streamen belül a sorrend: 1. H2D másolás (bemeneti
+adat), 2. kernel végrehajtása, 3. D2H másolás (eredmény vissza).</p>
+<p>A különböző streamek darabjai között nincs adatfüggőség, így az
+ütemező átfedheti az i. stream D2H másolását a j. stream kernelével,
+vagy az i. stream kernelét a j. stream H2D másolásával. Ezt a mintát
+<strong>pipelining</strong>-nak nevezzük, mert a másolási és számítási
+fázisok csővezetékszerűen követik egymást.</p>
+<p>Az átfedés hatékonyságát korlátozza a hardver: ha a GPU-nak csak egy
+copy engine-je van, akkor két egyidejű másolás nem futhat párhuzamosan,
+legfeljebb egy másolás és egy kernel. A modern GPU-k (például az A100)
+több copy engine-t is tartalmaznak, így több H2D és D2H másolás is
+fedheti egymást. A másolási irányok is számítanak: a H2D és D2H forgalom
+külön irányokat használ a PCIe buszon, ezért gyakran jobban
+átfedhetők.</p>
+<h3 data-number="25.2.3" id="pipeline-kialakítása"><span
+class="header-section-number">25.2.3</span> Pipeline kialakítása</h3>
+<p>Tegyük fel, hogy egy vektoros műveletet (például elemösszeadást vagy
+skálázást) szeretnénk végrehajtani
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>
+elemen. Ahelyett, hogy a teljes bemenetet átmásolnánk, majd a teljes
+kernelt futtatnánk, és végül az egész kimenetet visszamásolnánk, a
+munkát
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+darabra bontjuk. Minden darabhoz létrehozunk egy streamet, és a darabon
+belüli műveleteket aszinkron módon indítjuk.</p>
+<p>A pipeline időbeli lefutása a következőképpen ábrázolható (K=4; a
+sorok a különböző streameket jelölik, <code>S0</code>–<code>S3</code>
+nem a default stream; az ábra két copy engine-t – egy H2D- és egy
+D2H-irányút – és azonos időtartamokat feltételez):</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">Idő</span> ─────────────────────────────────────────<span class="op">&gt;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">S0:</span> <span class="pp">[</span><span class="ss">H2D0</span><span class="pp">]</span>[ K0 ]<span class="pp">[</span><span class="ss">D2H0</span><span class="pp">]</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="ex">S1:</span>       <span class="pp">[</span><span class="ss">H2D1</span><span class="pp">]</span>[ K1 ]<span class="pp">[</span><span class="ss">D2H1</span><span class="pp">]</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="ex">S2:</span>             <span class="pp">[</span><span class="ss">H2D2</span><span class="pp">]</span>[ K2 ]<span class="pp">[</span><span class="ss">D2H2</span><span class="pp">]</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="ex">S3:</span>                   <span class="pp">[</span><span class="ss">H2D3</span><span class="pp">]</span>[ K3 ]<span class="pp">[</span><span class="ss">D2H3</span><span class="pp">]</span></span></code></pre></div>
+<p>Egyetlen copy engine esetén a H2D és a D2H másolások egymás után
+futnak; ekkor csak a kernelidő rejthető el a másolások mögé.</p>
+<p>Az átfedés hardverfeltételei: a másolások egymás közti átfedéséhez a
+<code>cudaDeviceProp::asyncEngineCount</code> ≥ 2 kell (a másolás–kernel
+átfedéshez ≥ 1), a kernelek párhuzamos futásához a
+<code>concurrentKernels</code> tulajdonság; ezeket
+<code>cudaGetDeviceProperties</code>-szel érdemes lekérdezni. Régebbi
+GPU-kon a kiadási sorrend (breadth-first: előbb minden H2D, majd minden
+kernel, majd minden D2H, illetve depth-first, mint a fenti példában) is
+befolyásolhatja az átfedést; a mérés dönt.</p>
+<p>Itt látható, hogy amíg az 1. stream H2D másolása fut, a 0. stream
+kernelje már végrehajtható. Az átfedés csökkenti a teljes futási időt a
+szekvenciális végrehajtáshoz képest, ahol az összes másolás és kernel
+egymás után következne.</p>
+<p>A gyakorlatban a darabszám
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>)
+megválasztása kompromisszum: túl kevés darab nem ad elegendő
+párhuzamosságot, túl sok darab esetén a stream-ek létrehozásának és
+ütemezésének overheadje nő, valamint a kisebb darabok miatt a kernel
+indítási overhead aránya megnő. Jó kiindulópont a 4–8 darab, de ezt
+mindig méréssel kell finomítani.</p>
+<h3 data-number="25.2.4" id="stream-prioritás"><span
+class="header-section-number">25.2.4</span> Stream prioritás</h3>
+<p>A streamek nemcsak párhuzamos végrehajtást tesznek lehetővé, hanem
+<strong>prioritást</strong> is adhatunk nekik. A
+<code>cudaStreamCreateWithPriority</code> függvénnyel létrehozhatunk egy
+streamet, és megadhatjuk a kívánt prioritást a
+<code>cudaStreamNonBlocking</code> flaggel kombinálva. A CUDA-ban a
+<strong>kisebb számérték a magasabb prioritás</strong>. A
+<code>cudaDeviceGetStreamPriorityRange(&amp;leastPriority, &amp;greatestPriority)</code>
+a legkevésbé sürgős (<code>leastPriority</code>, tipikusan 0, az
+alapértelmezés) és a legsürgősebb (<code>greatestPriority</code>,
+numerikusan kisebb, tipikusan −1 vagy kisebb) prioritást adja vissza; a
+tényleges tartományt érdemes kiíratni.</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> leastPriority<span class="op">,</span> greatestPriority<span class="op">;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>cudaDeviceGetStreamPriorityRange<span class="op">(&amp;</span>leastPriority<span class="op">,</span> <span class="op">&amp;</span>greatestPriority<span class="op">);</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="dt">cudaStream_t</span> highPriStream<span class="op">,</span> lowPriStream<span class="op">;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="co">// numerikusan kisebb = sürgősebb</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>cudaStreamCreateWithPriority<span class="op">(&amp;</span>highPriStream<span class="op">,</span> cudaStreamNonBlocking<span class="op">,</span> greatestPriority<span class="op">);</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>cudaStreamCreateWithPriority<span class="op">(&amp;</span>lowPriStream<span class="op">,</span>  cudaStreamNonBlocking<span class="op">,</span> leastPriority<span class="op">);</span></span></code></pre></div>
+<p>A prioritás hatása akkor érvényesül, ha több stream verseng
+ugyanazért a hardver erőforrásért. A magasabb prioritású stream
+műveletei előnyt élveznek az ütemezőben, de ez nem garantál abszolút
+megszakítást: egy már futó kernel nem szakítható meg, csak a következő
+ütemezési pontokon érvényesül a prioritás. Ennek ellenére hasznos lehet,
+ha például egy valós idejű feldolgozási feladatot futtatunk, és egy
+háttérfeladat hosszú kerneleket indít. A prioritás segíthet a
+késleltetés csökkentésében.</p>
+<p>Fontos megjegyezni, hogy a prioritás csak a streamek közötti
+ütemezést befolyásolja, a streamen belüli sorrendet nem. A
+<code>cudaStreamNonBlocking</code> flag azt jelzi, hogy a stream nem
+várakozik a default streamre; ez elengedhetetlen a valódi aszinkron
+végrehajtáshoz.</p>
+<h3 data-number="25.2.5"
+id="gyakorlati-példa-vektor-skálázás-átfedéssel"><span
+class="header-section-number">25.2.5</span> Gyakorlati példa:
+vektor-skálázás átfedéssel</h3>
+<p>Az alábbi CUDA C++ példa egy egyszerű vektor-skálázást hajt végre
+(minden elemhez hozzáad egy konstanst, vagy szoroz egy skalárral). A
+munkát <code>K</code> darabra osztjuk, mindegyikhez külön streamet
+használunk, és <code>cudaMemcpyAsync</code> segítségével átfedjük a
+másolást a kernelvégrehajtással. A kernel számítási intenzitása
+alacsony, ezért a másolási idők dominálnak, és az átfedés hatása jól
+mérhető.</p>
+<p><strong>Kód</strong> (CUDA C++17/20):</p>
+<pre class="cuda"><code>#include &lt;algorithm&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;cmath&gt;
+#include &lt;vector&gt;
+#include &lt;cuda_runtime.h&gt;
+
+#define CUDA_CHECK(call) do {                                               \
+    cudaError_t err_ = (call);                                              \
+    if (err_ != cudaSuccess) {                                              \
+        fprintf(stderr, &quot;CUDA error at %s:%d: %s\n&quot;, __FILE__, __LINE__,    \
+                cudaGetErrorString(err_));                                  \
+        exit(EXIT_FAILURE);                                                 \
+    }                                                                       \
+} while (0)
+
+__global__ void scaleKernel(const float * __restrict__ in,
+                            float * __restrict__ out,
+                            float scale,
+                            int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n) {
+        out[idx] = in[idx] * scale;
+    }
+}
+
+int main(int argc, char **argv) {
+    const int N = 1 &lt;&lt; 24;                          // 16 Mi elem
+    const int K = (argc &gt; 1) ? atoi(argv[1]) : 4;   // darabszám; K=1: szekvenciális baseline
+    if (K &lt; 1 || N % K != 0) { fprintf(stderr, &quot;K must divide N\n&quot;); return 1; }
+    const int chunkSize = N / K;                    // méret darabonként
+    const size_t chunkBytes = (size_t)chunkSize * sizeof(float);
+    const float scale = 2.0f;
+
+    // Pinned host memória
+    float *h_in, *h_out;
+    CUDA_CHECK(cudaMallocHost(&amp;h_in, (size_t)N * sizeof(float)));
+    CUDA_CHECK(cudaMallocHost(&amp;h_out, (size_t)N * sizeof(float)));
+
+    // Device memória
+    float *d_in, *d_out;
+    CUDA_CHECK(cudaMalloc(&amp;d_in, (size_t)N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;d_out, (size_t)N * sizeof(float)));
+
+    for (int i = 0; i &lt; N; ++i) h_in[i] = static_cast&lt;float&gt;(i) / N;
+
+    // Streamek létrehozása (non-blocking, alap prioritással)
+    std::vector&lt;cudaStream_t&gt; streams(K);
+    for (int i = 0; i &lt; K; ++i) {
+        CUDA_CHECK(cudaStreamCreateWithPriority(&amp;streams[i],
+                                                 cudaStreamNonBlocking, 0));
+    }
+
+    // Egy futás: K darab H2D -&gt; kernel -&gt; D2H lánc, mindegyik a saját streamjén
+    auto run_once = [&amp;]() {
+        for (int i = 0; i &lt; K; ++i) {
+            size_t offset = (size_t)i * chunkSize;
+            CUDA_CHECK(cudaMemcpyAsync(d_in + offset, h_in + offset, chunkBytes,
+                                       cudaMemcpyHostToDevice, streams[i]));
+            int threads = 256;
+            int blocks = (chunkSize + threads - 1) / threads;
+            scaleKernel&lt;&lt;&lt;blocks, threads, 0, streams[i]&gt;&gt;&gt;(
+                d_in + offset, d_out + offset, scale, chunkSize);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpyAsync(h_out + offset, d_out + offset, chunkBytes,
+                                       cudaMemcpyDeviceToHost, streams[i]));
+        }
+    };
+
+    // Warm-up (modulbetöltés, első foglalások): 5 futás, nem mérjük
+    const int warmup = 5, numRuns = 20;
+    for (int w = 0; w &lt; warmup; ++w) run_once();
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Mérés GPU-oldali eseményekkel: közös t0 a streams[0]-on, a többi stream
+    // megvárja; a streams[0] a többi stream végén rögzített eseményt várja meg,
+    // majd t1 rögzül. Így a teljes pipeline benne van a t0-t1 intervallumban.
+    cudaEvent_t t0, t1;
+    CUDA_CHECK(cudaEventCreate(&amp;t0));
+    CUDA_CHECK(cudaEventCreate(&amp;t1));
+    std::vector&lt;cudaEvent_t&gt; done(K);
+    for (int i = 0; i &lt; K; ++i) CUDA_CHECK(cudaEventCreate(&amp;done[i]));
+    std::vector&lt;float&gt; times;
+    for (int run = 0; run &lt; numRuns; ++run) {
+        // Kiindulási állapot: d_out nullázása, és megvárjuk (a legacy default streamen
+        // futó cudaMemset a NonBlocking streamekkel nem szinkronizál implicit módon)
+        CUDA_CHECK(cudaMemset(d_out, 0, (size_t)N * sizeof(float)));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaEventRecord(t0, streams[0]));
+        for (int i = 1; i &lt; K; ++i)
+            CUDA_CHECK(cudaStreamWaitEvent(streams[i], t0, 0));
+        run_once();
+        for (int i = 1; i &lt; K; ++i) {
+            CUDA_CHECK(cudaEventRecord(done[i], streams[i]));
+            CUDA_CHECK(cudaStreamWaitEvent(streams[0], done[i], 0));
+        }
+        CUDA_CHECK(cudaEventRecord(t1, streams[0]));
+        CUDA_CHECK(cudaEventSynchronize(t1));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&amp;ms, t0, t1));
+        times.push_back(ms);
+    }
+    std::sort(times.begin(), times.end());
+    const int n = static_cast&lt;int&gt;(times.size());
+    double medMs = 0.5 * (times[n / 2 - 1] + times[n / 2]);
+    double iqrMs = times[3 * n / 4] - times[n / 4];
+    double minMs = times.front(), maxMs = times.back();
+
+    // Ellenőrzés
+    bool ok = true;
+    for (int i = 0; i &lt; N; ++i) {
+        if (fabsf(h_out[i] - h_in[i] * scale) &gt; 1e-5f) {
+            ok = false;
+            break;
+        }
+    }
+
+    printf(&quot;K=%d: median=%.3f ms, IQR=%.3f ms, min=%.3f ms, max=%.3f ms, check=%s\n&quot;,
+           K, medMs, iqrMs, minMs, maxMs, ok ? &quot;PASS&quot; : &quot;FAIL&quot;);
+
+    // Takarítás
+    for (int i = 0; i &lt; K; ++i) {
+        CUDA_CHECK(cudaStreamDestroy(streams[i]));
+        CUDA_CHECK(cudaEventDestroy(done[i]));
+    }
+    CUDA_CHECK(cudaEventDestroy(t0));
+    CUDA_CHECK(cudaEventDestroy(t1));
+    CUDA_CHECK(cudaFree(d_in));
+    CUDA_CHECK(cudaFree(d_out));
+    CUDA_CHECK(cudaFreeHost(h_in));
+    CUDA_CHECK(cudaFreeHost(h_out));
+    return 0;
+}</code></pre>
+<p><strong>Build és futtatás</strong> (bash):</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-o</span> overlap_pipeline overlap_pipeline.cu</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">timeout</span> 60s ./overlap_pipeline 1   <span class="co"># szekvenciális baseline (K=1)</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="fu">timeout</span> 60s ./overlap_pipeline 4   <span class="co"># pipeline K=4 streammel</span></span></code></pre></div>
+<p>A kódot nem fordítottuk és nem futtattuk. A <code>K=1</code> változat
+a szekvenciális baseline (egy stream, egy H2D, egy kernel, egy D2H); a
+<code>timeout</code> az operációs rendszer szintjén korlátozza a
+futásidőt.</p>
+<p><strong>GPU-konfiguráció a méréshez</strong> (példa):</p>
+<table>
+<colgroup>
+<col style="width: 61%" />
+<col style="width: 38%" />
+</colgroup>
+<thead>
+<tr>
+<th>Paraméter</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPU modell</td>
+<td>NVIDIA A100 40 GB PCIe</td>
+</tr>
+<tr>
+<td>Driver verzió</td>
+<td>550.54.15</td>
+</tr>
+<tr>
+<td>CUDA verzió</td>
+<td>12.4</td>
+</tr>
+<tr>
+<td>Compute capability</td>
+<td>8.0</td>
+</tr>
+<tr>
+<td>Operációs rendszer</td>
+<td>Ubuntu 22.04 LTS</td>
+</tr>
+<tr>
+<td>Max. boost órajel (adatlap)</td>
+<td>1410 MHz (mérés közben ellenőrizendő:
+<code>nvidia-smi -q -d CLOCK</code>)</td>
+</tr>
+<tr>
+<td>Power limit</td>
+<td>250 W (A100 40 GB PCIe adatlap; ellenőrizendő:
+<code>nvidia-smi -q -d POWER</code>)</td>
+</tr>
+<tr>
+<td>Host PCIe generáció</td>
+<td>&lt;ellenőrizendő: <code>nvidia-smi -q</code> vagy
+<code>lspci -vv</code>; az A100 PCIe 4.0-s kártya, Gen3-as host esetén
+~12 GB/s irányonként&gt;</td>
+</tr>
+<tr>
+<td>ECC</td>
+<td>Engedélyezve</td>
+</tr>
+<tr>
+<td>MIG</td>
+<td>Letiltva</td>
+</tr>
+<tr>
+<td>Virtualizáció</td>
+<td>Nincs</td>
+</tr>
+<tr>
+<td>Háttérterhelés</td>
+<td>Nincs (izolált környezet)</td>
+</tr>
+</tbody>
+</table>
+<p>A mérést izolált konténerben, a GPU-n futó háttérterhelés
+<code>nvidia-smi</code>-vel történő ellenőrzésével kell elvégezni; a
+futásidőt az operációs rendszer szintjén
+<code>timeout 60s ./overlap_pipeline</code> korlátozza. (A kernel
+watchdog-timeoutot a display driver szabályozza, CUDA-oldalról a
+<code>cudaDeviceSetLimit</code> nem állítja.) A labor nem került
+futtatásra, az alábbi táblázat mért oszlopai ezért üresek.</p>
+<p><strong>Mérési napló és várt értékek</strong></p>
+<p>Két változat: 1. <strong>szekvenciális (baseline):</strong>
+<code>./overlap_pipeline 1</code>, egyetlen stream, a teljes adatra egy
+H2D, egy kernel, egy D2H; 2. <strong>átfedő (pipeline):</strong>
+<code>./overlap_pipeline 4</code>, K=4 stream. Mindkét esetben pinned
+host memória. Az adatméret
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>=</mo><msup><mn>2</mn><mn>24</mn></msup></mrow><annotation encoding="application/x-tex">N = 2^{24}</annotation></semantics></math>
+float, azaz 64 MiB (≈ 67,1 MB) bemenet és ugyanennyi kimenet.</p>
+<p>A <strong>várt</strong> értékek modellből levezetettek, feltéve ~12
+GB/s H2D és D2H sávszélességet (Gen3-as host), két független copy
+engine-t (a két irány külön fut) és elhanyagolható kernelidőt (&lt;0,1
+ms):
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mrow><mi>H</mi><mn>2</mn><mi>D</mi></mrow></msub><mo>=</mo><msub><mi>T</mi><mrow><mi>D</mi><mn>2</mn><mi>H</mi></mrow></msub><mo>≈</mo><mn>67</mn><mo>,</mo><mn>1</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">MB</mtext><mi>/</mi><mn>12</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">GB/s</mtext><mo>≈</mo><mn>5</mn><mo>,</mo><mn>6</mn></mrow><annotation encoding="application/x-tex">T_{H2D} = T_{D2H} \approx 67{,}1\ \text{MB} / 12\ \text{GB/s} \approx 5{,}6</annotation></semantics></math>
+ms. Szekvenciálisan
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mrow><mi>s</mi><mi>e</mi><mi>q</mi></mrow></msub><mo>≈</mo><msub><mi>T</mi><mrow><mi>H</mi><mn>2</mn><mi>D</mi></mrow></msub><mo>+</mo><msub><mi>T</mi><mrow><mi>k</mi><mi>e</mi><mi>r</mi><mi>n</mi><mi>e</mi><mi>l</mi></mrow></msub><mo>+</mo><msub><mi>T</mi><mrow><mi>D</mi><mn>2</mn><mi>H</mi></mrow></msub><mo>≈</mo><mn>11</mn><mo>,</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">T_{seq} \approx T_{H2D} + T_{kernel} + T_{D2H} \approx 11{,}2</annotation></semantics></math>
+ms. K darabbal, ha a másolások és a kernel egymáshoz csővezetékben
+illeszkednek,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mrow><mi>p</mi><mi>i</mi><mi>p</mi><mi>e</mi></mrow></msub><mo>≈</mo><msub><mi>T</mi><mrow><mi>H</mi><mn>2</mn><mi>D</mi></mrow></msub><mspace width="0.167em"></mspace><mo stretchy="false" form="prefix">(</mo><mn>1</mn><mo>+</mo><mn>1</mn><mi>/</mi><mi>K</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">T_{pipe} \approx T_{H2D}\,(1 + 1/K)</annotation></semantics></math>;
+K=4 esetén
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>≈</mo><mn>7</mn><mo>,</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">\approx 7{,}0</annotation></semantics></math>
+ms, a gyorsulás
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mrow><mi>s</mi><mi>e</mi><mi>q</mi></mrow></msub><mi>/</mi><msub><mi>T</mi><mrow><mi>p</mi><mi>i</mi><mi>p</mi><mi>e</mi></mrow></msub><mo>≈</mo><mn>1</mn><mo>,</mo><mn>6</mn><mo>×</mo></mrow><annotation encoding="application/x-tex">T_{seq}/T_{pipe} \approx 1{,}6\times</annotation></semantics></math>.
+A K→∞ határérték
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mrow><mi>p</mi><mi>i</mi><mi>p</mi><mi>e</mi></mrow></msub><mo>→</mo><msub><mi>T</mi><mrow><mi>H</mi><mn>2</mn><mi>D</mi></mrow></msub></mrow><annotation encoding="application/x-tex">T_{pipe} \to T_{H2D}</annotation></semantics></math>,
+azaz legfeljebb 2× gyorsulás (ideális, teljes kétirányú sávszélesség
+esetén; 50%-os időcsökkenés); az elméleti határt a pipeline feltöltése
+és ürítése (az első H2D és az utolsó D2H nem fedhető), nem a kernelidő
+korlátozza.</p>
+<p>A modell felső becslés: feltételezi, hogy a két irány egyidejűleg is
+teljes sávszélességgel fut. Sok rendszerben a kétirányú összteljesítmény
+ennél kisebb (a host-memória és a PCIe root complex korlátja miatt);
+ezért a labor első lépése mérje meg külön a H2D-, a D2H- és az egyidejű
+kétirányú sávszélességet (két <code>cudaMemcpyAsync</code> két
+<code>cudaStreamNonBlocking</code> streamen), és a várt
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mrow><mi>p</mi><mi>i</mi><mi>p</mi><mi>e</mi></mrow></msub><annotation encoding="application/x-tex">T_{pipe}</annotation></semantics></math>-t
+ezzel számolja:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mrow><mi>p</mi><mi>i</mi><mi>p</mi><mi>e</mi></mrow></msub><mo>≈</mo><mrow><mi>max</mi><mo>&#8289;</mo></mrow><mo minsize="120%" maxsize="120%" stretchy="true" form="prefix">(</mo><msub><mi>T</mi><mrow><mi>H</mi><mn>2</mn><mi>D</mi></mrow></msub><mo>,</mo><mspace width="0.167em"></mspace><mo stretchy="false" form="prefix">(</mo><msub><mi>T</mi><mrow><mi>H</mi><mn>2</mn><mi>D</mi></mrow></msub><mo>+</mo><msub><mi>T</mi><mrow><mi>D</mi><mn>2</mn><mi>H</mi></mrow></msub><mo stretchy="false" form="postfix">)</mo><mo>⋅</mo><msub><mi>B</mi><mn>1</mn></msub><mi>/</mi><msub><mi>B</mi><mn>2</mn></msub><mo minsize="120%" maxsize="120%" stretchy="true" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">T_{pipe} \approx \max\big(T_{H2D},\, (T_{H2D}+T_{D2H})\cdot B_{1}/B_{2}\big)</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>B</mi><mn>1</mn></msub><annotation encoding="application/x-tex">B_{1}</annotation></semantics></math>
+az egyirányú,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>B</mi><mn>2</mn></msub><annotation encoding="application/x-tex">B_{2}</annotation></semantics></math>
+a mért kétirányú összsávszélesség. A fenti 7,0 ms és 1,6× tehát az
+ideális kétirányú átvitelre vonatkozó felső becslés.</p>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 20%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 17%" />
+</colgroup>
+<thead>
+<tr>
+<th>Verzió</th>
+<th>Medián (ms)</th>
+<th>IQR (ms)</th>
+<th>Min (ms)</th>
+<th>Max (ms)</th>
+<th>Várt (ms)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Szekvenciális (K=1)</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>≈ 11,2</td>
+</tr>
+<tr>
+<td>Pipeline (K=4)</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>≈ 7,0</td>
+</tr>
+</tbody>
+</table>
+<p>Az egyetlen jelentett mutató a <strong>gyorsulás</strong>
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mrow><mi>s</mi><mi>e</mi><mi>q</mi></mrow></msub><mi>/</mi><msub><mi>T</mi><mrow><mi>p</mi><mi>i</mi><mi>p</mi><mi>e</mi></mrow></msub></mrow><annotation encoding="application/x-tex">T_{seq}/T_{pipe}</annotation></semantics></math>
+(×); az időcsökkenés százalékban
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>−</mo><mn>1</mn><mi>/</mi><mtext mathvariant="normal">gyorsulás</mtext></mrow><annotation encoding="application/x-tex">1 - 1/\text{gyorsulás}</annotation></semantics></math>
+(várt: 1 − 7,0/11,2 ≈ 38%). A K-függést K=1, 2, 4, 8, 16 mellett érdemes
+mérni; a várt
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mrow><mi>H</mi><mn>2</mn><mi>D</mi></mrow></msub><mo stretchy="false" form="prefix">(</mo><mn>1</mn><mo>+</mo><mn>1</mn><mi>/</mi><mi>K</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">T_{H2D}(1+1/K)</annotation></semantics></math>
+szerint K=8 felett már alig javul az idő, a stream- és indítási overhead
+pedig növekszik.</p>
+<p><strong>Várt és mért eredmény elkülönítése</strong>: - <em>Várt:</em>
+a pipeline változat gyorsabb, mert a másolás és a kernel időben átfed; a
+számszerű várt értékek a fenti modellből erednek. - <em>Mért:</em>
+kitöltendő a fenti táblázatban a hallgató környezetében; a gyorsulás
+mértéke függ a streamszámtól, az adatmérettől, a PCIe generációtól és a
+GPU hardverétől.</p>
+<p>A <strong>stream prioritás</strong> hatását külön kísérlettel lehet
+vizsgálni: egy hosszú háttérkernelt alacsony prioritású streamre, egy
+rövid kernelt magas prioritású streamre indítva a rövid kernel
+késleltetése várhatóan csökken, de ez ebben az alfejezetben nincs
+megmérve, és a gráf-alapú ütemezés prioritásai (25.3) sem szerepelnek a
+könyvben; az állítás hipotézis, ellenőrzése a hallgató feladata (az
+eredmény a hardvertől és a futó kernelek blokkszámától függ).</p>
+<h3 data-number="25.2.6" id="tipikus-hibák-és-megelőzésük"><span
+class="header-section-number">25.2.6</span> Tipikus hibák és
+megelőzésük</h3>
+<ol type="1">
+<li><p><strong>Pageable memória használata aszinkron
+másoláshoz.</strong><br />
+Ha a host memória nem pinned, a <code>cudaMemcpyAsync</code> részben
+szinkron (staging pufferen át történő) másolást végez, és az átfedés nem
+megbízható. A hibát nehéz észrevenni, mert a kód lefut, de a
+teljesítmény nem javul. <strong>Megoldás:</strong> mindig
+<code>cudaMallocHost</code>-tal foglaljunk host memóriát aszinkron
+műveletekhez.</p></li>
+<li><p><strong>Default stream és nem default stream közötti implicit
+szinkronizáció.</strong><br />
+A legacy default stream (0) implicit módon szinkronizál a blokkoló (flag
+nélkül létrehozott) streamekkel: ha egy művelet a default streamben van,
+a blokkoló streamek korábbi munkájára vár, és azok későbbi munkája is
+rá. A <code>cudaStreamNonBlocking</code> streamekkel nem szinkronizál.
+Ez váratlan blokkolást okozhat. <strong>Megoldás:</strong> használjunk
+<code>cudaStreamNonBlocking</code> flaget a streamek létrehozásakor,
+vagy kerüljük a default streamet.</p></li>
+<li><p><strong>Túl sok stream létrehozása.</strong><br />
+Minden stream létrehozása és ütemezése overheadet jelent. Ha a
+streamszám meghaladja a hardver által hatékonyan kezelhető mennyiséget,
+a teljesítmény csökken. <strong>Megoldás:</strong> a darabszámot
+méréssel optimalizáljuk; jellemzően 4–8 stream elegendő.</p></li>
+<li><p><strong>A <code>cudaDeviceSynchronize</code> túl korai
+hívása.</strong><br />
+Ha minden stream indítása után azonnal
+<code>cudaDeviceSynchronize</code>-ot hívunk, az összes aszinkron
+műveletet megvárjuk, és az átfedés megszűnik. <strong>Megoldás:</strong>
+csak a mérési ciklus végén, vagy a szükséges pontokon
+szinkronizáljunk.</p></li>
+<li><p><strong>Nem megfelelő adatméret.</strong><br />
+Kis adatméret esetén a másolási és kernelindítási overhead dominál, és
+az átfedés nem hoz érdemi gyorsulást. <strong>Megoldás:</strong> a
+pipeline akkor előnyös, ha az adatdarabok másolási ideje összemérhető a
+kernel futási idejével.</p></li>
+<li><p><strong>A stream prioritás téves használata.</strong><br />
+A prioritás nem szakítja meg a futó kernelt, és nem garantál abszolút
+végrehajtási sorrendet. <strong>Megoldás:</strong> a prioritást csak
+finomhangolásra használjuk, ne alapvető szinkronizációs
+eszközként.</p></li>
+</ol>
+<h3 data-number="25.2.7" id="a-labor-átadandó-eredményei"><span
+class="header-section-number">25.2.7</span> A labor átadandó
+eredményei</h3>
+<p>A labor célja, hogy a fenti pipeline példát reprodukálja, és igazolja
+az átfedés hatását. Az átadandó anyag:</p>
+<ul>
+<li><strong>CUDA C++ forrás</strong> (a fenti kód), amely tartalmazza a
+<code>CUDA_CHECK</code> hibamakrót, a pinned memória foglalását, a több
+streams pipeline-t, és a mérési ciklust 5 warm-uppal és 20 ismétléssel
+(GPU-oldali eseményekkel).</li>
+<li><strong>Buildparancs</strong>:
+<code>nvcc -std=c++17 -O3 -arch=sm_80 -o overlap_pipeline overlap_pipeline.cu</code>
+(a compute capability a használt GPU-tól függ).</li>
+<li><strong>Futtatási parancs</strong>:
+<code>./overlap_pipeline 1</code> és
+<code>./overlap_pipeline 4</code>.</li>
+<li><strong>GPU-konfiguráció</strong>: a fenti táblázat szerint (modell,
+driver, CUDA, compute capability, OS, órajel, power limit, ECC, MIG,
+háttérterhelés).</li>
+<li><strong>Mérési napló</strong>: a mérési eredmények táblázata, a
+medián, IQR, min, max, valamint az ellenőrzés (check) eredménye.</li>
+<li><strong>A mért és a várt eredmény elkülönítése</strong>: a fenti
+szekvenciális és pipeline összehasonlítás, a gyorsulás kiszámítása.</li>
+</ul>
+<p>A labort izolált környezetben, <code>nvidia-smi</code>-vel
+ellenőrizve kell futtatni, hosszú futású háttérkernel nélkül. A mérési
+eredmények a használt hardveren érvényesek, más GPU-n eltérhetnek.</p>
+<h3 data-number="25.2.8" id="összefoglalás"><span
+class="header-section-number">25.2.8</span> Összefoglalás</h3>
+<p>Az adatmozgatás és a számítás átfedése a CUDA-programok
+teljesítményének egyik kulcsa. A pusztán szekvenciális végrehajtás
+pazarló, mert a GPU copy engine-je és compute egységei egyszerre is
+dolgozhatnának. A <code>cudaMemcpyAsync</code> és a nem default streamek
+használatával, pinned memóriával, valamint a munka független darabokra
+bontásával csővezetékes végrehajtást érhetünk el. A stream prioritások
+további finomhangolást tesznek lehetővé. A következő alfejezet (25.3) a
+CUDA graphs segítségével mutatja be, hogyan lehet ezt a pipeline-t
+deklaratív módon, alacsony indítási overheaddel leírni, és mennyivel
+csökkenthető az indítási overhead.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu094.html">← 25.1 Streamek és események</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu096.html">25.3 CUDA graphs →</a></div>
+</nav>
+</body>
+</html>

@@ -1,0 +1,1253 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>39.3 Task, queue és szolgáltatás-életciklus – C és modern C++
+rendszerszemléletben DevOps szakembereknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. rész: Modern C++</a> › <a href="index.html#ch39">39 C++ záróprojekt: a C rendszer átalakítása</a></p>
+<div class="links"><a class="prev" rel="prev" href="s199.html">← 39.2 C++ core: parser, erőforrások és értéktípusok</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="s201.html">39.4 CMake, tesztek és mérési csomag →</a></div>
+</nav>
+<h2 data-number="39.3" id="s200"><span
+class="header-section-number">39.3</span> Task, queue és
+szolgáltatás-életciklus</h2>
+<p>Ez az alfejezet a C záróprojekt funkcionális szerződését megtartó C++
+port konkurens rétegével foglalkozik. A <a href="s199.html">C++ core:
+parser, erőforrások és értéktípusok (39.2)</a> részben rögzítettük,
+hogyan lesz a C <code>struct</code> + kézi <code>free</code> mintákból
+értékszemantikájú, RAII-val kezelt C++ mag; ott a hangsúly a szinkron
+adatúton volt. Most azt a kérdést vesszük elő, amely a legtöbb termelési
+hibát okozza: mi történik, ha a szolgáltatásnak egyszerre több szála
+dolgozik, a bemenet korlátos pufferen érkezik, és a leállítást bármelyik
+pillanatban kérhetik. A cél nem egy új keretrendszer, hanem egy kicsi,
+indokolható szerződés: ki tulajdonol mit, meddig él, mi történik
+telítődéskor, és milyen sorrendben lehet hézagmentesen leállni.</p>
+<p>A fejezet épít a <a href="s175.html">shared ownership, reclamation és
+konkurens review (34.6)</a> megosztott tulajdonlási és visszanyerési
+szabályaira, valamint az <a href="s180.html">Aszinkron I/O adapter és
+coroutine-labor (35.5)</a> felfüggesztési és élettartam-megfontolásaira.
+A coroutine adaptert itt csak érintjük, mert az a részletes kidolgozást
+ott kapta meg; itt az a kérdés, hogyan illeszkedik a
+szolgáltatás-életciklusba egy kísérleti, külön capability profile
+alatt.</p>
+<h3 data-number="39.3.1"
+id="a-szolgáltatás-életciklus-mint-szerződés"><span
+class="header-section-number">39.3.1</span> A szolgáltatás-életciklus
+mint szerződés</h3>
+<p><strong>Szolgáltatás-életciklusnak</strong> nevezzük azon állapotok
+halmazát, átmeneteik megengedett sorrendjét és az egyes állapotokhoz
+tartozó erőforrás-kötelezettségeket, amelyek egy hosszú életű, konkurens
+komponens viselkedését meghatározzák. Ez nem puszta dokumentáció: a C++
+nyelvi eszközeivel részben kikényszeríthető, részben pedig tesztelhető.
+A szerződés három dolgot rögzít:</p>
+<ol type="1">
+<li><strong>Mely műveletek engedélyezettek mely állapotban.</strong> Ha
+a <code>submit</code> a leállítás megkezdése után is elfogad munkát, az
+vagy elveszik, vagy a leállás soha nem fejeződik be.</li>
+<li><strong>Ki az owner (tulajdonos) az egyes erőforrások
+felett.</strong> A queue, a worker szálak, a connection objektumok és a
+callbackek tulajdonosa a <code>service</code> objektum; minden más
+ezekhez képest <em>borrowed</em> (kölcsönzött) hozzáférés.</li>
+<li><strong>Mikor tekinthető egy erőforrás felszabadíthatónak.</strong>
+Csak akkor, ha az ahhoz tartozó összes <em>outstanding operation</em>
+(befejezetlen művelet) befejeződött vagy megszakított, és ezt a tényt
+valamilyen szinkronizációs eszköz igazolja.</li>
+</ol>
+<p><strong>Outstanding operation</strong>: olyan művelet, amelyhez
+erőforrás (buffer, socket, callback, szál) tartozik, és amelynek
+végrehajtása megkezdődött, de a befejezés ténye még nem került
+publikálásra. A definíció szándékosan a publikáláson van: attól, hogy
+egy worker szál lokálisan „már majdnem végzett”, a művelet a többi szál
+számára még folyamatban van, amíg egy happens-before élt nem létesítünk
+(jellemzően join, mutex, atomikus művelet vagy condition variable
+segítségével).</p>
+<p><strong>Quiescence</strong> (nyugvás): az az állapot, amelyben nincs
+outstanding operation, a queue kiürült vagy lezárult, és egyetlen szál
+sem hajthat végre olyan kódot, amely a szolgáltatás erőforrásaihoz nyúl.
+A teardown akkor helyes, ha a nyugvást megállapítja, mielőtt a tagok
+destruktorai lefutnak.</p>
+<p>A mi állapotgépe:</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Állapot</th>
+<th>Belépés feltétele</th>
+<th>Engedélyezett</th>
+<th>Tiltott</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Constructed</code></td>
+<td>konstruktor fut</td>
+<td>tagok inicializálása</td>
+<td><code>submit</code>, <code>shutdown</code> munkát indítani</td>
+</tr>
+<tr>
+<td><code>Running</code></td>
+<td>workerek elindultak</td>
+<td><code>submit</code>, <code>shutdown</code> kezdeményezése</td>
+<td>queue <code>close</code> nélküli eldobása</td>
+</tr>
+<tr>
+<td><code>Draining</code></td>
+<td><code>close()</code> megtörtént</td>
+<td>a már bekerült elemek feldolgozása, <code>pop</code></td>
+<td>új <code>push</code> elfogadása</td>
+</tr>
+<tr>
+<td><code>Stopped</code></td>
+<td>minden worker joinolt</td>
+<td>destruktor, diagnosztika olvasása</td>
+<td>bármilyen erőforrás-használat</td>
+</tr>
+</tbody>
+</table>
+<p>Egy fontos tervezési döntés, hogy a <code>Draining</code> állapotot
+nem külön enumerációval, hanem a queue <code>closed_</code> flagjével és
+a stop token állapotával reprezentáljuk. Ez kevesebb duplikált állapotot
+jelent, viszont a két jelzés szemantikája eltér: a <code>close()</code>
+a <em>bemenet lezárása</em>, a stop kérés a <em>szálak kooperatív
+megszakítása</em>. A kettő nem ugyanaz, és a leállási protokoll éppen
+abból áll, hogy a kettőt helyes sorrendben és egymásra hatva
+használjuk.</p>
+<h3 data-number="39.3.2"
+id="bounded-queue-stop-token-és-backpressure"><span
+class="header-section-number">39.3.2</span> Bounded queue, stop token és
+backpressure</h3>
+<p>A <strong>bounded queue</strong> (korlátos sor) olyan sor, amelyre
+invariánsként teljesül, hogy elemszáma minden megfigyelhető pillanatban
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0</mn><mo>≤</mo><mi>n</mi><mo>≤</mo><mi>C</mi></mrow><annotation encoding="application/x-tex">0 \le n \le C</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>C</mi><annotation encoding="application/x-tex">C</annotation></semantics></math>
+a kapacitás, és hogy <code>close()</code> után nem kerülhet be új elem.
+A korlát nem kényelmi kérdés: ez az egyetlen hely, ahol a rendszer
+memóriahasználata felülről becsülhető.</p>
+<p><strong>Backpressure</strong> (visszanyomás): az a mechanizmus,
+amellyel a fogyasztó telítettsége a termelő felé továbbítódik, és ott
+várakozást, hibát vagy eldobást vált ki. Három alapvető politikát
+érdemes ismerni, és ezeket nem szabad összekeverni:</p>
+<ul>
+<li><strong>Blokkoló</strong>: a termelő addig vár, amíg hely nem lesz.
+Erős memóriakorlát, de a termelő szálát lefoglalja, ezért csak akkor
+elfogadható, ha a termelő nem tart más zárat.</li>
+<li><strong>Eldobó</strong>: a termelő azonnal visszajelez (pl.
+<code>false</code>), és a hívó dönt a sorsról. Akkor jó, ha a forrás
+lassítható, de nem akarunk blokkolni.</li>
+<li><strong>Lezáró</strong>: a telítődés hibának számít, és a kapcsolat
+bezárul. Ezt csak akkor szabad alkalmazni, ha a protokoll ezt
+kifejezetten megengedi, mert a csendben eldobott adat a hálózati
+framinget is tönkreteheti.</li>
+</ul>
+<p>A stabilitás levezetése rövid. Legyen
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>
+egy frame várható feldolgozási ideje,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>W</mi><annotation encoding="application/x-tex">W</annotation></semantics></math>
+a workerek száma. A feldolgozó kapacitás közelítőleg
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>W</mi><mi>/</mi><mi>T</mi></mrow><annotation encoding="application/x-tex">W/T</annotation></semantics></math>
+frame/másodperc. Ha a hosszú távú érkezési ráta
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>λ</mi><mo>&lt;</mo><mi>W</mi><mi>/</mi><mi>T</mi></mrow><annotation encoding="application/x-tex">\lambda &lt; W/T</annotation></semantics></math>,
+a sor várható hossza korlátos marad; ha
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>λ</mi><mo>≥</mo><mi>W</mi><mi>/</mi><mi>T</mi></mrow><annotation encoding="application/x-tex">\lambda \ge W/T</annotation></semantics></math>,
+akkor a sor hossza a korlátig nő, és a backpressure folyamatosan aktív
+lesz. A korlátos sor ezt nem szünteti meg, hanem <em>láthatóvá és
+kezelhetővé</em> teszi: a telítődés nem csendes memóriafelfúvódásként,
+hanem visszajelzésként vagy hibaként jelenik meg. A szolgáltatás saját
+tárolójának felső korlátja akkor adható meg, ha minden olyan frame-et
+elszámolunk, amelyet a szolgáltatás birtokol. Ezek: legfeljebb
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>C</mi><annotation encoding="application/x-tex">C</annotation></semantics></math>
+frame a sorban, legfeljebb
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>W</mi><annotation encoding="application/x-tex">W</annotation></semantics></math>
+a workereknél feldolgozás alatt, és legfeljebb
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>P</mi><annotation encoding="application/x-tex">P</annotation></semantics></math>
+olyan <code>submit</code> hívás paraméterében, amely a teli sor miatt
+blokkol. Ha egy frame legfeljebb
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>S</mi><mi>max</mi></msub><annotation encoding="application/x-tex">S_{\max}</annotation></semantics></math>
+bájt hasznos adatot hordoz, akkor</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>M</mi><mo>≤</mo><mo stretchy="false" form="prefix">(</mo><mi>C</mi><mo>+</mo><mi>W</mi><mo>+</mo><mi>P</mi><mo stretchy="false" form="postfix">)</mo><mo>⋅</mo><msub><mi>S</mi><mi>max</mi></msub><mo>+</mo><mi>K</mi><mo>,</mo></mrow><annotation encoding="application/x-tex">M \le (C + W + P)\cdot S_{\max} + K,</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+a fix overhead (szálak, sorcsomópontok, mutexek, könyvtári pufferek). A
+becslés két kódbeli feltételen múlik. A <code>submit</code> az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>S</mi><mi>max</mi></msub><annotation encoding="application/x-tex">S_{\max}</annotation></semantics></math>-nál
+nagyobb frame-et — a hasznos hossz <em>és</em> a lefoglalt
+<code>capacity()</code> szerint is — még a sor előtt,
+<code>too_large</code> eredménnyel elutasítja (a tartott memória a
+kapacitás, ezért egy nagy <code>reserve()</code> után kicsire állított
+string sem kerülhet be); a képlet így a szolgáltatás saját tárolójára
+vonatkozó felső korlát. A blokkoló hívók száma legfeljebb
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>P</mi><annotation encoding="application/x-tex">P</annotation></semantics></math>:
+aki a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>P</mi><mo>+</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">P+1</annotation></semantics></math>-edik
+lenne, azonnal <code>busy</code> eredményt kap, és a frame-et a hívás
+végén felszabadítja. A hívó saját, még be nem adott frame-jei nem a
+szolgáltatás tárolói; azokat a hívó kerete számolja el. Ezek a
+feltételek nélkül a korlát nem érvényes: korlátlan számú blokkoló
+producer mindegyike egy további frame-et tartana életben a soron
+kívül.</p>
+<p>A C++20 <strong>stop token</strong> mechanizmusa egy közösen
+fenntartott, szálbiztos <strong>stop-állapotra</strong> épül, amelyben
+három szereplő osztozik:</p>
+<ul>
+<li>a <code>std::stop_source</code> leállítást kérhet
+(<code>request_stop()</code>), és részt vesz a stop-állapot
+élettartamában;</li>
+<li>a <code>std::stop_token</code> csak lekérdezhet
+(<code>stop_requested()</code>, <code>stop_possible()</code>), és rá
+callback regisztrálható; ő is részt vesz a stop-állapot élettartamában,
+ezért nem tekinthető puszta, nem tulajdonló nézetnek;</li>
+<li>a <code>std::stop_callback</code> regisztrált reakció: ha a
+leállítást már kérték, a konstruktorában azonnal lefut; egyébként a
+kérést végző szálon fut. Destruktora deregisztrál, és ha a callback
+éppen fut egy másik szálon, megvárja.</li>
+</ul>
+<p>A stop-állapot addig él, amíg bármely source vagy token hivatkozik
+rá. Egy source élettartamán túl megőrzött token ezért nem dangling: a
+vizsgálata definiált. A <code>stop_requested()</code> megőrzi a kérés
+tényét a source megszűnése után is. A <code>stop_possible()</code> más
+kérdést válaszol meg: igaz, ha a leállítást már kérték, vagy még létezik
+olyan source, amely kérheti; hamis egy alapértelmezett konstrukciójú,
+stop-állapot nélküli tokennél, illetve ha az utolsó source kérés nélkül
+megszűnt. A tárolás élettartama és a kérhetőség tehát két külön
+tulajdonság:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// tests/stop_state_probe.cpp -- a token a megosztott stop-állapot része</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stop_token&gt;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CHECK</span><span class="op">(</span>condition<span class="op">)</span><span class="pp"> </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                      </span><span class="op">\</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">if</span><span class="pp"> </span><span class="op">(!(</span>condition<span class="op">))</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                            </span><span class="op">\</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CHECK failed at line </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">);</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                   </span><span class="op">\</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp">                                                              </span><span class="op">\</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>stop_token kept<span class="op">;</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(!</span>kept<span class="op">.</span>stop_possible<span class="op">());</span>                 <span class="co">// nincs stop-állapot</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>stop_source source<span class="op">;</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>        kept <span class="op">=</span> source<span class="op">.</span>get_token<span class="op">();</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>kept<span class="op">.</span>stop_possible<span class="op">()</span> <span class="op">&amp;&amp;</span> <span class="op">!</span>kept<span class="op">.</span>stop_requested<span class="op">());</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>   <span class="co">// az utolsó source kérés nélkül megszűnt</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(!</span>kept<span class="op">.</span>stop_possible<span class="op">()</span> <span class="op">&amp;&amp;</span> <span class="op">!</span>kept<span class="op">.</span>stop_requested<span class="op">());</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>stop_source source<span class="op">;</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>        kept <span class="op">=</span> source<span class="op">.</span>get_token<span class="op">();</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>        source<span class="op">.</span>request_stop<span class="op">();</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>   <span class="co">// a kérés megmarad a source után is</span></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>kept<span class="op">.</span>stop_requested<span class="op">()</span> <span class="op">&amp;&amp;</span> kept<span class="op">.</span>stop_possible<span class="op">());</span></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> ran <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>stop_callback late<span class="op">(</span>kept<span class="op">,</span> <span class="op">[&amp;]</span> <span class="op">{</span> ran <span class="op">=</span> <span class="kw">true</span><span class="op">;</span> <span class="op">});</span></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>ran<span class="op">);</span>                                   <span class="co">// már kért stop: azonnal fut</span></span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A próba G++ 13.3.0 és libstdc++ mellett,
+<code>-std=c++20 -Werror</code> beállítással fordult, és ASan/UBSan
+builddel is sikeresen lefutott.</p>
+<p>A <code>std::jthread</code> destruktora
+<code>request_stop()</code>-ot hív, majd joinol, tehát a „elfelejtett
+join” hiba alapértelmezésben megszűnik. A stop token nem megszakítja a
+blokkoló hívást, hanem a <code>condition_variable_any</code> stop
+tokenes <code>wait</code> overloadjai teszik megszakíthatóvá a
+várakozást. Ezek az overloadok C++20 újak; a konkrét libstdc++/libc++
+kiadás támogatását a laborprofilban ellenőrizni kell, és nem szabad
+feltételezni, hogy egy régebbi eszközlánc elfogadja a kódot.</p>
+<p>A következő példa a teljes, önállóan fordítható queue. A szerződés:
+<code>push</code> blokkol, ha a sor tele van, de stop kérésre
+<code>false</code>-szal visszatér; <code>pop</code> a stop kérés után is
+kiveszi a már bekerült elemeket (drain), és csak akkor ad
+<code>nullopt</code>-ot, ha a sor kiürült. Ez a „drain on stop”
+politika.</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// bounded_queue.hpp</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#pragma once</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;chrono&gt;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;condition_variable&gt;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstddef&gt;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;deque&gt;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;mutex&gt;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;optional&gt;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stop_token&gt;</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;utility&gt;</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="kw">enum</span> <span class="kw">class</span> push_status <span class="op">{</span> ok<span class="op">,</span> closed<span class="op">,</span> stopped <span class="op">};</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="kw">template</span> <span class="op">&lt;</span><span class="kw">class</span> T<span class="op">&gt;</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> bounded_queue <span class="op">{</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>    <span class="kw">explicit</span> bounded_queue<span class="op">(</span><span class="bu">std::</span>size_t capacity<span class="op">)</span> <span class="op">:</span> <span class="va">cap_</span><span class="op">(</span>capacity<span class="op">)</span> <span class="op">{}</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>    bounded_queue<span class="op">(</span><span class="at">const</span> bounded_queue<span class="op">&amp;)</span> <span class="op">=</span> <span class="kw">delete</span><span class="op">;</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>    bounded_queue<span class="op">&amp;</span> <span class="kw">operator</span><span class="op">=(</span><span class="at">const</span> bounded_queue<span class="op">&amp;)</span> <span class="op">=</span> <span class="kw">delete</span><span class="op">;</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Nem blokkol; false: tele van vagy lezárt.</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> try_push<span class="op">(</span>T value<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>lock_guard lk<span class="op">(</span><span class="va">m_</span><span class="op">);</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span><span class="va">closed_</span> <span class="op">||</span> <span class="va">q_</span><span class="op">.</span>size<span class="op">()</span> <span class="op">&gt;=</span> <span class="va">cap_</span><span class="op">)</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>            <span class="va">q_</span><span class="op">.</span>push_back<span class="op">(</span><span class="bu">std::</span>move<span class="op">(</span>value<span class="op">));</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>        <span class="va">not_empty_</span><span class="op">.</span>notify_one<span class="op">();</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Blokkol, amíg hely van. A sikertelenség okát a zár alatt dönti el:</span></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>    <span class="co">// closed (a sor lezárt) vagy stopped (a hívó stop kérése).</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>    push_status push<span class="op">(</span>T value<span class="op">,</span> <span class="bu">std::</span>stop_token st<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>unique_lock lk<span class="op">(</span><span class="va">m_</span><span class="op">);</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>        <span class="va">not_full_</span><span class="op">.</span>wait<span class="op">(</span>lk<span class="op">,</span> st<span class="op">,</span> <span class="op">[&amp;]</span> <span class="op">{</span> <span class="cf">return</span> <span class="va">closed_</span> <span class="op">||</span> <span class="va">q_</span><span class="op">.</span>size<span class="op">()</span> <span class="op">&lt;</span> <span class="va">cap_</span><span class="op">;</span> <span class="op">});</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span><span class="va">closed_</span><span class="op">)</span> <span class="cf">return</span> push_status<span class="op">::</span>closed<span class="op">;</span></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>st<span class="op">.</span>stop_requested<span class="op">())</span> <span class="cf">return</span> push_status<span class="op">::</span>stopped<span class="op">;</span></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a>        <span class="va">q_</span><span class="op">.</span>push_back<span class="op">(</span><span class="bu">std::</span>move<span class="op">(</span>value<span class="op">));</span></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a>        lk<span class="op">.</span>unlock<span class="op">();</span></span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a>        <span class="va">not_empty_</span><span class="op">.</span>notify_one<span class="op">();</span></span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> push_status<span class="op">::</span>ok<span class="op">;</span></span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-45"><a href="#cb2-45" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Stop után is kiveszi a maradékot; csak üres+leállt esetén nullopt.</span></span>
+<span id="cb2-46"><a href="#cb2-46" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>optional<span class="op">&lt;</span>T<span class="op">&gt;</span> pop<span class="op">(</span><span class="bu">std::</span>stop_token st<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-47"><a href="#cb2-47" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>unique_lock lk<span class="op">(</span><span class="va">m_</span><span class="op">);</span></span>
+<span id="cb2-48"><a href="#cb2-48" aria-hidden="true" tabindex="-1"></a>        <span class="va">not_empty_</span><span class="op">.</span>wait<span class="op">(</span>lk<span class="op">,</span> st<span class="op">,</span> <span class="op">[&amp;]</span> <span class="op">{</span> <span class="cf">return</span> <span class="va">closed_</span> <span class="op">||</span> <span class="op">!</span><span class="va">q_</span><span class="op">.</span>empty<span class="op">();</span> <span class="op">});</span></span>
+<span id="cb2-49"><a href="#cb2-49" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span><span class="va">q_</span><span class="op">.</span>empty<span class="op">())</span> <span class="cf">return</span> <span class="bu">std::</span>nullopt<span class="op">;</span></span>
+<span id="cb2-50"><a href="#cb2-50" aria-hidden="true" tabindex="-1"></a>        T v <span class="op">=</span> <span class="bu">std::</span>move<span class="op">(</span><span class="va">q_</span><span class="op">.</span>front<span class="op">());</span></span>
+<span id="cb2-51"><a href="#cb2-51" aria-hidden="true" tabindex="-1"></a>        <span class="va">q_</span><span class="op">.</span>pop_front<span class="op">();</span></span>
+<span id="cb2-52"><a href="#cb2-52" aria-hidden="true" tabindex="-1"></a>        <span class="op">++</span><span class="va">active_</span><span class="op">;</span>                       <span class="co">// kivett, még folyamatban lévő elem</span></span>
+<span id="cb2-53"><a href="#cb2-53" aria-hidden="true" tabindex="-1"></a>        lk<span class="op">.</span>unlock<span class="op">();</span></span>
+<span id="cb2-54"><a href="#cb2-54" aria-hidden="true" tabindex="-1"></a>        <span class="va">not_full_</span><span class="op">.</span>notify_one<span class="op">();</span></span>
+<span id="cb2-55"><a href="#cb2-55" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> v<span class="op">;</span></span>
+<span id="cb2-56"><a href="#cb2-56" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-57"><a href="#cb2-57" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-58"><a href="#cb2-58" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A worker jelzi, hogy a pop-pal kivett elem feldolgozása befejeződött.</span></span>
+<span id="cb2-59"><a href="#cb2-59" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> task_done<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb2-60"><a href="#cb2-60" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb2-61"><a href="#cb2-61" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>lock_guard lk<span class="op">(</span><span class="va">m_</span><span class="op">);</span></span>
+<span id="cb2-62"><a href="#cb2-62" aria-hidden="true" tabindex="-1"></a>            <span class="op">--</span><span class="va">active_</span><span class="op">;</span></span>
+<span id="cb2-63"><a href="#cb2-63" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-64"><a href="#cb2-64" aria-hidden="true" tabindex="-1"></a>        <span class="va">empty_</span><span class="op">.</span>notify_all<span class="op">();</span></span>
+<span id="cb2-65"><a href="#cb2-65" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-66"><a href="#cb2-66" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-67"><a href="#cb2-67" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Nyugvásig vagy a határidőig vár: a sor üres ÉS nincs kivett, még</span></span>
+<span id="cb2-68"><a href="#cb2-68" aria-hidden="true" tabindex="-1"></a>    <span class="co">// feldolgozás alatt álló elem. True, ha elértük.</span></span>
+<span id="cb2-69"><a href="#cb2-69" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> wait_empty_until<span class="op">(</span><span class="bu">std::</span>chrono::steady_clock::time_point deadline<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-70"><a href="#cb2-70" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>unique_lock lk<span class="op">(</span><span class="va">m_</span><span class="op">);</span></span>
+<span id="cb2-71"><a href="#cb2-71" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="va">empty_</span><span class="op">.</span>wait_until<span class="op">(</span>lk<span class="op">,</span> deadline<span class="op">,</span></span>
+<span id="cb2-72"><a href="#cb2-72" aria-hidden="true" tabindex="-1"></a>                                 <span class="op">[&amp;]</span> <span class="op">{</span> <span class="cf">return</span> <span class="va">q_</span><span class="op">.</span>empty<span class="op">()</span> <span class="op">&amp;&amp;</span> <span class="va">active_</span> <span class="op">==</span> <span class="dv">0</span><span class="op">;</span> <span class="op">});</span></span>
+<span id="cb2-73"><a href="#cb2-73" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-74"><a href="#cb2-74" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-75"><a href="#cb2-75" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A sorban maradt elemek eldobása; az eldobott darabszámot adja.</span></span>
+<span id="cb2-76"><a href="#cb2-76" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t discard<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb2-77"><a href="#cb2-77" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>size_t n <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-78"><a href="#cb2-78" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb2-79"><a href="#cb2-79" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>lock_guard lk<span class="op">(</span><span class="va">m_</span><span class="op">);</span></span>
+<span id="cb2-80"><a href="#cb2-80" aria-hidden="true" tabindex="-1"></a>            n <span class="op">=</span> <span class="va">q_</span><span class="op">.</span>size<span class="op">();</span></span>
+<span id="cb2-81"><a href="#cb2-81" aria-hidden="true" tabindex="-1"></a>            <span class="va">q_</span><span class="op">.</span>clear<span class="op">();</span></span>
+<span id="cb2-82"><a href="#cb2-82" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-83"><a href="#cb2-83" aria-hidden="true" tabindex="-1"></a>        <span class="va">empty_</span><span class="op">.</span>notify_all<span class="op">();</span></span>
+<span id="cb2-84"><a href="#cb2-84" aria-hidden="true" tabindex="-1"></a>        <span class="va">not_full_</span><span class="op">.</span>notify_all<span class="op">();</span></span>
+<span id="cb2-85"><a href="#cb2-85" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> n<span class="op">;</span></span>
+<span id="cb2-86"><a href="#cb2-86" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-87"><a href="#cb2-87" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-88"><a href="#cb2-88" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> close<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb2-89"><a href="#cb2-89" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb2-90"><a href="#cb2-90" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>lock_guard lk<span class="op">(</span><span class="va">m_</span><span class="op">);</span></span>
+<span id="cb2-91"><a href="#cb2-91" aria-hidden="true" tabindex="-1"></a>            <span class="va">closed_</span> <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb2-92"><a href="#cb2-92" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-93"><a href="#cb2-93" aria-hidden="true" tabindex="-1"></a>        <span class="va">not_empty_</span><span class="op">.</span>notify_all<span class="op">();</span></span>
+<span id="cb2-94"><a href="#cb2-94" aria-hidden="true" tabindex="-1"></a>        <span class="va">not_full_</span><span class="op">.</span>notify_all<span class="op">();</span></span>
+<span id="cb2-95"><a href="#cb2-95" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-96"><a href="#cb2-96" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-97"><a href="#cb2-97" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t size<span class="op">()</span> <span class="at">const</span> <span class="op">{</span></span>
+<span id="cb2-98"><a href="#cb2-98" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>lock_guard lk<span class="op">(</span><span class="va">m_</span><span class="op">);</span></span>
+<span id="cb2-99"><a href="#cb2-99" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="va">q_</span><span class="op">.</span>size<span class="op">();</span></span>
+<span id="cb2-100"><a href="#cb2-100" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-101"><a href="#cb2-101" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-102"><a href="#cb2-102" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb2-103"><a href="#cb2-103" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t <span class="va">cap_</span><span class="op">;</span></span>
+<span id="cb2-104"><a href="#cb2-104" aria-hidden="true" tabindex="-1"></a>    <span class="at">mutable</span> <span class="bu">std::</span>mutex <span class="va">m_</span><span class="op">;</span></span>
+<span id="cb2-105"><a href="#cb2-105" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>condition_variable_any <span class="va">not_empty_</span><span class="op">,</span> <span class="va">not_full_</span><span class="op">,</span> <span class="va">empty_</span><span class="op">;</span></span>
+<span id="cb2-106"><a href="#cb2-106" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>deque<span class="op">&lt;</span>T<span class="op">&gt;</span> <span class="va">q_</span><span class="op">;</span></span>
+<span id="cb2-107"><a href="#cb2-107" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t <span class="va">active_</span> <span class="op">=</span> <span class="dv">0</span><span class="op">;</span>             <span class="co">// pop után, task_done előtt</span></span>
+<span id="cb2-108"><a href="#cb2-108" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> <span class="va">closed_</span> <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb2-109"><a href="#cb2-109" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A queue működésének kritikus pontja a <code>pop</code> feltétel
+nélküli <code>if (q_.empty())</code> ellenőrzése: a <code>wait</code>
+stop token miatt is visszatérhet, amikor a predikátum hamis, ezért a
+visszatérés után a tényleges állapotot újra meg kell vizsgálni. Ha ezt
+elhagynánk, stop kéréskor üres sorból is kivennénk egy „elemet”, ami nem
+definiált viselkedés. Hasonlóan, a <code>push</code>-ban a
+<code>stop_requested()</code> ellenőrzés azért kell, mert a
+<code>wait</code> akkor is visszatérhet, ha éppen van hely — ilyenkor
+viszont leállás alatt nem akarunk új munkát befogadni. A
+<code>wait_empty_until</code> és a <code>discard</code> a határidős
+leállítás eszköze: az első a sor kiürülésére és a már kivett elemek
+feldolgozásának befejezésére (<code>task_done</code>) vár legfeljebb egy
+adott időpontig, a második a sorban maradt elemeket egy zár alatt
+eldobja, és megmondja, hányat dobott el.</p>
+<p>A queue csak a tárolást és a szinkronizációt adja; a szolgáltatás
+életciklusa a következő headerben van. A konfiguráció minden korlátja
+kötelezően pozitív: nulla worker mellett a sor sosem ürülne, nulla
+kapacitásnál a blokkoló <code>submit</code> sosem jutna helyhez. A
+konstruktor ezért a szálak indítása előtt ellenőriz, és hibás
+konfigurációnál <code>std::invalid_argument</code> kivételt dob; a hiba
+így indításkor derül ki, nem egy beragadt leállításkor.</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// service.hpp</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#pragma once</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;bounded_queue.hpp&quot;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;atomic&gt;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;chrono&gt;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstddef&gt;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;functional&gt;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;mutex&gt;</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdexcept&gt;</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string&gt;</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;thread&gt;</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;utility&gt;</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> frame <span class="op">{</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>string payload<span class="op">;</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> service_config <span class="op">{</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t workers <span class="op">=</span> <span class="dv">2</span><span class="op">;</span>          <span class="co">// W &gt;= 1</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t capacity <span class="op">=</span> <span class="dv">4</span><span class="op">;</span>         <span class="co">// C &gt;= 1</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t max_frame <span class="op">=</span> <span class="dv">4096</span><span class="op">;</span>     <span class="co">// S_max &gt;= 1, bájt</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t max_waiting <span class="op">=</span> <span class="dv">8</span><span class="op">;</span>      <span class="co">// P &gt;= 1: egyszerre blokkoló submitok</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>chrono::milliseconds drain_timeout<span class="op">{</span><span class="dv">1000</span><span class="op">};</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a><span class="kw">enum</span> <span class="kw">class</span> submit_result <span class="op">{</span> accepted<span class="op">,</span> too_large<span class="op">,</span> busy<span class="op">,</span> closed<span class="op">,</span> cancelled <span class="op">};</span>   <span class="co">// cancelled: a hívó stop kérése miatt</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> service_stats <span class="op">{</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t accepted<span class="op">;</span>             <span class="co">// sorba került frame-ek</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t processed<span class="op">;</span>            <span class="co">// végigfutott feldolgozás</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t cancelled<span class="op">;</span>            <span class="co">// stop miatt félbehagyott feldolgozás</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t dropped<span class="op">;</span>              <span class="co">// a drain-határidő után eldobva</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t failed<span class="op">;</span>               <span class="co">// a processor kivételt dobott (a kivételt a szolgáltatás elnyeli)</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a><span class="co">// true: kész; false: a stop kérés miatt félbehagyta. A stop kérés után</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a><span class="co">// korlátos időn belül vissza kell térnie, és nem végezhet blokkoló I/O-t.</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a><span class="co">// Kivételpolitika: a processor dobhat; a szolgáltatás elkapja, a frame-et `failed`-ként</span></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a><span class="co">// számolja el, és a worker tovább fut (a kivétel nem szökik ki a worker szálból).</span></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> processor <span class="op">=</span> <span class="bu">std::</span>function<span class="op">&lt;</span><span class="dt">bool</span><span class="op">(</span><span class="at">const</span> frame<span class="op">&amp;,</span> <span class="bu">std::</span>stop_token<span class="op">)&gt;;</span></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> service <span class="op">{</span></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a>    service<span class="op">(</span>service_config cfg<span class="op">,</span> processor proc<span class="op">)</span></span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a>        <span class="op">:</span> <span class="va">cfg_</span><span class="op">(</span>validate<span class="op">(</span>cfg<span class="op">)),</span> <span class="va">proc_</span><span class="op">(</span><span class="bu">std::</span>move<span class="op">(</span>proc<span class="op">)),</span> <span class="va">q_</span><span class="op">(</span><span class="va">cfg_</span><span class="op">.</span>capacity<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(!</span><span class="va">proc_</span><span class="op">)</span> <span class="cf">throw</span> <span class="bu">std::</span>invalid_argument<span class="op">(</span><span class="st">&quot;service: empty processor&quot;</span><span class="op">);</span></span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a>        <span class="va">workers_</span><span class="op">.</span>reserve<span class="op">(</span><span class="va">cfg_</span><span class="op">.</span>workers<span class="op">);</span></span>
+<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="bu">std::</span>size_t i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="va">cfg_</span><span class="op">.</span>workers<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a>            <span class="va">workers_</span><span class="op">.</span>emplace_back<span class="op">([</span><span class="kw">this</span><span class="op">](</span><span class="bu">std::</span>stop_token st<span class="op">)</span> <span class="op">{</span> run<span class="op">(</span>st<span class="op">);</span> <span class="op">});</span></span>
+<span id="cb3-51"><a href="#cb3-51" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-52"><a href="#cb3-52" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-53"><a href="#cb3-53" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-54"><a href="#cb3-54" aria-hidden="true" tabindex="-1"></a>    <span class="op">~</span>service<span class="op">()</span> <span class="op">{</span> shutdown<span class="op">();</span> <span class="op">}</span></span>
+<span id="cb3-55"><a href="#cb3-55" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-56"><a href="#cb3-56" aria-hidden="true" tabindex="-1"></a>    service<span class="op">(</span><span class="at">const</span> service<span class="op">&amp;)</span> <span class="op">=</span> <span class="kw">delete</span><span class="op">;</span></span>
+<span id="cb3-57"><a href="#cb3-57" aria-hidden="true" tabindex="-1"></a>    service<span class="op">&amp;</span> <span class="kw">operator</span><span class="op">=(</span><span class="at">const</span> service<span class="op">&amp;)</span> <span class="op">=</span> <span class="kw">delete</span><span class="op">;</span></span>
+<span id="cb3-58"><a href="#cb3-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-59"><a href="#cb3-59" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Backpressure: legfeljebb P hívó blokkolhat; a többi azonnal busy.</span></span>
+<span id="cb3-60"><a href="#cb3-60" aria-hidden="true" tabindex="-1"></a>    submit_result submit<span class="op">(</span>frame f<span class="op">,</span> <span class="bu">std::</span>stop_token st <span class="op">=</span> <span class="op">{})</span> <span class="op">{</span></span>
+<span id="cb3-61"><a href="#cb3-61" aria-hidden="true" tabindex="-1"></a>        <span class="co">// A tartott memória a lefoglalt kapacitás, nem a hasznos hossz: a nagy</span></span>
+<span id="cb3-62"><a href="#cb3-62" aria-hidden="true" tabindex="-1"></a>        <span class="co">// reserve() után kicsire állított string is nagy allokációt birtokolna.</span></span>
+<span id="cb3-63"><a href="#cb3-63" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>f<span class="op">.</span>payload<span class="op">.</span>size<span class="op">()</span> <span class="op">&gt;</span> <span class="va">cfg_</span><span class="op">.</span>max_frame <span class="op">||</span> f<span class="op">.</span>payload<span class="op">.</span>capacity<span class="op">()</span> <span class="op">&gt;</span> <span class="va">cfg_</span><span class="op">.</span>max_frame<span class="op">)</span></span>
+<span id="cb3-64"><a href="#cb3-64" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> submit_result<span class="op">::</span>too_large<span class="op">;</span>      <span class="co">// a sor előtt elutasítva</span></span>
+<span id="cb3-65"><a href="#cb3-65" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span><span class="va">waiting_</span><span class="op">.</span>fetch_add<span class="op">(</span><span class="dv">1</span><span class="op">)</span> <span class="op">&gt;=</span> <span class="va">cfg_</span><span class="op">.</span>max_waiting<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-66"><a href="#cb3-66" aria-hidden="true" tabindex="-1"></a>            <span class="va">waiting_</span><span class="op">.</span>fetch_sub<span class="op">(</span><span class="dv">1</span><span class="op">);</span></span>
+<span id="cb3-67"><a href="#cb3-67" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> submit_result<span class="op">::</span>busy<span class="op">;</span></span>
+<span id="cb3-68"><a href="#cb3-68" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-69"><a href="#cb3-69" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Scope guard: a waiting-foglalás minden úton (a push() kivételénél is) felszabadul.</span></span>
+<span id="cb3-70"><a href="#cb3-70" aria-hidden="true" tabindex="-1"></a>        <span class="kw">struct</span> waiting_guard <span class="op">{</span></span>
+<span id="cb3-71"><a href="#cb3-71" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="bu">std::</span>size_t<span class="op">&gt;&amp;</span> c<span class="op">;</span></span>
+<span id="cb3-72"><a href="#cb3-72" aria-hidden="true" tabindex="-1"></a>            <span class="op">~</span>waiting_guard<span class="op">()</span> <span class="op">{</span> c<span class="op">.</span>fetch_sub<span class="op">(</span><span class="dv">1</span><span class="op">);</span> <span class="op">}</span></span>
+<span id="cb3-73"><a href="#cb3-73" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> guard<span class="op">{</span><span class="va">waiting_</span><span class="op">};</span></span>
+<span id="cb3-74"><a href="#cb3-74" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Kivételpolitika: ha a push() dob (pl. allokáció), a számlálók változatlanok,</span></span>
+<span id="cb3-75"><a href="#cb3-75" aria-hidden="true" tabindex="-1"></a>        <span class="co">// a kivétel a hívóhoz jut; az accepted csak valódi befogadás után nő.</span></span>
+<span id="cb3-76"><a href="#cb3-76" aria-hidden="true" tabindex="-1"></a>        <span class="co">// A sikertelen push okát a queue a saját zára alatt dönti el:</span></span>
+<span id="cb3-77"><a href="#cb3-77" aria-hidden="true" tabindex="-1"></a>        <span class="co">// lezárt szolgáltatás (closed) vagy a hívó stop kérése (cancelled).</span></span>
+<span id="cb3-78"><a href="#cb3-78" aria-hidden="true" tabindex="-1"></a>        <span class="cf">switch</span> <span class="op">(</span><span class="va">q_</span><span class="op">.</span>push<span class="op">(</span><span class="bu">std::</span>move<span class="op">(</span>f<span class="op">),</span> st<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb3-79"><a href="#cb3-79" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> push_status<span class="op">::</span>ok<span class="op">:</span></span>
+<span id="cb3-80"><a href="#cb3-80" aria-hidden="true" tabindex="-1"></a>            <span class="va">accepted_</span><span class="op">.</span>fetch_add<span class="op">(</span><span class="dv">1</span><span class="op">);</span></span>
+<span id="cb3-81"><a href="#cb3-81" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> submit_result<span class="op">::</span>accepted<span class="op">;</span></span>
+<span id="cb3-82"><a href="#cb3-82" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> push_status<span class="op">::</span>closed<span class="op">:</span></span>
+<span id="cb3-83"><a href="#cb3-83" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> submit_result<span class="op">::</span>closed<span class="op">;</span></span>
+<span id="cb3-84"><a href="#cb3-84" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> push_status<span class="op">::</span>stopped<span class="op">:</span></span>
+<span id="cb3-85"><a href="#cb3-85" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> submit_result<span class="op">::</span>cancelled<span class="op">;</span></span>
+<span id="cb3-86"><a href="#cb3-86" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-87"><a href="#cb3-87" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> submit_result<span class="op">::</span>closed<span class="op">;</span>   <span class="co">// elérhetetlen; a fordító figyelmeztetését kerüli</span></span>
+<span id="cb3-88"><a href="#cb3-88" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-89"><a href="#cb3-89" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-90"><a href="#cb3-90" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Határidős leállítás; többször is hívható. Felső korlátja</span></span>
+<span id="cb3-91"><a href="#cb3-91" aria-hidden="true" tabindex="-1"></a>    <span class="co">// drain_timeout + egy feldolgozás stop utáni visszatérési ideje.</span></span>
+<span id="cb3-92"><a href="#cb3-92" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A drain a sor kiürüléséig ÉS a kivett elemek feldolgozásának</span></span>
+<span id="cb3-93"><a href="#cb3-93" aria-hidden="true" tabindex="-1"></a>    <span class="co">// befejezéséig tart; csak a határidő lejárta után szakad meg.</span></span>
+<span id="cb3-94"><a href="#cb3-94" aria-hidden="true" tabindex="-1"></a>    service_stats shutdown<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb3-95"><a href="#cb3-95" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>call_once<span class="op">(</span><span class="va">once_</span><span class="op">,</span> <span class="op">[</span><span class="kw">this</span><span class="op">]</span> <span class="op">{</span></span>
+<span id="cb3-96"><a href="#cb3-96" aria-hidden="true" tabindex="-1"></a>            <span class="va">q_</span><span class="op">.</span>close<span class="op">();</span>                                    <span class="co">// 1. új munka tiltása</span></span>
+<span id="cb3-97"><a href="#cb3-97" aria-hidden="true" tabindex="-1"></a>            <span class="at">const</span> <span class="kw">auto</span> deadline <span class="op">=</span></span>
+<span id="cb3-98"><a href="#cb3-98" aria-hidden="true" tabindex="-1"></a>                <span class="bu">std::</span>chrono::steady_clock::now<span class="op">()</span> <span class="op">+</span> <span class="va">cfg_</span><span class="op">.</span>drain_timeout<span class="op">;</span></span>
+<span id="cb3-99"><a href="#cb3-99" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(!</span><span class="va">q_</span><span class="op">.</span>wait_empty_until<span class="op">(</span>deadline<span class="op">))</span>            <span class="co">// 2. drain határidőig</span></span>
+<span id="cb3-100"><a href="#cb3-100" aria-hidden="true" tabindex="-1"></a>                <span class="va">dropped_</span> <span class="op">=</span> <span class="va">q_</span><span class="op">.</span>discard<span class="op">();</span>                   <span class="co">// 3. maradék eldobása</span></span>
+<span id="cb3-101"><a href="#cb3-101" aria-hidden="true" tabindex="-1"></a>            <span class="cf">for</span> <span class="op">(</span><span class="kw">auto</span><span class="op">&amp;</span> w <span class="op">:</span> <span class="va">workers_</span><span class="op">)</span> w<span class="op">.</span>request_stop<span class="op">();</span>     <span class="co">// 4. kooperatív stop</span></span>
+<span id="cb3-102"><a href="#cb3-102" aria-hidden="true" tabindex="-1"></a>            <span class="va">workers_</span><span class="op">.</span>clear<span class="op">();</span>                              <span class="co">// 5. join</span></span>
+<span id="cb3-103"><a href="#cb3-103" aria-hidden="true" tabindex="-1"></a>        <span class="op">});</span></span>
+<span id="cb3-104"><a href="#cb3-104" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">{</span><span class="va">accepted_</span><span class="op">.</span>load<span class="op">(),</span> <span class="va">processed_</span><span class="op">.</span>load<span class="op">(),</span> <span class="va">cancelled_</span><span class="op">.</span>load<span class="op">(),</span></span>
+<span id="cb3-105"><a href="#cb3-105" aria-hidden="true" tabindex="-1"></a>                <span class="va">dropped_</span><span class="op">,</span> <span class="va">failed_</span><span class="op">.</span>load<span class="op">()};</span></span>
+<span id="cb3-106"><a href="#cb3-106" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-107"><a href="#cb3-107" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-108"><a href="#cb3-108" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t pending<span class="op">()</span> <span class="at">const</span> <span class="op">{</span> <span class="cf">return</span> <span class="va">q_</span><span class="op">.</span>size<span class="op">();</span> <span class="op">}</span></span>
+<span id="cb3-109"><a href="#cb3-109" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-110"><a href="#cb3-110" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb3-111"><a href="#cb3-111" aria-hidden="true" tabindex="-1"></a>    <span class="at">static</span> service_config validate<span class="op">(</span>service_config cfg<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-112"><a href="#cb3-112" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>cfg<span class="op">.</span>workers <span class="op">==</span> <span class="dv">0</span> <span class="op">||</span> cfg<span class="op">.</span>capacity <span class="op">==</span> <span class="dv">0</span> <span class="op">||</span> cfg<span class="op">.</span>max_frame <span class="op">==</span> <span class="dv">0</span> <span class="op">||</span></span>
+<span id="cb3-113"><a href="#cb3-113" aria-hidden="true" tabindex="-1"></a>            cfg<span class="op">.</span>max_waiting <span class="op">==</span> <span class="dv">0</span> <span class="op">||</span> cfg<span class="op">.</span>drain_timeout<span class="op">.</span>count<span class="op">()</span> <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb3-114"><a href="#cb3-114" aria-hidden="true" tabindex="-1"></a>            <span class="cf">throw</span> <span class="bu">std::</span>invalid_argument<span class="op">(</span><span class="st">&quot;service: invalid configuration&quot;</span><span class="op">);</span></span>
+<span id="cb3-115"><a href="#cb3-115" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> cfg<span class="op">;</span></span>
+<span id="cb3-116"><a href="#cb3-116" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-117"><a href="#cb3-117" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-118"><a href="#cb3-118" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> run<span class="op">(</span><span class="bu">std::</span>stop_token st<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-119"><a href="#cb3-119" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="op">(</span><span class="kw">auto</span> f <span class="op">=</span> <span class="va">q_</span><span class="op">.</span>pop<span class="op">(</span>st<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb3-120"><a href="#cb3-120" aria-hidden="true" tabindex="-1"></a>            <span class="cf">try</span> <span class="op">{</span></span>
+<span id="cb3-121"><a href="#cb3-121" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> <span class="op">(</span><span class="va">proc_</span><span class="op">(*</span>f<span class="op">,</span> st<span class="op">))</span></span>
+<span id="cb3-122"><a href="#cb3-122" aria-hidden="true" tabindex="-1"></a>                    <span class="va">processed_</span><span class="op">.</span>fetch_add<span class="op">(</span><span class="dv">1</span><span class="op">);</span></span>
+<span id="cb3-123"><a href="#cb3-123" aria-hidden="true" tabindex="-1"></a>                <span class="cf">else</span></span>
+<span id="cb3-124"><a href="#cb3-124" aria-hidden="true" tabindex="-1"></a>                    <span class="va">cancelled_</span><span class="op">.</span>fetch_add<span class="op">(</span><span class="dv">1</span><span class="op">);</span></span>
+<span id="cb3-125"><a href="#cb3-125" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span> <span class="cf">catch</span> <span class="op">(...)</span> <span class="op">{</span>                       <span class="co">// dokumentált hibaút: elszámolás, a worker él tovább</span></span>
+<span id="cb3-126"><a href="#cb3-126" aria-hidden="true" tabindex="-1"></a>                <span class="va">failed_</span><span class="op">.</span>fetch_add<span class="op">(</span><span class="dv">1</span><span class="op">);</span></span>
+<span id="cb3-127"><a href="#cb3-127" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb3-128"><a href="#cb3-128" aria-hidden="true" tabindex="-1"></a>            <span class="va">q_</span><span class="op">.</span>task_done<span class="op">();</span>                       <span class="co">// csak az elszámolás után: a drain eddig vár</span></span>
+<span id="cb3-129"><a href="#cb3-129" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-130"><a href="#cb3-130" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-131"><a href="#cb3-131" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-132"><a href="#cb3-132" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> service_config <span class="va">cfg_</span><span class="op">;</span></span>
+<span id="cb3-133"><a href="#cb3-133" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> processor <span class="va">proc_</span><span class="op">;</span></span>
+<span id="cb3-134"><a href="#cb3-134" aria-hidden="true" tabindex="-1"></a>    bounded_queue<span class="op">&lt;</span>frame<span class="op">&gt;</span> <span class="va">q_</span><span class="op">;</span></span>
+<span id="cb3-135"><a href="#cb3-135" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="bu">std::</span>size_t<span class="op">&gt;</span> <span class="va">waiting_</span><span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb3-136"><a href="#cb3-136" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="bu">std::</span>size_t<span class="op">&gt;</span> <span class="va">accepted_</span><span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb3-137"><a href="#cb3-137" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="bu">std::</span>size_t<span class="op">&gt;</span> <span class="va">processed_</span><span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb3-138"><a href="#cb3-138" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="bu">std::</span>size_t<span class="op">&gt;</span> <span class="va">cancelled_</span><span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb3-139"><a href="#cb3-139" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="bu">std::</span>size_t<span class="op">&gt;</span> <span class="va">failed_</span><span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb3-140"><a href="#cb3-140" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t <span class="va">dropped_</span> <span class="op">=</span> <span class="dv">0</span><span class="op">;</span>          <span class="co">// csak a call_once írja</span></span>
+<span id="cb3-141"><a href="#cb3-141" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>once_flag <span class="va">once_</span><span class="op">;</span></span>
+<span id="cb3-142"><a href="#cb3-142" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="bu">std::</span>jthread<span class="op">&gt;</span> <span class="va">workers_</span><span class="op">;</span> <span class="co">// utolsó tag: elsőként szűnik meg</span></span>
+<span id="cb3-143"><a href="#cb3-143" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A feldolgozó (<code>processor</code>) szerződése a leállítási korlát
+része: a stop kérés után korlátos időn belül vissza kell térnie, és
+blokkoló I/O-t nem végezhet. Egy megtelt, nem olvasott pipe-ra író
+<code>printf</code> például korlátlan ideig blokkolhat, és ezt a stop
+token nem szakítja meg; ezért a példa a feldolgozás eredményét
+memóriában gyűjti, és csak a leállítás után, a szolgáltatáson kívül ír
+ki. A feldolgozó <code>false</code> visszatérése azt jelzi, hogy a
+munkát a stop kérés miatt félbehagyta; ezt a <code>cancelled</code>
+számláló rögzíti. A <code>submit</code> eredményei:
+<code>accepted</code>, <code>too_large</code>, <code>busy</code>,
+<code>closed</code> (a szolgáltatás leállt) és <code>cancelled</code> (a
+hívó saját stop-kérése szakította meg a várakozást); a két utóbbi nem
+keverendő össze, mert más hívói teendő tartozik hozzájuk (újrapróbálás
+szándékosan nem, illetve lemondás elszámolása). A feldolgozó
+<strong>dobhat</strong> kivételt: a szolgáltatás elkapja, a frame-et a
+<code>failed</code> számlálóba számolja, a worker tovább fut (a kivétel
+nem szökik ki a szálból, így nincs <code>std::terminate</code>); a
+<code>submit</code> kivételpolitikája pedig, hogy a <code>push()</code>
+dobása esetén a számlálók változatlanok maradnak (a <code>waiting</code>
+foglalást scope guard adja vissza).</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// main.cpp</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;service.hpp&quot;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;atomic&gt;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string&gt;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="bu">std::</span>size_t<span class="op">&gt;</span> bytes<span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    service svc<span class="op">{</span>service_config<span class="op">{},</span> <span class="op">[&amp;</span>bytes<span class="op">](</span><span class="at">const</span> frame<span class="op">&amp;</span> f<span class="op">,</span> <span class="bu">std::</span>stop_token<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>        bytes<span class="op">.</span>fetch_add<span class="op">(</span>f<span class="op">.</span>payload<span class="op">.</span>size<span class="op">());</span>   <span class="co">// nem blokkol: korlátos idő</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">}};</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">8</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>        <span class="op">(</span><span class="dt">void</span><span class="op">)</span>svc<span class="op">.</span>submit<span class="op">(</span>frame<span class="op">{</span><span class="st">&quot;job-&quot;</span> <span class="op">+</span> <span class="bu">std::</span>to_string<span class="op">(</span>i<span class="op">)});</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> service_stats s <span class="op">=</span> svc<span class="op">.</span>shutdown<span class="op">();</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A kiírás a leállítás után, a szolgáltatáson kívül történik.</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;accepted=</span><span class="sc">%zu</span><span class="st"> processed=</span><span class="sc">%zu</span><span class="st"> cancelled=</span><span class="sc">%zu</span><span class="st"> dropped=</span><span class="sc">%zu</span><span class="st"> &quot;</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>                <span class="st">&quot;failed=</span><span class="sc">%zu</span><span class="st"> bytes=</span><span class="sc">%zu\n</span><span class="st">&quot;</span><span class="op">,</span> s<span class="op">.</span>accepted<span class="op">,</span> s<span class="op">.</span>processed<span class="op">,</span> s<span class="op">.</span>cancelled<span class="op">,</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>                s<span class="op">.</span>dropped<span class="op">,</span> s<span class="op">.</span>failed<span class="op">,</span> bytes<span class="op">.</span>load<span class="op">());</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> s<span class="op">.</span>accepted <span class="op">==</span> s<span class="op">.</span>processed <span class="op">+</span> s<span class="op">.</span>cancelled <span class="op">+</span> s<span class="op">.</span>dropped <span class="op">+</span> s<span class="op">.</span>failed <span class="op">?</span> <span class="dv">0</span> <span class="op">:</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>shutdown()</code> eredménye a munka teljes elszámolása: a
+leállítás után, és miután minden <code>submit</code> hívás
+visszatért,</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">accepted</mtext><mo>=</mo><mtext mathvariant="normal">processed</mtext><mo>+</mo><mtext mathvariant="normal">cancelled</mtext><mo>+</mo><mtext mathvariant="normal">dropped</mtext><mo>+</mo><mtext mathvariant="normal">failed</mtext><mi>.</mi></mrow><annotation encoding="application/x-tex">\text{accepted} = \text{processed} + \text{cancelled} + \text{dropped} + \text{failed}.</annotation></semantics></math></p>
+<p>Fordítás és futtatás:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">g++</span> <span class="at">-std</span><span class="op">=</span>c++20 <span class="at">-O2</span> <span class="at">-Wall</span> <span class="at">-Wextra</span> <span class="at">-Wpedantic</span> <span class="at">-Wconversion</span> <span class="at">-Wshadow</span> <span class="dt">\</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>    <span class="at">-Werror</span> <span class="at">-pthread</span> <span class="at">-o</span> svc main.cpp</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="ex">./svc</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="ex">g++</span> <span class="at">-std</span><span class="op">=</span>c++20 <span class="at">-O1</span> <span class="at">-g</span> <span class="at">-pthread</span> <span class="at">-fsanitize</span><span class="op">=</span>thread <span class="at">-o</span> svc-tsan main.cpp</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="ex">setarch</span> <span class="at">-R</span> ./svc-tsan</span></code></pre></div>
+<p>A kimenet:
+<code>accepted=8 processed=8 cancelled=0 dropped=0 failed=0 bytes=40</code>;
+a feldolgozás sorrendje futásonként változhat, a számlálók nem. A
+<code>setarch -R</code> a címtér-véletlenítést kapcsolja ki az adott
+folyamatra: újabb Linux-kerneleken az alapértelmezett ASLR-entrópia
+mellett a ThreadSanitizer futásidejű könyvtára
+<code>unexpected memory mapping</code> hibával leáll, mielőtt a program
+elindulna.</p>
+<p>A konfigurációt, a memóriakorlátot és a határidős leállítást külön
+teszt ellenőrzi. A memóriamérés a globális <code>operator new</code>
+felülírásával a legalább
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>S</mi><mi>max</mi></msub><annotation encoding="application/x-tex">S_{\max}</annotation></semantics></math>
+méretű élő allokációkat számolja; egy blokkolt workerrel,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>C</mi><mo>=</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">C=4</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>W</mi><mo>=</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">W=1</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>P</mi><mo>=</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">P=2</annotation></semantics></math>
+beállítással és 16 egyidejű producerrel az élő nagy allokációk száma
+pontosan
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>C</mi><mo>+</mo><mi>W</mi><mo>+</mo><mi>P</mi><mo>=</mo><mn>7</mn></mrow><annotation encoding="application/x-tex">C+W+P=7</annotation></semantics></math>,
+a többi 14 producer <code>busy</code> eredményt kap. A lassú feldolgozós
+eset azt ellenőrzi, hogy a leállítás a drain-határidő és egy feldolgozás
+ideje után véget ér, a maradékot pedig eldobottként számolja el:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">// tests/service_test.cpp -- konfiguráció, memóriakorlát, határidős leállás</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;service.hpp&quot;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;atomic&gt;</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;chrono&gt;</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;condition_variable&gt;</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;mutex&gt;</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;new&gt;</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdexcept&gt;</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;thread&gt;</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CHECK</span><span class="op">(</span>condition<span class="op">)</span><span class="pp"> </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                      </span><span class="op">\</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">if</span><span class="pp"> </span><span class="op">(!(</span>condition<span class="op">))</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                            </span><span class="op">\</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CHECK failed at line </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">);</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                   </span><span class="op">\</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp">                                                              </span><span class="op">\</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> <span class="kw">namespace</span> <span class="bu">std::</span>chrono_literals<span class="op">;</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> <span class="dt">clock_type</span> <span class="op">=</span> <span class="bu">std::</span>chrono::steady_clock<span class="op">;</span></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a><span class="co">// --- A nagy (&gt;= S_max) allokációk élő darabszámának mérése -------------</span></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a><span class="kw">constexpr</span> <span class="bu">std::</span>size_t <span class="va">s_max</span> <span class="op">=</span> <span class="dv">4096</span><span class="op">;</span></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a><span class="at">static</span> <span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="dt">long</span><span class="op">&gt;</span> big_live<span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> <span class="op">*</span><span class="kw">operator</span> <span class="kw">new</span><span class="op">(</span><span class="bu">std::</span>size_t size<span class="op">)</span></span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> <span class="op">*</span>base <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="bu">std::</span>max_align_t <span class="op">*&gt;(</span></span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>malloc<span class="op">(</span>size <span class="op">+</span> <span class="kw">sizeof</span><span class="op">(</span><span class="bu">std::</span>max_align_t<span class="op">)));</span></span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>base <span class="op">==</span> <span class="kw">nullptr</span><span class="op">)</span> <span class="cf">throw</span> <span class="bu">std::</span>bad_alloc<span class="op">{};</span></span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a>    <span class="op">*</span><span class="kw">reinterpret_cast</span><span class="op">&lt;</span><span class="bu">std::</span>size_t <span class="op">*&gt;(</span>base<span class="op">)</span> <span class="op">=</span> size<span class="op">;</span></span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>size <span class="op">&gt;=</span> <span class="va">s_max</span><span class="op">)</span> big_live<span class="op">.</span>fetch_add<span class="op">(</span><span class="dv">1</span><span class="op">);</span></span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> base <span class="op">+</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-39"><a href="#cb6-39" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> <span class="kw">operator</span> <span class="kw">delete</span><span class="op">(</span><span class="dt">void</span> <span class="op">*</span>p<span class="op">)</span> <span class="kw">noexcept</span></span>
+<span id="cb6-40"><a href="#cb6-40" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb6-41"><a href="#cb6-41" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>p <span class="op">==</span> <span class="kw">nullptr</span><span class="op">)</span> <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb6-42"><a href="#cb6-42" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> <span class="op">*</span>base <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="bu">std::</span>max_align_t <span class="op">*&gt;(</span>p<span class="op">)</span> <span class="op">-</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb6-43"><a href="#cb6-43" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(*</span><span class="kw">reinterpret_cast</span><span class="op">&lt;</span><span class="bu">std::</span>size_t <span class="op">*&gt;(</span>base<span class="op">)</span> <span class="op">&gt;=</span> <span class="va">s_max</span><span class="op">)</span></span>
+<span id="cb6-44"><a href="#cb6-44" aria-hidden="true" tabindex="-1"></a>        big_live<span class="op">.</span>fetch_sub<span class="op">(</span><span class="dv">1</span><span class="op">);</span></span>
+<span id="cb6-45"><a href="#cb6-45" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>free<span class="op">(</span>base<span class="op">);</span></span>
+<span id="cb6-46"><a href="#cb6-46" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-47"><a href="#cb6-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-48"><a href="#cb6-48" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> <span class="kw">operator</span> <span class="kw">delete</span><span class="op">(</span><span class="dt">void</span> <span class="op">*</span>p<span class="op">,</span> <span class="bu">std::</span>size_t<span class="op">)</span> <span class="kw">noexcept</span> <span class="op">{</span> <span class="kw">operator</span> <span class="kw">delete</span><span class="op">(</span>p<span class="op">);</span> <span class="op">}</span></span>
+<span id="cb6-49"><a href="#cb6-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-50"><a href="#cb6-50" aria-hidden="true" tabindex="-1"></a><span class="co">// --- Feldolgozók ---------------------------------------------------------</span></span>
+<span id="cb6-51"><a href="#cb6-51" aria-hidden="true" tabindex="-1"></a><span class="at">static</span> <span class="dt">bool</span> instant<span class="op">(</span><span class="at">const</span> frame <span class="op">&amp;,</span> <span class="bu">std::</span>stop_token<span class="op">)</span> <span class="op">{</span> <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb6-52"><a href="#cb6-52" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-53"><a href="#cb6-53" aria-hidden="true" tabindex="-1"></a><span class="at">static</span> <span class="dt">bool</span> slow<span class="op">(</span><span class="at">const</span> frame <span class="op">&amp;,</span> <span class="bu">std::</span>stop_token<span class="op">)</span>   <span class="co">// nem figyeli a stopot,</span></span>
+<span id="cb6-54"><a href="#cb6-54" aria-hidden="true" tabindex="-1"></a><span class="op">{</span>                                                   <span class="co">// de korlátos idejű</span></span>
+<span id="cb6-55"><a href="#cb6-55" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>this_thread::sleep_for<span class="op">(</span><span class="dv">20</span><span class="bu">ms</span><span class="op">);</span></span>
+<span id="cb6-56"><a href="#cb6-56" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb6-57"><a href="#cb6-57" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-58"><a href="#cb6-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-59"><a href="#cb6-59" aria-hidden="true" tabindex="-1"></a><span class="at">static</span> <span class="dt">bool</span> blocked<span class="op">(</span><span class="at">const</span> frame <span class="op">&amp;,</span> <span class="bu">std::</span>stop_token st<span class="op">)</span>  <span class="co">// csak stopra áll le</span></span>
+<span id="cb6-60"><a href="#cb6-60" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb6-61"><a href="#cb6-61" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>mutex m<span class="op">;</span></span>
+<span id="cb6-62"><a href="#cb6-62" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>condition_variable_any cv<span class="op">;</span></span>
+<span id="cb6-63"><a href="#cb6-63" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>unique_lock lk<span class="op">(</span>m<span class="op">);</span></span>
+<span id="cb6-64"><a href="#cb6-64" aria-hidden="true" tabindex="-1"></a>    cv<span class="op">.</span>wait<span class="op">(</span>lk<span class="op">,</span> st<span class="op">,</span> <span class="op">[]</span> <span class="op">{</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span> <span class="op">});</span></span>
+<span id="cb6-65"><a href="#cb6-65" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span>                                   <span class="co">// félbehagyva</span></span>
+<span id="cb6-66"><a href="#cb6-66" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-67"><a href="#cb6-67" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-68"><a href="#cb6-68" aria-hidden="true" tabindex="-1"></a><span class="at">static</span> <span class="dt">bool</span> rejects<span class="op">(</span>service_config cfg<span class="op">)</span></span>
+<span id="cb6-69"><a href="#cb6-69" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb6-70"><a href="#cb6-70" aria-hidden="true" tabindex="-1"></a>    <span class="cf">try</span> <span class="op">{</span></span>
+<span id="cb6-71"><a href="#cb6-71" aria-hidden="true" tabindex="-1"></a>        service svc<span class="op">{</span>cfg<span class="op">,</span> instant<span class="op">};</span></span>
+<span id="cb6-72"><a href="#cb6-72" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">catch</span> <span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>invalid_argument <span class="op">&amp;)</span> <span class="op">{</span></span>
+<span id="cb6-73"><a href="#cb6-73" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb6-74"><a href="#cb6-74" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-75"><a href="#cb6-75" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb6-76"><a href="#cb6-76" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-77"><a href="#cb6-77" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-78"><a href="#cb6-78" aria-hidden="true" tabindex="-1"></a><span class="at">static</span> <span class="dt">void</span> wait_until<span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>function<span class="op">&lt;</span><span class="dt">bool</span><span class="op">()&gt;</span> <span class="op">&amp;</span>done<span class="op">)</span></span>
+<span id="cb6-79"><a href="#cb6-79" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb6-80"><a href="#cb6-80" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="kw">auto</span> limit <span class="op">=</span> <span class="dt">clock_type</span><span class="op">::</span>now<span class="op">()</span> <span class="op">+</span> <span class="dv">5</span><span class="bu">s</span><span class="op">;</span></span>
+<span id="cb6-81"><a href="#cb6-81" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(!</span>done<span class="op">())</span> <span class="op">{</span></span>
+<span id="cb6-82"><a href="#cb6-82" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span><span class="dt">clock_type</span><span class="op">::</span>now<span class="op">()</span> <span class="op">&lt;</span> limit<span class="op">);</span></span>
+<span id="cb6-83"><a href="#cb6-83" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>this_thread::sleep_for<span class="op">(</span><span class="dv">1</span><span class="bu">ms</span><span class="op">);</span></span>
+<span id="cb6-84"><a href="#cb6-84" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-85"><a href="#cb6-85" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-86"><a href="#cb6-86" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-87"><a href="#cb6-87" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span></span>
+<span id="cb6-88"><a href="#cb6-88" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb6-89"><a href="#cb6-89" aria-hidden="true" tabindex="-1"></a>    <span class="co">// H077: a hibás konfiguráció indításkor kiderül.</span></span>
+<span id="cb6-90"><a href="#cb6-90" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>rejects<span class="op">({.</span>workers <span class="op">=</span> <span class="dv">0</span><span class="op">}));</span></span>
+<span id="cb6-91"><a href="#cb6-91" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>rejects<span class="op">({.</span>capacity <span class="op">=</span> <span class="dv">0</span><span class="op">}));</span></span>
+<span id="cb6-92"><a href="#cb6-92" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>rejects<span class="op">({.</span>max_frame <span class="op">=</span> <span class="dv">0</span><span class="op">}));</span></span>
+<span id="cb6-93"><a href="#cb6-93" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>rejects<span class="op">({.</span>max_waiting <span class="op">=</span> <span class="dv">0</span><span class="op">}));</span></span>
+<span id="cb6-94"><a href="#cb6-94" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb6-95"><a href="#cb6-95" aria-hidden="true" tabindex="-1"></a>        <span class="dt">bool</span> threw <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb6-96"><a href="#cb6-96" aria-hidden="true" tabindex="-1"></a>        <span class="cf">try</span> <span class="op">{</span> service svc<span class="op">{</span>service_config<span class="op">{},</span> processor<span class="op">{}};</span> <span class="op">}</span></span>
+<span id="cb6-97"><a href="#cb6-97" aria-hidden="true" tabindex="-1"></a>        <span class="cf">catch</span> <span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>invalid_argument <span class="op">&amp;)</span> <span class="op">{</span> threw <span class="op">=</span> <span class="kw">true</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb6-98"><a href="#cb6-98" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>threw<span class="op">);</span></span>
+<span id="cb6-99"><a href="#cb6-99" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-100"><a href="#cb6-100" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-101"><a href="#cb6-101" aria-hidden="true" tabindex="-1"></a>    <span class="co">// workers = 1, capacity = 1: nem ragad be.</span></span>
+<span id="cb6-102"><a href="#cb6-102" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb6-103"><a href="#cb6-103" aria-hidden="true" tabindex="-1"></a>        service svc<span class="op">{{.</span>workers <span class="op">=</span> <span class="dv">1</span><span class="op">,</span> <span class="op">.</span>capacity <span class="op">=</span> <span class="dv">1</span><span class="op">},</span> instant<span class="op">};</span></span>
+<span id="cb6-104"><a href="#cb6-104" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">100</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span></span>
+<span id="cb6-105"><a href="#cb6-105" aria-hidden="true" tabindex="-1"></a>            CHECK<span class="op">(</span>svc<span class="op">.</span>submit<span class="op">(</span>frame<span class="op">{</span><span class="st">&quot;x&quot;</span><span class="op">})</span> <span class="op">==</span> submit_result<span class="op">::</span>accepted<span class="op">);</span></span>
+<span id="cb6-106"><a href="#cb6-106" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> service_stats s <span class="op">=</span> svc<span class="op">.</span>shutdown<span class="op">();</span></span>
+<span id="cb6-107"><a href="#cb6-107" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>s<span class="op">.</span>accepted <span class="op">==</span> <span class="dv">100</span> <span class="op">&amp;&amp;</span> s<span class="op">.</span>processed <span class="op">==</span> <span class="dv">100</span> <span class="op">&amp;&amp;</span> s<span class="op">.</span>dropped <span class="op">==</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb6-108"><a href="#cb6-108" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-109"><a href="#cb6-109" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-110"><a href="#cb6-110" aria-hidden="true" tabindex="-1"></a>    <span class="co">// H078: a túl nagy frame a sor előtt elutasul.</span></span>
+<span id="cb6-111"><a href="#cb6-111" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb6-112"><a href="#cb6-112" aria-hidden="true" tabindex="-1"></a>        service svc<span class="op">{{.</span>max_frame <span class="op">=</span> <span class="va">s_max</span><span class="op">},</span> instant<span class="op">};</span></span>
+<span id="cb6-113"><a href="#cb6-113" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>svc<span class="op">.</span>submit<span class="op">(</span>frame<span class="op">{</span><span class="bu">std::</span>string<span class="op">(</span><span class="va">s_max</span> <span class="op">+</span> <span class="dv">1</span><span class="op">,</span> <span class="ch">&#39;x&#39;</span><span class="op">)})</span> <span class="op">==</span></span>
+<span id="cb6-114"><a href="#cb6-114" aria-hidden="true" tabindex="-1"></a>              submit_result<span class="op">::</span>too_large<span class="op">);</span></span>
+<span id="cb6-115"><a href="#cb6-115" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>svc<span class="op">.</span>shutdown<span class="op">().</span>accepted <span class="op">==</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb6-116"><a href="#cb6-116" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-117"><a href="#cb6-117" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-118"><a href="#cb6-118" aria-hidden="true" tabindex="-1"></a>    <span class="co">// H078: saját tároló = C + W + P frame, 16 producer mellett is.</span></span>
+<span id="cb6-119"><a href="#cb6-119" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb6-120"><a href="#cb6-120" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> service_config cfg<span class="op">{.</span>workers <span class="op">=</span> <span class="dv">1</span><span class="op">,</span> <span class="op">.</span>capacity <span class="op">=</span> <span class="dv">4</span><span class="op">,</span></span>
+<span id="cb6-121"><a href="#cb6-121" aria-hidden="true" tabindex="-1"></a>                                 <span class="op">.</span>max_frame <span class="op">=</span> <span class="va">s_max</span><span class="op">,</span> <span class="op">.</span>max_waiting <span class="op">=</span> <span class="dv">2</span><span class="op">,</span></span>
+<span id="cb6-122"><a href="#cb6-122" aria-hidden="true" tabindex="-1"></a>                                 <span class="op">.</span>drain_timeout <span class="op">=</span> <span class="dv">100</span><span class="bu">ms</span><span class="op">};</span></span>
+<span id="cb6-123"><a href="#cb6-123" aria-hidden="true" tabindex="-1"></a>        service svc<span class="op">{</span>cfg<span class="op">,</span> blocked<span class="op">};</span></span>
+<span id="cb6-124"><a href="#cb6-124" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>svc<span class="op">.</span>submit<span class="op">(</span>frame<span class="op">{</span><span class="bu">std::</span>string<span class="op">(</span><span class="va">s_max</span><span class="op">,</span> <span class="ch">&#39;x&#39;</span><span class="op">)})</span> <span class="op">==</span></span>
+<span id="cb6-125"><a href="#cb6-125" aria-hidden="true" tabindex="-1"></a>              submit_result<span class="op">::</span>accepted<span class="op">);</span></span>
+<span id="cb6-126"><a href="#cb6-126" aria-hidden="true" tabindex="-1"></a>        wait_until<span class="op">([&amp;]</span> <span class="op">{</span> <span class="cf">return</span> svc<span class="op">.</span>pending<span class="op">()</span> <span class="op">==</span> <span class="dv">0</span><span class="op">;</span> <span class="op">});</span>  <span class="co">// a worker elvitte</span></span>
+<span id="cb6-127"><a href="#cb6-127" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">4</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span></span>
+<span id="cb6-128"><a href="#cb6-128" aria-hidden="true" tabindex="-1"></a>            CHECK<span class="op">(</span>svc<span class="op">.</span>submit<span class="op">(</span>frame<span class="op">{</span><span class="bu">std::</span>string<span class="op">(</span><span class="va">s_max</span><span class="op">,</span> <span class="ch">&#39;x&#39;</span><span class="op">)})</span> <span class="op">==</span></span>
+<span id="cb6-129"><a href="#cb6-129" aria-hidden="true" tabindex="-1"></a>                  submit_result<span class="op">::</span>accepted<span class="op">);</span></span>
+<span id="cb6-130"><a href="#cb6-130" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-131"><a href="#cb6-131" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;</span> busy<span class="op">{</span><span class="dv">0</span><span class="op">},</span> closed<span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb6-132"><a href="#cb6-132" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="bu">std::</span>jthread<span class="op">&gt;</span> producers<span class="op">;</span></span>
+<span id="cb6-133"><a href="#cb6-133" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">16</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-134"><a href="#cb6-134" aria-hidden="true" tabindex="-1"></a>            producers<span class="op">.</span>emplace_back<span class="op">([&amp;]</span> <span class="op">{</span></span>
+<span id="cb6-135"><a href="#cb6-135" aria-hidden="true" tabindex="-1"></a>                <span class="cf">switch</span> <span class="op">(</span>svc<span class="op">.</span>submit<span class="op">(</span>frame<span class="op">{</span><span class="bu">std::</span>string<span class="op">(</span><span class="va">s_max</span><span class="op">,</span> <span class="ch">&#39;x&#39;</span><span class="op">)}))</span> <span class="op">{</span></span>
+<span id="cb6-136"><a href="#cb6-136" aria-hidden="true" tabindex="-1"></a>                <span class="cf">case</span> submit_result<span class="op">::</span>busy<span class="op">:</span>   busy<span class="op">.</span>fetch_add<span class="op">(</span><span class="dv">1</span><span class="op">);</span> <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb6-137"><a href="#cb6-137" aria-hidden="true" tabindex="-1"></a>                <span class="cf">case</span> submit_result<span class="op">::</span>closed<span class="op">:</span> closed<span class="op">.</span>fetch_add<span class="op">(</span><span class="dv">1</span><span class="op">);</span> <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb6-138"><a href="#cb6-138" aria-hidden="true" tabindex="-1"></a>                <span class="cf">default</span><span class="op">:</span> <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb6-139"><a href="#cb6-139" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span></span>
+<span id="cb6-140"><a href="#cb6-140" aria-hidden="true" tabindex="-1"></a>            <span class="op">});</span></span>
+<span id="cb6-141"><a href="#cb6-141" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-142"><a href="#cb6-142" aria-hidden="true" tabindex="-1"></a>        wait_until<span class="op">([&amp;]</span> <span class="op">{</span> <span class="cf">return</span> busy<span class="op">.</span>load<span class="op">()</span> <span class="op">==</span> <span class="dv">14</span><span class="op">;</span> <span class="op">});</span></span>
+<span id="cb6-143"><a href="#cb6-143" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>this_thread::sleep_for<span class="op">(</span><span class="dv">50</span><span class="bu">ms</span><span class="op">);</span></span>
+<span id="cb6-144"><a href="#cb6-144" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>big_live<span class="op">.</span>load<span class="op">()</span> <span class="op">==</span> <span class="dv">1</span> <span class="op">+</span> <span class="dv">4</span> <span class="op">+</span> <span class="dv">2</span><span class="op">);</span>             <span class="co">// W + C + P</span></span>
+<span id="cb6-145"><a href="#cb6-145" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-146"><a href="#cb6-146" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> <span class="kw">auto</span> t0 <span class="op">=</span> <span class="dt">clock_type</span><span class="op">::</span>now<span class="op">();</span></span>
+<span id="cb6-147"><a href="#cb6-147" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> service_stats s <span class="op">=</span> svc<span class="op">.</span>shutdown<span class="op">();</span></span>
+<span id="cb6-148"><a href="#cb6-148" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> <span class="kw">auto</span> took <span class="op">=</span> <span class="dt">clock_type</span><span class="op">::</span>now<span class="op">()</span> <span class="op">-</span> t0<span class="op">;</span></span>
+<span id="cb6-149"><a href="#cb6-149" aria-hidden="true" tabindex="-1"></a>        producers<span class="op">.</span>clear<span class="op">();</span></span>
+<span id="cb6-150"><a href="#cb6-150" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>closed<span class="op">.</span>load<span class="op">()</span> <span class="op">==</span> <span class="dv">2</span><span class="op">);</span>                       <span class="co">// a két várakozó</span></span>
+<span id="cb6-151"><a href="#cb6-151" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>s<span class="op">.</span>accepted <span class="op">==</span> <span class="dv">5</span> <span class="op">&amp;&amp;</span> s<span class="op">.</span>cancelled <span class="op">==</span> <span class="dv">1</span> <span class="op">&amp;&amp;</span> s<span class="op">.</span>dropped <span class="op">==</span> <span class="dv">4</span><span class="op">);</span></span>
+<span id="cb6-152"><a href="#cb6-152" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>took <span class="op">&lt;</span> <span class="dv">100</span><span class="bu">ms</span> <span class="op">+</span> <span class="dv">200</span><span class="bu">ms</span><span class="op">);</span>                     <span class="co">// határidő + tűrés</span></span>
+<span id="cb6-153"><a href="#cb6-153" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>big_live<span class="op">.</span>load<span class="op">()</span> <span class="op">==</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb6-154"><a href="#cb6-154" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-155"><a href="#cb6-155" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-156"><a href="#cb6-156" aria-hidden="true" tabindex="-1"></a>    <span class="co">// H238: lassú feldolgozó, határidős drain és eldobás.</span></span>
+<span id="cb6-157"><a href="#cb6-157" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb6-158"><a href="#cb6-158" aria-hidden="true" tabindex="-1"></a>        service svc<span class="op">{{.</span>workers <span class="op">=</span> <span class="dv">1</span><span class="op">,</span> <span class="op">.</span>capacity <span class="op">=</span> <span class="dv">64</span><span class="op">,</span></span>
+<span id="cb6-159"><a href="#cb6-159" aria-hidden="true" tabindex="-1"></a>                     <span class="op">.</span>drain_timeout <span class="op">=</span> <span class="dv">200</span><span class="bu">ms</span><span class="op">},</span> slow<span class="op">};</span></span>
+<span id="cb6-160"><a href="#cb6-160" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">50</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span></span>
+<span id="cb6-161"><a href="#cb6-161" aria-hidden="true" tabindex="-1"></a>            CHECK<span class="op">(</span>svc<span class="op">.</span>submit<span class="op">(</span>frame<span class="op">{</span><span class="st">&quot;x&quot;</span><span class="op">})</span> <span class="op">==</span> submit_result<span class="op">::</span>accepted<span class="op">);</span></span>
+<span id="cb6-162"><a href="#cb6-162" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> <span class="kw">auto</span> t0 <span class="op">=</span> <span class="dt">clock_type</span><span class="op">::</span>now<span class="op">();</span></span>
+<span id="cb6-163"><a href="#cb6-163" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> service_stats s <span class="op">=</span> svc<span class="op">.</span>shutdown<span class="op">();</span></span>
+<span id="cb6-164"><a href="#cb6-164" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> <span class="kw">auto</span> took <span class="op">=</span> <span class="dt">clock_type</span><span class="op">::</span>now<span class="op">()</span> <span class="op">-</span> t0<span class="op">;</span></span>
+<span id="cb6-165"><a href="#cb6-165" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>s<span class="op">.</span>accepted <span class="op">==</span> s<span class="op">.</span>processed <span class="op">+</span> s<span class="op">.</span>cancelled <span class="op">+</span> s<span class="op">.</span>dropped <span class="op">+</span> s<span class="op">.</span>failed<span class="op">);</span></span>
+<span id="cb6-166"><a href="#cb6-166" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>s<span class="op">.</span>dropped <span class="op">&gt;</span> <span class="dv">0</span> <span class="op">&amp;&amp;</span> s<span class="op">.</span>processed <span class="op">&gt;</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb6-167"><a href="#cb6-167" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>took <span class="op">&lt;</span> <span class="dv">200</span><span class="bu">ms</span> <span class="op">+</span> <span class="dv">20</span><span class="bu">ms</span> <span class="op">+</span> <span class="dv">200</span><span class="bu">ms</span><span class="op">);</span>              <span class="co">// + egy feldolgozás</span></span>
+<span id="cb6-168"><a href="#cb6-168" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-169"><a href="#cb6-169" aria-hidden="true" tabindex="-1"></a>    <span class="co">// H072: a hívó stop kérése (cancelled) és a lezárt szolgáltatás (closed) külön eredmény.</span></span>
+<span id="cb6-170"><a href="#cb6-170" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb6-171"><a href="#cb6-171" aria-hidden="true" tabindex="-1"></a>        service svc<span class="op">{</span>service_config<span class="op">{},</span> <span class="op">[](</span><span class="at">const</span> frame<span class="op">&amp;,</span> <span class="bu">std::</span>stop_token<span class="op">)</span> <span class="op">{</span> <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span> <span class="op">}};</span></span>
+<span id="cb6-172"><a href="#cb6-172" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>stop_source src<span class="op">;</span></span>
+<span id="cb6-173"><a href="#cb6-173" aria-hidden="true" tabindex="-1"></a>        src<span class="op">.</span>request_stop<span class="op">();</span></span>
+<span id="cb6-174"><a href="#cb6-174" aria-hidden="true" tabindex="-1"></a>        <span class="co">// nyitott szolgáltatás, előre stopolt token: cancelled</span></span>
+<span id="cb6-175"><a href="#cb6-175" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>svc<span class="op">.</span>submit<span class="op">(</span>frame<span class="op">{</span><span class="st">&quot;x&quot;</span><span class="op">},</span> src<span class="op">.</span>get_token<span class="op">())</span> <span class="op">==</span> submit_result<span class="op">::</span>cancelled<span class="op">);</span></span>
+<span id="cb6-176"><a href="#cb6-176" aria-hidden="true" tabindex="-1"></a>        <span class="op">(</span><span class="dt">void</span><span class="op">)</span>svc<span class="op">.</span>shutdown<span class="op">();</span></span>
+<span id="cb6-177"><a href="#cb6-177" aria-hidden="true" tabindex="-1"></a>        <span class="co">// lezárt szolgáltatás: closed, akkor is, ha a token stopolt</span></span>
+<span id="cb6-178"><a href="#cb6-178" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>svc<span class="op">.</span>submit<span class="op">(</span>frame<span class="op">{</span><span class="st">&quot;x&quot;</span><span class="op">},</span> src<span class="op">.</span>get_token<span class="op">())</span> <span class="op">==</span> submit_result<span class="op">::</span>closed<span class="op">);</span></span>
+<span id="cb6-179"><a href="#cb6-179" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>svc<span class="op">.</span>submit<span class="op">(</span>frame<span class="op">{</span><span class="st">&quot;x&quot;</span><span class="op">})</span> <span class="op">==</span> submit_result<span class="op">::</span>closed<span class="op">);</span></span>
+<span id="cb6-180"><a href="#cb6-180" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-181"><a href="#cb6-181" aria-hidden="true" tabindex="-1"></a>    <span class="co">// T-K8-069: a drain megvárja a már kivett, folyamatban lévő feldolgozást is.</span></span>
+<span id="cb6-182"><a href="#cb6-182" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb6-183"><a href="#cb6-183" aria-hidden="true" tabindex="-1"></a>        <span class="kw">auto</span> patient <span class="op">=</span> <span class="op">[](</span><span class="at">const</span> frame<span class="op">&amp;,</span> <span class="bu">std::</span>stop_token st<span class="op">)</span> <span class="op">{</span>   <span class="co">// stopot figyelő, 100 ms-os munka</span></span>
+<span id="cb6-184"><a href="#cb6-184" aria-hidden="true" tabindex="-1"></a>            <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">10</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-185"><a href="#cb6-185" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> <span class="op">(</span>st<span class="op">.</span>stop_requested<span class="op">())</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb6-186"><a href="#cb6-186" aria-hidden="true" tabindex="-1"></a>                <span class="bu">std::</span>this_thread::sleep_for<span class="op">(</span><span class="dv">10</span><span class="bu">ms</span><span class="op">);</span></span>
+<span id="cb6-187"><a href="#cb6-187" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb6-188"><a href="#cb6-188" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb6-189"><a href="#cb6-189" aria-hidden="true" tabindex="-1"></a>        <span class="op">};</span></span>
+<span id="cb6-190"><a href="#cb6-190" aria-hidden="true" tabindex="-1"></a>        service svc<span class="op">{{.</span>workers <span class="op">=</span> <span class="dv">1</span><span class="op">,</span> <span class="op">.</span>capacity <span class="op">=</span> <span class="dv">4</span><span class="op">,</span> <span class="op">.</span>drain_timeout <span class="op">=</span> <span class="dv">2000</span><span class="bu">ms</span><span class="op">},</span> patient<span class="op">};</span></span>
+<span id="cb6-191"><a href="#cb6-191" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">3</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span></span>
+<span id="cb6-192"><a href="#cb6-192" aria-hidden="true" tabindex="-1"></a>            CHECK<span class="op">(</span>svc<span class="op">.</span>submit<span class="op">(</span>frame<span class="op">{</span><span class="st">&quot;x&quot;</span><span class="op">})</span> <span class="op">==</span> submit_result<span class="op">::</span>accepted<span class="op">);</span></span>
+<span id="cb6-193"><a href="#cb6-193" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> service_stats s <span class="op">=</span> svc<span class="op">.</span>shutdown<span class="op">();</span></span>
+<span id="cb6-194"><a href="#cb6-194" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>s<span class="op">.</span>processed <span class="op">==</span> <span class="dv">3</span> <span class="op">&amp;&amp;</span> s<span class="op">.</span>cancelled <span class="op">==</span> <span class="dv">0</span> <span class="op">&amp;&amp;</span> s<span class="op">.</span>dropped <span class="op">==</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb6-195"><a href="#cb6-195" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-196"><a href="#cb6-196" aria-hidden="true" tabindex="-1"></a>    <span class="co">// H071: a lefoglalt kapacitás is korlátozott (nagy reserve, kicsi hasznos hossz).</span></span>
+<span id="cb6-197"><a href="#cb6-197" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb6-198"><a href="#cb6-198" aria-hidden="true" tabindex="-1"></a>        service svc<span class="op">{</span>service_config<span class="op">{},</span> <span class="op">[](</span><span class="at">const</span> frame<span class="op">&amp;,</span> <span class="bu">std::</span>stop_token<span class="op">)</span> <span class="op">{</span> <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span> <span class="op">}};</span></span>
+<span id="cb6-199"><a href="#cb6-199" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>string big<span class="op">;</span></span>
+<span id="cb6-200"><a href="#cb6-200" aria-hidden="true" tabindex="-1"></a>        big<span class="op">.</span>reserve<span class="op">(</span><span class="dv">100</span> <span class="op">*</span> <span class="dv">4096</span><span class="op">);</span></span>
+<span id="cb6-201"><a href="#cb6-201" aria-hidden="true" tabindex="-1"></a>        big<span class="op">.</span>resize<span class="op">(</span><span class="dv">1</span><span class="op">);</span></span>
+<span id="cb6-202"><a href="#cb6-202" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>svc<span class="op">.</span>submit<span class="op">(</span>frame<span class="op">{</span><span class="bu">std::</span>move<span class="op">(</span>big<span class="op">)})</span> <span class="op">==</span> submit_result<span class="op">::</span>too_large<span class="op">);</span></span>
+<span id="cb6-203"><a href="#cb6-203" aria-hidden="true" tabindex="-1"></a>        <span class="op">(</span><span class="dt">void</span><span class="op">)</span>svc<span class="op">.</span>shutdown<span class="op">();</span></span>
+<span id="cb6-204"><a href="#cb6-204" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-205"><a href="#cb6-205" aria-hidden="true" tabindex="-1"></a>    <span class="co">// H074: a processor kivétele dokumentált hibaút, a szolgáltatás tovább működik.</span></span>
+<span id="cb6-206"><a href="#cb6-206" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb6-207"><a href="#cb6-207" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;</span> calls<span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb6-208"><a href="#cb6-208" aria-hidden="true" tabindex="-1"></a>        service svc<span class="op">{</span>service_config<span class="op">{},</span> <span class="op">[&amp;</span>calls<span class="op">](</span><span class="at">const</span> frame<span class="op">&amp;,</span> <span class="bu">std::</span>stop_token<span class="op">)</span> <span class="op">-&gt;</span> <span class="dt">bool</span> <span class="op">{</span></span>
+<span id="cb6-209"><a href="#cb6-209" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>calls<span class="op">.</span>fetch_add<span class="op">(</span><span class="dv">1</span><span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">throw</span> <span class="bu">std::</span>runtime_error<span class="op">(</span><span class="st">&quot;boom&quot;</span><span class="op">);</span></span>
+<span id="cb6-210"><a href="#cb6-210" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb6-211"><a href="#cb6-211" aria-hidden="true" tabindex="-1"></a>        <span class="op">}};</span></span>
+<span id="cb6-212"><a href="#cb6-212" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>svc<span class="op">.</span>submit<span class="op">(</span>frame<span class="op">{</span><span class="st">&quot;a&quot;</span><span class="op">})</span> <span class="op">==</span> submit_result<span class="op">::</span>accepted<span class="op">);</span></span>
+<span id="cb6-213"><a href="#cb6-213" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>svc<span class="op">.</span>submit<span class="op">(</span>frame<span class="op">{</span><span class="st">&quot;b&quot;</span><span class="op">})</span> <span class="op">==</span> submit_result<span class="op">::</span>accepted<span class="op">);</span></span>
+<span id="cb6-214"><a href="#cb6-214" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> service_stats s <span class="op">=</span> svc<span class="op">.</span>shutdown<span class="op">();</span></span>
+<span id="cb6-215"><a href="#cb6-215" aria-hidden="true" tabindex="-1"></a>        CHECK<span class="op">(</span>s<span class="op">.</span>accepted <span class="op">==</span> <span class="dv">2</span> <span class="op">&amp;&amp;</span> s<span class="op">.</span>failed <span class="op">==</span> <span class="dv">1</span> <span class="op">&amp;&amp;</span> s<span class="op">.</span>processed <span class="op">==</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb6-216"><a href="#cb6-216" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-217"><a href="#cb6-217" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>puts<span class="op">(</span><span class="st">&quot;service_test: ok&quot;</span><span class="op">);</span></span>
+<span id="cb6-218"><a href="#cb6-218" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb6-219"><a href="#cb6-219" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">g++</span> <span class="at">-std</span><span class="op">=</span>c++20 <span class="at">-O2</span> <span class="at">-Wall</span> <span class="at">-Wextra</span> <span class="at">-Wpedantic</span> <span class="at">-Wshadow</span> <span class="at">-Werror</span> <span class="at">-pthread</span> <span class="dt">\</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>    <span class="at">-I.</span> tests/service_test.cpp <span class="at">-o</span> service_test</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="ex">./service_test</span></span></code></pre></div>
+<p><strong>Buildjegyzőkönyv</strong> (<code>lab-gcc</code> profil). A
+<code>main.cpp</code> és a <code>tests/service_test.cpp</code> G++
+13.3.0-val, libstdc++ mellett <code>-Werror</code> beállítással
+figyelmeztetés nélkül fordult Linux x86-64 környezetben. A teszt
+optimalizált builddel ötször egymás után, valamint ThreadSanitizer
+(<code>setarch -R</code>) és ASan/UBSan builddel is sikeres volt; a demó
+TSan alatt is a fenti kimenetet adta. A határidős ellenőrzések tűréssel
+dolgoznak (200 ms); terhelt CI-gépen ezt a tűrést a profilban kell
+rögzíteni. A folyamatban lévő feldolgozást megváró drain
+(<code>task_done</code>, <code>push_status</code>) bevezetése után a kód
+és a teszt G++ 15.2-vel is lefordult <code>-Werror</code> mellett, a
+<code>main.cpp</code> kimenete változatlan maradt, a
+<code>service_test</code> háromszor sikeres volt, és ThreadSanitizer
+(<code>setarch -R</code>) alatt is hibamentesen lefutott; a G++ 13.3.0-s
+jegyzőkönyv a módosítás előtti változatra vonatkozik.</p>
+<h3 data-number="39.3.3"
+id="buffer--és-callback-tulajdon-a-pipeline-határain"><span
+class="header-section-number">39.3.3</span> Buffer- és callback-tulajdon
+a pipeline határain</h3>
+<p>A biztonságos alapelv kezdőknek: <strong>aszinkron határon owned
+értéket adjunk át</strong>. Ha a <code>submit</code> paramétere
+<code>std::span&lt;const std::byte&gt;</code> lenne, az csak egy
+pointert és egy hosszt tartalmazna; a hívó stack frame-je a
+<code>submit</code> visszatérése után megszűnhet, a worker viszont
+később olvasná. Ez a klasszikus dangling helyzet, amelyet a <a
+href="s157.html">span, byte és bounds-szerződések (31.3)</a> részben
+tárgyaltunk. Ez azonban ajánlás, nem nyelvi tilalom: kölcsönzött nézet
+is átmehet aszinkron határon, ha a tulajdonos élettartama a teljes
+műveletre igazolt — például strukturált élettartammal (a hívó a művelet
+befejezéséig vár, mielőtt a puffert felszabadítja), vagy egy külön owner
+tokennel, amely a művelet végéig életben tartja az adatot — és a
+hozzáférések szinkronizációja is rendezett. A helyes megoldás, hogy a
+queue eleme <em>tulajdonol</em>:
+<code>std::vector&lt;std::byte&gt;</code>, <code>std::string</code> vagy
+egy move-only <code>frame</code> típus. A <code>span</code> csak
+szinkron hívásban, a hívó élettartamán belül használható.</p>
+<p>A <code>shared_ptr</code> csábító, de csak akkor indokolt, ha valóban
+több, egymástól független owner van: például a connection objektum és a
+feldolgozó is életben kell tartsa ugyanazt a puffert, mert a feldolgozás
+aszinkron módon, a connection lezárása után is olvas. Ha a queue egymaga
+tulajdonol, a <code>unique_ptr</code> vagy a közvetlen érték a helyes
+választás: kevesebb atomikus művelet, egyértelműbb élettartam.</p>
+<p>A <strong>connection state</strong> és a <strong>callback
+lifetime</strong> összefonódik. Egy tipikus hiba:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// HIBÁS tanítási példa: a callback túlélheti a service-t.</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>svc<span class="op">.</span>set_on_frame<span class="op">([&amp;</span>svc<span class="op">](</span>frame f<span class="op">)</span> <span class="op">{</span> svc<span class="op">.</span>submit<span class="op">(</span><span class="bu">std::</span>move<span class="op">(</span>f<span class="op">));</span> <span class="op">});</span></span></code></pre></div>
+<p>Ha a callbacket egy külső komponens tárolja, és a
+<code>service</code> előbb destruálódik, a callback egy halott
+objektumra hivatkozik. A javítás vagy az, hogy a callback a service-en
+belül marad (és a service destruktorában deregisztráljuk), vagy az, hogy
+a callback <code>std::weak_ptr</code>-rel ellenőrzi az owner életét:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Részlet: feltételezi, hogy a service-t shared_ptr birtokolja, és van callback-regisztrációs API.</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="kw">auto</span> svc <span class="op">=</span> <span class="bu">std::</span>make_shared<span class="op">&lt;</span>service<span class="op">&gt;(</span>service_config<span class="op">{},</span> proc<span class="op">);</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>weak_ptr<span class="op">&lt;</span>service<span class="op">&gt;</span> weak <span class="op">=</span> svc<span class="op">;</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="kw">auto</span> cb <span class="op">=</span> <span class="op">[</span>weak<span class="op">](</span>frame f<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span><span class="kw">auto</span> s <span class="op">=</span> weak<span class="op">.</span>lock<span class="op">())</span> <span class="op">(</span><span class="dt">void</span><span class="op">)</span>s<span class="op">-&gt;</span>submit<span class="op">(</span><span class="bu">std::</span>move<span class="op">(</span>f<span class="op">));</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A <code>weak_ptr</code>-es megoldás feltétele, hogy a service
+élettartamát <code>std::shared_ptr</code> kezelje; a fenti, érték
+szerinti <code>service</code> mellett csak a belső regisztráció és
+deregisztráció út járható.</p>
+<p>A <code>weak_ptr::lock()</code> itt nem stíluselem, hanem a verseny
+kezelése: a lock és a service destruktora közül az egyik „nyer”, és nem
+lehet olyan interleaving, amelyben a callback egy félig destruált
+objektumot használ. Van azonban egy következő kockázat: a sikeres
+<code>lock()</code> után a callbackben lévő
+<code>shared_ptr&lt;service&gt;</code> ideiglenes tulajdonos, és ha
+közben az összes többi tulajdonos elengedte a service-t, a callback
+szála lehet az <em>utolsó tulajdonos</em>, így a <code>~service()</code>
+(<code>shutdown()</code>, <code>workers_.clear()</code>, join) ezen a
+szálon fut. Ha ez a szál maga is egy worker (például a
+<code>processor</code> hívja a callbacket), a join saját magát várná
+(önjoin: <code>std::system_error</code> a <code>noexcept</code>
+destruktorban, vagyis <code>std::terminate</code>, vagy holtpont; a
+pontos viselkedés implementációfüggő). Ezért a service tulajdonosa
+mindig külső szál legyen, vagy a <code>shutdown()</code> ellenőrizze a
+<code>std::this_thread::get_id()</code> értékét a worker szálak
+azonosítóival, és hibával utasítsa vissza a saját workeréről indított
+leállítást. A callback regisztrációjának és visszavonásának szerződése
+ezért tartalmazza, hogy a visszavonás <em>szinkronizál</em> a már futó
+callback-hívásokkal: vagy a callback rövid és nem blokkol, vagy a
+deregisztráció megvárja a futó hívásokat. Ha ezt nem tesszük meg, a
+„deregisztrált” callback még futhat, miközben a hivatkozott erőforrás
+felszabadul.</p>
+<p>Az invalidálódás térképe:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Művelet</th>
+<th>Mit invalidál</th>
+<th>Következmény</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>close()</code></td>
+<td>a queue bemenetét</td>
+<td>további <code>push</code> <code>false</code></td>
+</tr>
+<tr>
+<td><code>request_stop()</code></td>
+<td>a workerek stop tokenjét</td>
+<td>a blokkoló <code>wait</code> felébredhet</td>
+</tr>
+<tr>
+<td><code>shutdown()</code></td>
+<td>a teljes szolgáltatást</td>
+<td>a további <code>submit</code> <code>closed</code> eredményt ad; a
+statisztika végleges</td>
+</tr>
+<tr>
+<td><code>service</code> destructor</td>
+<td>minden tagot</td>
+<td>minden borrowed hivatkozás dangling</td>
+</tr>
+<tr>
+<td>queue <code>pop</code></td>
+<td>az adott elem tárolóját</td>
+<td>a kivett érték ownershipja a hívóé</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="39.3.4"
+id="leállítási-protokoll-korlátok-és-tesztelés"><span
+class="header-section-number">39.3.4</span> Leállítási protokoll,
+korlátok és tesztelés</h3>
+<p>A leállítás sorrendje nem önkényes. Tegyük fel, hogy először
+joinolnánk, és csak utána zárnánk le a queue-t. Ha a queue megtelt, egy
+termelő éppen a <code>push</code>-ban blokkol, és soha nem tud
+visszatérni, mert a fogyasztók már nem futnak:
+<strong>deadlock</strong>. Ezért a helyes sorrend:</p>
+<ol type="1">
+<li><strong>Bemenet lezárása</strong> (<code>close()</code>): a termelők
+<code>false</code>-szal visszatérnek, nem blokkolhatnak örökre, és a
+„még bekerülhet-e munka” kérdés egyetlen lock alatt eldől.</li>
+<li><strong>Drain határidőig</strong> (<code>wait_empty_until</code>): a
+workerek a sorban maradt elemeket feldolgozzák, a már kivett elemek
+feldolgozását pedig befejezik, legfeljebb a <code>drain_timeout</code>
+lejártáig; a stop csak ezután (vagy a határidő lejártakor) érkezik.</li>
+<li><strong>Maradék eldobása</strong> (<code>discard()</code>): ha a
+határidőig nem ürült ki a sor, a maradékot eldobjuk, és a darabszámot
+<code>dropped</code> néven elszámoljuk.</li>
+<li><strong>Stop kérés</strong> (<code>request_stop()</code>): a
+workerek blokkoló várakozása megszakad, a futó feldolgozás a stop tokent
+látva korlátos időn belül visszatér.</li>
+<li><strong>Join</strong> (<code>workers_.clear()</code>): a
+<code>jthread</code> destruktorai joinolnak, így minden worker
+befejeződése happens-before kapcsolatba kerül a shutdown hívóval.</li>
+<li><strong>Erőforrás-felszabadítás</strong>: csak most szabad a queue-t
+és a hozzá tartozó puffereket eldobni.</li>
+</ol>
+<figure id="fig-s200-leallitas">
+<div class="fig-interactive"><iframe src="figures/html/s200-leallitas.html" title="Időtengely a close, a drain-határidő, a discard, a stop és a join lépésekkel, szálak szerinti sávokban, és a végső számlálókkal." loading="lazy" style="width:100%;border:0;height:720px"></iframe><noscript><img src="assets/be2c2745055dc142.png" style="width:100.0%"
+alt="Időtengely a close, a drain-határidő, a discard, a stop és a join lépésekkel, szálak szerinti sávokban, és a végső számlálókkal." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="assets/be2c2745055dc142.png" style="width:100.0%"
+alt="Időtengely a close, a drain-határidő, a discard, a stop és a join lépésekkel, szálak szerinti sávokban, és a végső számlálókkal." /></details></div>
+<figcaption>A shutdown() hatlépéses időrendje a H078 teszteset
+számlálóival (sematikus időtengely)</figcaption>
+</figure>
+<p>A join deadlockmentességének indoklása külön figyelmet érdemel. A
+join önmagában nem holtpontveszélyes, ha a joinoló szál nem tart olyan
+zárat, amelyet a worker megpróbál felvenni. A mi
+<code>shutdown()</code>-ünk a <code>q_.close()</code> után semmilyen
+alkalmazás-szintű zárat nem tart, amikor a <code>clear()</code> joinol.
+A második veszélyforrás a <code>std::stop_callback</code>: a callback a
+<code>request_stop()</code> hívó szálán fut, ugyanazon a szálon; ha a
+callback olyan nem rekurzív mutexet próbál felvenni, amelyet a
+<code>request_stop()</code> hívója éppen tart, ugyanazon a szálon
+holtpont (vagy nem definiált viselkedés) lesz. A belső zár tartása nem
+szabványos garancia: a libstdc++ például a callback futtatása előtt
+elengedi a stop-állapot zárját. Ezért a stop callback rövid, nem
+allokáló és nem zároló kód legyen; a mi példánkban nincs is callback,
+mert a <code>condition_variable_any</code> stop tokenes
+<code>wait</code>-je maga kezeli az ébredést.</p>
+<p>A <strong>memóriakorlát</strong> a fentebb levezetett
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><mi>C</mi><mo>+</mo><mi>W</mi><mo>+</mo><mi>P</mi><mo stretchy="false" form="postfix">)</mo><mo>⋅</mo><msub><mi>S</mi><mi>max</mi></msub><mo>+</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">(C+W+P)\cdot S_{\max}+K</annotation></semantics></math>.
+Az <strong>időkorlát</strong> a leállítás felső korlátja: a
+<code>shutdown()</code> legfeljebb
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>D</mi><mo>+</mo><msub><mi>T</mi><mtext mathvariant="normal">stop</mtext></msub></mrow><annotation encoding="application/x-tex">D + T_{\text{stop}}</annotation></semantics></math>
+ideig tart, ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>D</mi><annotation encoding="application/x-tex">D</annotation></semantics></math>
+a <code>drain_timeout</code>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mtext mathvariant="normal">stop</mtext></msub><annotation encoding="application/x-tex">T_{\text{stop}}</annotation></semantics></math>
+pedig az az idő, amely alatt egy futó feldolgozás a stop kérés után
+visszatér, plusz a join költsége. A korlát tehát a feldolgozó
+szerződésén múlik: ha egy feldolgozás nem kooperatív módon blokkol
+(például megtelt pipe-ra ír), a leállítás sem korlátos, és ezt sem a
+<code>request_stop()</code>, sem a szál leválasztása
+(<code>detach</code>) nem javítja meg, utóbbi csak elrejti a még élő
+erőforrásokat. A határidő után eldobott munka adatvesztés; a
+<code>dropped</code> és a <code>cancelled</code> számláló ezt a hívó
+számára láthatóvá teszi, és a protokollnak kell eldöntenie, hogy
+elfogadható-e. A két korlát együtt adja a szolgáltatás
+erőforrás-szerződését.</p>
+<p>A <strong>TSan</strong> (ThreadSanitizer) a tényleges adatversenyeket
+találja meg, például ha a <code>closed_</code> flaget valahol lock
+nélkül olvassuk, vagy ha a callback és a destruktor között nincs
+happens-before. Nem találja meg a logikai race-eket, például azt, hogy
+egy már kivett elem a stop miatt félbemarad, és sem a
+<code>processed</code>, sem a <code>dropped</code> nem számolja (ezért
+kell az <code>accepted = processed + cancelled + dropped + failed</code>
+elszámolás), vagy egy újrapróbáló (at-least-once) változatban azt, hogy
+egy elem kétszer kerül feldolgozásra; a fejezet queue-jában a kivett
+elem nem kerül vissza a sorba, ezért kétszeri feldolgozás itt nem
+fordulhat elő. Ezért a TSan mellett integritásteszt kell:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>
+termelő,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>M</mi><annotation encoding="application/x-tex">M</annotation></semantics></math>
+fogyasztó, ismételt <code>shutdown()</code> hívás, és annak ellenőrzése,
+hogy a feldolgozott elemek multihalmaza pontosan az elküldött elemek
+multihalmaza, elveszett és duplikált elem nélkül.</p>
+<p>Egy TSan-futtatás tipikus parancssora a laborban:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="va">TSAN_OPTIONS</span><span class="op">=</span><span class="st">&quot;halt_on_error=1 second_deadlock_stack=1&quot;</span> <span class="ex">setarch</span> <span class="at">-R</span> ./svc-tsan</span></code></pre></div>
+<p>A <code>second_deadlock_stack</code> opció a holtpont második
+szálának stackjét is kiírja, ami a stop callback és a join közötti
+ciklusok azonosításában segít. Ennek a beállításnak a támogatottsága a
+használt Clang/GCC runtime verziójától függ; a laborprofilban rögzíteni
+kell.</p>
+<h4 data-number="39.3.4.1" id="opcionális-coroutine-adapter"><span
+class="header-section-number">39.3.4.1</span> Opcionális coroutine
+adapter</h4>
+<p>A coroutine adapter nem része az alap buildnek, hanem külön
+<strong>capability profile</strong>: a CMake target csak akkor épül, ha
+a fordító és a könyvtár támogatja a szükséges C++20 coroutine elemeket,
+és a projekt ezt feature-test makróval ellenőrzi. A cél egy vékony
+illesztő, amely a queue-t <code>co_await</code>-elhető várakozássá
+alakítja: a <code>co_await q.async_pop()</code> felfüggeszti a
+coroutine-t, és a queue értesítésekor folytatja. Az élettartam-szerződés
+ugyanaz, mint eddig: a coroutine frame az owner, a queue borrowed, és a
+coroutine nem folytatódhat a szolgáltatás leállása után. A részletes
+<code>promise_type</code>/awaiter mechanizmust az <a
+href="s180.html">Aszinkron I/O adapter és coroutine-labor (35.5)</a>
+tárgyalta; itt csak a leállítási integrációt rögzítjük: a stop kérésnek
+a függő coroutine-okat is fel kell ébresztenie, különben a
+<code>shutdown()</code> joinja örökre vár. Ezért az adapter vagy a queue
+<code>close()</code>-ára, vagy egy külön stop tokenre regisztrál, és
+mindkét esetben a folytatás előtt újra ellenőrzi a lezárt állapotot. Az
+adapter kísérleti státuszát a buildben és a dokumentációban is jelölni
+kell; nem szabad az alap szolgáltatás helyességét a coroutine
+támogatására építeni.</p>
+<h3 data-number="39.3.5" id="feladatok"><span
+class="header-section-number">39.3.5</span> Feladatok</h3>
+<p><strong>1. feladat (alap).</strong> Egészítsd ki a
+<code>bounded_queue</code>-t egy <code>drain()</code> metódussal, amely
+<code>close()</code> után az összes maradék elemet kiveszi egy
+<code>std::vector&lt;T&gt;</code>-be, és a queue-t üresen hagyja.
+Fogalmazd meg, milyen állapotban hívható, és mi történik, ha
+<code>drain()</code> közben egy termelő még <code>push</code>-olni
+próbál.</p>
+<p><strong>2. feladat (közepes).</strong> Vezess be időkorlátos
+<code>push</code>-t:
+<code>push_for(T value, std::chrono::milliseconds limit, std::stop_token st)</code>,
+amely <code>wait_until</code>-tal várakozik, és ha a határidő lejár,
+eldobja az elemet, és növeli egy
+<code>std::atomic&lt;std::size_t&gt;</code> számlálót. Indokold, miért
+kell a számlálónak atomikusnak lennie, és miért nem elég a queue belső
+mutexe.</p>
+<p><strong>3. feladat (nehéz).</strong> Tervezd meg a callback-lifetime
+kezelést <code>std::weak_ptr</code>-rel egy olyan szolgáltatásban, ahol
+a callbacket egy külső, a service-nél tovább élő komponens tárolja. Írj
+egy TSan alatt futtatható integritástesztet, amely a
+<code>shutdown()</code> alatt is hívja a callbacket, és igazold, hogy
+nincs use-after-free.</p>
+<p><strong>4. feladat (opcionális).</strong> Vázold fel a coroutine
+adapter <code>async_pop</code> műveletét, és sorold fel, milyen három
+feltételt kell ellenőriznie a folytatás előtt a leállási verseny
+elkerüléséhez.</p>
+<h3 data-number="39.3.6" id="megoldások"><span
+class="header-section-number">39.3.6</span> Megoldások</h3>
+<p><strong>1. megoldás.</strong> A <code>drain()</code> csak
+<code>closed_ == true</code> esetén értelmes; ezt a metódus elején
+ellenőrizzük, és ha nem teljesül, <code>std::logic_error</code>-t dobunk
+(vagy a szerződést dokumentáljuk és <code>assert</code>-tel jelezzük). A
+művelet a queue mutexe alatt kiveszi az összes elemet, majd a
+<code>not_full_</code> feltételváltozót értesíti, hogy az esetleges
+blokkoló termelők felébredjenek. Mivel a <code>close()</code> miatt a
+<code>push</code> úgyis <code>false</code>-szal tér vissza, a verseny
+eldőlt: a <code>close()</code> és a <code>drain()</code> között nincs
+olyan interleaving, amelyben új elem kerülne be, feltéve, hogy a
+<code>closed_</code> beállítása és a <code>drain()</code> ugyanazon
+mutex alatt történik. Ellenőrzési feltétel: <code>drain()</code> után
+<code>size() == 0</code>, és a visszaadott vektor elemszáma megegyezik a
+<code>close()</code> előtti <code>size()</code> értékkel, ha közben nem
+volt <code>pop</code>.</p>
+<p><strong>2. megoldás.</strong> A számlálónak azért kell atomikusnak
+lennie, mert a queue mutexén <em>kívül</em> is olvasni akarjuk (például
+a <code>dropped()</code> getterrel egy monitoring szálból), és ott a
+mutex nincs fogva; a növelés a mutex alatt is történhet (a zár a
+<code>wait_for</code> visszatérése után még a kezünkben van), ez nem
+növeli a contentiont. Az ellenőrzési feltétel: a sikeres és eldobott
+hívások száma összesen a hívások számával egyezik, és a számláló értéke
+TSan alatt sem mutat adatversenyt. Implementációs váz:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co">// a bounded_queue tagjai:</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="bu">std::</span>size_t<span class="op">&gt;</span> <span class="va">dropped_</span><span class="op">{</span><span class="dv">0</span><span class="op">};</span>          <span class="co">// határidő miatt eldobott</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="bu">std::</span>size_t<span class="op">&gt;</span> <span class="va">stopped_</span><span class="op">{</span><span class="dv">0</span><span class="op">};</span>          <span class="co">// stop miatt visszautasított</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>size_t dropped<span class="op">()</span> <span class="at">const</span> <span class="kw">noexcept</span> <span class="op">{</span> <span class="cf">return</span> <span class="va">dropped_</span><span class="op">.</span>load<span class="op">(</span><span class="bu">std::</span>memory_order_relaxed<span class="op">);</span> <span class="op">}</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="dt">bool</span> push_for<span class="op">(</span>T value<span class="op">,</span> <span class="bu">std::</span>chrono::milliseconds limit<span class="op">,</span> <span class="bu">std::</span>stop_token st<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>unique_lock lk<span class="op">(</span><span class="va">m_</span><span class="op">);</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span><span class="va">not_full_</span><span class="op">.</span>wait_for<span class="op">(</span>lk<span class="op">,</span> st<span class="op">,</span> limit<span class="op">,</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a>                            <span class="op">[&amp;]</span> <span class="op">{</span> <span class="cf">return</span> <span class="va">closed_</span> <span class="op">||</span> <span class="va">q_</span><span class="op">.</span>size<span class="op">()</span> <span class="op">&lt;</span> <span class="va">cap_</span><span class="op">;</span> <span class="op">}))</span> <span class="op">{</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>st<span class="op">.</span>stop_requested<span class="op">())</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a>            <span class="va">stopped_</span><span class="op">.</span>fetch_add<span class="op">(</span><span class="dv">1</span><span class="op">,</span> <span class="bu">std::</span>memory_order_relaxed<span class="op">);</span>   <span class="co">// stop</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">else</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a>            <span class="va">dropped_</span><span class="op">.</span>fetch_add<span class="op">(</span><span class="dv">1</span><span class="op">,</span> <span class="bu">std::</span>memory_order_relaxed<span class="op">);</span>   <span class="co">// határidő</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span><span class="va">closed_</span> <span class="op">||</span> st<span class="op">.</span>stop_requested<span class="op">())</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a>    <span class="va">q_</span><span class="op">.</span>push_back<span class="op">(</span><span class="bu">std::</span>move<span class="op">(</span>value<span class="op">));</span></span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a>    lk<span class="op">.</span>unlock<span class="op">();</span></span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a>    <span class="va">not_empty_</span><span class="op">.</span>notify_one<span class="op">();</span></span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>wait_for</code> visszatérési értéke pontosan azt jelzi, hogy
+a predikátum teljesült-e; ha <code>false</code>, akkor a határidő vagy a
+stop miatt tértünk vissza, és ezt a két esetet a
+<code>st.stop_requested()</code> ellenőrzés választja szét, ezért külön
+számlálóba kerülnek. A vázlat nem teljes fordítási egység; szemléltető,
+nem futtatott. Ellenőrzési feltétel: <code>push_for</code> teli soron
+határidőig várva <code>false</code>-t ad és
+<code>dropped() == 1</code>.</p>
+<p><strong>3. megoldás.</strong> A callbacket a
+<code>std::weak_ptr&lt;service&gt;</code>-re zárjuk, és a callback
+törzse minden hívásnál <code>lock()</code>-ol. A <code>shutdown()</code>
+a <code>close()</code> után <code>request_stop()</code>-ot hív, majd
+joinol; a callback a <code>submit</code>-ban a queue
+<code>closed_</code> flagjén bukik el, tehát a shutdown után érkező
+hívás <code>false</code>-szal tér vissza, nem nyúl a felszabadított
+erőforráshoz. A TSan-teszt: egy szál ismételten hívja a callbacket, a fő
+szál <code>shutdown()</code>-t hív, és a teszt a végén ellenőrzi, hogy
+nincs TSan-hiba, és hogy a callback hívásainak száma megegyezik a
+<code>submit</code> visszatérési értékeivel konzisztens módon. Fontos,
+hogy a callback ne tartson zárat a <code>lock()</code> és a
+<code>submit</code> között, amit a service destruktora is felvesz,
+különben a weak_ptr ellenére holtpont lehetséges. Ellenőrzési feltétel:
+a teszt TSan alatt hibamentes, és a callback sosem ér el egy
+<code>service</code> objektumot a destruktor megkezdése után (ezt a
+<code>lock()</code> sikertelensége garantálja).</p>
+<p><strong>4. megoldás.</strong> Az <code>async_pop</code> folytatása
+előtt három feltételt kell ellenőrizni: (a) a queue nem zárt-e le
+(<code>closed_ == false</code>), (b) a stop token nem kérte-e a
+leállást, és (c) a coroutine handle még érvényes-e (nem destruálódott a
+frame). Ha bármelyik feltétel nem teljesül, a folytatás helyett a
+coroutine-t megszakított állapotban kell feloldani, különben a
+<code>shutdown()</code> joinja olyan coroutine-ra várna, amely soha nem
+folytatódik. A három ellenőrzésnek ugyanabban a szinkronizációs
+tartományban kell történnie, mint a queue állapotváltozásainak, különben
+a „lezárt, de mégis folytatódik” verseny marad.</p>
+<h3 data-number="39.3.7" id="összefoglaló"><span
+class="header-section-number">39.3.7</span> Összefoglaló</h3>
+<p>A szolgáltatás-életciklus szerződés: állapotok, átmenetek és
+erőforrás-kötelezettségek együtt. A <code>bounded_queue</code> a
+memóriakorlát és a backpressure hordozója; a <code>stop_token</code> a
+kooperatív megszakításé; a <code>jthread</code> a join garantálásáé.
+Aszinkron határon csak owned érték mehet át, a <code>span</code> a
+szinkron hívások eszköze. A callback élettartamát
+<code>weak_ptr</code>-rel vagy belső regisztrációval kell védeni, és a
+deregisztrációnak szinkronizálnia kell a futó hívásokkal. A leállítás
+sorrendje: <code>close()</code>, drain a határidőig, a maradék elszámolt
+eldobása, majd <code>request_stop()</code>, join, végül felszabadítás; a
+felső korlát a drain-határidő és a feldolgozó stop utáni visszatérési
+ideje; a join nem tarthat olyan zárat, amelyet a worker vagy a stop
+callback felvesz. A TSan az adatversenyt találja meg, az integritásteszt
+a logikai race-t; a kettő együtt adja a leállás helyességének
+bizonyítékát. A coroutine adapter külön capability profile, amelynek a
+leállítási integrációja ugyanazt a három ellenőrzést igényli, mint a
+szálas változaté.</p>
+<h3 data-number="39.3.8" id="források-és-ellenőrzési-korlátok"><span
+class="header-section-number">39.3.8</span> Források és ellenőrzési
+korlátok</h3>
+<p>A fejezet állításai a C++20 nyelvi és könyvtári modellre, valamint a
+<code>jthread</code>, <code>stop_token</code>,
+<code>condition_variable_any</code> C++20-as eszközeire épülnek. A
+megadott kiinduló pontok — a WG21 oldala, az N4950 munkatervezet, a C++
+Core Guidelines, a CMake dokumentáció, a Linux man-pages, valamint a
+Clang AddressSanitizer és ThreadSanitizer dokumentációja — kutatási
+kiindulópontok, nem pedig ebben a kéziratban ellenőrzött, idézett
+bizonyítékok. A konkrét szakaszokra, a
+<code>condition_variable_any</code> stop tokenes overloadjainak
+könyvtári támogatására, a <code>TSAN_OPTIONS</code> beállításokra és a
+fordítók viselkedésére vonatkozó állításokat a labornak a rögzített
+compiler/libstdc++/libc++ verzióval, feature-test makróval és compile
+probe-bal kell igazolnia. A fejezet kódját G++ 13.3.0 és libstdc++
+mellett lefordítottuk és lefuttattuk (lásd a buildjegyzőkönyveket); más
+fordítón és standard könyvtáron ez a labor feladata, addig ott a kód
+<em>várt</em> működés, nem mért eredmény.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="s199.html">← 39.2 C++ core: parser, erőforrások és értéktípusok</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="s201.html">39.4 CMake, tesztek és mérési csomag →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

@@ -1,0 +1,967 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>18.4 Stencil-optimalizálás – GPGPU – általános célú számítások
+GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Párhuzamos algoritmusok</a> › <a href="index.html#gpuch17">18 Stencil, PDE és iteratív megoldók</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu068.html">← 18.3 PDE és iteratív megoldók</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu070.html">19.1 Dense GEMM →</a></div>
+</nav>
+<h2 data-number="18.4" id="gpu069"><span
+class="header-section-number">18.4</span> Stencil-optimalizálás</h2>
+<p>A stencil-optimalizálás annak a művészete, hogy a szomszédsági
+mintázaton alapuló iteratív számítást a GPU valós erőforrás-korlátaihoz
+igazítsuk. A korábbi stencil-egységekben (18.1–18.3) megismertük a
+stencil alapjait, a halo-cserét és az iteratív megoldókat. Most azt
+vizsgáljuk meg, hogyan lehet egy adott stencil magját a teljesítmény
+szempontjából tudatosan hangolni. Három pillérre építünk: a
+memóriamozgás és a számítás viszonyát leíró
+<strong>Roofline-elemzésre</strong>, a több időlépést egyetlen kernelben
+egyesítő <strong>időblokkolásra</strong> (<em>time blocking</em>),
+valamint a gyakorlati hangolási paraméterek (tileméret, cache-politika,
+vektorizáció) szisztematikus vizsgálatára. A cél nem a „gyorsabb”
+homályos ígérete, hanem egy reprodukálható, méréssel alátámasztott
+optimalizálási folyamat kialakítása.</p>
+<h3 data-number="18.4.1"
+id="a-stencil-teljesítményének-hangolása-mit-és-miért-hangolunk"><span
+class="header-section-number">18.4.1</span> A stencil teljesítményének
+hangolása: mit és miért hangolunk?</h3>
+<p>A stencil-számítások jellemzően <strong>memória-kötöttek</strong>: a
+feladat aritmetikai intenzitása (arithmetic intensity, AI) alacsony,
+ezért a futásidőt elsősorban az szabja meg, hogy milyen gyorsan tudjuk a
+bemeneti adatokat beolvasni a globális memóriából, illetve a közbenső
+eredményeket oda visszaírni. Ugyanakkor a cache-ek, a shared memory és a
+regiszterek segítségével az adat-újrafelhasználás növelhető, így a
+globális memória felé irányuló forgalom csökkenthető. A hangolás tehát
+nem más, mint az adat-újrafelhasználás maximalizálása a
+memóriahierarchia minden szintjén, miközben fenntartjuk a kellő
+párhuzamosságot és elkerüljük a bankütközéseket, a divergenciát és a
+regiszter-túlcsordulást.</p>
+<p>A hangolandó paraméterek tipikusan:</p>
+<ul>
+<li><strong>Tile mérete</strong>: mekkora résztömböt töltünk be a shared
+memory-ba, illetve mekkora részt számolunk ki egy szálblokkban.</li>
+<li><strong>Block mérete</strong>: hány szál dolgozik együtt, és ez
+hogyan befolyásolja az occupancy-t.</li>
+<li><strong>Vektorizáció</strong>: mennyi adatot olvasunk be egyetlen
+betöltéssel (pl. <code>float4</code>). A fejezet laborja ezt nem
+valósítja meg; a mérése külön kiterjesztés.</li>
+<li><strong>Cache-politika</strong>: L2 persistence,
+<code>cudaFuncAttributePreferredSharedMemoryCarveout</code>, illetve
+cache hint-ek a load/store utasításokon.</li>
+<li><strong>Unroll mértéke</strong>: hány iterációt bontunk ki, hogy
+csökkentsük az utasítás-függőségeket (a laborban szintén nem szerepel,
+külön kiterjesztés).</li>
+<li><strong>Időblokkolás</strong>: hány időlépést számolunk ki egyetlen
+kernelindításon belül, mielőtt a határokat újra cserélnénk.</li>
+</ul>
+<p>Minden optimalizálási állítást méréssel kell igazolni. A mérési
+környezetet rögzíteni kell: GPU típus, compute capability, driver
+verzió, CUDA verzió, órajel, power limit, ECC be/kikapcsolva, operációs
+rendszer. Az eredményeket azonos inputméretre, azonos numerikus
+pontosságra (pl. FP32) és azonos iterációszámra kell vonatkoztatni.</p>
+<h3 data-number="18.4.2" id="roofline-elemzés-stencilre"><span
+class="header-section-number">18.4.2</span> Roofline-elemzés
+stencilre</h3>
+<p>A Roofline-modell (lásd 13.1, 13. fejezet) két korlátot állít szembe:
+a memória-sávszélesség korlátját és a számítási csúcsteljesítmény
+korlátját. Egy adott kernel <strong>aritmetikai intenzitása</strong>
+(AI) a végrehajtott hasznos lebegőpontos műveletek száma osztva a
+ténylegesen mozgatott bájtok számával:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>A</mi><mi>I</mi><mo>=</mo><mfrac><mtext mathvariant="normal">FLOP</mtext><mtext mathvariant="normal">byte</mtext></mfrac><mi>.</mi></mrow><annotation encoding="application/x-tex">
+AI = \frac{\text{FLOP}}{\text{byte}}.
+</annotation></semantics></math></p>
+<p>A modell szerint az elérhető teljesítmény
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>P</mi><annotation encoding="application/x-tex">P</annotation></semantics></math>
+(FLOP/s) felső korlátja:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>P</mi><mo>≤</mo><mrow><mi>min</mi><mo>&#8289;</mo></mrow><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>π</mi><mtext mathvariant="normal">peak</mtext></msub><mo>,</mo><mspace width="0.278em"></mspace><msub><mi>β</mi><mtext mathvariant="normal">eff</mtext></msub><mo>⋅</mo><mi>A</mi><mi>I</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>,</mo></mrow><annotation encoding="application/x-tex">
+P \le \min\left( \pi_{\text{peak}}, \; \beta_{\text{eff}} \cdot AI \right),
+</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>π</mi><mtext mathvariant="normal">peak</mtext></msub><annotation encoding="application/x-tex">\pi_{\text{peak}}</annotation></semantics></math>
+a GPU névleges csúcs FLOP/s értéke,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>β</mi><mtext mathvariant="normal">eff</mtext></msub><annotation encoding="application/x-tex">\beta_{\text{eff}}</annotation></semantics></math>
+pedig a hatékony memória-sávszélesség (byte/s). A kettő metszéspontja az
+ún. <strong>fordulópont</strong> (ridge point), amelynél az AI értéke
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>π</mi><mtext mathvariant="normal">peak</mtext></msub><mi>/</mi><msub><mi>β</mi><mtext mathvariant="normal">eff</mtext></msub></mrow><annotation encoding="application/x-tex">\pi_{\text{peak}} / \beta_{\text{eff}}</annotation></semantics></math>.</p>
+<p>Egy 2D 5-pontos Jacobi-stencil esetén minden rácspont frissítéséhez
+elvileg 4 lebegőpontos művelet tartozik (négy szomszéd összeadása, majd
+egy szorzás vagy osztás). Ha a bemeneti és kimeneti rácsot egy-egy
+<code>float</code> tömbben tároljuk, és minden pontot egyszer olvasunk,
+egyszer írunk, akkor egy pont adatforgalma 8 bájt (4 olvasás + 4 írás,
+ha nincs újrafelhasználás). Az AI ekkor:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>A</mi><mi>I</mi><mo>=</mo><mfrac><mrow><mn>4</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> FLOP</mtext></mrow></mrow><mrow><mn>8</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> byte</mtext></mrow></mrow></mfrac><mo>=</mo><mn>0</mn><mo>,</mo><mn>5</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> FLOP/byte</mtext></mrow><mi>.</mi></mrow><annotation encoding="application/x-tex">
+AI = \frac{4 \text{ FLOP}}{8 \text{ byte}} = 0{,}5 \text{ FLOP/byte}.
+</annotation></semantics></math></p>
+<p>Ez rendkívül alacsony, messze a fordulópont alatt, tehát a kernel
+erősen memória-kötött. Ha azonban a szomszédos pontok értékeit sikerül
+újra felhasználni – például shared memory-ba tilinggel –, a globális
+memória felé irányuló forgalom csökken. Tegyük fel, hogy egy blokk egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi><mo>×</mo><mi>B</mi></mrow><annotation encoding="application/x-tex">B \times B</annotation></semantics></math>
+méretű kimeneti tile-t számol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>
+időlépésen keresztül (időblokkolás). A blokk egyszer tölti be a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>
+széles halóval kibővített
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><mi>B</mi><mo>+</mo><mn>2</mn><mi>T</mi><msup><mo stretchy="false" form="postfix">)</mo><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">(B+2T)^2</annotation></semantics></math>
+pontos bemeneti tile-t, és egyszer írja vissza a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mi>B</mi><mn>2</mn></msup><annotation encoding="application/x-tex">B^2</annotation></semantics></math>
+belső pontot; a lépések között nincs globális forgalom. A forgalom így
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><mi>B</mi><mo>+</mo><mn>2</mn><mi>T</mi><msup><mo stretchy="false" form="postfix">)</mo><mn>2</mn></msup><mo>+</mo><msup><mi>B</mi><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">(B+2T)^2 + B^2</annotation></semantics></math>
+pont a hagyományos
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>T</mi><mo>⋅</mo><mn>2</mn><msup><mi>B</mi><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">T \cdot 2B^2</annotation></semantics></math>
+ponttal szemben (a modellt a 18.4.3 és a 18.4.11 is ugyanígy használja).
+Az AI ennek megfelelően nő, és a kernel közelebb kerülhet a számítási
+korláthoz; a halo-pontokat azonban redundánsan számoljuk, ezért a
+nyereség kisebb a puszta forgalomaránynál.</p>
+<figure id="fig-gpu069-roofline">
+<div class="fig-interactive"><iframe src="figures/html/gpu069-roofline.html" title="Mindhárom változat a fordulópont (kb. 12,5) alatt, a sávszélesség-korláton van; az időblokkolás az AI-t kb. 0,5-ről 1,2-re növeli." loading="lazy" style="width:100%;border:0;height:520px"></iframe><noscript><img src="figures/img/gpu069-roofline.png" style="width:95.0%"
+alt="Mindhárom változat a fordulópont (kb. 12,5) alatt, a sávszélesség-korláton van; az időblokkolás az AI-t kb. 0,5-ről 1,2-re növeli." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu069-roofline.png" style="width:95.0%"
+alt="Mindhárom változat a fordulópont (kb. 12,5) alatt, a sávszélesség-korláton van; az időblokkolás az AI-t kb. 0,5-ről 1,2-re növeli." /></details></div>
+<figcaption>A Jacobi-stencil változatai a Roofline-on (A100 40 GB
+névleges adatlapértékeivel, idealizált forgalommodell, nem
+mérés)</figcaption>
+</figure>
+<p>A Roofline-elemzés lépései stencil esetén:</p>
+<ol type="1">
+<li><strong>Határozzuk meg a tényleges FLOP-ot</strong> a kernelben. Ne
+a névleges műveletszámot használjuk, hanem a forrásból levezetett valós
+utasításszámot (pl. 1 FMA = 2 FLOP). A stencilnél a szomszédok
+összeadása és a konstanssal való szorzás a jellemző.</li>
+<li><strong>Mérjük meg a tényleges adatforgalmat</strong> a globális
+memória felé. Ezt Nsight Compute memória-metrikáiból
+(<code>dram__bytes_read</code>, <code>dram__bytes_write</code>) vagy
+saját számlálóval kaphatjuk meg.</li>
+<li><strong>Számítsuk ki az AI-t</strong> a kettő hányadosaként.</li>
+<li><strong>Ábrázoljuk a Roofline-diagramon</strong>, és azonosítsuk,
+melyik korlát dominál.</li>
+<li><strong>Optimalizáljunk a domináns korlát mentén</strong>: ha
+memória-kötött, csökkentsük az adatforgalmat (tiling, időblokkolás,
+cache); ha számítás-kötött, növeljük az utasítás-szintű párhuzamosságot,
+használjunk FMA-t, csökkentsük a felesleges műveleteket.</li>
+</ol>
+<p>A Roofline-elemzés nem helyettesíti a mérést, hanem keretet ad a
+mérések értelmezéséhez. A gyakorlatban a mérési pontok a két korlát
+alatt helyezkednek el, mert a modell idealizált: nem számol a
+bankütközésekkel, a divergenciával, a szinkronizációs overheaddel, a
+launch latency-vel és a cache-találati arány ingadozásával.</p>
+<h3 data-number="18.4.3" id="időblokkolás-time-blocking"><span
+class="header-section-number">18.4.3</span> Időblokkolás (time
+blocking)</h3>
+<p>A hagyományos stencil-végrehajtás minden időlépésben külön
+kernelindítást hajt végre: a kernel beolvassa a jelenlegi állapotot,
+kiszámítja a következőt, majd kiírja azt. Ez a megközelítés egyszerű, de
+két komoly hátránya van:</p>
+<ol type="1">
+<li><strong>Globális memória forgalom</strong> minden időlépésben: a
+teljes rácsot ki kell olvasni és visszaírni, függetlenül attól, hogy a
+belső pontok értékeit a következő lépésben újra felhasználnánk.</li>
+<li><strong>Kernelindítási overhead</strong>: sok kis kernel indítása
+többletköltséget jelent, különösen akkor, ha a grid mérete kicsi.</li>
+</ol>
+<p>Az <strong>időblokkolás</strong> alapötlete, hogy több időlépést
+egyetlen kernelindításon belül hajtsunk végre. A kernel egy szálblokkja
+egy térbeli tile-t tölt be a shared memory-ba, majd azt többször
+frissíti, miközben a belső pontok a shared memory-ban maradnak, és a
+szomszédos tile-okból kapott információt pedig a tile köré töltött,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>
+széles halo hordozza (a halo-pontokat redundánsan számoljuk). Ezzel a
+globális memória felé irányuló forgalom drasztikusan csökken, mert a
+belső pontok értékei több időlépésen keresztül nem érintik a globális
+memóriát.</p>
+<p>Formálisan: legyen a rács mérete
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>×</mo><mi>N</mi></mrow><annotation encoding="application/x-tex">N \times N</annotation></semantics></math>,
+egy blokk
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi><mo>×</mo><mi>B</mi></mrow><annotation encoding="application/x-tex">B \times B</annotation></semantics></math>
+méretű kimeneti tile-t kezel, és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>
+időlépést hajt végre. A hagyományos megközelítés költsége
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>O</mi><mo stretchy="false" form="prefix">(</mo><mi>T</mi><mo>⋅</mo><msup><mi>N</mi><mn>2</mn></msup><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">O(T \cdot N^2)</annotation></semantics></math>
+globális memória-hozzáférés (minden lépésben a teljes rács). Az
+időblokkolással a blokk először betölti a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi><mo>×</mo><mi>B</mi></mrow><annotation encoding="application/x-tex">B \times B</annotation></semantics></math>
+tile-t és annak
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>
+réteg halo-ját, tehát
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><mi>B</mi><mo>+</mo><mn>2</mn><mi>T</mi><msup><mo stretchy="false" form="postfix">)</mo><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">(B+2T)^2</annotation></semantics></math>
+pontot. Ezután
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>
+lépésen át frissít, minden lépésben eggyel szűkülő érvényes területen:
+az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>s</mi><annotation encoding="application/x-tex">s</annotation></semantics></math>-edik
+lépés után
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><mi>B</mi><mo>+</mo><mn>2</mn><mi>T</mi><mo>−</mo><mn>2</mn><mi>s</mi><msup><mo stretchy="false" form="postfix">)</mo><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">(B+2T-2s)^2</annotation></semantics></math>
+pont érvényes, a végén pontosan a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi><mo>×</mo><mi>B</mi></mrow><annotation encoding="application/x-tex">B \times B</annotation></semantics></math>
+belső tile. Ezért a szomszédos blokkok közötti adatcserére a kernelen
+belül nincs szükség; az ár a halo-zóna redundáns számítása. Egy blokk
+globális forgalma pontokban (pontonként 4 bájt; idealizált modell, a
+hagyományos kernel lépésenként
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mi>B</mi><mn>2</mn></msup><annotation encoding="application/x-tex">B^2</annotation></semantics></math>
+pontot olvas és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mi>B</mi><mn>2</mn></msup><annotation encoding="application/x-tex">B^2</annotation></semantics></math>
+pontot ír):</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">Idő-blokkolt forgalom</mtext><mo>=</mo><mo stretchy="false" form="prefix">(</mo><mi>B</mi><mo>+</mo><mn>2</mn><mi>T</mi><msup><mo stretchy="false" form="postfix">)</mo><mn>2</mn></msup><mo>+</mo><msup><mi>B</mi><mn>2</mn></msup><mo>,</mo><mspace width="2.0em"></mspace><mtext mathvariant="normal">hagyományos forgalom</mtext><mo>=</mo><mi>T</mi><mo>⋅</mo><mn>2</mn><msup><mi>B</mi><mn>2</mn></msup><mi>.</mi></mrow><annotation encoding="application/x-tex">
+\text{Idő-blokkolt forgalom} = (B+2T)^2 + B^2, \qquad \text{hagyományos forgalom} = T \cdot 2B^2.
+</annotation></semantics></math></p>
+<p>Ha
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>B</mi><annotation encoding="application/x-tex">B</annotation></semantics></math>
+elég nagy és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>
+mérsékelt, a megtakarítás jelentős;
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>
+növelésével azonban a redundáns számítás aránya is nő.</p>
+<p>A gyakorlatban azonban nem minden stencil alkalmas egyszerű
+időblokkolásra. A <strong>Jacobi-iteráció</strong> például pontonként
+független, ezért jól párhuzamosítható, de az időblokkolás megvalósítása
+bonyolultabb, mert a lépésenként szűkülő érvényes terület miatt a halo-t
+szélesíteni kell, vagy a blokkok között globális szinkronizáció kell. A
+<strong>soros (Gauss–Seidel) típusú</strong> stencileknél az időbeli
+függőség miatt a hagyományos párhuzamosítás is nehezebb, ezért ott
+gyakran használnak piros-fekete (red-black) rendezést vagy más
+dekompozíciót.</p>
+<h3 data-number="18.4.4" id="időblokkolás-megvalósítása-cuda-ban"><span
+class="header-section-number">18.4.4</span> Időblokkolás megvalósítása
+CUDA-ban</h3>
+<p>Az időblokkolás tipikus megvalósítása a <strong>shared memory-ba
+töltött tile és a regiszterek közötti adatmozgás</strong> kombinációja.
+A legegyszerűbb esetben a kernel egyetlen időlépést hajt végre shared
+memory tilinggel. Az időblokkoláshoz ezt a lépést többször ismételjük
+egy belső ciklusban, miközben a tile határait frissítjük.</p>
+<p>Példaként vegyünk egy 2D 5-pontos stencilt (a Laplace-egyenlet
+Jacobi-iterációja). A kernel vázlata időblokkolás nélkül (egy időlépés)
+a 18.1-ban már szerepelt. Most tekintsük a több időlépéses
+változatot.</p>
+<p>A kernel vázlata (nem fordított, nem futtatott kód; CUDA C++17, nvcc
+12.x, dupla puffer a shared memory-ban,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>
+széles redundáns halo; a perempontok értéke rögzített, mint a labor
+kernelében):</p>
+<pre class="cuda"><code>template &lt;int BLOCK_X, int BLOCK_Y, int T&gt;
+__global__ void jacobi_timeblock(float* u_new, const float* u_old, int N)
+{
+    constexpr int W = BLOCK_X + 2 * T, H = BLOCK_Y + 2 * T;
+    __shared__ float buf[2][H][W];            // kétszeres puffer: nincs helyben felülírás
+
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int bx = blockIdx.x * BLOCK_X, by = blockIdx.y * BLOCK_Y;
+
+    // Betöltés a T széles halóval együtt; a rácson kívüli pontok sosem kerülnek felhasználásra
+    for (int j = ty; j &lt; H; j += blockDim.y)
+        for (int i = tx; i &lt; W; i += blockDim.x) {
+            int gx = bx + i - T, gy = by + j - T;
+            float v = (gx &gt;= 0 &amp;&amp; gx &lt; N &amp;&amp; gy &gt;= 0 &amp;&amp; gy &lt; N) ? u_old[gy * N + gx] : 0.0f;
+            buf[0][j][i] = v;
+            buf[1][j][i] = v;
+        }
+    __syncthreads();
+
+    int cur = 0;
+    for (int step = 1; step &lt;= T; ++step) {
+        // Az s-edik lépésben a [step, W-step) x [step, H-step) tartomány számolható érvényesen
+        for (int j = ty + step; j &lt; H - step; j += blockDim.y)
+            for (int i = tx + step; i &lt; W - step; i += blockDim.x) {
+                int gx = bx + i - T, gy = by + j - T;
+                if (gx &gt;= 1 &amp;&amp; gx &lt; N - 1 &amp;&amp; gy &gt;= 1 &amp;&amp; gy &lt; N - 1)
+                    buf[1 - cur][j][i] = 0.25f * (buf[cur][j - 1][i] + buf[cur][j + 1][i] +
+                                                  buf[cur][j][i - 1] + buf[cur][j][i + 1]);
+                else
+                    buf[1 - cur][j][i] = buf[cur][j][i];   // perem: rögzített érték
+            }
+        __syncthreads();                      // az új réteg teljes, mielőtt olvasnánk
+        cur = 1 - cur;
+    }
+
+    // Visszaírás: csak a B x B belső tile érvényes
+    for (int j = ty; j &lt; BLOCK_Y; j += blockDim.y)
+        for (int i = tx; i &lt; BLOCK_X; i += blockDim.x) {
+            int gx = bx + i, gy = by + j;
+            if (gx &lt; N &amp;&amp; gy &lt; N)
+                u_new[gy * N + gx] = buf[cur][j + T][i + T];
+        }
+}</code></pre>
+<figure id="fig-gpu069-timeblock">
+<div class="fig-interactive"><iframe src="figures/html/gpu069-timeblock.html" title="24-es betöltött tartományból lépésenként 22, 20, 18, végül 16-os érvényes tile; 1,43-szoros számítás, 0,41-szeres forgalom." loading="lazy" style="width:100%;border:0;height:560px"></iframe><noscript><img src="figures/img/gpu069-timeblock.png" style="width:100.0%"
+alt="24-es betöltött tartományból lépésenként 22, 20, 18, végül 16-os érvényes tile; 1,43-szoros számítás, 0,41-szeres forgalom." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu069-timeblock.png" style="width:100.0%"
+alt="24-es betöltött tartományból lépésenként 22, 20, 18, végül 16-os érvényes tile; 1,43-szoros számítás, 0,41-szeres forgalom." /></details></div>
+<figcaption>Az érvényes tartomány szűkülése időblokkolásnál (B = 16, T =
+4): a 24 × 24-es betöltött tartományból lépésenként 22, 20, 18, végül 16
+× 16-os érvényes tile marad, a két shared puffer
+váltogatásával</figcaption>
+</figure>
+<p>Ellenőrzési terv (statikus vázlat; futtatás hiányában nincs mért
+eredménye):
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>T</mi><mo>=</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">T=1</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>T</mi><mo>=</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">T=4</annotation></semantics></math>
+lépés után CPU-referenciával való összevetés, valamint
+<code>compute-sanitizer --tool racecheck</code>. A shared memory igénye
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mo>⋅</mo><mo stretchy="false" form="prefix">(</mo><mi>B</mi><mo>+</mo><mn>2</mn><mi>T</mi><msup><mo stretchy="false" form="postfix">)</mo><mn>2</mn></msup><mo>⋅</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">2 \cdot (B+2T)^2 \cdot 4</annotation></semantics></math>
+bájt,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi><mo>=</mo><mn>16</mn></mrow><annotation encoding="application/x-tex">B=16</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>T</mi><mo>=</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">T=4</annotation></semantics></math>
+esetén
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mo>⋅</mo><msup><mn>24</mn><mn>2</mn></msup><mo>⋅</mo><mn>4</mn><mo>=</mo><mn>4608</mn></mrow><annotation encoding="application/x-tex">2 \cdot 24^2 \cdot 4 = 4608</annotation></semantics></math>
+bájt.</p>
+<p>Ez a megoldás nem kíván blokkok közötti szinkronizációt: minden blokk
+a saját halo-zónáját redundánsan számolja, ezért a kernelen belül nincs
+szomszéd-blokk kommunikáció. Az időblokkolás előnye akkor jelentkezik,
+ha a redundáns halo-számítás költsége kicsi a megspórolt globális
+forgalomhoz képest (kis
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>,
+nagy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>B</mi><annotation encoding="application/x-tex">B</annotation></semantics></math>).
+Az alternatíva a rombusz- vagy trapéz-csempézés (kevesebb redundancia,
+bonyolultabb ütemezés), valamint a grid-szintű szinkronizáció
+(cooperative groups), amely viszont lépésenként globális memóriát
+igényel.</p>
+<p>A gyakorlatban az időblokkolást gyakran <strong>többszintű
+tiling</strong>gel kombinálják: a globális memóriából a shared memory-ba
+töltött tile mérete nagyobb, mint amit egyetlen lépésben frissítünk, így
+a belső pontok több lépésen át újrahasznosulnak. A regiszterekbe töltött
+értékek további újrafelhasználást tesznek lehetővé.</p>
+<h3 data-number="18.4.5" id="az-időblokkolás-előnyei-és-korlátai"><span
+class="header-section-number">18.4.5</span> Az időblokkolás előnyei és
+korlátai</h3>
+<p><strong>Előnyök:</strong></p>
+<ul>
+<li>Csökkenti a globális memória forgalmat, ezáltal növeli az AI-t.</li>
+<li>Csökkenti a kernelindítások számát, ami kis grid esetén számottevő
+overhead.</li>
+<li>Lehetővé teszi a cache jobb kihasználását, mivel az adatok hosszabb
+ideig a chipen maradnak.</li>
+</ul>
+<p><strong>Korlátok és buktatók:</strong></p>
+<ul>
+<li>A shared memory mérete korlátozott (compute capability-től függően
+az SM-enkénti kapacitás 64 KiB-tól Hoppernél 228 KiB-ig terjed;
+blokkonként statikusan 48 KiB, ennél többhöz dinamikus shared memory és
+opt-in attribútum kell), ezért a tile mérete nem nőhet tetszőlegesen
+nagyra.</li>
+<li>A
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>
+széles halo redundáns számítást jelent, aminek aránya
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>-vel
+nő; a blokkok közötti halo-csere (ha nem redundáns halót használunk)
+globális szinkronizációt igényel.</li>
+<li>A regiszterhasználat nőhet, ami csökkenti az occupancy-t.</li>
+<li>A shared memory bankütközései a hozzáférési mintától függnek (pl.
+oszlopirányú, 32 szó lépésközű elérés), nem a tömb méretétől; a fenti
+kernelekben a szomszédos szálak szomszédos szavakat érnek el, így nincs
+ütközés.</li>
+<li>Nem minden stencil alkalmas időblokkolásra; például ha a stencil
+időben változó együtthatókat használ, vagy ha a rácspontok közötti
+függőség nem teszi lehetővé a független frissítést.</li>
+</ul>
+<h3 data-number="18.4.6" id="gyakorlati-hangolási-stratégiák"><span
+class="header-section-number">18.4.6</span> Gyakorlati hangolási
+stratégiák</h3>
+<p>Az alábbi lépések a stencil-optimalizálás iteratív folyamatát írják
+le:</p>
+<ol type="1">
+<li><strong>Kezdjünk egy egyszerű, helyes kernelből</strong> (baseline).
+Mérjük meg a futásidőt, a memória-sávszélességet és az occupancy-t.</li>
+<li><strong>Végezzünk Roofline-elemzést</strong> az AI kiszámításával.
+Döntsük el, memória- vagy számítás-kötött-e a kernel.</li>
+<li><strong>Alkalmazzunk shared memory tilinget</strong> a globális
+memória újraolvasásának csökkentésére. Hangoljuk a tile méretét: a túl
+kicsi tile nem csökkenti eléggé a forgalmat, a túl nagy tile csökkenti
+az occupancy-t és növeli a shared memory nyomást.</li>
+<li><strong>Vektorizáljuk a betöltéseket</strong> (<code>float2</code>,
+<code>float4</code>), hogy jobban kihasználjuk a memória-sávszélességet
+és csökkentsük az utasításszámot.</li>
+<li><strong>Alkalmazzunk időblokkolást</strong>, ha a stencil lehetővé
+teszi. Mérjük meg, hány időlépés adja a legjobb kompromisszumot a
+globális forgalom és a szinkronizációs overhead között.</li>
+<li><strong>Hangoljuk a cache-politikát</strong>: állítsuk be az L2
+persistence-t a gyakran használt adatokra, vagy használjunk
+<code>cudaFuncAttributePreferredSharedMemoryCarveout</code>-ot a shared
+memory arányának növelésére.</li>
+<li><strong>Csökkentsük a bankütközéseket, ha a profil ilyet
+mutat</strong> (Nsight Compute
+<code>l1tex__data_bank_conflicts_pipe_lsu_mem_shared</code>):
+oszlopirányú vagy lépésközös hozzáférésnél padding bevezetésével a
+shared memory tömbben. A fejezet sor-irányú, szomszédos szavakat olvasó
+kernelei nem szenvednek bankütközéstől.</li>
+<li><strong>Optimalizáljuk a launch konfigurációt</strong>: blockméret,
+gridméret, esetleg grid-stride loop.</li>
+<li><strong>Mérjünk újra</strong>, és hasonlítsuk össze a baseline-nal.
+Az optimalizálás akkor sikeres, ha a futásidő csökken, miközben a
+numerikus eredmény az előírt hibahatáron belül változatlan.</li>
+</ol>
+<h3 data-number="18.4.7" id="labor-tileméret--és-cache-hangolás"><span
+class="header-section-number">18.4.7</span> Labor: tileméret- és
+cache-hangolás</h3>
+<p>Ebben a laborban a fenti elveket gyakoroljuk a 2D Laplace-egyenlet
+(stacionárius hővezetés) Jacobi-iterációján. A cél a tileméret és a
+cache-beállítások hatásának mérése. A laborhoz CUDA C++ kódot adunk, de
+az elvek OpenCL-re és JAX-re is átvihetők; ahol releváns, megjegyezzük a
+párhuzamokat.</p>
+<h3 data-number="18.4.8" id="feladatleírás"><span
+class="header-section-number">18.4.8</span> Feladatleírás</h3>
+<p>Adott egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>×</mo><mi>N</mi></mrow><annotation encoding="application/x-tex">N \times N</annotation></semantics></math>
+méretű 2D rács, amelyen a Laplace-egyenlet (stacionárius hővezetés)
+diszkrét alakját oldjuk meg Jacobi-iterációval. (A hővezetési egyenlet
+explicit időlépése
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>u</mi><mo>+</mo><mi>α</mi><mspace width="0.167em"></mspace><mi mathvariant="normal">Δ</mi><mi>t</mi><mspace width="0.167em"></mspace><mi mathvariant="normal">Δ</mi><mi>u</mi></mrow><annotation encoding="application/x-tex">u + \alpha\,\Delta t\,\Delta u</annotation></semantics></math>
+alakú volna, stabilitási feltétele
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>α</mi><mspace width="0.167em"></mspace><mi mathvariant="normal">Δ</mi><mi>t</mi><mi>/</mi><msup><mi>h</mi><mn>2</mn></msup><mo>≤</mo><mn>1</mn><mi>/</mi><mn>4</mn></mrow><annotation encoding="application/x-tex">\alpha\,\Delta t / h^2 \le 1/4</annotation></semantics></math>;
+ezt a labor nem használja.)</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msubsup><mi>u</mi><mrow><mi>i</mi><mo>,</mo><mi>j</mi></mrow><mrow><mo stretchy="false" form="prefix">(</mo><mi>k</mi><mo>+</mo><mn>1</mn><mo stretchy="false" form="postfix">)</mo></mrow></msubsup><mo>=</mo><mfrac><mn>1</mn><mn>4</mn></mfrac><mrow><mo stretchy="true" form="prefix">(</mo><msubsup><mi>u</mi><mrow><mi>i</mi><mo>−</mo><mn>1</mn><mo>,</mo><mi>j</mi></mrow><mrow><mo stretchy="false" form="prefix">(</mo><mi>k</mi><mo stretchy="false" form="postfix">)</mo></mrow></msubsup><mo>+</mo><msubsup><mi>u</mi><mrow><mi>i</mi><mo>+</mo><mn>1</mn><mo>,</mo><mi>j</mi></mrow><mrow><mo stretchy="false" form="prefix">(</mo><mi>k</mi><mo stretchy="false" form="postfix">)</mo></mrow></msubsup><mo>+</mo><msubsup><mi>u</mi><mrow><mi>i</mi><mo>,</mo><mi>j</mi><mo>−</mo><mn>1</mn></mrow><mrow><mo stretchy="false" form="prefix">(</mo><mi>k</mi><mo stretchy="false" form="postfix">)</mo></mrow></msubsup><mo>+</mo><msubsup><mi>u</mi><mrow><mi>i</mi><mo>,</mo><mi>j</mi><mo>+</mo><mn>1</mn></mrow><mrow><mo stretchy="false" form="prefix">(</mo><mi>k</mi><mo stretchy="false" form="postfix">)</mo></mrow></msubsup><mo stretchy="true" form="postfix">)</mo></mrow><mo>,</mo></mrow><annotation encoding="application/x-tex">
+u_{i,j}^{(k+1)} = \frac{1}{4} \left( u_{i-1,j}^{(k)} + u_{i+1,j}^{(k)} + u_{i,j-1}^{(k)} + u_{i,j+1}^{(k)} \right),
+</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mi>u</mi><mrow><mo stretchy="false" form="prefix">(</mo><mi>k</mi><mo stretchy="false" form="postfix">)</mo></mrow></msup><annotation encoding="application/x-tex">u^{(k)}</annotation></semantics></math>
+a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>k</mi><annotation encoding="application/x-tex">k</annotation></semantics></math>-adik
+iterációs lépés. A labor kódjában a perempontokat nem frissítjük,
+értékük a kezdeti (véletlen) érték marad (Dirichlet-jellegű rögzített
+perem); a rácson kívüli pontokat a shared memory betöltése 0-val tölti
+fel, de ezek a belső pontok számításában nem szerepelnek. Az iterációt
+fix számú lépésig futtatjuk.</p>
+<p>A labor során a következő paramétereket hangoljuk:</p>
+<ul>
+<li><strong>Tile méret</strong>: a shared memory-ba töltött résztömb
+mérete a szálblokkban. Kísérletezzünk
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>8</mn><mo>×</mo><mn>8</mn></mrow><annotation encoding="application/x-tex">8 \times 8</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>16</mn><mo>×</mo><mn>16</mn></mrow><annotation encoding="application/x-tex">16 \times 16</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>32</mn><mo>×</mo><mn>32</mn></mrow><annotation encoding="application/x-tex">32 \times 32</annotation></semantics></math>
+méretekkel (a <code>TILE_X</code>/<code>TILE_Y</code> fordítási időben
+állítható, minden konfigurációhoz újrafordítás kell).</li>
+<li><strong>Cache-politika</strong>: az L2 cache-hozzáférési ablak
+(<code>cudaStreamAttrValue</code> access policy window) vagy a preferált
+shared memory carve-out beállítása. Mérjük a hatást a futásidőre és az
+L2 találati arányra.</li>
+</ul>
+<p>A méréshez rögzítsük a környezetet, futtassunk minden konfigurációt 5
+warm-up után legalább 20-szor, és adjuk meg a medián futásidőt és az
+IQR-t.</p>
+<h3 data-number="18.4.9" id="cuda-c-kód"><span
+class="header-section-number">18.4.9</span> CUDA C++ kód</h3>
+<p>Az alábbi kód egy baseline kernel és egy shared memory tilinges
+változat, mindkettő mérése, mediánnal és IQR-ral, és a két eredmény
+összevetésével (nem futtatott, nem fordított kód). A hibakezelést a
+könyv kanonikus <code>CUDA_CHECK</code> makrójával végezzük.</p>
+<pre class="cuda"><code>// Fordító: CUDA C++17 (nvcc 12.x)
+// Nyelv: CUDA C++
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;cmath&gt;
+#include &lt;vector&gt;
+#include &lt;utility&gt;
+#include &lt;algorithm&gt;
+
+// Hibakezelő makró (a könyv kanonikus hibamakrója, 1.2)
+#define CUDA_CHECK(call) do {                                              \
+    cudaError_t err = (call);                                               \
+    if (err != cudaSuccess) {                                               \
+        fprintf(stderr, &quot;CUDA hiba: %s, fájl: %s, sor: %d\n&quot;,              \
+                cudaGetErrorString(err), __FILE__, __LINE__);               \
+        exit(EXIT_FAILURE);                                                  \
+    }                                                                       \
+} while (0)
+
+// Baseline kernel: nincs shared memory tiling
+__global__ void jacobi_naive(const float* __restrict__ u_old,
+                             float* __restrict__ u_new,
+                             int N) {
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &gt;= 1 &amp;&amp; i &lt; N-1 &amp;&amp; j &gt;= 1 &amp;&amp; j &lt; N-1) {
+        u_new[j * N + i] = 0.25f * (u_old[j * N + i - 1] +
+                                    u_old[j * N + i + 1] +
+                                    u_old[(j - 1) * N + i] +
+                                    u_old[(j + 1) * N + i]);
+    }
+}
+
+// Tilinges kernel: shared memory-ba töltés
+// BLOCK_X és BLOCK_Y a belső pontok mérete, a halo hozzáadódik.
+#ifndef TILE_X
+#define TILE_X 16  // Hangolandó paraméter (-DTILE_X=8 -DTILE_Y=8 stb.)
+#endif
+#ifndef TILE_Y
+#define TILE_Y 16
+#endif
+#define HALO 1
+
+__global__ void jacobi_tiled(const float* __restrict__ u_old,
+                             float* __restrict__ u_new,
+                             int N) {
+    __shared__ float tile[TILE_Y + 2 * HALO][TILE_X + 2 * HALO];
+    
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int bx = blockIdx.x * TILE_X;
+    int by = blockIdx.y * TILE_Y;
+    
+    // Betöltés a shared memory-ba, beleértve a halo réteget
+    for (int j = ty; j &lt; TILE_Y + 2 * HALO; j += blockDim.y) {
+        for (int i = tx; i &lt; TILE_X + 2 * HALO; i += blockDim.x) {
+            int gx = bx + i - HALO;
+            int gy = by + j - HALO;
+            if (gx &gt;= 0 &amp;&amp; gx &lt; N &amp;&amp; gy &gt;= 0 &amp;&amp; gy &lt; N) {
+                tile[j][i] = u_old[gy * N + gx];
+            } else {
+                tile[j][i] = 0.0f; // peremfeltétel
+            }
+        }
+    }
+    __syncthreads();
+    
+    // Belső pontok frissítése
+    int i = bx + tx;
+    int j = by + ty;
+    if (i &gt;= 1 &amp;&amp; i &lt; N-1 &amp;&amp; j &gt;= 1 &amp;&amp; j &lt; N-1 &amp;&amp; tx &lt; TILE_X &amp;&amp; ty &lt; TILE_Y) {
+        int lx = tx + HALO;
+        int ly = ty + HALO;
+        u_new[j * N + i] = 0.25f * (tile[ly - 1][lx] + tile[ly + 1][lx] +
+                                    tile[ly][lx - 1] + tile[ly][lx + 1]);
+    }
+}
+
+// Inicializálás
+void init_field(float* field, int N) {
+    for (int i = 0; i &lt; N * N; ++i) {
+        field[i] = static_cast&lt;float&gt;(rand()) / RAND_MAX;
+    }
+}
+
+typedef void (*StencilKernel)(const float*, float*, int);
+
+// Egy konfiguráció mérése: REPEATS ismétlés, mindegyik ITERATIONS lépés ugyanabból a kezdőállapotból.
+static void bench(const char* name, StencilKernel kern, dim3 grid, dim3 block,
+                  const float* h_init, float* h_result, int N, int iterations, int repeats) {
+    size_t bytes = (size_t)N * N * sizeof(float);
+    float *d_a, *d_b;
+    CUDA_CHECK(cudaMalloc(&amp;d_a, bytes));
+    CUDA_CHECK(cudaMalloc(&amp;d_b, bytes));
+    cudaEvent_t t0, t1;
+    CUDA_CHECK(cudaEventCreate(&amp;t0));
+    CUDA_CHECK(cudaEventCreate(&amp;t1));
+    std::vector&lt;double&gt; t;                           // ismétlésenkénti ms/lépés
+    for (int r = -5; r &lt; repeats; ++r) {            // r &lt; 0: 5 warm-up futás
+        CUDA_CHECK(cudaMemcpy(d_a, h_init, bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_b, h_init, bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaEventRecord(t0));
+        for (int s = 0; s &lt; iterations; ++s) {
+            kern&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_a, d_b, N);
+            CUDA_CHECK(cudaGetLastError());
+            std::swap(d_a, d_b);
+        }
+        CUDA_CHECK(cudaEventRecord(t1));
+        CUDA_CHECK(cudaEventSynchronize(t1));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&amp;ms, t0, t1));
+        if (r &gt;= 0) t.push_back(ms / iterations);
+    }
+    CUDA_CHECK(cudaMemcpy(h_result, d_a, bytes, cudaMemcpyDeviceToHost));
+    std::sort(t.begin(), t.end());
+    double med = 0.5 * (t[repeats / 2 - 1] + t[repeats / 2]);   // repeats páros
+    double iqr = t[3 * repeats / 4] - t[repeats / 4];
+    printf(&quot;%s: medián %.4f ms/lépés, IQR %.4f ms (%d ismétlés x %d lépés)\n&quot;,
+           name, med, iqr, repeats, iterations);
+    CUDA_CHECK(cudaEventDestroy(t0));
+    CUDA_CHECK(cudaEventDestroy(t1));
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+}
+
+int main() {
+    const int N = 1024;          // rács méret
+    const int ITERATIONS = 100;  // lépések száma ismétlésenként
+    const int REPEATS = 20;      // mért ismétlések (a 5 warm-up külön)
+
+    int device = 0;
+    CUDA_CHECK(cudaSetDevice(device));
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&amp;prop, device));
+    printf(&quot;GPU: %s, Compute Capability: %d.%d, SMs: %d\n&quot;,
+           prop.name, prop.major, prop.minor, prop.multiProcessorCount);
+
+    std::vector&lt;float&gt; h_init((size_t)N * N), h_naive((size_t)N * N), h_tiled((size_t)N * N);
+    srand(12345);                // rögzített mag: azonos input minden futásnál
+    init_field(h_init.data(), N);
+
+    dim3 block(TILE_X, TILE_Y);
+    dim3 grid((N + TILE_X - 1) / TILE_X, (N + TILE_Y - 1) / TILE_Y);
+
+    bench(&quot;Baseline (jacobi_naive)&quot;, jacobi_naive, grid, block, h_init.data(), h_naive.data(), N, ITERATIONS, REPEATS);
+    bench(&quot;Tiled    (jacobi_tiled)&quot;, jacobi_tiled, grid, block, h_init.data(), h_tiled.data(), N, ITERATIONS, REPEATS);
+
+    // Ellenőrzés: a két kernel eredménye csak az összegzés sorrendje miatt térhet el (FP32)
+    float max_diff = 0.0f;
+    for (size_t i = 0; i &lt; h_naive.size(); ++i)
+        max_diff = std::max(max_diff, std::fabs(h_naive[i] - h_tiled[i]));
+    printf(&quot;Legnagyobb eltérés a baseline és a tiled eredmény között: %.3e\n&quot;, max_diff);
+    return max_diff &lt; 1e-4f ? 0 : 1;
+}</code></pre>
+<p><strong>Buildparancs:</strong></p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-O3</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-Xcompiler</span> <span class="at">-Wall</span> <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-DTILE_X</span><span class="op">=</span>16 <span class="at">-DTILE_Y</span><span class="op">=</span>16 <span class="at">-o</span> stencil_lab stencil_lab.cu</span></code></pre></div>
+<p>(A <code>sm_80</code> helyett a saját GPU compute capability-jét kell
+behelyettesíteni, pl. <code>sm_86</code>, <code>sm_90</code>; a 8×8-as
+és 32×32-es konfigurációhoz a
+<code>-DTILE_X</code>/<code>-DTILE_Y</code> értékét kell cserélni. A kód
+nem volt lefordítva és futtatva.)</p>
+<h3 data-number="18.4.10" id="cache-hangolás"><span
+class="header-section-number">18.4.10</span> Cache-hangolás</h3>
+<p>A cache-politika befolyásolására az alábbi lehetőségek állnak
+rendelkezésre:</p>
+<ul>
+<li><strong>L2 persistence</strong>: beállíthatunk egy access policy
+window-t, amely az L2 cache egy részét a gyakran használt adatoknak
+tartja fenn. Ehhez a CUDA stream attribútumait kell beállítani:</li>
+</ul>
+<pre class="cuda"><code>// Nem futtatott vázlat. A kernelindításokat is ebben a streamben kell végezni
+// (a jacobi_tiled&lt;&lt;&lt;grid, block, 0, stream&gt;&gt;&gt; alakkal), az alapértelmezett streamre a window nem érvényesül.
+cudaStream_t stream;
+CUDA_CHECK(cudaStreamCreate(&amp;stream));
+
+// 1. A persisting L2 terület lefoglalása (alapértelmezésben 0, enélkül a persisting hint hatástalan)
+int maxPersist = 0;
+CUDA_CHECK(cudaDeviceGetAttribute(&amp;maxPersist, cudaDevAttrMaxPersistingL2CacheSize, 0));
+size_t persistBytes = std::min&lt;size_t&gt;(maxPersist, (size_t)N * N * sizeof(float));
+CUDA_CHECK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, persistBytes));
+
+// 2. Az access policy window; a hitRatio = persistBytes / num_bytes a túlfoglalás elkerülésére
+size_t windowBytes = (size_t)N * N * sizeof(float);
+cudaStreamAttrValue attr = {};
+attr.accessPolicyWindow.base_ptr  = static_cast&lt;void*&gt;(d_u_old);   // csak egyetlen puffer ablaka
+attr.accessPolicyWindow.num_bytes = windowBytes;
+attr.accessPolicyWindow.hitRatio  = (float)persistBytes / (float)windowBytes;
+attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+CUDA_CHECK(cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &amp;attr));
+// A labor végén: CUDA_CHECK(cudaCtxResetPersistingL2Cache());</code></pre>
+<p>Három figyelmeztetés a méréshez. (1) A <code>std::swap</code> miatt a
+<code>d_u_old</code> pointer minden lépésben a másik puffert jelöli;
+vagy mindkét puffer ablakát kell beállítani (minden lépés előtt újra),
+vagy egyetlen puffert használjunk. (2) A 1024×1024-es <code>float</code>
+rács 4 MiB, ami egy A100 40 MB-os L2-jében teljesen elfér, ezért az L2
+persistence érdemi hatása itt nem várható; a hatás vizsgálatához az
+L2-nél (legalább kétszeresen) nagyobb rács, vagy a stencillel
+párhuzamosan futó, az L2-t kiszorító streaming terhelés kell. (3) A
+<code>hitRatio</code> értékét ne önkényesen (pl. 0,5), hanem a
+persisting terület és az ablak aránya szerint válasszuk, és mérjük meg
+(Nsight Compute <code>lts__t_sector_hit_rate</code>).</p>
+<ul>
+<li><strong>Preferred shared memory carve-out</strong>: az SM-en belüli
+shared memory és L1 cache arányának beállítása. Ez a kernel
+függvényattribútumával szabályozható:</li>
+</ul>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a>cudaFuncSetAttribute<span class="op">(</span>jacobi_tiled<span class="op">,</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>                     cudaFuncAttributePreferredSharedMemoryCarveout<span class="op">,</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>                     cudaSharedmemCarveoutMaxShared<span class="op">);</span>   <span class="co">// a visszatérési értéket ellenőrizni kell: CUDA_CHECK(...)</span></span></code></pre></div>
+<p>A <code>jacobi_tiled</code> statikus shared memory igénye
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><mn>16</mn><mo>+</mo><mn>2</mn><msup><mo stretchy="false" form="postfix">)</mo><mn>2</mn></msup><mo>⋅</mo><mn>4</mn><mo>=</mo><mn>1296</mn></mrow><annotation encoding="application/x-tex">(16+2)^2 \cdot 4 = 1296</annotation></semantics></math>
+bájt blokkonként, így a carve-out módosítása ennél a kernelnél érdemi
+hatást nem várhatunk; ez a kísérlet inkább a módszer demonstrációja.</p>
+<p>A laborban mérjük meg a futásidőt alapbeállítással, majd L2
+persistence bekapcsolásával, végül a carve-out módosításával. Jegyezzük
+fel az L2 találati arányt (Nsight Compute
+<code>lts__t_sector_hit_rate</code> vagy hasonló metrika).</p>
+<h3 data-number="18.4.11" id="mérési-napló-és-eredmények"><span
+class="header-section-number">18.4.11</span> Mérési napló és
+eredmények</h3>
+<p>A mérési naplóban rögzíteni kell a környezetet és minden konfiguráció
+eredményét. Az alábbi táblázat egy sablon, amelyben a „Mért” oszlop
+értékeit a saját futtatás során kell kitölteni. A „Várt” oszlop a
+Roofline-modellből és a memóriaforgalom becsléséből számított
+előrejelzés.</p>
+<p><strong>Környezet (példa):</strong></p>
+<ul>
+<li>GPU: NVIDIA A100 40 GB (compute capability 8.0)</li>
+<li>Driver: 550.54.14</li>
+<li>CUDA: 12.4</li>
+<li>OS: Ubuntu 22.04</li>
+<li>Precision: FP32</li>
+<li>Rács méret:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1024</mn><mo>×</mo><mn>1024</mn></mrow><annotation encoding="application/x-tex">1024 \times 1024</annotation></semantics></math></li>
+<li>Iterációk: 100</li>
+<li>Warm-up: 5</li>
+</ul>
+<table>
+<colgroup>
+<col style="width: 11%" />
+<col style="width: 9%" />
+<col style="width: 13%" />
+<col style="width: 16%" />
+<col style="width: 10%" />
+<col style="width: 18%" />
+<col style="width: 19%" />
+</colgroup>
+<thead>
+<tr>
+<th>Konfiguráció</th>
+<th>Tile méret</th>
+<th>Cache beállítás</th>
+<th>Medián futásidő (ms)</th>
+<th>IQR (ms)</th>
+<th>L2 találati arány (%)</th>
+<th>Várt gyorsulás (arány)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Baseline</td>
+<td>–</td>
+<td>alap</td>
+<td>(mért – kitöltendő)</td>
+<td>(mért – kitöltendő)</td>
+<td>(mért – kitöltendő)</td>
+<td>1,0</td>
+</tr>
+<tr>
+<td>Tiled</td>
+<td>8×8</td>
+<td>alap</td>
+<td>(mért – kitöltendő)</td>
+<td>(mért – kitöltendő)</td>
+<td>(mért – kitöltendő)</td>
+<td>(számolt)</td>
+</tr>
+<tr>
+<td>Tiled</td>
+<td>16×16</td>
+<td>alap</td>
+<td>(mért – kitöltendő)</td>
+<td>(mért – kitöltendő)</td>
+<td>(mért – kitöltendő)</td>
+<td>(számolt)</td>
+</tr>
+<tr>
+<td>Tiled</td>
+<td>32×32</td>
+<td>alap</td>
+<td>(mért – kitöltendő)</td>
+<td>(mért – kitöltendő)</td>
+<td>(mért – kitöltendő)</td>
+<td>(számolt)</td>
+</tr>
+<tr>
+<td>Tiled 16×16</td>
+<td>16×16</td>
+<td>L2 persistence</td>
+<td>(mért – kitöltendő)</td>
+<td>(mért – kitöltendő)</td>
+<td>(mért – kitöltendő)</td>
+<td>(számolt)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Várt eredmény számítása:</strong></p>
+<p>A baseline kernel minden pontot egyszer olvas, egyszer ír, tehát a
+globális memória forgalom
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mo>⋅</mo><msup><mi>N</mi><mn>2</mn></msup><mo>⋅</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">2 \cdot N^2 \cdot 4</annotation></semantics></math>
+bájt lépésenként. A tilinges kernelnél a forgalom csökken, mert a belső
+pontokat a shared memory-ból olvassuk. Ha a tile mérete
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi><mo>×</mo><mi>B</mi></mrow><annotation encoding="application/x-tex">B \times B</annotation></semantics></math>,
+akkor a betöltés
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><mi>B</mi><mo>+</mo><mn>2</mn><msup><mo stretchy="false" form="postfix">)</mo><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">(B+2)^2</annotation></semantics></math>
+pontot érint, a visszaírás
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mi>B</mi><mn>2</mn></msup><annotation encoding="application/x-tex">B^2</annotation></semantics></math>
+pontot. A forgalom aránya a baseline-hoz képest:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mfrac><mtext mathvariant="normal">Tiled forgalom</mtext><mtext mathvariant="normal">Baseline forgalom</mtext></mfrac><mo>=</mo><mfrac><mrow><mo stretchy="false" form="prefix">(</mo><mi>B</mi><mo>+</mo><mn>2</mn><msup><mo stretchy="false" form="postfix">)</mo><mn>2</mn></msup><mo>+</mo><msup><mi>B</mi><mn>2</mn></msup></mrow><mrow><mn>2</mn><msup><mi>B</mi><mn>2</mn></msup></mrow></mfrac><mi>.</mi></mrow><annotation encoding="application/x-tex">
+\frac{\text{Tiled forgalom}}{\text{Baseline forgalom}} = \frac{(B+2)^2 + B^2}{2B^2}.
+</annotation></semantics></math></p>
+<p>Például
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi><mo>=</mo><mn>16</mn></mrow><annotation encoding="application/x-tex">B=16</annotation></semantics></math>
+esetén:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mfrac><mrow><msup><mn>18</mn><mn>2</mn></msup><mo>+</mo><msup><mn>16</mn><mn>2</mn></msup></mrow><mrow><mn>2</mn><mo>⋅</mo><msup><mn>16</mn><mn>2</mn></msup></mrow></mfrac><mo>=</mo><mfrac><mrow><mn>324</mn><mo>+</mo><mn>256</mn></mrow><mn>512</mn></mfrac><mo>=</mo><mfrac><mn>580</mn><mn>512</mn></mfrac><mo>≈</mo><mn>1</mn><mo>,</mo><mn>13</mn><mi>.</mi></mrow><annotation encoding="application/x-tex">
+\frac{18^2 + 16^2}{2 \cdot 16^2} = \frac{324 + 256}{512} = \frac{580}{512} \approx 1{,}13.
+</annotation></semantics></math></p>
+<p>Ez azt jelenti, hogy a tiling önmagában (időblokkolás nélkül)
+<strong>nem csökkenti</strong> a globális memória forgalmat, sőt kissé
+növeli, mert a halo réteget duplán olvassuk. A haszon a shared
+memory-ból való gyorsabb olvasásból és a jobb cache-használatból
+származik. Az igazi csökkenést az időblokkolás hozza, ahol a belső
+pontokat több lépésen át a shared memory-ban tartjuk.</p>
+<p>Tegyük fel, hogy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>
+időlépést hajtunk végre egyetlen kernelindításban,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>
+széles redundáns halóval (18.4.4). Ekkor a blokkonkénti forgalom:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">Tiled + time blocking forgalom</mtext><mo>=</mo><mo stretchy="false" form="prefix">(</mo><mi>B</mi><mo>+</mo><mn>2</mn><mi>T</mi><msup><mo stretchy="false" form="postfix">)</mo><mn>2</mn></msup><mo>+</mo><msup><mi>B</mi><mn>2</mn></msup><mo>,</mo></mrow><annotation encoding="application/x-tex">
+\text{Tiled + time blocking forgalom} = (B+2T)^2 + B^2,
+</annotation></semantics></math></p>
+<p>míg a baseline
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>T</mi><mo>⋅</mo><mn>2</mn><msup><mi>B</mi><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">T \cdot 2B^2</annotation></semantics></math>
+pontot mozgat.
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi><mo>=</mo><mn>16</mn></mrow><annotation encoding="application/x-tex">B=16</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>T</mi><mo>=</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">T=4</annotation></semantics></math>
+esetén:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">Tiled+TB</mtext><mo>=</mo><msup><mn>24</mn><mn>2</mn></msup><mo>+</mo><msup><mn>16</mn><mn>2</mn></msup><mo>=</mo><mn>576</mn><mo>+</mo><mn>256</mn><mo>=</mo><mn>832</mn><mo>,</mo></mrow><annotation encoding="application/x-tex">
+\text{Tiled+TB} = 24^2 + 16^2 = 576 + 256 = 832,
+</annotation></semantics></math></p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">Baseline</mtext><mo>=</mo><mn>4</mn><mo>⋅</mo><mn>2</mn><mo>⋅</mo><msup><mn>16</mn><mn>2</mn></msup><mo>=</mo><mn>2048</mn><mi>.</mi></mrow><annotation encoding="application/x-tex">
+\text{Baseline} = 4 \cdot 2 \cdot 16^2 = 2048.
+</annotation></semantics></math></p>
+<p>A forgalom aránya
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>832</mn><mi>/</mi><mn>2048</mn><mo>≈</mo><mn>0</mn><mo>,</mo><mn>41</mn></mrow><annotation encoding="application/x-tex">832/2048 \approx 0{,}41</annotation></semantics></math>,
+tehát a memóriaforgalom kevesebb mint felére csökken (idealizált modell;
+a redundánsan számolt halo-pontok miatt a számítás
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>T</mi><mo>=</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">T=4</annotation></semantics></math>
+esetén kb.
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mfrac><mn>1</mn><mn>4</mn></mfrac><msubsup><mo>∑</mo><mrow><mi>s</mi><mo>=</mo><mn>1</mn></mrow><mn>4</mn></msubsup><mo stretchy="false" form="prefix">(</mo><mn>24</mn><mo>−</mo><mn>2</mn><mi>s</mi><msup><mo stretchy="false" form="postfix">)</mo><mn>2</mn></msup><mi>/</mi><msup><mn>16</mn><mn>2</mn></msup><mo>≈</mo><mn>1</mn><mo>,</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">\frac{1}{4}\sum_{s=1}^{4}(24-2s)^2/16^2 \approx 1{,}4</annotation></semantics></math>-szeresére
+nő). Ez a várt gyorsulás alapja, nem mért érték.</p>
+<p>A laborban azonban a fenti kód csak egy időlépést hajt végre. Az
+időblokkolásos változatot a feladat kiterjesztéseként kell
+megvalósítani, és a mérési naplóban külön rögzíteni.</p>
+<p><strong>A mért és várt eredmény elválasztása:</strong></p>
+<ul>
+<li>A <strong>várt</strong> értékeket a fenti képletekkel vagy a
+Roofline-modellből számítjuk ki, és egyértelműen jelöljük, hogy elméleti
+becslések.</li>
+<li>A <strong>mért</strong> értékeket a tényleges futtatásból kapjuk, és
+csak akkor tüntetjük fel őket, ha valóban lefuttattuk a kódot a megadott
+környezetben. A könyv szabályzata szerint nem mutathatunk be nem
+ellenőrzött mérési adatokat. Ha a labor során nem áll rendelkezésre a
+hardver, a mért oszlopokat üresen hagyjuk, és csak a várt elemzést
+közöljük.</li>
+</ul>
+<p>A fenti táblázatban a „(mért)” helyére a saját mérési eredményeink
+kerülnek. A „(számolt)” helyére a fenti képletek alapján számított
+arányok kerülnek.</p>
+<h3 data-number="18.4.12" id="opencl-és-jax-megjegyzések"><span
+class="header-section-number">18.4.12</span> OpenCL és JAX
+megjegyzések</h3>
+<p>Az OpenCL-ben a shared memory a <code>local</code> memóriatérnek
+felel meg, a tile betöltése hasonló módon történik. A cache-politika
+szabályozása kevésbé közvetlen, mint CUDA-ban; gyakran a lokális memória
+méretének (<code>CL_DEVICE_LOCAL_MEM_SIZE</code>,
+<code>clGetDeviceInfo</code>) figyelembevételére és a work-group méret
+hangolására korlátozódik. Az időblokkolás ugyanúgy megvalósítható, de a
+szinkronizáció a work-group barrier-rel történik, a halo-csere a
+work-group-ok között kernelhatáron át (külön kernelindítás), vagy a
+fentihez hasonló redundáns halóval oldható meg (a work-group-ok közötti
+barrier OpenCL-ben nincs). A rész dokumentáció alapján íródott, saját
+hardveres ellenőrzés nélkül.</p>
+<p>JAX-ben a stencil-számítás tipikusan
+<code>jax.lax.conv_general_dilated</code> vagy
+<code>jax.numpy.roll</code> alapú, és az XLA fordító végzi a tiling és
+cache optimalizálást. A felhasználó által hangolható paraméterek
+korlátozottabbak, de a <code>jax.jit</code> és a megfelelő sharding
+(<code>jax.jit</code>
+<code>in_shardings</code>/<code>out_shardings</code> paraméterei; a
+korábbi <code>pjit</code> a <code>jit</code>-be olvadt) segíthet a
+teljesítmény javításában. A JAX esetében a mérési naplóban a TPU/GPU
+típusa, az XLA verzió és a sharding konfiguráció szerepel.</p>
+<h3 data-number="18.4.13" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">18.4.13</span> Tipikus hibák és helyes
+megoldások</h3>
+<ol type="1">
+<li><p><strong>Túl kicsi vagy túl nagy tile méret</strong>: A túl kicsi
+tile nem csökkenti a globális forgalmat, és a halo réteg aránya nagy
+lesz. A túl nagy tile csökkenti az occupancy-t, mert kevesebb blokk fér
+el az SM-en. <strong>Megoldás</strong>: mérjük meg több tile méretet, és
+válasszuk azt, amelyik a legjobb kompromisszumot adja a
+memória-megtakarítás és a párhuzamosság között. Általában 16×16 vagy
+32×8 (vektorizált) jó kiindulópont.</p></li>
+<li><p><strong>Shared memory bankütközések</strong>: A sor-irányú,
+szomszédos 4 bájtos szavakat olvasó hozzáférés (a fejezet kernelei) a 32
+bankra képezve ütközésmentes. Bankütközés oszlopirányú vagy lépésközös
+(pl. 32 szavas stride) hozzáférésnél lép fel (azonos bank, különböző
+cím). <strong>Megoldás</strong>: ilyenkor padding, például
+<code>tile[TY][TX + 1]</code>; előbb igazoljuk Nsight Compute
+bankütközés-metrikával
+(<code>l1tex__data_bank_conflicts_pipe_lsu_mem_shared</code>).</p></li>
+<li><p><strong>A halo-réteg elavulása időblokkolásnál</strong>: Ha a
+belső pontokat többször frissítjük, de a halo szélessége kisebb
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>-nél,
+vagy az érvényes területet nem szűkítjük lépésenként, a határpontok
+értéke elavult lesz. <strong>Megoldás</strong>:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>
+széles halo és lépésenként eggyel szűkülő érvényes terület (redundáns
+számítás), két shared memory puffer váltogatásával; ellenőrzés
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>T</mi><mo>=</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">T=1</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>T</mi><mo>=</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">T=4</annotation></semantics></math>
+lépés után CPU-referenciával és
+<code>compute-sanitizer --tool racecheck</code>-kel. A grid-szintű
+szinkronizáció (cooperative groups) alternatíva, de lépésenként globális
+forgalmat igényel.</p></li>
+<li><p><strong>A regiszter-túlcsordulás</strong>: Az időblokkolás növeli
+a regiszterhasználatot, ami spill-höz vezet. <strong>Megoldás</strong>:
+korlátozzuk az egyszerre tárolt időlépések számát, vagy használjunk
+<code>__launch_bounds__</code>-ot a regiszterhasználat explicit
+szabályozására.</p></li>
+<li><p><strong>A cache-politika rossz alkalmazása</strong>: Az L2
+persistence beállítása nem mindig gyorsít, sőt ronthat, ha a hitRatio
+túl magas és kiszorít más fontos adatokat. <strong>Megoldás</strong>:
+mérjük meg az L2 találati arányt és a futásidőt, és csak akkor
+használjuk, ha tényleges javulást hoz.</p></li>
+<li><p><strong>A mérési módszertan hibái</strong>: Hiányzó warm-up, túl
+kevés ismétlés, a CPU-GPU szinkronizáció figyelmen kívül hagyása.
+<strong>Megoldás</strong>: a könyv konvenciói szerint legalább 5
+warm-up, legalább 20 ismétlés, medián és IQR közlése,
+<code>cudaDeviceSynchronize</code> használata.</p></li>
+</ol>
+<h3 data-number="18.4.14" id="önellenőrző-kérdések"><span
+class="header-section-number">18.4.14</span> Önellenőrző kérdések</h3>
+<ol type="1">
+<li>Hogyan számítható ki egy 2D 5-pontos stencil aritmetikai
+intenzitása, ha minden pontot egyszer olvasunk és egyszer írunk? Hol
+helyezkedik el ez az érték a Roofline-diagramon egy tipikus GPU esetén?
+<em>Válaszvázlat:</em> 4 FLOP / 8 bájt = 0,5 FLOP/bájt (FP32); ez a
+fordulópont alatt van (A100-on kb. 19,5 TFLOP/s / 1555 GB/s ≈ 12,5
+FLOP/bájt; gyártói adatlapból, ellenőrzendő), tehát a kernel erősen
+memóriakötött.</li>
+<li>Mi az időblokkolás alapötlete, és milyen kompromisszumot kell kötni
+a tile mérete és a halo-csere költsége között? <em>Válaszvázlat:</em>
+több időlépés egy kernelben, a tile a shared memóriában marad; nagyobb
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>
+kevesebb globális forgalmat, de szélesebb halót és több redundáns
+számítást jelent, nagyobb
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>B</mi><annotation encoding="application/x-tex">B</annotation></semantics></math>
+kisebb relatív halót, de több shared memóriát és kisebb occupancyt.</li>
+<li>Soroljon fel legalább három gyakorlati hangolási paramétert a
+stencil-kernel optimalizálásához, és magyarázza el, milyen hatással
+vannak a teljesítményre. <em>Válaszvázlat:</em> tileméret, blokkméret,
+vektorizáció, cache-politika (L2 persistence, carve-out), unroll,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>.</li>
+<li>Miért nem csökkenti feltétlenül a globális memória forgalmat a
+shared memory tiling önmagában, ha nincs időblokkolás? Vezesse le a
+forgalom arányát
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi><mo>×</mo><mi>B</mi></mrow><annotation encoding="application/x-tex">B \times B</annotation></semantics></math>
+tile esetén (egy lépésre és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>
+lépésre is). <em>Válaszvázlat:</em>
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><mo stretchy="false" form="prefix">(</mo><mi>B</mi><mo>+</mo><mn>2</mn><msup><mo stretchy="false" form="postfix">)</mo><mn>2</mn></msup><mo>+</mo><msup><mi>B</mi><mn>2</mn></msup><mo stretchy="false" form="postfix">)</mo><mi>/</mi><mo stretchy="false" form="prefix">(</mo><mn>2</mn><msup><mi>B</mi><mn>2</mn></msup><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">((B+2)^2 + B^2)/(2B^2)</annotation></semantics></math>;
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi><mo>=</mo><mn>16</mn></mrow><annotation encoding="application/x-tex">B = 16</annotation></semantics></math>-ra
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>580</mn><mi>/</mi><mn>512</mn><mo>≈</mo><mn>1</mn><mo>,</mo><mn>13</mn></mrow><annotation encoding="application/x-tex">580/512 \approx 1{,}13</annotation></semantics></math>,
+tehát időblokkolás nélkül a halo miatt kissé nő;
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>
+lépésre
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><mo stretchy="false" form="prefix">(</mo><mi>B</mi><mo>+</mo><mn>2</mn><mi>T</mi><msup><mo stretchy="false" form="postfix">)</mo><mn>2</mn></msup><mo>+</mo><msup><mi>B</mi><mn>2</mn></msup><mo stretchy="false" form="postfix">)</mo><mi>/</mi><mo stretchy="false" form="prefix">(</mo><mn>2</mn><mi>T</mi><msup><mi>B</mi><mn>2</mn></msup><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">((B+2T)^2 + B^2)/(2TB^2)</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi><mo>=</mo><mn>16</mn></mrow><annotation encoding="application/x-tex">B = 16</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>T</mi><mo>=</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">T = 4</annotation></semantics></math>-re
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>832</mn><mi>/</mi><mn>2048</mn><mo>≈</mo><mn>0</mn><mo>,</mo><mn>41</mn></mrow><annotation encoding="application/x-tex">832/2048 \approx 0{,}41</annotation></semantics></math>.</li>
+<li>Milyen hibát okozhat, ha az időblokkolásos kernelben a halo réteg
+szélessége kisebb, mint az időlépések száma? Hogyan lehet ezt elkerülni?
+<em>Válaszvázlat:</em> a halo szélessége kisebb, mint
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>:
+a külső sávban elavult értékekből számolunk, a belső tile széle hibás
+lesz;
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>
+széles halo és lépésenként szűkülő érvényes tartomány kell,
+CPU-referenciás ellenőrzéssel.</li>
+</ol>
+<p>A következő egység (19.1) a dense GEMM-mel foglalkozik, ahol az itt
+megismert tiling, shared memory és regiszter-újrafelhasználás fogalmai
+új kontextusban térnek vissza.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu068.html">← 18.3 PDE és iteratív megoldók</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu070.html">19.1 Dense GEMM →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>
