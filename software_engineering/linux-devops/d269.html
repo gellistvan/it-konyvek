@@ -1,0 +1,813 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>54.4 Capacity, FinOps és performance engineering – Linux és
+DevOps rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch54">54 HA architektúra, distributed storage és kapacitástervezés</a></p>
+<div class="links"><a class="prev" rel="prev" href="d268.html">← 54.3 Ceph, SAN/NAS és object/block/file fabric</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d270.html">54.5 HA és adatplatform failure game day →</a></div>
+</nav>
+<h2 data-number="54.4" id="d269"><span
+class="header-section-number">54.4</span> Capacity, FinOps és
+performance engineering</h2>
+<h3 data-number="54.4.1" id="motiváció-és-üzemeltetési-probléma"><span
+class="header-section-number">54.4.1</span> Motiváció és üzemeltetési
+probléma</h3>
+<p>Egy szenior C++ fejlesztő csapat mostanra üzemeltet egy Linux VM-ekre
+és Kubernetesre épülő szolgáltatást. A telemetria, a rollout és a
+diagnosztika már működik, de a kapacitástervezés gyakran ad hoc marad:
+„van még CPU”, „az éjszakai batch elfér”, „a cloud számla nőtt”. A
+kapacitástervezés és a FinOps célja, hogy a szolgáltatás elvárt
+teljesítményét – SLO-kat – a legkisebb üzemeltetési kockázattal és
+ésszerű költséggel érjük el. A fejezetben egy munkamennyiség-vezérelt
+erőforrásmodellt építünk, amely a request, a concurrency, a CPU, a
+memória, a storage és a hálózat oldaláról is megbecsüli a szükséges
+kapacitást, és ezt pénzügyi modellé alakítja. A szenior C++ tudás itt a
+natív szolgáltatás erőforrásprofiljának értelmezésében hasznosul, de a
+kernel, a hálózat és a cloud viselkedése ettől még nem lesz ismert.</p>
+<h3 data-number="54.4.2" id="definíciók-és-rétegek"><span
+class="header-section-number">54.4.2</span> Definíciók és rétegek</h3>
+<p><strong>Kapacitásmodell (capacity model)</strong> alatt a
+szolgáltatás erőforrásigényének és a hozzá rendelt infrastruktúrának
+explicit, mért adatokon alapuló összefüggését értjük. A modell bemenete
+a munkamennyiség (workload), a kimenete a szükséges erőforrás: CPU
+magok, memória GiB, storage GiB / IOPS, hálózati sávszélesség és a
+költség. A <strong>headroom</strong> az a felesleges kapacitás, amelyet
+a váratlan forgalom, a hibás node, a rollout vagy a mérési hiba
+elnyelésére tartunk fenn. A <strong>FinOps</strong> a cloud pénzügyi
+működtetés diszciplínája: a unit cost (pl. USD per millió kérés), a
+használat és a költség folyamatos összevetése, valamint a tradeoffok –
+például reservation vagy on-demand, storage tier vagy egress – tudatos
+kezelése.</p>
+<p>A kapacitástervezést négy rétegben vizsgáljuk:</p>
+<ol type="1">
+<li><strong>Alkalmazásszint</strong>: egy kérés erőforrás-lábnyoma (CPU
+idő, memória, I/O, hálózat) és a concurencia.</li>
+<li><strong>Platformszint (Kubernetes/VM)</strong>: requests, limits,
+overcommit, scheduling, autoscaling.</li>
+<li><strong>Infrastruktúra-szint (node, storage, hálózat)</strong>:
+tényleges hardware, saturation, failure domain.</li>
+<li><strong>Költségszint</strong>: unit cost, retention, egress, storage
+tier, reservation.</li>
+</ol>
+<p>A <strong>reservation</strong> előre vásárolt kapacitás (VM,
+instance, storage), amely kedvezőbb árat ad, de kihasználatlanul is
+fizetünk érte. A <strong>limit</strong> a konténer vagy VM felső
+erőforráskorlátja, a <strong>request</strong> pedig a scheduler által
+garantált minimális foglalás. Az <strong>overcommit</strong> az a
+helyzet, amikor egy node-on a podok sum(limits) értéke meghaladja a node
+allokálható kapacitását; a requestek összege ennél nem nagyobb, mert a
+scheduler a requestek alapján helyez el. CPU-nál a túlhasználat
+throttlingot (CFS quota) okoz, memóriánál node-szintű memóriahiányt:
+kubelet-evictiont vagy kernel OOM-killt.</p>
+<h3 data-number="54.4.3" id="erőforrásmodell-és-levezetés"><span
+class="header-section-number">54.4.3</span> Erőforrásmodell és
+levezetés</h3>
+<p>A munkamennyiség jellemzőit mérjük, nem feltételezzük. Egy HTTP
+szolgáltatásnál a fő bemenetek:</p>
+<ul>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>R</mi><annotation encoding="application/x-tex">R</annotation></semantics></math>:
+request per másodperc (RPS), csúcs és átlag külön;</li>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>C</mi><annotation encoding="application/x-tex">C</annotation></semantics></math>:
+egyidejű (inflight) kérések száma;</li>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mrow><mi>c</mi><mi>p</mi><mi>u</mi></mrow></msub><annotation encoding="application/x-tex">T_{cpu}</annotation></semantics></math>:
+egy kérés CPU ideje másodpercben (CPU time);</li>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>M</mi><mrow><mi>r</mi><mi>s</mi><mi>s</mi></mrow></msub><annotation encoding="application/x-tex">M_{rss}</annotation></semantics></math>:
+egy kérés által lefoglalt átlagos memória GiB-ben, vagy jobb esetben a
+process steady-state RSS;</li>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>B</mi><annotation encoding="application/x-tex">B</annotation></semantics></math>:
+egy kérés átlagos válaszmérete byte-ban;</li>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>S</mi><mrow><mi>w</mi><mi>r</mi><mi>i</mi><mi>t</mi><mi>e</mi></mrow></msub><annotation encoding="application/x-tex">S_{write}</annotation></semantics></math>:
+egy kérés által generált tartós adat GiB-ben.</li>
+</ul>
+<p>A szükséges CPU magok számát az alábbi levezetéssel becsüljük. A CPU
+kihasználtság
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>U</mi><annotation encoding="application/x-tex">U</annotation></semantics></math>
+(0–1) a feldolgozandó munka és a rendelkezésre álló idő hányadosa. A
+teljes CPU idő másodpercenként:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>R</mi><mo>⋅</mo><msub><mi>T</mi><mrow><mi>c</mi><mi>p</mi><mi>u</mi></mrow></msub></mrow><annotation encoding="application/x-tex">R \cdot T_{cpu}</annotation></semantics></math>.
+A szükséges magok száma
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>n</mi><mrow><mi>c</mi><mi>p</mi><mi>u</mi></mrow></msub><mo>=</mo><mfrac><mrow><mi>R</mi><mo>⋅</mo><msub><mi>T</mi><mrow><mi>c</mi><mi>p</mi><mi>u</mi></mrow></msub></mrow><msub><mi>U</mi><mrow><mi>t</mi><mi>a</mi><mi>r</mi><mi>g</mi><mi>e</mi><mi>t</mi></mrow></msub></mfrac></mrow><annotation encoding="application/x-tex">n_{cpu} = \frac{R \cdot T_{cpu}}{U_{target}}</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>U</mi><mrow><mi>t</mi><mi>a</mi><mi>r</mi><mi>g</mi><mi>e</mi><mi>t</mi></mrow></msub><annotation encoding="application/x-tex">U_{target}</annotation></semantics></math>
+a megengedett átlagos kihasználtság. Például ha
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>R</mi><mo>=</mo><mn>1000</mn></mrow><annotation encoding="application/x-tex">R = 1000</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mrow><mi>c</mi><mi>p</mi><mi>u</mi></mrow></msub><mo>=</mo><mn>0.002</mn></mrow><annotation encoding="application/x-tex">T_{cpu} = 0.002</annotation></semantics></math>
+s, akkor a CPU igény
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1000</mn><mo>⋅</mo><mn>0.002</mn><mo>=</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">1000 \cdot 0.002 = 2</annotation></semantics></math>
+mag. Ha
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>U</mi><mrow><mi>t</mi><mi>a</mi><mi>r</mi><mi>g</mi><mi>e</mi><mi>t</mi></mrow></msub><mo>=</mo><mn>0.6</mn></mrow><annotation encoding="application/x-tex">U_{target} = 0.6</annotation></semantics></math>,
+akkor
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>n</mi><mrow><mi>c</mi><mi>p</mi><mi>u</mi></mrow></msub><mo>=</mo><mn>2</mn><mi>/</mi><mn>0.6</mn><mo>≈</mo><mn>3.33</mn></mrow><annotation encoding="application/x-tex">n_{cpu} = 2 / 0.6 \approx 3.33</annotation></semantics></math>
+mag. A headroom miatt hozzáadunk még
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>+</mi><mn>1</mn></mrow><annotation encoding="application/x-tex">+1</annotation></semantics></math>
+magot vagy 20%-ot, így 5 magot kérünk. A derivation feltételezi, hogy a
+kérés CPU ideje független a concurenciától, és a CPU idő nem változik a
+szoftververzióval.</p>
+<p>A memóriánál a steady-state process RSS-t mérjük, nem a csúcsterhelés
+alatti pillanatnyi értéket. A konténer <code>memory request</code>
+értéke legalább a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>M</mi><mrow><mi>r</mi><mi>s</mi><mi>s</mi></mrow></msub><mo>⋅</mo><mo stretchy="false" form="prefix">(</mo><mn>1</mn><mo>+</mo><mi>b</mi><mi>u</mi><mi>f</mi><mi>f</mi><mi>e</mi><mi>r</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">M_{rss} \cdot (1 + buffer)</annotation></semantics></math>,
+ahol a buffer 10–20%, mert a heap növekedhet. A
+<code>memory limit</code> ennél magasabb lehet, de a node-on a
+sum(requests) nem haladhatja meg a node foglalható memóriáját, mert
+akkor a scheduler nem tud új podot indítani. A memória overcommit
+veszélyes: a kernel OOM killer nem ismeri a cloud költséget.</p>
+<p>A storage esetében megkülönböztetjük a <strong>provisioned</strong>
+és a <strong>used</strong> kapacitást. A provisioned az a kapacitás,
+amelyet a cloud vagy a Ceph klaszter lefoglal; a used a ténylegesen írt
+adat. A vékony provisioning (thin provisioning) esetén a kettő eltér,
+ami kockázatot jelent: a filesystem tele lehet, miközben a cloud volume
+mutat még szabad helyet.</p>
+<p>A hálózati sávszélesség becslése:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>W</mi><mo>=</mo><mi>R</mi><mo>⋅</mo><mi>B</mi><mo>⋅</mo><mn>8</mn></mrow><annotation encoding="application/x-tex">W = R \cdot B \cdot 8</annotation></semantics></math>
+bit/s, ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>B</mi><annotation encoding="application/x-tex">B</annotation></semantics></math>
+a válasz mérete byte-ban. Például
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>R</mi><mo>=</mo><mn>1000</mn></mrow><annotation encoding="application/x-tex">R = 1000</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi><mo>=</mo><mn>200</mn></mrow><annotation encoding="application/x-tex">B = 200</annotation></semantics></math>
+KiB, akkor
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>W</mi><mo>=</mo><mn>1000</mn><mo>⋅</mo><mn>200</mn><mo>⋅</mo><mn>1024</mn><mo>⋅</mo><mn>8</mn><mo>≈</mo><mn>1.64</mn></mrow><annotation encoding="application/x-tex">W = 1000 \cdot 200 \cdot 1024 \cdot 8 \approx 1.64</annotation></semantics></math>
+Gbit/s. Az egress forgalom a cloudban pénzbe kerül, ezért a válasz
+méretét cache-eléssel vagy tömörítéssel csökkenthetjük.</p>
+<h3 data-number="54.4.4" id="autoscale-delay-burst-és-queue"><span
+class="header-section-number">54.4.4</span> Autoscale delay, burst és
+queue</h3>
+<p>Az autoscaling – akár HPA Kubernetesben, akár cloud instance scaling
+– nem azonnali. A <strong>scaling delay</strong>
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>D</mi><mrow><mi>s</mi><mi>c</mi><mi>a</mi><mi>l</mi><mi>e</mi></mrow></msub><annotation encoding="application/x-tex">D_{scale}</annotation></semantics></math>)
+a metrika átlépésétől az új kapacitás rendelkezésre állásáig eltelt idő.
+Ez Kubernetes HPA esetén jellemzően 1–2 perc (metrika polling + pod
+indítás), cluster autoscaler esetén 2–5 perc (node provision), cloud VM
+esetén 1–10 perc az image méretétől és a bootstrap scripttől függően. A
+<strong>burst</strong> a hirtelen forgalomnövekedés, amelyet a jelenlegi
+kapacitás nem tud kiszolgálni. Az autoscale delay alatt a bejövő kérések
+várakozó sorba kerülnek.</p>
+<p>A várakozó sor viselkedését a Little-törvény segítségével
+modellezhetjük:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi><mo>=</mo><mi>λ</mi><mo>⋅</mo><mi>W</mi></mrow><annotation encoding="application/x-tex">L = \lambda \cdot W</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>L</mi><annotation encoding="application/x-tex">L</annotation></semantics></math>
+a sorban álló feladatok száma,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>λ</mi><annotation encoding="application/x-tex">\lambda</annotation></semantics></math>
+az érkezési ráta,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>W</mi><annotation encoding="application/x-tex">W</annotation></semantics></math>
+a várakozási idő. Ha a kapacitás
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>C</mi><mrow><mi>c</mi><mi>u</mi><mi>r</mi><mi>r</mi><mi>e</mi><mi>n</mi><mi>t</mi></mrow></msub><annotation encoding="application/x-tex">C_{current}</annotation></semantics></math>
+request/s, és a bejövő forgalom
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>λ</mi><mo>&gt;</mo><msub><mi>C</mi><mrow><mi>c</mi><mi>u</mi><mi>r</mi><mi>r</mi><mi>e</mi><mi>n</mi><mi>t</mi></mrow></msub></mrow><annotation encoding="application/x-tex">\lambda &gt; C_{current}</annotation></semantics></math>,
+akkor a sor hossza
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi><mo stretchy="false" form="prefix">(</mo><mi>t</mi><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mo stretchy="false" form="prefix">(</mo><mi>λ</mi><mo>−</mo><msub><mi>C</mi><mrow><mi>c</mi><mi>u</mi><mi>r</mi><mi>r</mi><mi>e</mi><mi>n</mi><mi>t</mi></mrow></msub><mo stretchy="false" form="postfix">)</mo><mo>⋅</mo><mi>t</mi></mrow><annotation encoding="application/x-tex">L(t) = (\lambda - C_{current}) \cdot t</annotation></semantics></math>
+lesz. A cél az, hogy a sor ne növekedjen korlátlanul: vagy a kapacitás
+nő, vagy load shedding lép be. A <strong>saturation budget</strong> az
+az időablak, ameddig a rendszer túlterhelt lehet anélkül, hogy az SLO
+sérülne. A saturation budget deriválható az error budgetből. Ha a havi
+error budget 0,1%, és a szolgáltatás átlagos forgalma 1000 RPS, a havi
+kérés-budget
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0</mn><mo>,</mo><mn>001</mn><mo>⋅</mo><mn>1000</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">1/s</mtext><mo>⋅</mo><mn>2</mn><mspace width="0.167em"></mspace><mn>592</mn><mspace width="0.167em"></mspace><mn>000</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">s</mtext><mo>=</mo><mn>2</mn><mspace width="0.167em"></mspace><mn>592</mn><mspace width="0.167em"></mspace><mn>000</mn></mrow><annotation encoding="application/x-tex">0{,}001 \cdot 1000\ \text{1/s} \cdot 2\,592\,000\ \text{s} = 2\,592\,000</annotation></semantics></math>
+hibás kérés (időben 43,2 perc teljes kiesés). Egy 10 s-os teljes
+telítettség 10 000 hibás kérés, a budget
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>≈</mo><mn>0</mn><mo>,</mo><mn>39</mn><mi>%</mi></mrow><annotation encoding="application/x-tex">\approx 0{,}39\%</annotation></semantics></math>-a;
+havonta legfeljebb kb. 259 ilyen esemény fér bele, ha más hiba nincs.
+Általánosan: a megengedett telítési idő havonta = az error budget erre
+szánt része
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>⋅</mi><annotation encoding="application/x-tex">\cdot</annotation></semantics></math>
+2592 s.</p>
+<p>Az alábbi ábra a fluid sor-modell időbeli lefutását mutatja a 2.
+feladat számaival: a sor a kapacitás megérkezése után is csak lassan, a
+többletkapacitás ütemében ürül.</p>
+<table>
+<thead>
+<tr>
+<th>idő [s]</th>
+<th>λ [RPS]</th>
+<th>C [RPS]</th>
+<th>L [kérés]</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>1000</td>
+<td>500</td>
+<td>0</td>
+</tr>
+<tr>
+<td>60</td>
+<td>1000</td>
+<td>500</td>
+<td>30 000</td>
+</tr>
+<tr>
+<td>120</td>
+<td>1000</td>
+<td>1200</td>
+<td>60 000</td>
+</tr>
+<tr>
+<td>270</td>
+<td>1000</td>
+<td>1200</td>
+<td>30 000</td>
+</tr>
+<tr>
+<td>420</td>
+<td>1000</td>
+<td>1200</td>
+<td>0</td>
+</tr>
+</tbody>
+</table>
+<figure id="fig-d269-autoscale-queue">
+<div class="fig-interactive"><iframe src="figures/html/d269-autoscale-queue.html" title="A forgalom 500-ról 1000 RPS-re ugrik; a kapacitás 120 s-ig 500 RPS marad, a sor 60 000 kérésig nő, majd 1200 RPS kapacitással 300 s alatt kiürül." loading="lazy" style="width:100%;border:0;height:600px"></iframe><noscript><img src="figures/img/d269-autoscale-queue.png" style="width:90.0%"
+alt="A forgalom 500-ról 1000 RPS-re ugrik; a kapacitás 120 s-ig 500 RPS marad, a sor 60 000 kérésig nő, majd 1200 RPS kapacitással 300 s alatt kiürül." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d269-autoscale-queue.png" style="width:90.0%"
+alt="A forgalom 500-ról 1000 RPS-re ugrik; a kapacitás 120 s-ig 500 RPS marad, a sor 60 000 kérésig nő, majd 1200 RPS kapacitással 300 s alatt kiürül." /></details></div>
+<figcaption>Autoscale-késés alatti sorhossz (számított modell, nem
+mérés): a forgalom 500-ról 1000 RPS-re ugrik, a kapacitás 120 s-ig 500
+RPS, a sor 60 000 kérésig nő, majd 1200 RPS kapacitással 300 s alatt,
+420 s-ra ürül ki</figcaption>
+</figure>
+<p>Az autoscale konfigurációban fontos a <strong>stabilizációs
+ablak</strong> (scale-down stabilization window), amely megakadályozza a
+flappinget. Ha a forgalom ingadozó, a scale-down túl gyorsan csökkenti a
+replikákat, majd ismét fel kell skálázni. A stabilizációs ablakot a
+munkamennyiség periodicitásához igazítjuk.</p>
+<h3 data-number="54.4.5" id="unit-cost-hipotetikus-árak-és-finops"><span
+class="header-section-number">54.4.5</span> Unit cost, hipotetikus árak
+és FinOps</h3>
+<p>A költségmodellben a <strong>unit cost</strong> az egységnyi
+szolgáltatás – például 1 millió kérés – költsége. A unit cost
+kiszámítása:</p>
+<p><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>u</mi><mi>n</mi><mi>i</mi><mi>t</mi><mi>_</mi><mi>c</mi><mi>o</mi><mi>s</mi><mi>t</mi><mo>=</mo><mfrac><mrow><msub><mi>C</mi><mrow><mi>i</mi><mi>n</mi><mi>f</mi><mi>r</mi><mi>a</mi></mrow></msub><mo>+</mo><msub><mi>C</mi><mrow><mi>s</mi><mi>t</mi><mi>o</mi><mi>r</mi><mi>a</mi><mi>g</mi><mi>e</mi></mrow></msub><mo>+</mo><msub><mi>C</mi><mrow><mi>n</mi><mi>e</mi><mi>t</mi><mi>w</mi><mi>o</mi><mi>r</mi><mi>k</mi></mrow></msub><mo>+</mo><msub><mi>C</mi><mrow><mi>o</mi><mi>s</mi></mrow></msub></mrow><msub><mi>R</mi><mrow><mi>t</mi><mi>o</mi><mi>t</mi><mi>a</mi><mi>l</mi></mrow></msub></mfrac></mrow><annotation encoding="application/x-tex">unit\_cost = \frac{C_{infra} + C_{storage} + C_{network} + C_{os}}{R_{total}}</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>C</mi><mrow><mi>i</mi><mi>n</mi><mi>f</mi><mi>r</mi><mi>a</mi></mrow></msub><annotation encoding="application/x-tex">C_{infra}</annotation></semantics></math>
+a compute,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>C</mi><mrow><mi>s</mi><mi>t</mi><mi>o</mi><mi>r</mi><mi>a</mi><mi>g</mi><mi>e</mi></mrow></msub><annotation encoding="application/x-tex">C_{storage}</annotation></semantics></math>
+a tárolás,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>C</mi><mrow><mi>n</mi><mi>e</mi><mi>t</mi><mi>w</mi><mi>o</mi><mi>r</mi><mi>k</mi></mrow></msub><annotation encoding="application/x-tex">C_{network}</annotation></semantics></math>
+a hálózati forgalom,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>C</mi><mrow><mi>o</mi><mi>s</mi></mrow></msub><annotation encoding="application/x-tex">C_{os}</annotation></semantics></math>
+az egyéb (pl. managed service) költség,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>R</mi><mrow><mi>t</mi><mi>o</mi><mi>t</mi><mi>a</mi><mi>l</mi></mrow></msub><annotation encoding="application/x-tex">R_{total}</annotation></semantics></math>
+az adott időszakban kiszolgált kérések száma. A cloud árak gyorsan
+változnak, ezért a számpéldában <strong>hipotetikus árakat</strong>
+használunk, és ezt mindig jelezzük.</p>
+<p>Hipotetikus példa: egy régióban egy <code>m6i.large</code> típusú VM
+óradíja legyen <code>0.03 USD</code> (ez nem aktuális AWS ár). Egy
+managed block storage GB-havi díja <code>0.08 USD</code>, az egress
+forgalom <code>0.09 USD/GB</code> az ingyenes keret felett. A
+reservation 1 éves, all upfront esetén 40% kedvezményt adhat – de ezt az
+adott cloud szolgáltatónál ellenőrizni kell. A FinOps feladata, hogy a
+reservation és az on-demand kapacitás arányát a tényleges használathoz
+igazítsa: ha a baseline 70%-ban kihasznált, a fennmaradó 30% burst
+on-demand maradhat.</p>
+<p>A <strong>retention</strong> és a <strong>storage tier</strong>
+tradeoff: a gyakran olvasott adatot drágább, gyorsabb tierre tesszük, a
+ritkán olvasott logot olcsóbb, lassabb tierre vagy object storage-ba. A
+retention policy meghatározza, mennyi ideig tartjuk az adatot. A
+hipotetikus költség: hot SSD <code>0.10 USD/GB/hó</code>, cold object
+<code>0.02 USD/GB/hó</code>, de az átállás során az egress és az API
+hívások díja növekedhet. Az adatéletciklus szabályt aszerint állítjuk
+be, hogy az SLO megköveteli-e a gyors visszaállítást.</p>
+<h3 data-number="54.4.6" id="kidolgozott-példa"><span
+class="header-section-number">54.4.6</span> Kidolgozott példa</h3>
+<p>Vegyünk egy képzeletbeli C++ microservice-t, amely JSON API-t szolgál
+ki, és a d199-ben bemutatott Kubernetes HPA mintához hasonlóan
+skálázódik. A szolgáltatás mérései:</p>
+<ul>
+<li>Átlagos RPS: 300, csúcs RPS: 600.</li>
+<li>Egy kérés CPU ideje
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mrow><mi>c</mi><mi>p</mi><mi>u</mi></mrow></msub><mo>=</mo><mn>1.5</mn></mrow><annotation encoding="application/x-tex">T_{cpu} = 1.5</annotation></semantics></math>
+ms.</li>
+<li>Egy pod steady-state RSS: 400 MiB.</li>
+<li>Átlagos válasz méret: 50 KiB.</li>
+<li>Tartós adat: 0.1 GiB per 1e6 kérés (object storage).</li>
+</ul>
+<p>A CPU igény a csúcsterhelésre 600 RPS esetén:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>600</mn><mo>⋅</mo><mn>0.0015</mn></mrow><annotation encoding="application/x-tex">600 \cdot 0.0015</annotation></semantics></math>
+s = 0.9 mag. Ha a target kihasználtság 0.6, akkor
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0.9</mn><mi>/</mi><mn>0.6</mn><mo>=</mo><mn>1.5</mn></mrow><annotation encoding="application/x-tex">0.9 / 0.6 = 1.5</annotation></semantics></math>
+mag, plusz headroom → 2 mag. A HPA target CPU utilization 60%,
+minReplicas 3, maxReplicas 10. A pod <code>request.cpu = 500m</code>,
+<code>limit.cpu = 2</code>, <code>request.memory = 512Mi</code>,
+<code>limit.memory = 1Gi</code>. A 3 pod request összesen 1.5 CPU és 1.5
+GiB memória, ami egy 4 vCPU / 8 GiB node-on elfér, de nem hagy nagy
+headroomot. Ezért 2 node-ot tartunk, hogy egy node kiesésekor a másik
+elbírja a terhelést: a csúcs 600 RPS, ami 1.5–2 magot igényel, tehát egy
+4 magos node is elég, de a memória és a storage miatt két node
+biztonságosabb.</p>
+<p>A storage: az object store havi 0.1 GiB per 1e6 kérés, tehát 300 RPS
+átlagnál havi kérés
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>300</mn><mo>⋅</mo><mn>3600</mn><mo>⋅</mo><mn>24</mn><mo>⋅</mo><mn>30</mn><mo>≈</mo><mn>777.6</mn></mrow><annotation encoding="application/x-tex">300 \cdot 3600 \cdot 24 \cdot 30 \approx 777.6</annotation></semantics></math>
+millió kérés. A havi adat:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0.1</mn><mo>⋅</mo><mn>777.6</mn><mo>≈</mo><mn>77.8</mn></mrow><annotation encoding="application/x-tex">0.1 \cdot 777.6 \approx 77.8</annotation></semantics></math>
+GiB. Ha a retention 90 nap, akkor a teljes állomány
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>77.8</mn><mo>⋅</mo><mn>3</mn><mo>≈</mo><mn>233.4</mn></mrow><annotation encoding="application/x-tex">77.8 \cdot 3 \approx 233.4</annotation></semantics></math>
+GiB. Hipotetikus cold object áron
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>0.02</mn><annotation encoding="application/x-tex">0.02</annotation></semantics></math>
+USD/GB/hó:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>233.4</mn><mo>⋅</mo><mn>0.02</mn><mo>≈</mo><mn>4.67</mn></mrow><annotation encoding="application/x-tex">233.4 \cdot 0.02 \approx 4.67</annotation></semantics></math>
+USD/hó. Az egress: a válaszok összesen
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>50</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">KiB</mtext><mo>⋅</mo><mn>777</mn><mo>,</mo><mn>6</mn><mo>⋅</mo><msup><mn>10</mn><mn>6</mn></msup><mo>≈</mo><mn>37</mn><mspace width="0.167em"></mspace><mn>079</mn></mrow><annotation encoding="application/x-tex">50\ \text{KiB} \cdot 777{,}6 \cdot 10^6 \approx 37\,079</annotation></semantics></math>
+GiB
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>≈</mo><mn>36</mn><mo>,</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">\approx 36{,}2</annotation></semantics></math>
+TiB; ebből az ingyenes 100 GiB feletti rész
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>36</mn><mspace width="0.167em"></mspace><mn>979</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>09</mn><mo>≈</mo><mn>3</mn><mspace width="0.167em"></mspace><mn>328</mn></mrow><annotation encoding="application/x-tex">36\,979 \cdot 0{,}09 \approx 3\,328</annotation></semantics></math>
+USD/hó, ami irreálisan magas lenne. Ezért a szolgáltatás elé CDN-t vagy
+cache-t teszünk, ami a válasz 90%-át elnyeli, így az origin egress
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>≈</mo><mn>3</mn><mspace width="0.167em"></mspace><mn>708</mn></mrow><annotation encoding="application/x-tex">\approx 3\,708</annotation></semantics></math>
+GiB
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>≈</mo><mn>3</mn><mo>,</mo><mn>6</mn></mrow><annotation encoding="application/x-tex">\approx 3{,}6</annotation></semantics></math>
+TiB-ra csökken, a CDN pedig
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>≈</mo><mn>33</mn><mspace width="0.167em"></mspace><mn>371</mn></mrow><annotation encoding="application/x-tex">\approx 33\,371</annotation></semantics></math>
+GiB
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>≈</mo><mn>32</mn><mo>,</mo><mn>6</mn></mrow><annotation encoding="application/x-tex">\approx 32{,}6</annotation></semantics></math>
+TiB-ot szolgál ki. A hipotetikus példa jól mutatja, hogy az egress
+költség gyakran nagyobb, mint a compute.</p>
+<p>A számításokhoz használjunk PromQL-t a tényleges használat mérésére.
+A container CPU használat:</p>
+<pre class="promql"><code>rate(container_cpu_usage_seconds_total{
+  container=&quot;api&quot;, namespace=&quot;lab-prod&quot;}[5m])</code></pre>
+<p>A memória RSS a <code>container_memory_working_set_bytes</code>
+metrika. A hálózati forgalom:</p>
+<pre class="promql"><code># a hálózati számlálók pod-szintűek (container=&quot;&quot; sor), ezért podra szűrünk
+sum by (pod) (rate(container_network_transmit_bytes_total{
+  namespace=&quot;lab-prod&quot;, pod=~&quot;lab-api-.*&quot;}[5m]))</code></pre>
+<p>A kapacitásmodellezéshez futtathatunk load tesztet, de a production
+mérés hitelesebb. A kapacitásmodell táblázatát így rögzítjük:</p>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr>
+<th>Erőforrás</th>
+<th>Csúcsigény</th>
+<th>Request/limit</th>
+<th>Target kihasználtság</th>
+<th>Headroom</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CPU</td>
+<td>0.9 mag</td>
+<td>request 500m podonként, limit 2</td>
+<td>60%</td>
+<td>+33% (1,5 → 2 mag összesen)</td>
+</tr>
+<tr>
+<td>Memória</td>
+<td>400 MiB/pod</td>
+<td>request 512 MiB, limit 1 Gi</td>
+<td>80%</td>
+<td>+20% buffer</td>
+</tr>
+<tr>
+<td>Storage (object)</td>
+<td>77.8 GiB/hó</td>
+<td>–</td>
+<td>–</td>
+<td>90 nap retention</td>
+</tr>
+<tr>
+<td>Hálózat egress</td>
+<td>36,2 TiB/hó kliens felé, ebből 3,6 TiB origin</td>
+<td>–</td>
+<td>–</td>
+<td>CDN cache 90%</td>
+</tr>
+</tbody>
+</table>
+<p>A pod autoscale késleltetésének becslése. A modell szerint 3 pod a
+HPA 60%-os célján
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>3</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>5</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>6</mn><mi>/</mi><mn>0</mn><mo>,</mo><mn>0015</mn><mo>=</mo><mn>600</mn></mrow><annotation encoding="application/x-tex">3 \cdot 0{,}5 \cdot 0{,}6 / 0{,}0015 = 600</annotation></semantics></math>
+RPS-t visz, tehát a 300 → 600 RPS-es ugrás még nem okoz sort. Vegyük
+ezért a 600 → 1200 RPS-es burstöt, azzal az explicit feltevéssel, hogy a
+podok a requestjük fölött nem kapnak CPU-t (a node CPU-ját más podok is
+terhelik); ekkor 3 pod kapacitása
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>3</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>5</mn><mi>/</mi><mn>0</mn><mo>,</mo><mn>0015</mn><mo>=</mo><mn>1000</mn></mrow><annotation encoding="application/x-tex">3 \cdot 0{,}5 / 0{,}0015 = 1000</annotation></semantics></math>
+RPS. A HPA 60 másodperc alatt érzékeli (metrics polling 30 s, scale-up
+30 s), és egy új pod 10 másodperc alatt indul:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>D</mi><mrow><mi>s</mi><mi>c</mi><mi>a</mi><mi>l</mi><mi>e</mi></mrow></msub><mo>≈</mo><mn>70</mn></mrow><annotation encoding="application/x-tex">D_{scale} \approx 70</annotation></semantics></math>
+s. Ez alatt a többlet
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1200</mn><mo>−</mo><mn>1000</mn><mo>=</mo><mn>200</mn></mrow><annotation encoding="application/x-tex">1200 - 1000 = 200</annotation></semantics></math>
+RPS sorba kerül:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi><mo>=</mo><mn>200</mn><mo>⋅</mo><mn>70</mn><mo>=</mo><mn>14</mn><mspace width="0.167em"></mspace><mn>000</mn></mrow><annotation encoding="application/x-tex">L = 200 \cdot 70 = 14\,000</annotation></semantics></math>
+kérés. Ez meghaladja a kapcsolat várakozási timeoutját, ezért a kliensek
+hibát kapnak. A megoldás: a HPA scale-up threshold 60% helyett 50%, és a
+pod startup probe gyors; vagy előre provisioned burst capacity (pl.
+minReplicas 5). Ha a sorba került kérések timeouttal hibára futnak, a 14
+000 hiba a havi kérés-alapú budget
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0</mn><mo>,</mo><mn>001</mn><mo>⋅</mo><mn>777</mn><mo>,</mo><mn>6</mn><mo>⋅</mo><msup><mn>10</mn><mn>6</mn></msup><mo>≈</mo><mn>777</mn><mspace width="0.167em"></mspace><mn>600</mn></mrow><annotation encoding="application/x-tex">0{,}001 \cdot 777{,}6 \cdot 10^6 \approx 777\,600</annotation></semantics></math>
+kérés)
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>≈</mo><mn>1</mn><mo>,</mo><mn>8</mn><mi>%</mi></mrow><annotation encoding="application/x-tex">\approx 1{,}8\%</annotation></semantics></math>-a.</p>
+<p>A költségmodell hipotetikus havi költsége:</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Tétel</th>
+<th>Mennyiség</th>
+<th>Hipotetikus egységár</th>
+<th>Havi költség</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Compute (2 × m6i.large)</td>
+<td>730 óra</td>
+<td>0.03 USD/óra</td>
+<td>43.8 USD</td>
+</tr>
+<tr>
+<td>Object storage</td>
+<td>233.4 GiB</td>
+<td>0.02 USD/GiB/hó</td>
+<td>4.67 USD</td>
+</tr>
+<tr>
+<td>Egress (origin)</td>
+<td>3 708 GiB (≈ 3,6 TiB), 100 GiB ingyenes</td>
+<td>0.09 USD/GiB</td>
+<td>324.71 USD</td>
+</tr>
+<tr>
+<td>CDN</td>
+<td>33 371 GiB (≈ 32,6 TiB)</td>
+<td>0.01 USD/GiB</td>
+<td>333.71 USD</td>
+</tr>
+<tr>
+<td><strong>Összesen</strong></td>
+<td></td>
+<td></td>
+<td><strong>706.89 USD</strong></td>
+</tr>
+</tbody>
+</table>
+<p>A unit cost havi 777,6 millió kérésre:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>706</mn><mo>,</mo><mn>89</mn><mi>/</mi><mn>777</mn><mo>,</mo><mn>6</mn><mo>≈</mo><mn>0</mn><mo>,</mo><mn>909</mn></mrow><annotation encoding="application/x-tex">706{,}89 / 777{,}6 \approx 0{,}909</annotation></semantics></math>
+USD per millió kérés, azaz
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>≈</mo><mn>9</mn><mo>,</mo><mn>1</mn><mo>⋅</mo><msup><mn>10</mn><mrow><mi>−</mi><mn>7</mn></mrow></msup></mrow><annotation encoding="application/x-tex">\approx 9{,}1 \cdot 10^{-7}</annotation></semantics></math>
+USD per kérés. Ez hipotetikus, nem valós ár.</p>
+<p>A példához egy YAML konfigurációt is adunk a HPA-hoz és a Pod
+resource-jaihoz:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Illusztratív Deployment (apps/v1) és HPA (autoscaling/v2)</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Ellenőrzés: kubectl apply --dry-run=server -f lab-api.yaml</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> apps/v1</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Deployment</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-api</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-prod</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">replicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">3</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">selector</span><span class="kw">:</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">matchLabels</span><span class="kw">:</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">app</span><span class="kw">:</span><span class="at"> lab-api</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">template</span><span class="kw">:</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">app</span><span class="kw">:</span><span class="at"> lab-api</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">containers</span><span class="kw">:</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> api</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">image</span><span class="kw">:</span><span class="at"> registry.example/lab-api:1.2.3</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">requests</span><span class="kw">:</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">cpu</span><span class="kw">:</span><span class="at"> 500m</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">memory</span><span class="kw">:</span><span class="at"> 512Mi</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">limits</span><span class="kw">:</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">cpu</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;2&quot;</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">memory</span><span class="kw">:</span><span class="at"> 1Gi</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a><span class="pp">---</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> autoscaling/v2</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> HorizontalPodAutoscaler</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-api</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-prod</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">scaleTargetRef</span><span class="kw">:</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> apps/v1</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">kind</span><span class="kw">:</span><span class="at"> Deployment</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-api</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">minReplicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">3</span></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">maxReplicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">10</span></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">metrics</span><span class="kw">:</span></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">type</span><span class="kw">:</span><span class="at"> Resource</span></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">resource</span><span class="kw">:</span></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">name</span><span class="kw">:</span><span class="at"> cpu</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">target</span><span class="kw">:</span></span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">type</span><span class="kw">:</span><span class="at"> Utilization</span></span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">averageUtilization</span><span class="kw">:</span><span class="at"> </span><span class="dv">60</span></span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">behavior</span><span class="kw">:</span></span>
+<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">scaleDown</span><span class="kw">:</span></span>
+<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">stabilizationWindowSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">300</span></span></code></pre></div>
+<h3 data-number="54.4.7" id="illusztratív-számított-ábra"><span
+class="header-section-number">54.4.7</span> Illusztratív, számított
+ábra</h3>
+<p>A kapacitáshoz tartozó terhelés és kihasználtság összefüggését a
+lineáris modellből számoljuk:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>U</mi><mo stretchy="false" form="prefix">(</mo><mi>R</mi><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mn>0</mn><mo>,</mo><mn>1</mn><mo>+</mo><mn>0</mn><mo>,</mo><mn>0015</mn><mo>⋅</mo><mi>R</mi></mrow><annotation encoding="application/x-tex">U(R) = 0{,}1 + 0{,}0015 \cdot R</annotation></semantics></math>
+mag (0,1 mag alapterhelés + 1,5 ms CPU-idő kérésenként). Az adatok
+hipotetikus, számított értékek, nem valós mérés; a 600 RPS-es pont
+alapterhelés nélkül a kidolgozott példa 0,9 magjának felel meg.</p>
+<figure>
+<img src="assets/d269-plot-1.png"
+alt="Kapacitásmodellezés: RPS és CPU kihasználtság - Számított lineáris modell: 0,1 mag alapterhelés + 1,5 ms CPU-idő kérésenként; a kihasználtság magokban kifejezve, nem mérési eredmény." />
+<figcaption aria-hidden="true">Kapacitásmodellezés: RPS és CPU
+kihasználtság - Számított lineáris modell: 0,1 mag alapterhelés + 1,5 ms
+CPU-idő kérésenként; a kihasználtság magokban kifejezve, nem mérési
+eredmény.</figcaption>
+</figure>
+<p>A táblázat ugyanehhez:</p>
+<table>
+<thead>
+<tr>
+<th>RPS</th>
+<th>CPU kihasználtság [mag]</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>0.1</td>
+</tr>
+<tr>
+<td>100</td>
+<td>0.25</td>
+</tr>
+<tr>
+<td>200</td>
+<td>0.4</td>
+</tr>
+<tr>
+<td>300</td>
+<td>0.55</td>
+</tr>
+<tr>
+<td>400</td>
+<td>0.7</td>
+</tr>
+<tr>
+<td>500</td>
+<td>0.85</td>
+</tr>
+<tr>
+<td>600</td>
+<td>1.0</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="54.4.8" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">54.4.8</span> Tipikus hibák és
+ellenpróbák</h3>
+<p>A leggyakoribb hiba, hogy a kapacitást kizárólag a CPU-átlagból
+becsülik, figyelmen kívül hagyva a memória, a storage és az egress
+hatását. A tünet: a HPA felveszi a podokat, de a node-okon OOM vagy disk
+pressure lép fel. Az ellenőrzés:
+<code>kubectl describe node &lt;node&gt;</code> és a
+<code>kubectl top nodes</code> mellett a storage used és a hálózati
+forgalom grafikonjait is megnézzük. A hipotézis: a memória request
+alulbecsült, mert a C++ alkalmazás heap növekedése nem lett figyelembe
+véve.</p>
+<p>A második hiba az overcommit túlzott használata: a sum(requests)
+belefér a node kapacitásába, de a sum(limits) sokkal nagyobb. A saját
+memória-limitjét túllépő pod overcommittől függetlenül OOM killt kap; az
+overcommit sajátos következménye, hogy ha a podok egyszerre közelítik a
+limitjüket, a node <code>MemoryPressure</code> állapotba kerül: a
+kubelet evictál, vagy a kernel OOM killer olyan podot is leállíthat,
+amely a saját limitje alatt van. Ez request hibákhoz vezet, és a HPA nem
+tudja megmenteni. Az ellenőrzés: <code>kubectl get pods -o wide</code>,
+<code>kubectl describe pod &lt;pod&gt;</code> az OOMKilled státusz,
+valamint a node <code>/var/log/syslog</code> OOM bejegyzése.</p>
+<p>A harmadik hiba a FinOps oldalon a reservation nélküli on-demand
+költségre való hagyatkozás, miközben a baseline terhelés stabil. A
+tünet: a havi számla magasabb, mint a hasonló profile-oké; a hipotézis:
+nincs reservation, vagy a reservation lejárt. Az ellenőrzés a cloud
+billing API-val történhet. A megoldás egy fokozatos reservation
+vásárlás, de csak azután, hogy a tényleges használat mérésén alapul.</p>
+<h3 data-number="54.4.9" id="feladatok"><span
+class="header-section-number">54.4.9</span> Feladatok</h3>
+<h4 data-number="54.4.9.1" id="feladat-kapacitásmodell-készítése"><span
+class="header-section-number">54.4.9.1</span> 1. Feladat:
+Kapacitásmodell készítése</h4>
+<p>Egy szolgáltatás mérései: átlag RPS 500, csúcs 800, kérés CPU idő 2
+ms, steady-state RSS 300 MiB, átlagos válasz 20 KiB, tartós adat 0.05
+GiB per 1e6 kérés. Számold ki a csúcshoz szükséges CPU magokat 60%
+target kihasználtságnál és 20% headroommal. Add meg a memória
+request/limit javaslatot podonként, ha 4 podot futtatunk. Írd fel a havi
+storage és egress hipotetikus költségét a fenti hipotetikus árakkal
+(0.08 USD/GB/hó storage, 0.09 USD/GB egress), feltéve, hogy nincs
+CDN.</p>
+<h4 data-number="54.4.9.2"
+id="feladat-autoscale-delay-és-burst-modellezése"><span
+class="header-section-number">54.4.9.2</span> 2. Feladat: Autoscale
+delay és burst modellezése</h4>
+<p>A fenti szolgáltatás HPA-ja 60% CPU utilization-t céloz, 2 perc a
+scale-up delay. A forgalom 500 RPS-ről 1000 RPS-re ugrik. Számold ki,
+hány kérés kerül a sorba a delay alatt, ha a jelenlegi kapacitás 500
+RPS. Ezután módosítsd a HPA konfigurációt úgy, hogy a minReplicas 6
+legyen, és a target 50%. Add meg a YAML-t.</p>
+<h4 data-number="54.4.9.3"
+id="feladat-regression-benchmark-és-saturation-budget-ellenőrzése"><span
+class="header-section-number">54.4.9.3</span> 3. Feladat: Regression
+benchmark és saturation budget ellenőrzése</h4>
+<p>Írj egy PromQL lekérdezést, amely a deployment CPU használatának 5
+perces átlagát adja. Ezután egy shell parancsot, amely egy load tesztet
+futtat a szolgáltatás ellen a kapacitásmodell validálására. Végül
+számold ki, mekkora a havi error budget 0.1% SLO esetén, és hasonlítsd
+össze a 2. feladatban kapott sorban álló kérések számával.</p>
+<h3 data-number="54.4.10" id="megoldások"><span
+class="header-section-number">54.4.10</span> Megoldások</h3>
+<h4 data-number="54.4.10.1" id="feladat-megoldása"><span
+class="header-section-number">54.4.10.1</span> 1. Feladat megoldása</h4>
+<p>A csúcs CPU igény:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>800</mn><mo>⋅</mo><mn>0.002</mn><mo>=</mo><mn>1.6</mn></mrow><annotation encoding="application/x-tex">800 \cdot 0.002 = 1.6</annotation></semantics></math>
+mag. Target kihasználtság 0.6, így
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1.6</mn><mi>/</mi><mn>0.6</mn><mo>=</mo><mn>2.67</mn></mrow><annotation encoding="application/x-tex">1.6 / 0.6 = 2.67</annotation></semantics></math>
+mag. Headroom 20%:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2.67</mn><mo>⋅</mo><mn>1.2</mn><mo>=</mo><mn>3.2</mn></mrow><annotation encoding="application/x-tex">2.67 \cdot 1.2 = 3.2</annotation></semantics></math>
+mag. Ha 4 podunk van, akkor podonként request CPU
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>3.2</mn><mi>/</mi><mn>4</mn><mo>=</mo><mn>0.8</mn></mrow><annotation encoding="application/x-tex">3.2 / 4 = 0.8</annotation></semantics></math>
+mag, azaz <code>800m</code>. A memória: steady-state 300 MiB, buffer 20%
+→ 360 MiB, tehát request <code>360Mi</code>, limit <code>512Mi</code>
+vagy <code>1Gi</code> a burst lehetőséghez.</p>
+<p>Havi kérések:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>500</mn><mo>⋅</mo><mn>3600</mn><mo>⋅</mo><mn>24</mn><mo>⋅</mo><mn>30</mn><mo>=</mo><mn>1.296</mn></mrow><annotation encoding="application/x-tex">500 \cdot 3600 \cdot 24 \cdot 30 = 1.296</annotation></semantics></math>
+milliárd kérés. Storage:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0.05</mn><mo>⋅</mo><mn>1296</mn><mo>≈</mo><mn>64.8</mn></mrow><annotation encoding="application/x-tex">0.05 \cdot 1296 \approx 64.8</annotation></semantics></math>
+GiB, 90 nap retentionnel
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>64.8</mn><mo>⋅</mo><mn>3</mn><mo>=</mo><mn>194.4</mn></mrow><annotation encoding="application/x-tex">64.8 \cdot 3 = 194.4</annotation></semantics></math>
+GiB. Költség:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>194.4</mn><mo>⋅</mo><mn>0.08</mn><mo>=</mo><mn>15.55</mn></mrow><annotation encoding="application/x-tex">194.4 \cdot 0.08 = 15.55</annotation></semantics></math>
+USD. Egress:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>20</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">KiB</mtext><mo>⋅</mo><mn>1</mn><mo>,</mo><mn>296</mn><mo>⋅</mo><msup><mn>10</mn><mn>9</mn></msup><mo>=</mo><mn>2</mn><mo>,</mo><mn>592</mn><mo>⋅</mo><msup><mn>10</mn><mn>10</mn></msup></mrow><annotation encoding="application/x-tex">20\ \text{KiB} \cdot 1{,}296 \cdot 10^9 = 2{,}592 \cdot 10^{10}</annotation></semantics></math>
+KiB
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>=</mo><mn>2</mn><mo>,</mo><mn>592</mn><mo>⋅</mo><msup><mn>10</mn><mn>10</mn></msup><mi>/</mi><msup><mn>1024</mn><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">= 2{,}592 \cdot 10^{10} / 1024^2</annotation></semantics></math>
+GiB
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>≈</mo><mn>24</mn><mspace width="0.167em"></mspace><mn>719</mn></mrow><annotation encoding="application/x-tex">\approx 24\,719</annotation></semantics></math>
+GiB
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>≈</mo><mn>24</mn><mo>,</mo><mn>14</mn></mrow><annotation encoding="application/x-tex">\approx 24{,}14</annotation></semantics></math>
+TiB (a KiB → GiB váltás bináris, 1024-es osztóval). Hipotetikus költség:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>24</mn><mspace width="0.167em"></mspace><mn>719</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>09</mn><mo>≈</mo><mn>2</mn><mspace width="0.167em"></mspace><mn>225</mn></mrow><annotation encoding="application/x-tex">24\,719 \cdot 0{,}09 \approx 2\,225</annotation></semantics></math>
+USD/hó; a kidolgozott példa 100 GiB-os ingyenes keretével
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>24</mn><mspace width="0.167em"></mspace><mn>619</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>09</mn><mo>≈</mo><mn>2</mn><mspace width="0.167em"></mspace><mn>216</mn></mrow><annotation encoding="application/x-tex">24\,619 \cdot 0{,}09 \approx 2\,216</annotation></semantics></math>
+USD. A válasz: a CPU
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>3.2</mn><annotation encoding="application/x-tex">3.2</annotation></semantics></math>
+mag, podonként <code>800m</code> request; a storage 15.55 USD, az egress
+≈ 2 225 USD hipotetikus áron. A postcondition: a deployment resource
+requestjei és a HPA célértéke a mért modellből következik, nem ad
+hoc.</p>
+<h4 data-number="54.4.10.2" id="feladat-megoldása-1"><span
+class="header-section-number">54.4.10.2</span> 2. Feladat megoldása</h4>
+<p>A sorban álló kérések: a bejövő 1000 RPS, a kapacitás 500 RPS, a
+delay 120 s. A sor hossza:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><mn>1000</mn><mo>−</mo><mn>500</mn><mo stretchy="false" form="postfix">)</mo><mo>⋅</mo><mn>120</mn><mo>=</mo><mn>60</mn><mn>000</mn></mrow><annotation encoding="application/x-tex">(1000 - 500) \cdot 120 = 60 000</annotation></semantics></math>
+kérés. Ez nagy, ezért a minReplicas növelése és a target csökkentése.
+Módosított YAML:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> autoscaling/v2</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> HorizontalPodAutoscaler</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-api</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">scaleTargetRef</span><span class="kw">:</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> apps/v1</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">kind</span><span class="kw">:</span><span class="at"> Deployment</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-api</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">minReplicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">6</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">maxReplicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">12</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">metrics</span><span class="kw">:</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">type</span><span class="kw">:</span><span class="at"> Resource</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">resource</span><span class="kw">:</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">name</span><span class="kw">:</span><span class="at"> cpu</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">target</span><span class="kw">:</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">type</span><span class="kw">:</span><span class="at"> Utilization</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">averageUtilization</span><span class="kw">:</span><span class="at"> </span><span class="dv">50</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">behavior</span><span class="kw">:</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">scaleDown</span><span class="kw">:</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">stabilizationWindowSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">600</span></span></code></pre></div>
+<p>A hatás számszerűen, az 1. feladat requestjeivel (800m/pod): 6 pod ·
+800m = 4,8 mag request; 1000 RPS · 2 ms = 2 mag →
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mi>/</mi><mn>4</mn><mo>,</mo><mn>8</mn><mo>≈</mo><mn>42</mn><mi>%</mi></mrow><annotation encoding="application/x-tex">2/4{,}8 \approx 42\%</annotation></semantics></math>
+kihasználtság, a 50%-os cél alatt. A burst tehát a delay alatt is
+kiszolgálható, a sorhossz ≈ 0. A HPA nem reagál gyorsabban (a
+metrikagyűjtés és a sync period ugyanaz), de a 6 podos alapkapacitás
+miatt nem is kell; a <code>maxReplicas: 12</code> a további, 2000 RPS-es
+burstre ad tartalékot
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2000</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>002</mn><mi>/</mi><mo stretchy="false" form="prefix">(</mo><mn>0</mn><mo>,</mo><mn>8</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>5</mn><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mn>10</mn></mrow><annotation encoding="application/x-tex">2000 \cdot 0{,}002 / (0{,}8 \cdot 0{,}5) = 10</annotation></semantics></math>
+pod), a hosszabb, 600 s-os scale-down stabilizációs ablak pedig
+megakadályozza, hogy a burstök között túl korán leskálázzon.</p>
+<h4 data-number="54.4.10.3" id="feladat-megoldása-2"><span
+class="header-section-number">54.4.10.3</span> 3. Feladat megoldása</h4>
+<p>PromQL a CPU használatra:</p>
+<pre class="promql"><code>sum(rate(container_cpu_usage_seconds_total{
+  namespace=&quot;lab-prod&quot;, pod=~&quot;lab-api-.*&quot;, container=&quot;api&quot;}[5m]))</code></pre>
+<p>A <code>container="api"</code> szűrő nélkül a cAdvisor pod-szintű
+(<code>container=""</code>) és pause-konténer sorai is összeadódnának,
+és a CPU-használat kb. kétszeres lenne.</p>
+<p>Load teszt a <code>hey</code> eszközzel, a modell szerinti
+reprezentatív végponton (a <code>-q</code> munkásonkénti QPS-korlát, így
+50 worker · 20 QPS = 1000 RPS):</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">hey</span> <span class="at">-z</span> 10m <span class="at">-c</span> 50 <span class="at">-q</span> 20 <span class="at">-m</span> GET <span class="dt">\</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>  http://lab-api.lab-prod.svc.cluster.local/api/v1/items/42</span></code></pre></div>
+<p>A mért CPU (mag) / RPS arányt a 2 ms-os modellel vetjük össze: várt
+érték
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1000</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>002</mn><mo>=</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">1000 \cdot 0{,}002 = 2</annotation></semantics></math>
+mag. A <code>/health</code> végpont nem a modell kérése, ezért arra nem
+validálható a kapacitásmodell.</p>
+<p>A havi error budget 0.1% egy 30 napos hónapban:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>30</mn><mo>⋅</mo><mn>24</mn><mo>⋅</mo><mn>3600</mn><mo>⋅</mo><mn>0.001</mn><mo>≈</mo><mn>2592</mn></mrow><annotation encoding="application/x-tex">30 \cdot 24 \cdot 3600 \cdot 0.001 \approx 2592</annotation></semantics></math>
+s. A 2. feladatban 60 000 kérés 120 s alatt; ha ezek mind error-ök,
+akkor 120 s a 2592 s-ból, azaz 4.6%-át fogyasztja el. A saturation
+budget tehát nagyobb, mint a tipikus autoscale késés, de a rendszeres
+burstök kimeríthetik.</p>
+<h3 data-number="54.4.11" id="rövid-összefoglaló"><span
+class="header-section-number">54.4.11</span> Rövid összefoglaló</h3>
+<p>A kapacitástervezés a mért workloadból indul ki, és a CPU, memória,
+storage, hálózat dimenzióit együttesen modellezi. A
+<strong>headroom</strong> a változékonyság és a hibák elnyelésére
+fenntartott többletkapacitás. Az <strong>autoscale delay</strong> alatt
+a forgalom és a kapacitás különbsége sorba áll; a sor hosszát a
+Little-törvényből becsülhetjük. A <strong>FinOps</strong> a unit cost és
+a retention/egress tradeoff segítségével hozza össze a műszaki
+kapacitást a költségekkel. A hipotetikus árak csak számítási példák; a
+tényleges cloud billing és support mindig az aktuális szolgáltatótól
+ellenőrzendő.</p>
+<h3 data-number="54.4.12" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">54.4.12</span> Források és ellenőrzési
+hiányok</h3>
+<p>Ebben a kérésben nem volt webes keresőeszköz, ezért az alábbi
+hivatkozások seed források, nem olvasott bizonyítékok. A Kubernetes HPA
+és resource management pontos API-verziója a generáláskor támogatott
+stabil minorhoz kötött; az itt használt <code>autoscaling/v2</code> és
+mezők illusztratívak. A cloud árak – még ha hipotetikusnak jelöltük is
+őket – nem ellenőrzöttek; a tényleges AWS/Azure/GCP billing API és
+pricing oldal használata szükséges. A PromQL metrikanevek a
+<code>kube-state-metrics</code> és a <code>cadvisor</code>
+konfigurációjától függenek.</p>
+<ul>
+<li><a
+href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/">Kubernetes
+Documentation: Managing Resources for Containers</a></li>
+<li><a
+href="https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/">Kubernetes
+Documentation: Horizontal Pod Autoscaling</a></li>
+<li><a href="https://sre.google/sre-book/practical-alerting/">SRE Book:
+Practical Alerting</a></li>
+<li><a href="https://aws.amazon.com/pricing/">AWS Pricing (seed, nem
+ellenőrzött)</a></li>
+</ul>
+<p>További állításonkénti források (hivatkozott verzió: Kubernetes
+v1.30+ stabil API-k: <code>apps/v1</code>,
+<code>autoscaling/v2</code>):</p>
+<ul>
+<li>Deployment <code>spec.selector</code> kötelező mező: <a
+href="https://kubernetes.io/docs/concepts/workloads/controllers/deployment/"
+class="uri">https://kubernetes.io/docs/concepts/workloads/controllers/deployment/</a></li>
+<li>Node-pressure eviction, <code>MemoryPressure</code>: <a
+href="https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/"
+class="uri">https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/</a></li>
+<li>cAdvisor/kubelet metrikák
+(<code>container_cpu_usage_seconds_total</code>): <a
+href="https://kubernetes.io/docs/reference/instrumentation/cadvisor-metric-labels/"
+class="uri">https://kubernetes.io/docs/reference/instrumentation/cadvisor-metric-labels/</a>
+(a mezőkészlet a kubelet-verziótól függ, ellenőrizendő)</li>
+<li><code>hey</code> kapcsolói (<code>-c</code>, <code>-q</code> per
+worker, <code>-z</code>): <a href="https://github.com/rakyll/hey"
+class="uri">https://github.com/rakyll/hey</a></li>
+<li>Error budget: Google SRE Workbook, „Implementing SLOs” — <a
+href="https://sre.google/workbook/implementing-slos/"
+class="uri">https://sre.google/workbook/implementing-slos/</a></li>
+</ul>
+<p>Reprodukciós státusz: a számítások helyben újraszámolva; a példák
+laborban ellenőrizendők, dátumozott futtatási napló még nem készült.</p>
+<p>A d269 gyakorlati ellenőrzése megkívánja: a production metrikák
+gyűjtését, a load teszt futtatását elkülönített környezetben, a cloud
+billing API lekérdezését és a Kubernetes-verzió support matrixának
+ellenőrzését. A jelen alfejezet csak a fogalmi modellt és a számítási
+vázat adja.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d268.html">← 54.3 Ceph, SAN/NAS és object/block/file fabric</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d270.html">54.5 HA és adatplatform failure game day →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

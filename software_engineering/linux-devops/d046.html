@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>10.1 Syscalltól az eszközig: I/O rétegek – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch10">10 Linux blokk-I/O, VFS és tartósság</a></p>
+<div class="links"><a class="prev" rel="prev" href="d045.html">← 9.5 Memória-, swap- és cgroup labor</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d047.html">10.2 write, fsync, flush és crash consistency →</a></div>
+</nav>
+<h2 data-number="10.1" id="d046"><span
+class="header-section-number">10.1</span> Syscalltól az eszközig: I/O
+rétegek</h2>
+<h3 data-number="10.1.1" id="motiváció"><span
+class="header-section-number">10.1.1</span> Motiváció</h3>
+<p>Egy szenior C++ fejlesztő számára a fájlba írás gyakran egyetlen
+<code>write()</code> hívás, amely „sikeresen visszatért”, így az adatot
+sokan tartósnak hiszik. A Linux rendszerben azonban a
+<code>write()</code> visszatérése és a médián való tényleges tartósság
+között több kernelréteg, cache és aszinkron ütemezés van. Ugyanez a
+rétegződés magyarázza, hogy miért lehet egy <code>write()</code> gyors,
+míg a hozzá tartozó <code>fsync()</code> nagyon lassú, vagy miért mutat
+az <code>iostat -x</code> <code>w_await</code> oszlopa magas értéket
+akkor is, amikor a syscall maga rövid. Ebben az alfejezetben a
+read/write utat bontjuk VFS, page cache, block layer és driver
+rétegekre, hogy a késleltetést és a tartósságot a megfelelő rétegekhez
+tudja rendelni.</p>
+<h3 data-number="10.1.2" id="definíció-és-működés"><span
+class="header-section-number">10.1.2</span> Definíció és működés</h3>
+<p>Az alábbi fogalmakat az I/O út sorrendjében használjuk.</p>
+<ul>
+<li><strong>File descriptor (FD):</strong> processzenkénti egész index,
+amely egy <strong>open file description</strong> objektumra mutat.</li>
+<li><strong>Open file description:</strong> a kernelben tárolt
+megosztott állapot, amely tartalmazza a fájl aktuális offsetjét, open
+flagjeit (<code>O_APPEND</code>, <code>O_NONBLOCK</code>), valamint a
+hivatkozást a <strong>VFS inode</strong>-ra. Ugyanaz a fájl több FD-n
+keresztül is megnyitható; a <code>dup()</code>, <code>fork()</code> vagy
+<code>open()</code> másolatok megosztott vagy független open file
+descriptiont hozhatnak létre.</li>
+<li><strong>VFS (Virtual File System):</strong> közös kernelbeli
+fájlabsztrakció, amely a <code>file_operations</code> műveleti táblán
+keresztül dispatcheli a hívást a tényleges fájlrendszer (például ext4,
+XFS, Btrfs) implementációjára.</li>
+<li><strong>Page cache:</strong> a kernel memóriájában lévő fájloldalak
+gyűjteménye, amely a buffered I/O alapja. A fájl tartalma oldalanként
+(jellemzően 4 KiB, THP esetén nagyobb) kerül be a memóriába. A
+módosított oldal <strong>dirty</strong>.</li>
+<li><strong>Block layer, blk-mq:</strong> a fájlrendszer
+<code>bio</code>-kat (block I/O kérelmeket) nyújt be, ezekből a
+multi-queue blk-mq keret <code>request</code>-eket készít. Az I/O
+scheduler ezeket a requesteket rendezi, merge-eli és ütemezi.</li>
+<li><strong>I/O scheduler:</strong> blk-mq alatt jellemzően
+<code>mq-deadline</code>, <code>kyber</code> vagy <code>none</code>;
+NVMe eszközökön gyakran nincs klasszikus scheduler, mert a device maga
+is mély queue-t kezel.</li>
+<li><strong>Device driver és completion:</strong> a driver a requestet
+hardverparanccsá alakítja, DMA-t indít, a befejezést interrupt jelzi. A
+driver <strong>completion</strong> callbackje ébreszti fel a várakozó
+syscallt.</li>
+</ul>
+<h4 data-number="10.1.2.1" id="buffered-write-adatút"><span
+class="header-section-number">10.1.2.1</span> Buffered write adatút</h4>
+<p>A <code>write()</code> hívás a userspace bufferből a kernelbe másol
+(<code>copy_from_user</code>). Ezután a VFS az open file description
+aktuális offsetjét használva a fájlrendszer <code>write_iter</code>
+metódusát hívja. A fájlrendszer a page cache megfelelő oldalait
+megkeresi vagy allokálja, az adatot a lapokba másolja, a módosított
+lapokat dirty-nek jelöli. A <code>write()</code> ekkor visszatérhet,
+mert az adat a kernel memóriájában van; a device még nem feltétlenül
+látta.</p>
+<p>A tartóssághoz explicit szinkronizáció kell: <code>fsync()</code>
+vagy <code>fdatasync()</code>. Az <code>fsync()</code> a fájl adatait
+<strong>és</strong> a szükséges metadatait (például méret, módosítási
+idő) a device-ra kényszeríti, majd flush parancsot ad, ha a device write
+cache használatban van. Az <code>fdatasync()</code> a felhasználói
+adatra és a méretre fókuszál, nem feltétlenül minden metadata. A
+flush/FUA kérdését <a href="d023.html">Sector, alignment, TRIM és write
+cache</a> tárgyalja.</p>
+<h4 data-number="10.1.2.2" id="read-adatút"><span
+class="header-section-number">10.1.2.2</span> Read adatút</h4>
+<p>Olvasáskor a fájlrendszer először a page cache-ben keres. Ha az oldal
+uptodate, a kernel közvetlenül a lapból másol a userspace bufferbe, és
+nincs block I/O. Ha cache miss van, a fájlrendszer <code>bio</code>-t
+nyújt be, a block layer beolvassa a device-ról, a lap bekerül a page
+cache-be, majd a memória-másolás megtörténik. A beolvasott oldal a
+cache-ben marad, hogy a következő hozzáférés ne menjen device-ra.</p>
+<h4 data-number="10.1.2.3" id="késleltetés-rétegenként"><span
+class="header-section-number">10.1.2.3</span> Késleltetés
+rétegenként</h4>
+<p>Az alábbi táblázat a buffered I/O tipikus késleltetési forrásait
+rendeli rétegekhez. A tényleges mért értékek labfüggőek, ezért a
+mérésnél mindig külön kell választani a syscall időt, a page cache
+állapotot, a block layer queue idejét és a device completion idejét.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Réteg</th>
+<th><code>write()</code> latency elem</th>
+<th><code>fsync()</code> latency elem</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Userspace buffer → kernel</td>
+<td><code>copy_from_user</code> CPU-memcpy</td>
+<td>—</td>
+</tr>
+<tr>
+<td>VFS / filesystem operation</td>
+<td>dispatch, offset, lock</td>
+<td>dirty oldalak felkutatása</td>
+</tr>
+<tr>
+<td>Page cache</td>
+<td>oldalkeresés, allokáció, másolás</td>
+<td>writeback indítás</td>
+</tr>
+<tr>
+<td>Block layer / blk-mq</td>
+<td>— (aszinkron writeback)</td>
+<td>bio → request késleltetés</td>
+</tr>
+<tr>
+<td>I/O scheduler</td>
+<td>—</td>
+<td>queue wait, merge, scheduling</td>
+</tr>
+<tr>
+<td>Device driver</td>
+<td>—</td>
+<td>command submit, interrupt, completion</td>
+</tr>
+<tr>
+<td>Device media / write cache</td>
+<td>—</td>
+<td>seek/transfer/flush</td>
+</tr>
+</tbody>
+</table>
+<figure id="fig-d046-write-fsync">
+<div class="fig-interactive"><iframe src="figures/html/d046-write-fsync.html" title="Nyolc egymás alatti réteg: userspace buffer, VFS és ext4, page cache, block layer, I/O scheduler, driver, device write cache, média. A write() nyila a page cache-ig megy és onnan tér vissza 0.000045 másodperc alatt, a lap dirty lesz. Az fsync() vastag szaggatott nyila a médiáig megy, a write cache és a média között FLUSH/FUA, majd a completion után tér vissza 0.023100 másodperc alatt. Zárójelek: a strace -T a syscall be- és kilépése közti teljes időt méri, az iostat w_await és f_await csak a block layertől a completionig tartó szakaszt." loading="lazy" style="width:100%;border:0;height:860px"></iframe><noscript><img src="figures/img/d046-write-fsync.png" style="width:75.0%"
+alt="Nyolc egymás alatti réteg: userspace buffer, VFS és ext4, page cache, block layer, I/O scheduler, driver, device write cache, média. A write() nyila a page cache-ig megy és onnan tér vissza 0.000045 másodperc alatt, a lap dirty lesz. Az fsync() vastag szaggatott nyila a médiáig megy, a write cache és a média között FLUSH/FUA, majd a completion után tér vissza 0.023100 másodperc alatt. Zárójelek: a strace -T a syscall be- és kilépése közti teljes időt méri, az iostat w_await és f_await csak a block layertől a completionig tartó szakaszt." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d046-write-fsync.png" style="width:75.0%"
+alt="Nyolc egymás alatti réteg: userspace buffer, VFS és ext4, page cache, block layer, I/O scheduler, driver, device write cache, média. A write() nyila a page cache-ig megy és onnan tér vissza 0.000045 másodperc alatt, a lap dirty lesz. Az fsync() vastag szaggatott nyila a médiáig megy, a write cache és a média között FLUSH/FUA, majd a completion után tér vissza 0.023100 másodperc alatt. Zárójelek: a strace -T a syscall be- és kilépése közti teljes időt méri, az iostat w_await és f_await csak a block layertől a completionig tartó szakaszt." /></details></div>
+<figcaption>A write() és az fsync() útja rétegenként: a write() a page
+cache-nél visszatér, az fsync() a médiáig megy FLUSH/FUA-val; oldalt,
+mit mér a strace -T és az iostat -x (illusztratív értékek, nem
+mérés)</figcaption>
+</figure>
+<p>A <code>write()</code> syscall ideje tehát elsősorban a
+userspace→kernel másolás, a VFS és a page cache költsége. Az
+<code>iostat -x</code> <code>r_await</code>/<code>w_await</code> oszlopa
+(régebbi sysstat-ban <code>await</code>) ezzel szemben a device
+requestek turn-around idejét mutatja, az <code>aqu-sz</code> (régebben
+<code>avgqu-sz</code>) az átlagos queue-mélységet, az <code>f/s</code>
+és <code>f_await</code> pedig a flush (fsync/FUA) kérések számát és
+idejét. A <code>fsync()</code> ideje a dirty oldalak writebackjét, a
+block layer queue-t, a driver command feldolgozást és a device
+média/kiolvasási időt egyaránt tartalmazza.</p>
+<h3 data-number="10.1.3" id="kidolgozott-példa"><span
+class="header-section-number">10.1.3</span> Kidolgozott példa</h3>
+<p><strong>Cél:</strong> megmutatni, hogy egy buffered
+<code>write()</code> rövid syscall időkkel visszatér, az
+<code>fsync()</code> viszont a block layer és a device felé
+szinkronizál, ezért nagyobb késleltetést mutat.</p>
+<p><strong>Target:</strong> <code>labhost1</code>, <code>labadmin</code>
+UID 1000, <code>/mnt/lab-data</code> mounted disposable labdisk, write
+access. Nem root szükséges, csak a labfilesystem jog.</p>
+<p><strong>Előfeltétel:</strong> <code>/mnt/lab-data</code> mount
+létezik, a labdisk név szerint kijelölt, a <code>strace</code> csomag
+telepítve.</p>
+<p>A mérést két lépésre bontjuk: (a) fsync nélküli buffered írás, utána
+azonnal <code>Dirty</code>-mintavétel – itt látszik a dirty lapok
+felhalmozódása; (b) külön <code>fsync</code> a már megírt fájlra, mérve
+és utána újabb mintavétellel.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, labadmin (UID 1000)</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># előfeltétel: /mnt/lab-data mounted labdisken, write access</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co"># nem destruktív; a cleanup a lab saját lab-write-test.bin fájljára</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="co"># terjed ki</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="bu">umask</span> 0022</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> /mnt/lab-data/lab-ioutest</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> /mnt/lab-data/lab-ioutest <span class="kw">||</span> <span class="bu">exit</span> 1</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;^(Dirty|Writeback):&#39;</span> /proc/meminfo        <span class="co"># alapállapot</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="co"># (a) buffered írás fsync nélkül</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="ex">strace</span> <span class="at">-T</span> <span class="at">-e</span> trace=write <span class="at">-o</span> /tmp/lab-ioutest-write.strace <span class="dt">\</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>  dd if=/dev/zero of=lab-write-test.bin bs=1M count=64</span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;^(Dirty|Writeback):&#39;</span> /proc/meminfo        <span class="co"># Dirty kb. +64 MiB</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="co"># (b) fsync a megírt fájlra (a coreutils sync FILE fsync-et hív)</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="ex">strace</span> <span class="at">-T</span> <span class="at">-e</span> trace=fsync,fdatasync <span class="at">-o</span> /tmp/lab-ioutest-fsync.strace <span class="dt">\</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>  sync lab-write-test.bin</span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;^(Dirty|Writeback):&#39;</span> /proc/meminfo        <span class="co"># Dirty visszaesik</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-c</span> <span class="st">&#39;write(&#39;</span> /tmp/lab-ioutest-write.strace</span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /tmp/lab-ioutest-fsync.strace</span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="fu">stat</span> <span class="at">-c</span> <span class="st">&#39;%n %s bytes&#39;</span> lab-write-test.bin</span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a><span class="co"># cleanup</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">-f</span> lab-write-test.bin /tmp/lab-ioutest-write.strace <span class="dt">\</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>  /tmp/lab-ioutest-fsync.strace</span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> / <span class="kw">&amp;&amp;</span> <span class="fu">rmdir</span> /mnt/lab-data/lab-ioutest <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="fu">true</span></span></code></pre></div>
+<p><strong>Várható kimenet és ellenőrzés</strong> (illusztratív, nem
+ténylegesen futtatott mérés):</p>
+<p>A <code>Dirty</code> érték az (a) lépés után kb. 64 MiB-tal megnő (ha
+a háttér-writeback közben még nem indult el), majd a (b) lépés után
+visszaesik. Az (a) trace-ben 64 adat-<code>write()</code> sor látható;
+GNU coreutils <code>dd</code> az <code>of=</code> fájlt az 1-es fd-n
+írja (más <code>dd</code>-implementációnál más fd-szám látszik), a
+<code>write(2, …)</code> sorok pedig a <code>dd</code> stderr-re írt
+statisztikája. A (b) trace egy <code>fsync()</code> sort tartalmaz:</p>
+<pre class="text"><code>write(1, &quot;\0\0\0\0...&quot;..., 1048576) = 1048576 &lt;0.000045&gt;
+write(1, &quot;\0\0\0\0...&quot;..., 1048576) = 1048576 &lt;0.000038&gt;
+...
+fsync(3)                  = 0 &lt;0.023100&gt;</code></pre>
+<p>Ellenőrzési feltétel: a fájl mérete <code>67108864</code> bájt; a (b)
+trace legalább egy <code>fsync</code> sort tartalmaz; a
+<code>Dirty</code> az alapállapotban alacsony, az (a) után magasabb, a
+(b) után alacsonyabb. Ha a <code>Dirty</code> az (a) lépés után nem nő,
+akkor a mérés valószínűleg <code>O_DIRECT</code> vagy szinkron
+(<code>sync</code>) mounton fut, vagy a writeback a mintavétel előtt már
+lezajlott.</p>
+<p>Hibajelenség: buffered írásnál a device-hiba jellemzően az
+<code>fsync()</code>/<code>fdatasync()</code> <code>-1 EIO</code>
+visszatérésében jelenik meg – a <code>write()</code> addigra sikeresen
+visszatért. EIO után az alkalmazás ne tekintse az adatot tartósnak, és
+ne pusztán ismételje az fsync-et (a hibás dirty lap addigra már nem
+garantáltan van meg), hanem a saját forrásából írja újra az adatot, vagy
+álljon le. <code>write()</code> EIO főleg <code>O_DIRECT</code>-nél vagy
+már ismert eszközhibánál jön. Ha az <code>fsync</code> hosszú, de a
+<code>write</code> gyors, akkor a szűk keresztmetszet a writeback/device
+útban van, nem a CPU-ban.</p>
+<h3 data-number="10.1.4" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">10.1.4</span> Tipikus hibák és
+ellenpróbák</h3>
+<p><strong>A <code>write()</code> visszatérését tartósságnak
+tekintik.</strong> Tünet: power loss után hiányzó commit. Adatgyűjtés:
+<code>Dirty</code> oldalak nőnek, <code>fsync</code> nincs a trace-ben.
+Hipotézis: az alkalmazás nem hív
+<code>fsync()</code>/<code>fdatasync()</code>, vagy a device write cache
+nem kap flush-t. Egy változtatás: explicit <code>fsync()</code> a commit
+ponton. Verifikáció: <code>strace -e trace=fsync</code> mutatja a
+hívást, és utána a <code>Dirty</code> csökken.</p>
+<p><strong>A lassú <code>fsync</code>-et a CPU-ra vezetik
+vissza.</strong> Tünet: a <code>write()</code> pár tíz mikroszekundum,
+az <code>fsync()</code> több száz milliszekundum. A
+<code>strace -T</code> megmutatja, hogy a <code>write</code> csak page
+cache-be ír; az <code>iostat -x</code> a device <code>w_await</code>,
+<code>f_await</code> és <code>aqu-sz</code> (régebbi sysstat-ban
+<code>await</code>, <code>avgqu-sz</code>) értékek növekedését mutatja.
+A hipotézis a device queue vagy a flush költsége. Ellenpróba:
+<code>conv=notrunc,fdatasync</code> ugyanazon adattal rövidebb, ha csak
+kisebb metadata kell, de a device flush akkor is benne van.</p>
+<p><strong>Partial write kezelés hiánya.</strong> A <code>write()</code>
+kevesebb bájtot is visszaadhat; a programnak ciklusban, az eltolt
+bufferrel újra kell hívnia a maradékra (az <code>EINTR</code>-t is
+kezelve). A hiba tünete a csonka fájl, a diagnózis a
+<code>write()</code> visszatérési érték és a <code>strace</code> mutatja
+a rövid írást.</p>
+<p><strong><code>O_DIRECT</code> használata helytelen
+feltételezéssel.</strong> Az <code>O_DIRECT</code> kikerüli a page
+cache-t, de nem ad automatikus FUA-t, és alignment/len megkötései
+vannak. A tartóssághoz <code>O_DIRECT</code> mellett is
+<code>fsync()</code> kell, ha a device write cache aktív. Ez összhangban
+van a <a href="d023.html">d023</a> write cache szerződésével.</p>
+<h3 data-number="10.1.5" id="feladatok"><span
+class="header-section-number">10.1.5</span> Feladatok</h3>
+<h4 data-number="10.1.5.1"
+id="rétegkésleltetés-hozzárendelés-magyarázó-szint"><span
+class="header-section-number">10.1.5.1</span> 1. Réteg–késleltetés
+hozzárendelés (magyarázó szint)</h4>
+<p>Adott egy buffered <code>write()</code> + <code>fsync()</code>
+folyamat és az <code>iostat -x</code> kimenet
+<code>w_await</code>/<code>f_await</code>/<code>aqu-sz</code> értéke
+(régebbi sysstat-ban <code>await</code>/<code>avgqu-sz</code>).
+Készítsen táblázatot, amely hozzárendeli a következő megfigyeléseket a
+megfelelő rétegekhez: <code>write()</code> syscall idő,
+<code>fsync()</code> syscall idő, <code>Dirty</code> oldalak,
+<code>w_await</code>, <code>f_await</code>, <code>aqu-sz</code>.
+Indokolja, miért nem jelenik meg a <code>write()</code> késleltetés a
+<code>w_await</code>-ben.</p>
+<h4 data-number="10.1.5.2"
+id="rétegelt-mérés-a-labhoston-adminisztrációskonfigurációs-szint"><span
+class="header-section-number">10.1.5.2</span> 2. Rétegelt mérés a
+labhoston (adminisztrációs/konfigurációs szint)</h4>
+<p>A <code>labhost1</code> labhoston, <code>labadmin</code> UID 1000,
+<code>/mnt/lab-data</code> labdisken hozzon létre egy
+<code>lab-write-test.bin</code> nevű labfájlt. Mérje
+<code>strace -T</code>-vel a <code>write</code> és <code>fsync</code>
+syscall időket; rögzítse a <code>Dirty</code>/<code>Writeback</code>
+állapotot a write előtt, az fsync nélküli write után és az fsync után;
+ellenőrizze a fájlméretet. Tisztítsa a saját labfájlját. A
+jegyzőkönyvben nevezze meg, melyik megfigyelt érték melyik réteghez
+tartozik.</p>
+<h4 data-number="10.1.5.3"
+id="lassú-writeelveszett-adat-diagnosztika-diagnosztikaifailurerecovery-szint"><span
+class="header-section-number">10.1.5.3</span> 3. Lassú write/elveszett
+adat diagnosztika (diagnosztikai/failure/recovery szint)</h4>
+<p>Egy laboralkalmazás arról számol be, hogy a commit power cut után
+elveszik, és a <code>fsync()</code> nagyon lassú. Gyűjtsön
+<code>strace -T</code>, <code>/proc/meminfo</code> és
+<code>iostat -x 1</code> adatokat. Állapítsa meg, mi a legvalószínűbb
+réteg (page cache, block layer queue, driver/device, flush). Hajtson
+végre egy ellenőrzött változtatást: például <code>fdatasync</code>
+kontroll vagy a device write cache/FUA viselkedés vizsgálata.
+Verifikálja a méréssel, és fogalmazza meg a tartóssági szerződést a
+<code>write()</code> visszatérés és az <code>fsync()</code> siker
+között.</p>
+<h3 data-number="10.1.6" id="megoldások"><span
+class="header-section-number">10.1.6</span> Megoldások</h3>
+<h4 data-number="10.1.6.1" id="megoldás"><span
+class="header-section-number">10.1.6.1</span> 1. megoldás</h4>
+<p>A <code>write()</code> syscall idő a userspace→kernel másolás, VFS
+dispatch és page cache allokáció/másolás rétegéhez tartozik. A
+<code>fsync()</code> idő a dirty oldalak writebackjéből, a block
+layer/blk-mq queue-ból, a scheduler döntéséből, a driver
+parancskezelésből és a device flush/media idejéből áll. A
+<code>Dirty</code> oldalak a page cache writeback állapotát mutatják. Az
+<code>iostat -x</code> <code>w_await</code> és <code>f_await</code> a
+block layer/device írási, illetve flush request completion idejét, az
+<code>aqu-sz</code> az átlagos queue-mélységet írja le. A
+<code>write()</code> nem jelenik meg a <code>w_await</code>-ben, mert a
+buffered write a page cache-be ír, és a device request csak később, a
+writeback során keletkezik.</p>
+<h4 data-number="10.1.6.2" id="megoldás-1"><span
+class="header-section-number">10.1.6.2</span> 2. megoldás</h4>
+<p>A mérés parancsa megegyezik a kidolgozott példában lévővel; a
+<code>Dirty</code> az fsync nélküli write után nő, az <code>fsync</code>
+után csökken. A <code>strace</code> write sorok rövidek, az
+<code>fsync</code> nagyobb. Ez a page cache jelenlétét és a block layer
+eszközszintű szinkronizációját igazolja. A jegyzőkönyv postconditionje:
+a <code>lab-write-test.bin</code> és
+<code>/tmp/lab-ioutest.strace</code> törölve, a
+<code>/mnt/lab-data</code> mount tartalma eredeti, a mérési adatok a
+jegyzőkönyvben rögzítve.</p>
+<h4 data-number="10.1.6.3" id="megoldás-2"><span
+class="header-section-number">10.1.6.3</span> 3. megoldás</h4>
+<p>Az adatvesztés oka: a <code>write()</code> csak a page cache-be
+másol, és power loss előtt nincs <code>fsync</code>/FUA, a device write
+cache tartalma elveszhet. A lassú <code>fsync</code> esetén az
+<code>iostat -x</code> <code>w_await</code>, <code>f_await</code> és
+<code>aqu-sz</code> értéke magas; ez a block layer/device réteget teszi
+felelőssé. A változtatás: a commit ponton <code>fdatasync()</code> és
+szükség esetén FUA, vagy a device write cache beállítás vizsgálata.
+Verifikáció: a trace-ben megjelenik a <code>fdatasync</code>, a
+<code>Dirty</code> csökken, a <code>w_await</code>/<code>f_await</code>
+a várható device időt mutatja. A tartóssági szerződés:
+<code>write()</code> sikere = az adat a kernel page cache-ben;
+<code>fsync</code>/<code>fdatasync</code> sikere = a device tartóssági
+pontján van, feltéve, hogy a flush/FUA parancsot a device
+megerősítette.</p>
+<h3 data-number="10.1.7" id="rövid-összefoglaló"><span
+class="header-section-number">10.1.7</span> Rövid összefoglaló</h3>
+<p>A Linux fájlműveletek útja a userspace buffertől a VFS-en, a page
+cache-en, a block layeren és a driveren keresztül a device médiáig tart.
+A <code>write()</code> visszatérése nem tartósság, csak annyit jelent,
+hogy az adat a kernel page cache-ben van; a tartóssághoz
+<code>fsync()</code>/<code>fdatasync()</code> és szükség szerint
+flush/FUA kell. A késleltetést rétegenként kell értelmezni: a buffered
+write leginkább a másolás és page cache költsége, az <code>fsync</code>
+a writeback, block queue, driver és device flush költsége. Az
+<code>iostat -x</code> <code>w_await</code>/<code>f_await</code> a
+device request completiont mutatja, nem a <code>write()</code> syscall
+idejét.</p>
+<p>Továbbhasznált definíciók:</p>
+<ul>
+<li><strong>Page cache:</strong> a kernel memóriájában lévő
+fájloldal-gyűjtemény, amely a buffered I/O alapja.</li>
+<li><strong>Open file description:</strong> a VFS által használt
+megosztott állapot, amely az offsetet és az open flagjeit
+tartalmazza.</li>
+<li><strong>bio:</strong> a fájlrendszertől a block layer felé
+benyújtott blokkos I/O kérelem, amelyből a blk-mq request
+keletkezik.</li>
+</ul>
+<h3 data-number="10.1.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">10.1.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>Az alábbi hivatkozások a téma elsődleges kiindulópontjai, de ebben a
+munkamenetben nem ellenőrzött, olvasott bizonyítékok:</p>
+<ul>
+<li><a href="https://docs.kernel.org/">Linux kernel documentation</a> —
+block layer, blk-mq, I/O scheduler és page cache leírás.</li>
+<li><a href="https://man7.org/linux/man-pages/">Linux man-pages</a> —
+<code>write(2)</code>, <code>fsync(2)</code>, <code>fdatasync(2)</code>,
+<code>open(2)</code> szemantika.</li>
+<li><a href="https://nvmexpress.org/specifications/">NVM Express
+specifications</a> — NVMe flush/FUA, queue és completion
+viselkedés.</li>
+</ul>
+<p>Állításonkénti forrásindex (viszonyítási pont: Ubuntu Server 24.04
+LTS, 6.8-as GA kernel; a sysstat és strace a 24.04 csomagváltozata):</p>
+<ul>
+<li><code>write(2)</code> részleges írás és EIO:
+https://man7.org/linux/man-pages/man2/write.2.html – RETURN VALUE,
+ERRORS; <code>fsync(2)</code>/<code>fdatasync(2)</code>:
+https://man7.org/linux/man-pages/man2/fsync.2.html.</li>
+<li>blk-mq: https://docs.kernel.org/block/blk-mq.html; I/O schedulerek:
+https://docs.kernel.org/block/index.html.</li>
+<li><code>/proc/meminfo</code>
+<code>Dirty</code>/<code>Writeback</code>:
+https://docs.kernel.org/filesystems/proc.html – „meminfo” rész.</li>
+<li><code>iostat -x</code> oszlopai (<code>r_await</code>,
+<code>w_await</code>, <code>f_await</code>, <code>aqu-sz</code>):
+https://man7.org/linux/man-pages/man1/iostat.1.html (sysstat).</li>
+<li><code>sync FILE</code> és <code>dd</code>: GNU coreutils kézikönyv,
+https://www.gnu.org/software/coreutils/manual/coreutils.html – „sync
+invocation”, „dd invocation”.</li>
+</ul>
+<p>A példák laborban ellenőrizendők; dátumozott futtatási napló
+(verziók, parancskimenet, sikeres és hibás ág) még nem készült.</p>
+<p>Ellenőrzési hiányok:</p>
+<ul>
+<li>Az Ubuntu Server 24.04 LTS labkiadás aktuális kernelverziója,
+elérhető I/O scheduler készlete és blk-mq beállításai a labhoston
+ellenőrizendők.</li>
+<li>A használt labdisk NVMe/SATA flush, FUA és write cache viselkedése,
+valamint az <code>iostat -x</code>
+<code>r_await</code>/<code>w_await</code>/<code>f_await</code>/<code>aqu-sz</code>
+mezők (régebbi sysstat-ban <code>await</code>/<code>avgqu-sz</code>)
+sysstat-verziós értelmezése ellenőrizendő.</li>
+<li>A példában szereplő <code>strace</code>/<code>dd</code> idők
+hipotetikusak; tényleges mérést a laborban kell elvégezni.</li>
+</ul>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d045.html">← 9.5 Memória-, swap- és cgroup labor</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d047.html">10.2 write, fsync, flush és crash consistency →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

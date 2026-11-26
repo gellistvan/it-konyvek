@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>16.5 Service deploy, debug és rollback labor – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch16">16 Szolgáltatások és systemd működtetése</a></p>
+<div class="links"><a class="prev" rel="prev" href="d079.html">← 16.4 Timer, socket és mount activation</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d081.html">17.1 journald, syslog és naplóút →</a></div>
+</nav>
+<h2 data-number="16.5" id="d080"><span
+class="header-section-number">16.5</span> Service deploy, debug és
+rollback labor</h2>
+<h3 data-number="16.5.1" id="motiváció"><span
+class="header-section-number">16.5.1</span> Motiváció</h3>
+<p>Egy C++ worker daemon üzemeltetése nem áll meg a bináris
+lefordításánál és átmásolásánál. A systemd unit a szolgáltatás futási
+szerződése: megmondja, melyik user futtat, milyen resource limit véd,
+milyen configot olvas, és hogyan áll le. Ha ezt a szerződést nem
+verifikáljuk deploy előtt, egy rossz <code>Restart=on-failure</code>
+beállítás könnyen úgynevezett <strong>failure loop</strong>-ba viszi a
+szolgáltatást: a worker elindul, hibával kilép, a systemd újraindítja,
+majd ismét hiba, amíg a daemon el nem éri a start limitet. A rollback
+sem csupán a régi bináris visszamásolása; a <code>current</code> release
+pointer, a config séma és a running process együtt alkot egy
+visszaállítható release-t. Ez a labor egy egyszerű, de teljes deploy
+service contractját mutatja be.</p>
+<h3 data-number="16.5.2" id="definíció-és-működés"><span
+class="header-section-number">16.5.2</span> Definíció és működés</h3>
+<p>A <strong>service release contract</strong> egy bináris artifactból,
+verzióval és build identitással ellátott manifestből, sémázott
+configból, valamint a systemd unitból és drop-injaiból áll. A
+<strong>unit verify</strong> a systemd szintaktikai és
+unit-tulajdonságok szerinti ellenőrzése, például
+<code>systemd-analyze verify</code>. Nem helyettesíti az alkalmazás
+configjának validálását; a kettő egymástól elkülönülő réteg. A
+<strong>failure loop</strong> azt jelenti, hogy a processz sikertelenül
+lép ki, a <code>Restart=</code> policy ismételten újraindítja, és a PID1
+végül a <code>start-limit</code> találat után megtagadja a további
+indítást. A <strong>rollback</strong> itt nem fájlok visszamásolását
+jelenti, hanem a <code>current</code> symlink visszairányítását egy
+korábban már bevált release-re, majd a service restartját.</p>
+<p>A systemd három fő réteget fog össze: a unit definíciót, a PID1 által
+létrehozott cgroupot és a journald-t. A
+<code>systemctl daemon-reload</code> újraolvassa a unit fájlokat, de a
+már futó service-t nem indítja újra. A <code>systemctl start</code>
+indítja a processzt a unit <code>[Service]</code> szekciója szerint, a
+<code>systemctl stop</code> leállítja, a <code>systemctl restart</code>
+stop/start párt hajt végre. A <code>systemctl show -p Property</code>
+parancs a betöltött unit <strong>aktuális observed state</strong>-jét
+mutatja, beleértve a PID1 által érvényesített resource control értékeket
+is. A journal a <code>journalctl -u &lt;unit&gt;</code> csatornán
+keresztül kapcsolható össze metric extractionnel.</p>
+<h3 data-number="16.5.3" id="kidolgozott-példa"><span
+class="header-section-number">16.5.3</span> Kidolgozott példa</h3>
+<p>A laborban a <code>lab-vm1</code> hoston root felhasználó deployol. A
+worker neve <code>lab-worker</code>, a release <code>0.1.0</code>, az
+előző stabil release <code>0.0.9</code>. A service user
+<code>lab-worker</code> rendszerfiók, shell nélkül. A binary a
+<code>/opt/lab-worker/releases/&lt;version&gt;/bin/lab-worker</code>, a
+<code>current</code> symlink erre mutat, az adatkönyvtár
+<code>/var/lib/lab-worker</code>, a config release-enként a
+<code>/opt/lab-worker/releases/&lt;version&gt;/lab-worker.toml</code>,
+amelyre a <code>/etc/lab-worker/lab-worker.toml</code> symlink a
+<code>current</code>-en keresztül mutat.</p>
+<p>Először készítsük el a usert és a könyvtárstruktúrát:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm1, root</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">id</span> lab-worker <span class="kw">||</span> <span class="ex">useradd</span> <span class="at">--system</span> <span class="at">--home-dir</span> /nonexistent <span class="dt">\</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--shell</span> /usr/sbin/nologin lab-worker</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="fu">install</span> <span class="at">-d</span> <span class="at">-o</span> root <span class="at">-g</span> lab-worker <span class="at">-m</span> 0750 /opt/lab-worker/releases/0.1.0/bin</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="fu">install</span> <span class="at">-d</span> <span class="at">-o</span> root <span class="at">-g</span> lab-worker <span class="at">-m</span> 0750 /opt/lab-worker/releases/0.0.9/bin</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="fu">install</span> <span class="at">-d</span> <span class="at">-o</span> root <span class="at">-g</span> lab-worker <span class="at">-m</span> 0750 /etc/lab-worker</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="fu">install</span> <span class="at">-d</span> <span class="at">-o</span> lab-worker <span class="at">-g</span> lab-worker <span class="at">-m</span> 0750 /var/lib/lab-worker</span></code></pre></div>
+<p>Telepítsük a release artifactot. A <code>manifest.json</code> az
+artifact tulajdonosát, forrásrevisionjét és build identitását
+rögzíti:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm1, root</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="co"># mindkét release binárisa, manifestje és configja a saját könyvtárába</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> v <span class="kw">in</span> 0.1.0 0.0.9<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>  <span class="va">r</span><span class="op">=</span>/opt/lab-worker/releases/<span class="va">$v</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>  <span class="fu">install</span> <span class="at">-m</span> 0755 /tmp/lab-worker-<span class="va">$v</span>/bin/lab-worker <span class="st">&quot;</span><span class="va">$r</span><span class="st">/bin/lab-worker&quot;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>  <span class="fu">install</span> <span class="at">-m</span> 0644 /tmp/lab-worker-<span class="va">$v</span>/manifest.json <span class="st">&quot;</span><span class="va">$r</span><span class="st">/manifest.json&quot;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>  <span class="fu">install</span> <span class="at">-m</span> 0640 <span class="at">-o</span> root <span class="at">-g</span> lab-worker <span class="dt">\</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    /tmp/lab-worker-<span class="va">$v</span>/config/lab-worker.toml <span class="st">&quot;</span><span class="va">$r</span><span class="st">/lab-worker.toml&quot;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="fu">ln</span> <span class="at">-sfn</span> /opt/lab-worker/releases/0.1.0 /opt/lab-worker/current</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="co"># a /etc alatti config a current release configjára mutat</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="fu">ln</span> <span class="at">-sfn</span> /opt/lab-worker/current/lab-worker.toml /etc/lab-worker/lab-worker.toml</span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="fu">stat</span> <span class="at">-L</span> <span class="at">-c</span> <span class="st">&#39;%U:%G %a&#39;</span> /etc/lab-worker/lab-worker.toml</span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="co"># várt: root:lab-worker 640</span></span></code></pre></div>
+<p>A manifest leírja a release-t:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;binary&quot;</span><span class="fu">:</span> <span class="st">&quot;lab-worker&quot;</span><span class="fu">,</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;version&quot;</span><span class="fu">:</span> <span class="st">&quot;0.1.0&quot;</span><span class="fu">,</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;source_revision&quot;</span><span class="fu">:</span> <span class="st">&quot;lab-src-111&quot;</span><span class="fu">,</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;build_id&quot;</span><span class="fu">:</span> <span class="st">&quot;lab-worker-0.1.0-20250101&quot;</span><span class="fu">,</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;artifact_owner&quot;</span><span class="fu">:</span> <span class="st">&quot;platform-lab&quot;</span><span class="fu">,</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;config_schema_version&quot;</span><span class="fu">:</span> <span class="dv">1</span><span class="fu">,</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;binary_sha256&quot;</span><span class="fu">:</span> <span class="st">&quot;replace-with-sha256-from-build&quot;</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>A config megadja a listen címet, state dir-t és log szintet:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode toml"><code class="sourceCode toml"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># /opt/lab-worker/releases/0.1.0/lab-worker.toml</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co"># (a /etc/lab-worker/lab-worker.toml a current-en át erre mutat)</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="dt">version</span> <span class="op">=</span> <span class="st">&quot;0.1.0&quot;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="dt">listen</span> <span class="op">=</span> <span class="st">&quot;127.0.0.1:8081&quot;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="dt">state_dir</span> <span class="op">=</span> <span class="st">&quot;/var/lib/lab-worker&quot;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="dt">log_level</span> <span class="op">=</span> <span class="st">&quot;info&quot;</span></span></code></pre></div>
+<p>A unit a worker futási szerződése. A <code>ProtectSystem=full</code>
+a <code>/usr</code>, <code>/boot</code> és <code>/etc</code>
+fájlrendszereket read-onlyvá teszi, a <code>ReadWritePaths</code> csak a
+state dir-t engedi. A <code>Restart=on-failure</code> az érdemi hibáknál
+újraindít, de a <code>SuccessExitStatus=</code> nélkül a
+<code>SIGTERM</code>-es leállást nem tekinti hibának. A drop-in a
+resource control értékeket adja meg:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode ini"><code class="sourceCode ini"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># /etc/systemd/system/lab-worker.service</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">[Unit]</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="dt">Description</span><span class="ot">=</span><span class="st">lab-worker C++ daemon</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="dt">After</span><span class="ot">=</span><span class="st">network.target</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="co"># explicit start-limit: 60 s alatt legfeljebb 5 indítás</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="dt">StartLimitIntervalSec</span><span class="ot">=</span><span class="st">60s</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="dt">StartLimitBurst</span><span class="ot">=</span><span class="dv">5</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="kw">[Service]</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="dt">User</span><span class="ot">=</span><span class="st">lab-worker</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="dt">Group</span><span class="ot">=</span><span class="st">lab-worker</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="dt">ExecStart</span><span class="ot">=</span><span class="st">/opt/lab-worker/current/bin/lab-worker \</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="dt">    --config /etc/lab-worker/lab-worker.toml</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="dt">Restart</span><span class="ot">=</span><span class="st">on-failure</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="dt">RestartSec</span><span class="ot">=</span><span class="st">2s</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="dt">TimeoutStopSec</span><span class="ot">=</span><span class="st">15s</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="dt">KillSignal</span><span class="ot">=</span><span class="st">SIGTERM</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="dt">NoNewPrivileges</span><span class="ot">=</span><span class="kw">true</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="dt">PrivateTmp</span><span class="ot">=</span><span class="kw">true</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="dt">ProtectSystem</span><span class="ot">=</span><span class="st">full</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a><span class="dt">ProtectHome</span><span class="ot">=</span><span class="kw">true</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a><span class="dt">ReadWritePaths</span><span class="ot">=</span><span class="st">/var/lib/lab-worker</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a><span class="kw">[Install]</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a><span class="dt">WantedBy</span><span class="ot">=</span><span class="st">multi-user.target</span></span></code></pre></div>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode ini"><code class="sourceCode ini"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># /etc/systemd/system/lab-worker.service.d/10-resource.conf</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="kw">[Service]</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="dt">CPUWeight</span><span class="ot">=</span><span class="dv">100</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="dt">MemoryHigh</span><span class="ot">=</span><span class="st">512M</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="dt">MemoryMax</span><span class="ot">=</span><span class="st">768M</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="dt">TasksMax</span><span class="ot">=</span><span class="dv">64</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="dt">IOWeight</span><span class="ot">=</span><span class="dv">100</span></span></code></pre></div>
+<p>A deploy után mindig verifikáljuk a unitot és a configot:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm1, root</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">systemd-analyze</span> verify /etc/systemd/system/lab-worker.service</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> lab-worker /opt/lab-worker/current/bin/lab-worker <span class="dt">\</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--config</span> /etc/lab-worker/lab-worker.toml <span class="at">--config-check</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> daemon-reload</span></code></pre></div>
+<p>A <code>systemd-analyze verify</code> a unit mellől a
+<code>lab-worker.service.d/*.conf</code> drop-ineket is beolvassa (a
+drop-in fájlt argumentumként nem fogadja el); az összefésült képet a
+<code>daemon-reload</code> után a
+<code>systemctl cat lab-worker.service</code> mutatja. A
+<code>--config-check</code> a worker saját, release-szerződésbe foglalt
+opciója. Ha a config sémája nem egyezik, a bináris nem indul el, és
+hibakódot ad.</p>
+<p>Indítsuk el és végezzünk <strong>start/readiness/stop smoke
+test</strong>-et:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm1, root</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> start lab-worker.service</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> is-active lab-worker.service</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> show <span class="at">-p</span> ActiveState <span class="at">-p</span> SubState <span class="at">-p</span> MainPID lab-worker.service</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">-u</span> lab-worker.service <span class="at">--since</span> <span class="st">&quot;-2 minutes&quot;</span> <span class="at">--no-pager</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="ex">ss</span> <span class="at">-lnp</span> <span class="kw">|</span> <span class="fu">grep</span> 8081</span></code></pre></div>
+<p>A <code>systemctl is-active</code> kimenete <code>active</code> kell
+legyen, a <code>SubState</code> <code>running</code>, a
+<code>MainPID</code> egy pozitív PID, a journalban a worker
+<code>listening on 127.0.0.1:8081</code> üzenete, a <code>ss</code>
+kimenetben a listener socket. A resource limit és permission fixture
+ellenőrzése:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm1, root</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> show <span class="at">-p</span> User <span class="at">-p</span> Group <span class="at">-p</span> MemoryHigh <span class="at">-p</span> MemoryMax <span class="at">-p</span> CPUWeight <span class="dt">\</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-p</span> NoNewPrivileges <span class="at">-p</span> ProtectSystem lab-worker.service</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. mode-réteg: a hoszt namespace-ében a könyvtár módja tilt</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> lab-worker touch /etc/lab-worker/test</span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="co"># várt (illusztratív): touch: cannot touch &#39;/etc/lab-worker/test&#39;:</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="co">#   Permission denied</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. sandbox-réteg: a unit beállításaival futtatott ideiglenes szolgáltatás</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a><span class="ex">systemd-run</span> <span class="at">--wait</span> <span class="at">--pipe</span> <span class="at">-p</span> User=lab-worker <span class="at">-p</span> ProtectSystem=full <span class="dt">\</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>  touch /etc/lab-worker/test</span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span class="co"># várt (illusztratív): touch: cannot touch &#39;/etc/lab-worker/test&#39;:</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a><span class="co">#   Read-only file system</span></span></code></pre></div>
+<p>A <code>MemoryHigh</code> a memory throttle pont, a
+<code>MemoryMax</code> a hard limit. A két permission-teszt két külön
+réteget mutat. A hosti <code>sudo -u</code> hívásra a unit sandboxa nem
+hat: ott a <code>/etc/lab-worker</code>
+<code>root:lab-worker 0750</code> módja (nincs csoportírás) adja a
+<code>Permission denied</code>-et. A <code>ProtectSystem=full</code>
+read-only mountját csak a unit kontextusában (például
+<code>systemd-run -p ProtectSystem=full</code>) lehet igazolni; ott az
+üzenet <code>Read-only file system</code>, akkor is, ha a mód engedné az
+írást.</p>
+<p>A metrikát a journalból és a systemd propertykből nyerjük ki. Ez
+illusztratív <code>jq</code> alapú extrakció:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm1, root</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="co"># a journal JSON-ban a PRIORITY string, ezért számmá alakítjuk</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">-u</span> lab-worker.service <span class="at">-o</span> json <span class="at">--since</span> <span class="st">&quot;-10m&quot;</span> <span class="dt">\</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>  <span class="kw">|</span> <span class="ex">jq</span> <span class="at">-s</span> <span class="st">&#39;length as $n | {log_lines_10m: $n,</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="st">      errors_10m: ([.[] | select((.PRIORITY|tonumber) &lt;= 3)] | length)}&#39;</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> show lab-worker.service <span class="at">-p</span> CPUUsageNSec <span class="at">-p</span> MemoryCurrent <span class="dt">\</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">-p</span> NRestarts <span class="dt">\</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>  <span class="kw">|</span> <span class="fu">awk</span> <span class="at">-F</span><span class="op">=</span> <span class="st">&#39;BEGIN { m[&quot;CPUUsageNSec&quot;]  = &quot;cpu_usage_nsec&quot;</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="st">                    m[&quot;MemoryCurrent&quot;] = &quot;memory_current_bytes&quot;</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="st">                    m[&quot;NRestarts&quot;]     = &quot;restarts_total&quot; }</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="st">             $2 ~ /^[0-9]+$/ { printf &quot;lab_worker_%s %s\n&quot;, m[$1], $2 }&#39;</span></span></code></pre></div>
+<p>Az átalakítás a systemd tulajdonságneveket explicit leképezéssel
+Prometheus-szerű metrikanévvé alakítja, a nem numerikus értékeket
+(például <code>[not set]</code>) kihagyja. A pontos property nevek a
+labhost systemd verziójától függenek, így ezeket ellenőrizni kell.</p>
+<p>Az alábbi ábra lépésenként mutatja, mikor egyezik a futó processz a
+<code>current</code> symlinkkel (stored és observed state), alatta a
+16.5.4 failure loop ágával.</p>
+<figure id="fig-d080-release-rollback">
+<div class="fig-interactive"><iframe src="figures/html/d080-release-rollback.html" title="Fájlfa a 0.0.9 és a 0.1.0 release-szel és a current symlinkkel, mellette a lab-worker.service. Rollback: deploy, start, a symlink-csere után a symlink már a 0.0.9-re, a futó processz még a 0.1.0-ra mutat, a restart után mindkettő 0.0.9. Failure loop: hibás listen értéknél auto-restart, 60 másodperces ablakkal a hatodik indítás start-limit-hit, a reset-failed és a javított config után a szolgáltatás aktív." loading="lazy" style="width:100%;border:0;height:860px"></iframe><noscript><img src="figures/img/d080-release-rollback.png" style="width:90.0%"
+alt="Fájlfa a 0.0.9 és a 0.1.0 release-szel és a current symlinkkel, mellette a lab-worker.service. Rollback: deploy, start, a symlink-csere után a symlink már a 0.0.9-re, a futó processz még a 0.1.0-ra mutat, a restart után mindkettő 0.0.9. Failure loop: hibás listen értéknél auto-restart, 60 másodperces ablakkal a hatodik indítás start-limit-hit, a reset-failed és a javított config után a szolgáltatás aktív." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d080-release-rollback.png" style="width:90.0%"
+alt="Fájlfa a 0.0.9 és a 0.1.0 release-szel és a current symlinkkel, mellette a lab-worker.service. Rollback: deploy, start, a symlink-csere után a symlink már a 0.0.9-re, a futó processz még a 0.1.0-ra mutat, a restart után mindkettő 0.0.9. Failure loop: hibás listen értéknél auto-restart, 60 másodperces ablakkal a hatodik indítás start-limit-hit, a reset-failed és a javított config után a szolgáltatás aktív." /></details></div>
+<figcaption>Release-pointer, futó processz és rollback; a failure loop
+ága</figcaption>
+</figure>
+<p>A rollback a <code>current</code> symlink visszairányítása és a
+service restartja:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm1, root</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="va">r</span><span class="op">=</span>/opt/lab-worker/releases/0.0.9</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="co"># a symlink-csere csak sikeres config-check után</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="bu">test</span> <span class="at">-x</span> <span class="st">&quot;</span><span class="va">$r</span><span class="st">/bin/lab-worker&quot;</span> <span class="kw">&amp;&amp;</span> <span class="fu">sudo</span> <span class="at">-u</span> lab-worker <span class="st">&quot;</span><span class="va">$r</span><span class="st">/bin/lab-worker&quot;</span> <span class="dt">\</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>     <span class="at">--config</span> <span class="st">&quot;</span><span class="va">$r</span><span class="st">/lab-worker.toml&quot;</span> <span class="at">--config-check</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>  <span class="fu">ln</span> <span class="at">-sfn</span> <span class="st">&quot;</span><span class="va">$r</span><span class="st">&quot;</span> /opt/lab-worker/current</span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>  <span class="ex">systemctl</span> restart lab-worker.service</span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="cf">fi</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="ex">/opt/lab-worker/current/bin/lab-worker</span> <span class="at">--version</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> is-active lab-worker.service</span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">-u</span> lab-worker.service <span class="at">--since</span> <span class="st">&quot;-1 minute&quot;</span> <span class="at">--no-pager</span></span></code></pre></div>
+<p>A desired state: a <code>current</code> symlink (és vele a config) a
+<code>0.0.9</code>-re mutat, a <code>--version</code> a
+<code>0.0.9</code>-et írja ki, a service <code>active</code>, a
+journalban nincs hiba. A rollback akkor hiteles, ha a korábbi release
+binárisa és configja változatlanul működik.</p>
+<h3 data-number="16.5.4" id="hibák-és-ellenpróbák"><span
+class="header-section-number">16.5.4</span> Hibák és ellenpróbák</h3>
+<p>A leggyakoribb hiba a <strong>failure loop</strong>. Tünet: a
+<code>systemctl status lab-worker.service</code> kimenetében
+<code>start-limit-hit</code> vagy a <code>Restart</code> számlálója
+gyorsan növekszik. Hipotézis: a config file sérült, a state dir
+hiányzik, vagy a worker exit code nem nulla. Adatgyűjtés:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm1, root</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">-u</span> lab-worker.service <span class="at">-n</span> 50 <span class="at">--no-pager</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> show <span class="at">-p</span> NRestarts lab-worker.service</span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> show <span class="at">-p</span> ExecMainCode <span class="at">-p</span> ExecMainStatus lab-worker.service</span></code></pre></div>
+<p>Ha a journalban <code>config parse failed: invalid listen</code>
+szerepel, a configot javítjuk. Ezután a failure state resetelése és az
+indítás:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm1, root</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> reset-failed lab-worker.service</span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> start lab-worker.service</span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> is-active lab-worker.service</span></code></pre></div>
+<p>A <code>reset-failed</code> törli a start-limit számlálót; anélkül a
+javított config ellenére sem indul újra a service.</p>
+<p>A <strong>shutdown hiba</strong> tünete: a
+<code>systemctl stop</code> 15 másodpercnél tovább tart, a journalban
+<code>Main process exited, code=killed, status=9/KILL</code>. Hipotézis:
+a worker nem kezeli a <code>SIGTERM</code>-et, ezért a
+<code>TimeoutStopSec=15s</code> után a systemd <code>SIGKILL</code>-t
+küld. A diagnózist a journal és a processz exit state visszaigazolja. A
+javítás a worker oldalán a <code>SIGTERM</code> graceful kezelése, vagy
+ha átmeneti mentés kell, a <code>TimeoutStopSec</code> és a
+<code>KillSignal</code> módosítása. A laborban a <code>SIGKILL</code>
+ténye a <code>systemctl status</code> kimenetéből is látszik.</p>
+<p>A <strong>version mismatch</strong> ellenpróbája: a config
+<code>version = "0.1.0"</code>, de a régi <code>0.0.9</code> binary
+<code>--config-check</code>-je elutasítja, mert a séma 0. A rollback
+során tehát nem elég a binárist visszaállítani; a hozzá tartozó configot
+is. Ezért tároljuk a configot release-enként
+(<code>/opt/lab-worker/releases/&lt;version&gt;/lab-worker.toml</code>),
+és ezért mutat a <code>/etc/lab-worker/lab-worker.toml</code> symlink a
+<code>current</code>-en keresztül: a <code>current</code> cseréje a
+binárist és a configot együtt váltja, a csere előtt pedig a célrelease
+<code>--config-check</code>-je fut.</p>
+<h3 data-number="16.5.5" id="feladatok"><span
+class="header-section-number">16.5.5</span> Feladatok</h3>
+<h4 data-number="16.5.5.1"
+id="f1-unit-verify-és-effektív-resource-policy"><span
+class="header-section-number">16.5.5.1</span> F1 – Unit verify és
+effektív resource policy</h4>
+<p>A <code>lab-vm1</code> hoston futtasd a
+<code>systemd-analyze verify</code> parancsot a
+<code>lab-worker.service</code> unitra és a drop-inra, majd a
+<code>systemctl cat lab-worker.service</code> kimenetéből állapítsd meg,
+hogy mekkora a <code>MemoryHigh</code> és <code>MemoryMax</code> érték.
+Magyarázd el, miért kell a <code>MemoryHigh</code> értékét a
+<code>MemoryMax</code> alá vinni, és miért nem elég a
+<code>MemoryMax</code> önmagában a jól működő terheléshez.</p>
+<h4 data-number="16.5.5.2"
+id="f2-release-deploy-smoke-test-és-rollback"><span
+class="header-section-number">16.5.5.2</span> F2 – Release deploy, smoke
+test és rollback</h4>
+<p>A <code>lab-vm1</code> root felhasználójaként deployold a
+<code>0.1.0</code> release-t a fenti manifesttel, configgal, userrel és
+unit drop-innal. Indítsd a service-t, ellenőrizd a readiness-t, majd
+rollbackelj a <code>0.0.9</code> release-re. A feladat postconditionje:
+a <code>current</code> symlink a <code>0.0.9</code>-re mutat, a
+<code>lab-worker --version</code> a <code>0.0.9</code>-et írja ki, a
+<code>systemctl is-active lab-worker.service</code> kimenete
+<code>active</code>, és a journalban az utolsó 2 percben nincs
+<code>error</code> szintű üzenet.</p>
+<h4 data-number="16.5.5.3"
+id="f3-failure-loop-diagnosztika-és-recovery"><span
+class="header-section-number">16.5.5.3</span> F3 – Failure loop
+diagnosztika és recovery</h4>
+<p>A <code>lab-worker.toml</code> configban állítsd a
+<code>listen</code> mezőt érvénytelen <code>abc</code> értékre, majd
+indítsd el a service-t. Diagnosztizáld a kialakult failure loopot a
+journal, az <code>NRestarts</code> és a <code>start-limit</code> állapot
+alapján. Javítsd a configot, resetteld a failure state-et, és indítsd a
+service-t. Igazold, hogy a service aktív, a <code>MainPID</code>
+pozitív, és a journalban a <code>config parse failed</code> nem
+szerepel.</p>
+<h3 data-number="16.5.6" id="megoldások"><span
+class="header-section-number">16.5.6</span> Megoldások</h3>
+<h4 data-number="16.5.6.1" id="f1-megoldása"><span
+class="header-section-number">16.5.6.1</span> F1 megoldása</h4>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm1, root</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="ex">systemd-analyze</span> verify /etc/systemd/system/lab-worker.service</span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> cat lab-worker.service</span></code></pre></div>
+<p>A <code>systemctl cat</code> mutatja a unit és a drop-in összefésült
+képét. A <code>MemoryHigh=512M</code>, <code>MemoryMax=768M</code>. A
+<code>MemoryHigh</code> a cgroup v2 memória-throttle pontja, amely a
+processzt lassítja, amikor a felhasználás eléri a beállított értéket. A
+<code>MemoryMax</code> a kemény limit, amely felett a kernel OOM kill-t
+hajthat végre a cgroupban. Ha a <code>MemoryHigh</code> nagyobb a
+<code>MemoryMax</code>-nál, a throttle pont soha nem érhető el a hard
+limit előtt, így a <code>MemoryHigh</code> hatástalan. A
+<code>MemoryHigh</code> alacsonyabbra állítása a hirtelen memóriakitörés
+esetén ad lassulást és observability ablakot, mielőtt a
+<code>MemoryMax</code> OOM-ot váltana ki.</p>
+<h4 data-number="16.5.6.2" id="f2-megoldása"><span
+class="header-section-number">16.5.6.2</span> F2 megoldása</h4>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm1, root</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="fu">id</span> lab-worker <span class="kw">||</span> <span class="ex">useradd</span> <span class="at">--system</span> <span class="at">--home-dir</span> /nonexistent <span class="dt">\</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--shell</span> /usr/sbin/nologin lab-worker</span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="fu">install</span> <span class="at">-d</span> <span class="at">-o</span> root <span class="at">-g</span> lab-worker <span class="at">-m</span> 0750 /opt/lab-worker/releases/0.1.0/bin</span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a><span class="fu">install</span> <span class="at">-d</span> <span class="at">-o</span> root <span class="at">-g</span> lab-worker <span class="at">-m</span> 0750 /opt/lab-worker/releases/0.0.9/bin</span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a><span class="fu">install</span> <span class="at">-d</span> <span class="at">-o</span> root <span class="at">-g</span> lab-worker <span class="at">-m</span> 0750 /etc/lab-worker</span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a><span class="fu">install</span> <span class="at">-d</span> <span class="at">-o</span> lab-worker <span class="at">-g</span> lab-worker <span class="at">-m</span> 0750 /var/lib/lab-worker</span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a><span class="co"># mindkét release binárisa, manifestje és configja a saját könyvtárába</span></span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> v <span class="kw">in</span> 0.1.0 0.0.9<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a>  <span class="va">r</span><span class="op">=</span>/opt/lab-worker/releases/<span class="va">$v</span></span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a>  <span class="fu">install</span> <span class="at">-m</span> 0755 /tmp/lab-worker-<span class="va">$v</span>/bin/lab-worker <span class="st">&quot;</span><span class="va">$r</span><span class="st">/bin/lab-worker&quot;</span></span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a>  <span class="fu">install</span> <span class="at">-m</span> 0644 /tmp/lab-worker-<span class="va">$v</span>/manifest.json <span class="st">&quot;</span><span class="va">$r</span><span class="st">/manifest.json&quot;</span></span>
+<span id="cb15-14"><a href="#cb15-14" aria-hidden="true" tabindex="-1"></a>  <span class="fu">install</span> <span class="at">-m</span> 0640 <span class="at">-o</span> root <span class="at">-g</span> lab-worker <span class="dt">\</span></span>
+<span id="cb15-15"><a href="#cb15-15" aria-hidden="true" tabindex="-1"></a>    /tmp/lab-worker-<span class="va">$v</span>/config/lab-worker.toml <span class="st">&quot;</span><span class="va">$r</span><span class="st">/lab-worker.toml&quot;</span></span>
+<span id="cb15-16"><a href="#cb15-16" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span>
+<span id="cb15-17"><a href="#cb15-17" aria-hidden="true" tabindex="-1"></a><span class="fu">ln</span> <span class="at">-sfn</span> /opt/lab-worker/releases/0.1.0 /opt/lab-worker/current</span>
+<span id="cb15-18"><a href="#cb15-18" aria-hidden="true" tabindex="-1"></a><span class="co"># a /etc alatti config a current release configjára mutat</span></span>
+<span id="cb15-19"><a href="#cb15-19" aria-hidden="true" tabindex="-1"></a><span class="fu">ln</span> <span class="at">-sfn</span> /opt/lab-worker/current/lab-worker.toml /etc/lab-worker/lab-worker.toml</span>
+<span id="cb15-20"><a href="#cb15-20" aria-hidden="true" tabindex="-1"></a><span class="fu">stat</span> <span class="at">-L</span> <span class="at">-c</span> <span class="st">&#39;%U:%G %a&#39;</span> /etc/lab-worker/lab-worker.toml</span>
+<span id="cb15-21"><a href="#cb15-21" aria-hidden="true" tabindex="-1"></a><span class="co"># várt: root:lab-worker 640</span></span></code></pre></div>
+<p>A unit és drop-in létrehozása, majd verify:</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm1, root</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="fu">install</span> <span class="at">-d</span> /etc/systemd/system/lab-worker.service.d</span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="co"># unit és drop-in tartalma a fenti példa szerint</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a><span class="ex">systemd-analyze</span> verify /etc/systemd/system/lab-worker.service</span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> lab-worker /opt/lab-worker/current/bin/lab-worker <span class="dt">\</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--config</span> /etc/lab-worker/lab-worker.toml <span class="at">--config-check</span></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> daemon-reload</span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> start lab-worker.service</span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> is-active lab-worker.service</span></code></pre></div>
+<p>Smoke test:</p>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm1, root</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> show <span class="at">-p</span> ActiveState <span class="at">-p</span> SubState <span class="at">-p</span> MainPID lab-worker.service</span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ss</span> <span class="at">-lnp</span> <span class="kw">|</span> <span class="fu">grep</span> 8081</span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">-u</span> lab-worker.service <span class="at">--since</span> <span class="st">&quot;-2 minutes&quot;</span> <span class="at">--no-pager</span></span></code></pre></div>
+<p>Rollback:</p>
+<div class="sourceCode" id="cb18"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm1, root</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="va">r</span><span class="op">=</span>/opt/lab-worker/releases/0.0.9</span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="co"># a symlink-csere csak sikeres config-check után</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="bu">test</span> <span class="at">-x</span> <span class="st">&quot;</span><span class="va">$r</span><span class="st">/bin/lab-worker&quot;</span> <span class="kw">&amp;&amp;</span> <span class="fu">sudo</span> <span class="at">-u</span> lab-worker <span class="st">&quot;</span><span class="va">$r</span><span class="st">/bin/lab-worker&quot;</span> <span class="dt">\</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a>     <span class="at">--config</span> <span class="st">&quot;</span><span class="va">$r</span><span class="st">/lab-worker.toml&quot;</span> <span class="at">--config-check</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a>  <span class="fu">ln</span> <span class="at">-sfn</span> <span class="st">&quot;</span><span class="va">$r</span><span class="st">&quot;</span> /opt/lab-worker/current</span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a>  <span class="ex">systemctl</span> restart lab-worker.service</span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a><span class="cf">fi</span></span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a><span class="ex">/opt/lab-worker/current/bin/lab-worker</span> <span class="at">--version</span></span>
+<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> is-active lab-worker.service</span>
+<span id="cb18-11"><a href="#cb18-11" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">-u</span> lab-worker.service <span class="at">--since</span> <span class="st">&quot;-1 minute&quot;</span> <span class="at">--no-pager</span></span></code></pre></div>
+<p>Postcondition: <code>current</code> a <code>0.0.9</code>-re mutat, a
+<code>--version</code> kimenete <code>0.0.9</code>, a service
+<code>active</code>, és a journal nem tartalmaz <code>level=error</code>
+bejegyzést az utóbbi percben.</p>
+<h4 data-number="16.5.6.3" id="f3-megoldása"><span
+class="header-section-number">16.5.6.3</span> F3 megoldása</h4>
+<p>A configot rontsd el:</p>
+<div class="sourceCode" id="cb19"><pre
+class="sourceCode toml"><code class="sourceCode toml"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="co"># /etc/lab-worker/lab-worker.toml</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="dt">version</span> <span class="op">=</span> <span class="st">&quot;0.1.0&quot;</span></span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a><span class="dt">listen</span> <span class="op">=</span> <span class="st">&quot;abc&quot;</span></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a><span class="dt">state_dir</span> <span class="op">=</span> <span class="st">&quot;/var/lib/lab-worker&quot;</span></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a><span class="dt">log_level</span> <span class="op">=</span> <span class="st">&quot;info&quot;</span></span></code></pre></div>
+<p>Indítás után a systemd <code>Restart=on-failure</code> miatt többször
+újraindítja a service-t, amíg a start-limit el nem éri:</p>
+<div class="sourceCode" id="cb20"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm1, root</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> start lab-worker.service</span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> status lab-worker.service <span class="at">--no-pager</span> <span class="at">-l</span></span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">-u</span> lab-worker.service <span class="at">-n</span> 50 <span class="at">--no-pager</span></span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> show <span class="at">-p</span> NRestarts lab-worker.service</span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> show <span class="at">-p</span> ActiveState <span class="at">-p</span> SubState <span class="at">-p</span> Result lab-worker.service</span></code></pre></div>
+<p>A hipotézis: a <code>listen</code> mező érvénytelen, a worker
+<code>--config-check</code> és a valódi indítás is hibával kilép. A
+journalban <code>config parse failed: invalid listen</code> szerepel. A
+<code>Restart</code> számláló növekszik, a <code>Result</code>
+start-limit hibát mutat.</p>
+<p>Javítás: a <code>listen</code> visszaállítása
+<code>127.0.0.1:8081</code>-re:</p>
+<div class="sourceCode" id="cb21"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm1, root</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="co"># szerkeszd a configot</span></span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> reset-failed lab-worker.service</span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> start lab-worker.service</span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> is-active lab-worker.service</span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> show <span class="at">-p</span> MainPID lab-worker.service</span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">-u</span> lab-worker.service <span class="at">--since</span> <span class="st">&quot;-1 minute&quot;</span> <span class="at">--no-pager</span></span></code></pre></div>
+<p>Postcondition: a service <code>active</code>, a <code>MainPID</code>
+pozitív, a journalban nincs <code>config parse failed</code>, és a
+<code>NRestarts</code> nem növekszik tovább.</p>
+<h3 data-number="16.5.7" id="rövid-összefoglaló"><span
+class="header-section-number">16.5.7</span> Rövid összefoglaló</h3>
+<p>A service deploy akkor ismételhető, ha a bináris artifact, verzió,
+config séma, unit és drop-in egyaránt verifikált. A
+<code>systemd-analyze verify</code> a unit syntaxisát, a worker
+<code>--config-check</code> az alkalmazásconfigot validálja; a kettő
+együttesen védi ki a failure loopot. A resource control és permission
+fixture a <code>systemctl show</code> propertykben ellenőrizhető, a
+journal és a propertyk metrikává normalizálhatók. A rollback a
+<code>current</code> symlink cseréjéből és a service restartjából áll,
+de a config sémának is a release-hez kell tartoznia. Továbbhasznált
+definíciók: <strong>service release contract</strong>, <strong>failure
+loop</strong>, <strong>rollback symlink</strong>.</p>
+<h3 data-number="16.5.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">16.5.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>Állításonkénti források (laborprofil: Ubuntu Server 24.04 LTS,
+systemd 255, jq 1.7; a <code>noble</code> kézikönyvoldalak ehhez a
+kiadáshoz tartoznak, a freedesktop.org <code>latest</code> oldalai újabb
+systemd-t írhatnak le):</p>
+<ul>
+<li><code>StartLimitIntervalSec=</code>/<code>StartLimitBurst=</code>
+(alapérték 10 s / 5 indítás), drop-in könyvtárak:
+<code>systemd.unit(5)</code> – <a
+href="https://manpages.ubuntu.com/manpages/noble/man5/systemd.unit.5.html"
+class="uri">https://manpages.ubuntu.com/manpages/noble/man5/systemd.unit.5.html</a></li>
+<li><code>Restart=</code>, <code>RestartSec=</code>,
+<code>TimeoutStopSec=</code>: <code>systemd.service(5)</code> – <a
+href="https://manpages.ubuntu.com/manpages/noble/man5/systemd.service.5.html"
+class="uri">https://manpages.ubuntu.com/manpages/noble/man5/systemd.service.5.html</a></li>
+<li><code>ProtectSystem=full</code>, <code>ReadWritePaths=</code>,
+<code>NoNewPrivileges=</code>: <code>systemd.exec(5)</code> – <a
+href="https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html"
+class="uri">https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html</a>;
+<code>MemoryHigh=</code>, <code>MemoryMax=</code>,
+<code>CPUWeight=</code>: <code>systemd.resource-control(5)</code> – <a
+href="https://manpages.ubuntu.com/manpages/noble/man5/systemd.resource-control.5.html"
+class="uri">https://manpages.ubuntu.com/manpages/noble/man5/systemd.resource-control.5.html</a></li>
+<li><code>systemd-analyze verify</code> (unitfájl-argumentum):
+<code>systemd-analyze(1)</code> – <a
+href="https://manpages.ubuntu.com/manpages/noble/man1/systemd-analyze.1.html"
+class="uri">https://manpages.ubuntu.com/manpages/noble/man1/systemd-analyze.1.html</a>;
+<code>systemd-run -p … --wait --pipe</code>: <code>systemd-run(1)</code>
+– <a
+href="https://manpages.ubuntu.com/manpages/noble/man1/systemd-run.1.html"
+class="uri">https://manpages.ubuntu.com/manpages/noble/man1/systemd-run.1.html</a></li>
+<li>journal JSON-mezők (a <code>PRIORITY</code> string):
+<code>systemd.journal-fields(7)</code> – <a
+href="https://www.freedesktop.org/software/systemd/man/latest/systemd.journal-fields.html"
+class="uri">https://www.freedesktop.org/software/systemd/man/latest/systemd.journal-fields.html</a>;
+<code>journalctl(1)</code> <code>-o json</code> – <a
+href="https://manpages.ubuntu.com/manpages/noble/man1/journalctl.1.html"
+class="uri">https://manpages.ubuntu.com/manpages/noble/man1/journalctl.1.html</a>;
+<code>jq</code> <code>tonumber</code>: jq 1.7 manual – <a
+href="https://jqlang.github.io/jq/manual/v1.7/"
+class="uri">https://jqlang.github.io/jq/manual/v1.7/</a></li>
+<li>Prometheus metrikanév-konvenciók: <a
+href="https://prometheus.io/docs/practices/naming/"
+class="uri">https://prometheus.io/docs/practices/naming/</a></li>
+</ul>
+<p>Reprodukciós állapot: dátumozott futtatási napló a 24.04-es labhoston
+még nem készült; a példák laborban ellenőrizendők.</p>
+<p>Ellenőrzési hiányok: a <code>lab-worker</code> bináris, a
+<code>--config-check</code> opció, a <code>manifest.json</code> séma és
+a config példa nem valós laborból származik, hanem illusztratív. A
+<code>systemctl show --property</code> nevek, például
+<code>CPUUsageNSec</code>, <code>MemoryCurrent</code>, a labhost
+tényleges systemd verzióján ellenőrizendők. A <code>MemoryHigh</code> és
+<code>MemoryMax</code> viselkedése a cgroup v2 kernelparaméterektől
+függ. A <code>ss -lnp | grep 8081</code> kimenete csak akkor jelenik
+meg, ha a worker ténylegesen listenel az adott porton. A rollback
+példában a <code>0.0.9</code> release artifactja
+(<code>/tmp/lab-worker-0.0.9/</code>) a laborban előzetesen elérhető; a
+pontos artifact útvonalat a lab inventoryban rögzíteni kell.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d079.html">← 16.4 Timer, socket és mount activation</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d081.html">17.1 journald, syslog és naplóút →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>35.3 VM block storage, snapshot és backup – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch35">35 VM tárolás, hálózat, image és lifecycle</a></p>
+<div class="links"><a class="prev" rel="prev" href="d172.html">← 35.2 VM bridge/NAT/routed hálózat</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d174.html">35.4 Provision, migration, upgrade és shutdown →</a></div>
+</nav>
+<h2 data-number="35.3" id="d173"><span
+class="header-section-number">35.3</span> VM block storage, snapshot és
+backup</h2>
+<h3 data-number="35.3.1" id="motiváció-és-definíció"><span
+class="header-section-number">35.3.1</span> Motiváció és definíció</h3>
+<p>A VM vendéggép (guest) számára a háttértár „csak egy blokkeszköz”: a
+guest kernel a saját fájlrendszerét írja rá, és a host oldali fájl, LVM
+kötet, SAN LUN vagy hálózati storage mind ugyanúgy blokkos I/O-ként
+jelenik meg. A host operátornak azonban a storage backend, a cache mode
+és a pillanatkép (snapshot) működését ismernie kell, mert ezek
+határozzák meg, hogy a guest által leállított, konzisztensnek hitt adat
+milyen tartóssággal és visszaállíthatósággal rendelkezik.</p>
+<p><strong>VM block storage</strong> alatt a VM virtuális lemezét
+kiszolgáló perzisztens blokkeszközt értjük. A guest oldali fájlrendszer
+állapota a host storage rétegei felett él; a host snapshot vagy backup
+csak akkor nevezhető konzisztensnek, ha a guest oldal is elvégezte a
+szükséges flush/leállítási lépéseket. A jelen fejezet hatóköre a VM
+storage backend-ek, a cache/flush szemantika, a guest-oldali freeze, a
+host snapshot és a teljes VM backup megkülönböztetése, valamint a resize
+és hotplug host–guest együttműködése.</p>
+<h3 data-number="35.3.2" id="storage-backendek-és-cache-mode"><span
+class="header-section-number">35.3.2</span> Storage backendek és cache
+mode</h3>
+<p>A libvirt/QEMU a guest lemezt többféle host storage-ból adhatja:</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Backend</th>
+<th>Jellemző</th>
+<th>Előny</th>
+<th>Hátrány</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>File-backed</strong></td>
+<td>qcow2/raw fájl egy fájlrendszerben</td>
+<td>egyszerű, hordozható, snapshot lánc</td>
+<td>dupla fájlrendszer- és page cache overhead</td>
+</tr>
+<tr>
+<td><strong>LVM volume</strong></td>
+<td>LV a host VG-ben, akár thin pool-ból</td>
+<td>jó teljesítmény, kapacitáskezelés, thin snapshot</td>
+<td>host LVM adminisztrációt igényel</td>
+</tr>
+<tr>
+<td><strong>Block device</strong></td>
+<td>közvetlen diszkpartíció, SAN LUN, NVMe namespace</td>
+<td>legkevesebb réteg, alacsonyabb latency</td>
+<td>per-VM méretezés rugalmatlanabb</td>
+</tr>
+<tr>
+<td><strong>Network storage</strong></td>
+<td>RBD (Ceph), iSCSI, NFS, fiber channel</td>
+<td>shared storage, élő migráció</td>
+<td>hálózati és multipath kockázat, write-order kérdések</td>
+</tr>
+</tbody>
+</table>
+<p>A QEMU cache mode meghatározza, hogy a guest <code>write()</code>
+hívása mikor és milyen szintű flush-t kap a host oldalon. A gyakorlatban
+a következő cache mode-okat használjuk libvirt <code>&lt;disk&gt;</code>
+<code>driver</code> attribútumával vagy <code>cache</code>
+paraméterrel:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Cache mode</th>
+<th>Jelentés</th>
+<th>Tartósság a guest <code>fsync</code> után</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>none</code></td>
+<td>host page cache nélkül, O_DIRECT; a vendég írási cache-es lemezt
+lát</td>
+<td>a vendég flush-e host flush-t vált ki: tartós</td>
+</tr>
+<tr>
+<td><code>writethrough</code></td>
+<td>minden írás O_DSYNC-kel; a vendég nem lát írási cache-t</td>
+<td>minden befejezett írás tartós, lassú</td>
+</tr>
+<tr>
+<td><code>writeback</code></td>
+<td>host page cache; a vendég írási cache-es lemezt lát</td>
+<td>a vendég flush-e host <code>fdatasync</code>: tartós; a még nem
+flush-ölt írás host-crashnél elveszhet</td>
+</tr>
+<tr>
+<td><code>directsync</code></td>
+<td>O_DIRECT + O_DSYNC</td>
+<td>minden befejezett írás tartós, a legszigorúbb</td>
+</tr>
+<tr>
+<td><code>unsafe</code></td>
+<td>a vendég flush-eit figyelmen kívül hagyja</td>
+<td>nincs garancia; csak eldobható labhoz</td>
+</tr>
+</tbody>
+</table>
+<p>A vendég sikeresen visszatért <code>fsync</code>-je minden módban
+tartós, kivéve az <code>unsafe</code>-et; a módok a még nem flush-ölt
+írások sorsában és a teljesítményben különböznek. A
+<code>writeback</code> úgy viselkedik, mint egy írási cache-es fizikai
+lemez: ami flush nélkül van a cache-ben, az host-crashnél elveszhet, de
+a naplózó fájlrendszer (journal) flush-ei érvényesek. A szenior C++
+fejlesztő a
+<code>std::ofstream</code>/<code>fsync</code>/<code>fdatasync</code>
+hívásokat úgy érzékeli, mint a guest alkalmazás tartóssági határát; ez a
+határ a flush-t tisztelő cache mode-oknál a host oldalon is érvényes
+marad, az <code>unsafe</code> viszont eltörli.</p>
+<h3 data-number="35.3.3"
+id="guest-filesystem-freeze-és-konzisztens-snapshot"><span
+class="header-section-number">35.3.3</span> Guest filesystem freeze és
+konzisztens snapshot</h3>
+<p>A host snapshot készítése önmagában
+<strong>crash-consistent</strong>: a lemezkép olyan állapotot rögzít,
+mintha a guest váratlanul leállt volna. Ez a naplózó fájlrendszereknél
+gyakran elég a journal visszajátszásához, de nem garantálja, hogy az
+adatbázis vagy alkalmazás tranzakciói is befejeződtek, és nem garantálja
+a guest fájlrendszer metaadatainak pillanatnyi érvényességét.</p>
+<p><strong>Application-consistent snapshot</strong> készítéséhez a guest
+oldali <strong>fájlrendszer-freeze</strong> szükséges. A QEMU guest
+agent <code>qemu-guest-agent</code> szolgáltatás futtatja a vendégen a
+<code>guest-fsfreeze-freeze</code> parancsot, amely a guest
+fájlrendszereit quiesce állapotba hozza. Ez lehívja a guest kernel
+szintű <code>syncfs</code>-et és leállítja a további alkalmazási
+írásokat addig, amíg a host snapshot el nem készül, majd
+<code>guest-fsfreeze-thaw</code> jön. A freeze alatt a háttérben az
+alkalmazások esetleg pufferelnek, de a fájlrendszeri tranzakciók
+nyugalmi állapotban vannak.</p>
+<p>A libvirt a <code>--quiesce</code> kapcsolóval kéri a guest agent
+freeze-t; ez csak lemezes (<code>--disk-only</code>) snapshotnál
+használható:
+<code>virsh snapshot-create-as &lt;domain&gt; &lt;name&gt; --disk-only --diskspec &lt;target&gt;,file=... --quiesce</code>.
+A freeze fájlrendszer-konzisztenciát ad; alkalmazáskonzisztenciához az
+alkalmazásnak is nyugalmi állapotba kell kerülnie (például a guest agent
+fsfreeze-hook szkriptjével). Ha a guest agent nem fut, a parancs hibát
+jelez, és a snapshot nem jön létre. A freeze nem helyettesíti az
+adatbázis-szintű backupot; a d098-ban tanultak szerint a
+logical/physical backup WAL-kezeléssel az adatbázis szempontjából
+teljesebb garanciát ad.</p>
+<h3 data-number="35.3.4" id="host-snapshot-versus-full-vm-backup"><span
+class="header-section-number">35.3.4</span> Host snapshot versus full VM
+backup</h3>
+<p>A <strong>host snapshot</strong> egy pillanatkép: a VM lemez
+állapotát rögzíti egy adott időpontban, jellemzően a QEMU copy-on-write
+láncával vagy LVM snapshot-tal. A snapshot nem backup: ugyanazon a
+hoston él, nem véd a host meghibásodása, törlés, ransomware vagy pool
+corruption ellen. A teljes VM backup ezzel szemben egy külön, tartós,
+integritásellenőrzött másolat, amelyből a VM visszaállítható egy másik
+hoston vagy egy másik időpontban.</p>
+<p>Két fő héj:</p>
+<ol type="1">
+<li><strong>Offline full VM backup</strong>: a VM leállítása után a
+lemezképek és a domain XML másolása egy dedikált backup tárba. Ez a
+legkonzisztensebb és legegyszerűbb; a mentés alatt a VM nem elérhető
+(tervezett állásidő a mentési ablakban). Az RPO a mentések közti idő
+(napi mentésnél legfeljebb 24 h), az RTO a visszamásolás + indítás +
+ellenőrzés ideje, amely a mérettől és a tár sebességétől függ, nem a
+mentés közbeni leállástól.</li>
+<li><strong>Online full VM backup</strong>: guest filesystem freeze +
+host LVM/QEMU snapshot, majd a snapshot tartalmának másolása/restic/borg
+backupja. A QEMU external snapshot lánc esetén a snapshot fájl önmagában
+nem teljes; a teljes lánc (base + snapshot) kell a visszaállításhoz. A
+szokásos minta: quiesce-elt külső snapshot, amely után a base csak
+olvasható; a base mentése; végül
+<code>virsh blockcommit --active --pivot</code>, amely a snapshot óta
+írt adatot visszaírja a base-be, és azt teszi ismét aktívvá. Alternatíva
+a libvirt backup API (<code>virsh backup-begin</code>), a libvirt
+verziójának támogatása szerint.</li>
+</ol>
+<p>A teljes VM backupnak magában kell foglalnia a domain XML-t
+(<code>virsh dumpxml &lt;domain&gt;</code>), a hálózati definíciót, a
+titkokat (külön titkosított forrásból) és a guest hostname/időzóna
+konfigurációját, valamint a backup integritásellenőrzését. RPO/RTO és
+retention policy a d098-ban felépített módszertannal számítható.</p>
+<h3 data-number="35.3.5"
+id="resize-és-hotplug-guesthost-oldal-szétválasztva"><span
+class="header-section-number">35.3.5</span> Resize és hotplug guest/host
+oldal szétválasztva</h3>
+<p>A VM lemez méretnövelése két jól elkülöníthető fázisból áll: a host
+oldali blokkeszköz bővítése, majd a guest oldali partíció és
+fájlrendszer növelése. A host nem ismerheti a guest fájlrendszer
+méretét; a guest nem tud a host LVM/file resize lépéseiről. A kettőt
+lépésenként kell elvégezni.</p>
+<p><strong>Host oldal:</strong></p>
+<ol type="1">
+<li>Ha LVM thin pool a backend: a thin LV bővítése
+<code>lvextend -L +5G /dev/vg-labthin/vm1-root</code> (a device-mapper
+név a kötőjeleket duplázza:
+<code>/dev/mapper/vg--labthin-vm1--root</code>).</li>
+<li>Ha qcow2 fájl és a VM <strong>le van állítva</strong>:
+<code>qemu-img resize /var/lib/libvirt/images/lab-vm1.qcow2 +5G</code>.
+Használatban lévő képet <code>qemu-img</code>-gel módosítani tilos
+(adatvesztés, inkonzisztencia).</li>
+<li>Ha a VM fut: kizárólag
+<code>virsh blockresize &lt;domain&gt; vda 25G</code>, amely az aktív
+réteget a futó QEMU-n keresztül növeli és értesíti a vendéget; előtte
+<code>virsh domblklist &lt;domain&gt;</code> mutatja, melyik fájl az
+aktív réteg. A két munkafolyamatot (offline <code>qemu-img</code>,
+online <code>blockresize</code>) nem keverjük.</li>
+</ol>
+<p><strong>Guest oldal:</strong></p>
+<ol type="1">
+<li>A guest kernel érzékeli az új méretet; <code>lsblk</code> mutatja a
+nagyobb <code>/dev/vda</code>-t.</li>
+<li>Partíciós táblánál <code>growpart /dev/vda 1</code> (vagy fdisk),
+majd kernel update: <code>partprobe /dev/vda</code>.</li>
+<li>Fájlrendszer növelése a típus szerint
+(<code>findmnt -no FSTYPE /</code>): <code>resize2fs /dev/vda1</code>
+(ext4, az Ubuntu alapértelmezése) vagy <code>xfs_growfs /</code>
+(XFS).</li>
+</ol>
+<p>A csökkentés jóval veszélyesebb: a legtöbb fájlrendszer nem támogatja
+a shrink-et, és a guest migráció/backup előtt teljes ellenőrzés kell. A
+d087-ben bemutatott LVM VG/PV szabad PE-feltételek is érvényesek.</p>
+<p>A <strong>hotplug</strong> új lemezt csatol a futó VM-hez: a host
+oldali
+<code>virsh attach-disk &lt;domain&gt; &lt;source&gt; &lt;target&gt; --persistent --live</code>
+elküldi a guestnek a virtuális eszközt; a guest kernel udev szabálya
+létrehozza a <code>/dev/vdb</code>-t. A guestnek
+<code>udevadm settle</code> és <code>lsblk</code> ellenőrzés után lehet
+mountolni. A hotremove
+<code>virsh detach-disk &lt;domain&gt; &lt;target&gt;</code> követeli
+meg, hogy a guesten ne legyen mountolt vagy nyitott fájl azon az
+eszközön, különben a guest I/O hibát észlel.</p>
+<h3 data-number="35.3.6"
+id="kidolgozott-példa-storage-resize-snapshot-backup"><span
+class="header-section-number">35.3.6</span> Kidolgozott példa: storage,
+resize, snapshot, backup</h3>
+<p>A példa labhoston fut, Ubuntu Server 24.04 LTS guesttel (ext4 root
+fájlrendszer), KVM/libvirt alatt. A VM neve <code>lab-vm1</code>, a
+virtuális lemez <code>/dev/vda</code>, a backend egyetlen
+<code>qcow2</code> fájl a <code>default</code> storage poolban
+(<code>/var/lib/libvirt/images/lab-vm1.qcow2</code>); az LVM thin
+változatot a 2. feladat tárgyalja.</p>
+<p><strong>Előfeltételek:</strong></p>
+<ul>
+<li>VM fut, <code>qemu-guest-agent</code> telepítve és fut a guestben
+(<code>virsh qemu-agent-command lab-vm1 '{"execute":"guest-ping"}'</code>).</li>
+<li>A hoston a <code>libvirt</code> és <code>qemu-kvm</code> verziója az
+Ubuntu 24.04 LTS csomagjainak felel meg
+(<code>virsh version</code>).</li>
+<li>A kiinduló virtuális méret 20 GiB
+(<code>qemu-img info -U .../lab-vm1.qcow2</code> →
+<code>virtual size: 20 GiB</code>), ezért a +5G után 25G a cél.</li>
+<li>Van friss, visszaállíthatóságában ellenőrzött mentés.</li>
+</ul>
+<p><strong>1. Snapshot készítés quiesce-szel (host oldal):</strong></p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Host: labhost1, UID: oper (sudo)</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> virsh snapshot-create-as lab-vm1 snap-before-resize <span class="dt">\</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--disk-only</span> <span class="at">--atomic</span> <span class="dt">\</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--diskspec</span> vda,file=/var/lib/libvirt/images/lab-vm1-snap1.qcow2 <span class="dt">\</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--quiesce</span></span></code></pre></div>
+<p>Várt kimenet (illusztratív):</p>
+<pre><code>Domain snapshot snap-before-resize created</code></pre>
+<p>Ellenőrzés:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> virsh domblklist lab-vm1   <span class="co"># vda → .../lab-vm1-snap1.qcow2</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> qemu-img info <span class="at">-U</span> <span class="at">--backing-chain</span> <span class="dt">\</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>  /var/lib/libvirt/images/lab-vm1-snap1.qcow2</span></code></pre></div>
+<p>A <code>qemu-img info</code> (a <code>-U</code> a futó VM által
+zárolt képet csak olvasásra nyitja) mutatja a backing file-t (a base
+image-et), ezért a snapshot önmagában nem teljes. A VM mostantól a
+<code>lab-vm1-snap1.qcow2</code>-be ír, a <code>lab-vm1.qcow2</code>
+csak olvasható backing.</p>
+<p><strong>2. Disk resize guest fájlrendszerrel:</strong></p>
+<p>A futó VM lemezláncának egyetlen fájlját sem módosítjuk
+<code>qemu-img</code>-gel; a bővítés kizárólag a
+<code>virsh blockresize</code>-zal, az aktív rétegen történik:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Host oldal: az aktív réteg (snap1) bővítése a futó QEMU-n át</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> virsh blockresize lab-vm1 vda 25G</span></code></pre></div>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Guest oldal (SSH lab-vm1, UID: labuser)</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> growpart /dev/vda 1</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="ex">findmnt</span> <span class="at">-no</span> FSTYPE /              <span class="co"># ext4 vagy xfs</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> resize2fs /dev/vda1          <span class="co"># ext4 esetén</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="co"># sudo xfs_growfs /               # xfs esetén</span></span></code></pre></div>
+<p>Várható kimenet <code>df -h</code> után a <code>/</code> mérete 25G
+közelében.</p>
+<p>Az alábbi ábra lépésenként követi, melyik fájl az aktív réteg, melyik
+a csak olvasható backing, és mit módosít a <code>blockresize</code>,
+illetve a commit/pivot.</p>
+<figure id="fig-d173-snapshot-lanc">
+<div class="fig-interactive"><iframe src="figures/html/d173-snapshot-lanc.html" title="Öt panel. 1: egyetlen réteg, lab-vm1.qcow2 20 GiB, aktív. 2: külső snapshot után a lab-vm1-snap1.qcow2 az aktív réteg, a lab-vm1.qcow2 csak olvasható backing. 3: blockresize után az aktív snap1 25 GiB, a base 20 GiB marad. 4: commit és pivot után ismét a lab-vm1.qcow2 az aktív, 25 GiB. 5: mentés offline vagy backup API-val. Tilos a qemu-img resize a futó VM használatban lévő képén." loading="lazy" style="width:100%;border:0;height:560px"></iframe><noscript><img src="figures/img/d173-snapshot-lanc.png" style="width:100.0%"
+alt="Öt panel. 1: egyetlen réteg, lab-vm1.qcow2 20 GiB, aktív. 2: külső snapshot után a lab-vm1-snap1.qcow2 az aktív réteg, a lab-vm1.qcow2 csak olvasható backing. 3: blockresize után az aktív snap1 25 GiB, a base 20 GiB marad. 4: commit és pivot után ismét a lab-vm1.qcow2 az aktív, 25 GiB. 5: mentés offline vagy backup API-val. Tilos a qemu-img resize a futó VM használatban lévő képén." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d173-snapshot-lanc.png" style="width:100.0%"
+alt="Öt panel. 1: egyetlen réteg, lab-vm1.qcow2 20 GiB, aktív. 2: külső snapshot után a lab-vm1-snap1.qcow2 az aktív réteg, a lab-vm1.qcow2 csak olvasható backing. 3: blockresize után az aktív snap1 25 GiB, a base 20 GiB marad. 4: commit és pivot után ismét a lab-vm1.qcow2 az aktív, 25 GiB. 5: mentés offline vagy backup API-val. Tilos a qemu-img resize a futó VM használatban lévő képén." /></details></div>
+<figcaption>External snapshot lánc állapotai: a snapshot után a VM a
+<code>lab-vm1-snap1.qcow2</code>-be ír, a <code>blockresize</code> az
+aktív réteget növeli 25 GiB-ra, a
+<code>blockcommit --active --pivot</code> után ismét a base az aktív
+réteg</figcaption>
+</figure>
+<p><strong>3. A lánc visszalaposítása aktív commit és pivot
+segítségével:</strong></p>
+<p>A snapshot óta írt adatot az aktív réteg tartalmazza; az aktív commit
+ezt visszaírja a base-be, majd a pivot a base-t teszi ismét aktív
+réteggé:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> virsh blockcommit lab-vm1 vda <span class="at">--active</span> <span class="at">--pivot</span> <span class="at">--wait</span> <span class="at">--verbose</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> virsh domblklist lab-vm1   <span class="co"># vda → .../lab-vm1.qcow2</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> qemu-img info <span class="at">-U</span> <span class="at">--backing-chain</span> <span class="dt">\</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>  /var/lib/libvirt/images/lab-vm1.qcow2</span></code></pre></div>
+<p>Elfogadás: a <code>domblklist</code> a <code>lab-vm1.qcow2</code>-t
+mutatja aktív fájlként, a <code>--backing-chain</code> egyelemű láncot
+és 25 GiB virtuális méretet ad. Ezután a
+<code>lab-vm1-snap1.qcow2</code> már nem része a láncnak (a
+snapshot-metaadat
+<code>virsh snapshot-delete lab-vm1 snap-before-resize --metadata</code>-val
+törölhető, a fájl a scratch könyvtárba mozgatható).</p>
+<p><strong>4. Konzisztens teljes VM backup:</strong></p>
+<p>Egy élő, változó qcow2 közvetlen másolata nem konzisztens mentés: a
+vendég írhat a fájlba, miközben a restic olvassa. Két elfogadható
+eljárás van.</p>
+<p><em>Offline (a legegyszerűbb):</em> a VM leállítása, várakozás a
+<code>shut off</code> állapotig, majd a lemezkép és az XML mentése.</p>
+<p><em>Online:</em> új, quiesce-elt külső snapshot, amely után a base
+csak olvasható és fájlrendszer-konzisztens; a base mentése; végül aktív
+commit és pivot:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> virsh snapshot-create-as lab-vm1 bk-tmp <span class="at">--disk-only</span> <span class="at">--atomic</span> <span class="dt">\</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--diskspec</span> vda,file=/var/lib/libvirt/images/lab-vm1-bk-tmp.qcow2 <span class="dt">\</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--quiesce</span> <span class="at">--no-metadata</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="co"># a base most nem íródik: konzisztensen menthető</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> restic <span class="at">-r</span> /mnt/backup-repo backup <span class="dt">\</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>  /var/lib/libvirt/images/lab-vm1.qcow2</span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> virsh dumpxml lab-vm1 <span class="dt">\</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>  <span class="kw">|</span> <span class="fu">sudo</span> tee /var/lib/libvirt/images/lab-vm1.xml <span class="op">&gt;</span>/dev/null</span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> restic <span class="at">-r</span> /mnt/backup-repo backup <span class="dt">\</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>  /var/lib/libvirt/images/lab-vm1.xml</span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> virsh blockcommit lab-vm1 vda <span class="at">--active</span> <span class="at">--pivot</span> <span class="at">--wait</span> <span class="at">--verbose</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> virsh domblklist lab-vm1   <span class="co"># ismét a lab-vm1.qcow2 aktív</span></span></code></pre></div>
+<p>A <code>sudo virsh dumpxml ... &gt; fájl</code> alakban az
+átirányítást a hívó (nem root) shell nyitná meg, ezért a
+<code>sudo tee</code> kell; a pipeline exit-kódját
+<code>set -o pipefail</code> mellett ellenőrizzük. A quiesce
+fájlrendszer-konzisztenciát ad; alkalmazáskonzisztenciához az
+alkalmazást is nyugalmi állapotba kell hozni (fsfreeze-hook vagy az
+alkalmazás saját mentése, d098). Alternatív, verziófüggő út a libvirt
+backup API (<code>virsh backup-begin</code>).</p>
+<p>A mentés csak a visszaállítás bizonyításával kész:
+<code>restic check</code>, majd egy scratch könyvtárba végzett
+<code>restic restore</code> után <code>qemu-img check</code> a
+visszaállított képen, és egy próbaindítás külön, eldobható domainnel. A
+d098-ban felépített retention és integrity ellenőrzés itt is
+kötelező.</p>
+<h3 data-number="35.3.7" id="hibák-és-ellenpróbák"><span
+class="header-section-number">35.3.7</span> Hibák és ellenpróbák</h3>
+<ul>
+<li><strong>Space exhaustion a thin poolban</strong>: ha a thin pool
+data vagy metadata kifogy, a VM I/O hibákat észlel. Adatgyűjtés:
+<code>lvs -a</code>, <code>vgs</code>, <code>dmesg | tail</code>.
+Kezelés: felesleges snapshot-ok törlése, <code>fstrim</code> a host
+fájlrendszeren, thin pool bővítés vagy thin LV resize utáni monitoring.
+<strong>Ellenpróba</strong>: ne vágjunk bele törlésbe, amíg a pool
+kihasználtság nem ismert.</li>
+<li><strong>Snapshot chain corruption</strong>: ha egy external snapshot
+backing file elérhetetlenné válik (törlés, path változás), a VM nem
+indul. Adatgyűjtés: <code>qemu-img info</code>,
+<code>virsh snapshot-list</code>. Helyreállítás: a lánc helyreállítása a
+backupból vagy a base image-re való <code>blockcommit</code>.
+<strong>Ellenpróba</strong>: ne másoljunk kézzel qcow2 fájlokat a lánc
+megértése nélkül.</li>
+<li><strong>Hotplug utáni hiányzó eszköz</strong>: a guest nem látja a
+<code>/dev/vdb</code>-t. Adatgyűjtés: <code>lsblk</code>,
+<code>udevadm monitor</code>. Kezelés: <code>udevadm trigger</code>,
+<code>partprobe</code>, esetleg újraindítás.
+<strong>Ellenpróba</strong>: ne
+<code>echo "- - -" &gt; /sys/class/scsi_host/hostX/scan</code>
+parancssal kísérletezgessünk, amíg a VM SCSI típusa nem ismert.</li>
+<li><strong>Quiesce hiba</strong>:
+<code>virsh snapshot-create-as --quiesce</code> hibát ad, ha a guest
+agent nem fut. Ellenőrzés:
+<code>virsh qemu-agent-command lab-vm1 '{"execute":"guest-ping"}'</code>.
+<strong>Ellenpróba</strong>: ne készítsünk „csendes” snapshotot quiesce
+nélkül, ha az alkalmazás integritása számít.</li>
+</ul>
+<h3 data-number="35.3.8" id="feladatok"><span
+class="header-section-number">35.3.8</span> Feladatok</h3>
+<h4 data-number="35.3.8.1" id="magyarázó-feladat"><span
+class="header-section-number">35.3.8.1</span> 1. Magyarázó feladat</h4>
+<p>Dokumentáld egy adott labVM storage konfigurációját: backend típusát,
+cache mode-ját, a guest fájlrendszer típusát és a host storage pool
+szabad kapacitását. Írd le, hogy milyen feltételek mellett lesz a host
+snapshot ezen a VM-en application-consistent, és mi történik, ha a cache
+mode <code>writeback</code>-re van állítva. Adj meg egy ellenőrző
+parancssort, amellyel a guest agent és a host pool állapota
+megvizsgálható.</p>
+<h4 data-number="35.3.8.2"
+id="adminisztrációskonfigurációs-feladat"><span
+class="header-section-number">35.3.8.2</span> 2.
+Adminisztrációs/konfigurációs feladat</h4>
+<p>Egy <code>lab-vm2</code> VM jelenleg 20 GiB virtuális lemezzel fut,
+LVM thin pool backenddel. Növeld a lemezt 30 GiB-ra a következő
+lépésekkel: host oldali <code>lvextend</code>,
+<code>virsh blockresize</code>, majd guest oldali partíció- és
+fájlrendszer-növelés. Készíts előtte egy quiesce nélküli host snapshotot
+a biztonsági visszaút érdekében. Írd le a parancsokat, a várt állapotot
+és egy rollback tervet arra az esetre, ha a guest fájlrendszer növelése
+meghiúsul.</p>
+<h4 data-number="35.3.8.3"
+id="diagnosztikaifailurerecovery-feladat"><span
+class="header-section-number">35.3.8.3</span> 3.
+Diagnosztikai/failure/recovery feladat</h4>
+<p>A <code>lab-vm3</code> indítása után a guest a root fájlrendszer I/O
+hibákat jelez. A host oldalon a <code>qemu-img info</code> azt mutatja,
+hogy a backing file <code>lab-vm3-base.qcow2</code> nem található. A
+libvirt log szerint a korábbi blockcommit félbeszakadt, és a snapshot
+lánc sérült. Végezd el az adatgyűjtést, fogalmazz meg egy hipotézist a
+hiba okáról, és javasolj egy recovery folyamatot a rendelkezésre álló
+backupból. Adj meg egy ellenőrzési feltételt, amely igazolja, hogy a
+guest ismét egészségesen indul.</p>
+<h3 data-number="35.3.9" id="megoldások"><span
+class="header-section-number">35.3.9</span> Megoldások</h3>
+<h4 data-number="35.3.9.1" id="megoldás"><span
+class="header-section-number">35.3.9.1</span> 1. Megoldás</h4>
+<p>A dokumentációhoz a következő parancsok szükségesek (hostoldal,
+<code>sudo</code>):</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> dumpxml lab-vm1 <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-A5</span> <span class="st">&#39;&lt;disk&#39;</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">lvdisplay</span> /dev/vg-labthin/vm1-root</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="ex">lsblk</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> qemu-agent-command lab-vm1 <span class="st">&#39;{&quot;execute&quot;:&quot;guest-ping&quot;}&#39;</span></span></code></pre></div>
+<p>Az application-consistent snapshot feltételei: a guest agent fut, a
+fájlrendszer quiesce-re képes, a host snapshot parancs
+<code>--quiesce</code> opciót használ, és a host storage poolban van
+szabad hely a snapshotnak. <code>writeback</code> cache mode esetén a
+vendég flush-ét (<code>fsync</code>) a QEMU host oldali
+<code>fdatasync</code>-kel teljesíti, így a sikeres guest
+<code>fsync</code> tartós; csak a még nem flush-ölt írások veszhetnek el
+host-crashnél. A quiesce pedig éppen flush-t és freeze-t kér, így a
+snapshot <code>writeback</code> mellett is konzisztens. Kockázatot az
+<code>unsafe</code> mód jelent, amely a vendég flush-eit figyelmen kívül
+hagyja; a dokumentációban ezt kell kizárni.</p>
+<p><strong>Postcondition</strong>: a dokumentum tartalmazza a backend,
+cache mode, guest fájlrendszer, pool szabad kapacitás és a quiesce
+feltételek minden elemét; az ellenőrző parancsok lefuttathatók.</p>
+<h4 data-number="35.3.9.2" id="megoldás-1"><span
+class="header-section-number">35.3.9.2</span> 2. Megoldás</h4>
+<p>Snapshot mellett a bővítés csak az aktív rétegen történhet: külső
+lemez-snapshot után a <code>lab-vm2-snap-pre.qcow2</code> az új írási
+réteg, a pre-resize állapotot pedig a base LV őrzi, amelyet a snapshot
+élettartama alatt nem módosítunk (nincs <code>lvextend</code> a
+base-en). A host oldali LV-bővítés a commit után, külön lépésként
+jöhet.</p>
+<p><strong>Host oldal (labhost, sudo):</strong></p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">LIBVIRT_DEFAULT_URI</span><span class="op">=</span>qemu:///system</span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Lemezes snapshot a visszaúthoz (quiesce nélkül, a feladat szerint)</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> snapshot-create-as lab-vm2 snap-pre-resize <span class="at">--disk-only</span> <span class="at">--atomic</span> <span class="dt">\</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--diskspec</span> vda,file=/var/lib/libvirt/images/lab-vm2-snap-pre.qcow2</span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> domblklist lab-vm2      <span class="co"># vda → .../lab-vm2-snap-pre.qcow2</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="co"># Az aktív réteg (overlay) virtuális méretének növelése</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> blockresize lab-vm2 vda 30G</span></code></pre></div>
+<p><strong>Guest oldal (SSH lab-vm2):</strong></p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> growpart /dev/vda 1</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="ex">findmnt</span> <span class="at">-no</span> FSTYPE /              <span class="co"># ext4 vagy xfs</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> resize2fs /dev/vda1          <span class="co"># ext4 esetén</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="co"># sudo xfs_growfs /               # xfs esetén</span></span></code></pre></div>
+<p><strong>Ellenőrzés</strong>: <code>df -h /</code> mutassa a növelt
+méretet.</p>
+<p><strong>Rollback</strong>: ha a guest fájlrendszer-növelés meghiúsul:
+a VM leállítása (<code>virsh shutdown</code>, várakozás
+<code>shut off</code>-ig); a domain disk forrásának visszaállítása a
+base-re (<code>virsh edit lab-vm2</code> →
+<code>&lt;source dev='/dev/vg-labthin/lab-vm2-root'/&gt;</code>, vagy
+<code>virsh snapshot-revert</code> a libvirt verziója szerint); az
+overlay (<code>lab-vm2-snap-pre.qcow2</code>) áthelyezése a
+scratch/karantén könyvtárba; indítás és ellenőrzés. A base-t NEM
+töröljük és nem commitolunk bele, mert éppen az őrzi a pre-resize
+állapotot.</p>
+<p><strong>Sikeres ellenőrzés után</strong>:
+<code>virsh blockcommit lab-vm2 vda --active --pivot --wait --verbose</code>,
+majd <code>virsh domblklist lab-vm2</code> a base LV-t mutatja
+aktívként. Mivel az overlay 30 GiB-os, a commit előtt a base LV-nek is
+legalább 30 GiB-osnak kell lennie: ezt a lépést
+(<code>lvextend -L 30G /dev/vg-labthin/lab-vm2-root</code>, majd a
+commit) csak a döntés után, a rollback-pont feladásával végezzük.</p>
+<p><strong>Postcondition</strong>: a guest root fájlrendszer 30 GiB
+kapacitású; commit után a lánc egyelemű, a host LVM thin LV 30 GiB;
+commit előtt a pre-resize állapot a base LV-ben érintetlen.</p>
+<h4 data-number="35.3.9.3" id="megoldás-2"><span
+class="header-section-number">35.3.9.3</span> 3. Megoldás</h4>
+<p><strong>Adatgyűjtés</strong>:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">qemu-img</span> info /var/lib/libvirt/images/lab-vm3.qcow2</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-la</span> /var/lib/libvirt/images/</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> dumpxml lab-vm3 <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-A5</span> <span class="st">&#39;&lt;disk &#39;</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="fu">tail</span> <span class="at">-n</span> 100 /var/log/libvirt/qemu/lab-vm3.log</span></code></pre></div>
+<p><strong>Hipotézis</strong>: a korábbi <code>virsh blockcommit</code>
+megszakadt, így az aktuális top fájl egy backing file-ra hivatkozik,
+amely már nem létezik.</p>
+<p><strong>Recovery</strong>:</p>
+<ol type="1">
+<li>A backup repóból állítsuk vissza a legutóbbi teljes base image-et és
+az azóta készült snapshot fájlokat, valamint a domain XML-t.</li>
+<li>Ellenőrizzük a <code>qemu-img info</code> kimenetét, hogy a backing
+file path létezik-e, és a virtuális méret megegyezik-e az
+elvárttal.</li>
+<li>Indítsuk el a VM-et; ha indul, ellenőrizzük a guest fájlrendszert
+<code>fsck</code>-kel (vészhelyzeti módban), majd a guest
+alkalmazást.</li>
+<li>Ha a lánc sérült, de a backupból megvan a base + snapshot:
+leállított VM-en <code>qemu-img info --backing-chain</code> ellenőrzés
+után <code>qemu-img commit &lt;top&gt;</code>; futó VM-en
+<code>virsh blockcommit lab-vm3 vda --active --pivot --wait</code>, hogy
+újra lapos láncot kapjunk.</li>
+</ol>
+<p><strong>Ellenőrzés</strong>: a guest eléri a root fájlrendszert,
+<code>df -h</code> és a demo alkalmazás health endpointja 200-at ad.</p>
+<p><strong>Postcondition</strong>: a VM indul, a guest root fájlrendszer
+hibamentes, a host oldali qcow2 lánc teljes és a domain XML a backupból
+visszaállítva.</p>
+<h3 data-number="35.3.10" id="rövid-összefoglaló"><span
+class="header-section-number">35.3.10</span> Rövid összefoglaló</h3>
+<p>A VM block storage a host oldali blokkeszköz, amelyet a guest
+fájlrendszer saját blokkos eszközként lát. A host snapshot akkor lesz
+application-consistent, ha a guest oldali <code>qemu-guest-agent</code>
+fájlrendszer-freeze-t végez, és a host <code>--quiesce</code> opcióval
+készíti a snapshotot. A cache mode-ok közül csak az <code>unsafe</code>
+hagyja figyelmen kívül a guest <code>fsync</code>-et; a
+<code>none</code>, <code>writethrough</code>, <code>writeback</code> és
+<code>directsync</code> a flush-t tiszteli, és a még nem flush-ölt
+írások sorsában, illetve a teljesítményben különbözik. A resize és
+hotplug mindig host és guest oldali lépésekre bontható; a host bővíti a
+blokkeszközt, a guest a partíciót és a fájlrendszert. A teljes VM backup
+különbözik a snapshot-tól: a snapshot a pillanatnyi állapot, a backup
+tartós, ellenőrzött másolat.</p>
+<p><strong>Továbbhasznált definíciók</strong>:</p>
+<ul>
+<li><strong>Application-consistent snapshot</strong>: olyan pillanatkép,
+amelynél a guest alkalmazások fájlrendszer-tranzakciói quiesce
+állapotban voltak, így a visszaállítás után a guest alkalmazás érvényes
+állapotot lát.</li>
+<li><strong>External snapshot lánc</strong>: QEMU copy-on-write snapshot
+fájlok sorozata, ahol egy fájl a megelőző backing file-ra hivatkozik; a
+teljes állapot a lánc együttesével áll elő.</li>
+<li><strong>Cache mode</strong>: a QEMU/libvirt beállítás, amely a guest
+írás és a host lemez közötti cache/flush viselkedést szabályozza,
+befolyásolva a tartósságot és a teljesítményt.</li>
+</ul>
+<h3 data-number="35.3.11" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">35.3.11</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li><a href="https://www.qemu.org/docs/master/tools/qemu-img.html">QEMU
+– Disk image file formats / qemu-img</a>: <code>info -U</code>,
+<code>resize</code>, <code>commit</code>, <code>check</code>; a
+használatban lévő kép módosításának tilalma. A master dokumentáció nem
+azonos az Ubuntu 24.04 csomagjával; a laborban
+<code>qemu-img --version</code> rögzítendő.</li>
+<li><a
+href="https://www.qemu.org/docs/master/system/invocation.html">QEMU –
+Invocation, <code>-drive</code> opciók</a>:
+<code>cache=none|writethrough|writeback|directsync|unsafe</code>.</li>
+<li><a href="https://libvirt.org/formatdomain.html">libvirt – Domain XML
+format</a>:
+<code>&lt;disk&gt;</code>/<code>&lt;driver cache=...&gt;</code>.</li>
+<li><a href="https://libvirt.org/formatsnapshot.html">libvirt – Snapshot
+XML / snapshots</a>: external disk-only snapshot,
+<code>--quiesce</code>.</li>
+<li><a href="https://wiki.libvirt.org/">libvirt wiki</a>, „Live disk
+backup with active blockcommit” oldal: snapshot → mentés →
+<code>blockcommit --active --pivot</code> minta.</li>
+<li><a href="https://libvirt.org/manpages/virsh.html">virsh(1)</a>:
+<code>snapshot-create-as</code>, <code>blockresize</code>,
+<code>blockcommit</code>, <code>domblklist</code>,
+<code>backup-begin</code>; a laborban <code>virsh version</code>
+rögzítendő.</li>
+<li><a href="https://restic.readthedocs.io/en/stable/">restic
+dokumentáció</a>: <code>backup</code>, <code>check</code>,
+<code>restore</code>.</li>
+</ul>
+<p>A kimenetek illusztratívak, nem tényleges futtatás eredményei. A
+példák laborban ellenőrizendők; ebben a munkamenetben nem történt
+laborfuttatás, dátumozott futtatási napló még nincs. A
+<code>qemu-guest-agent</code> freeze korlátai (egyes fájlrendszerek vagy
+alkalmazások esetén) további verifikációt igényelnek; a restic
+backup/restore lépéshez a d098-ban már jelzett ellenőrzési igény
+tartozik.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d172.html">← 35.2 VM bridge/NAT/routed hálózat</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d174.html">35.4 Provision, migration, upgrade és shutdown →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

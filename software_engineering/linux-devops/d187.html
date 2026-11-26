@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>38.2 Container lifecycle, config és shutdown – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch38">38 Docker, Podman, containerd és lokális deployment</a></p>
+<div class="links"><a class="prev" rel="prev" href="d186.html">← 38.1 Engine, runtime, shim és CRI</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d188.html">38.3 Container networking, volume és host boundary →</a></div>
+</nav>
+<h2 data-number="38.2" id="d187"><span
+class="header-section-number">38.2</span> Container lifecycle, config és
+shutdown</h2>
+<p>A stateful konténer üzemeltetésének legnagyobb hibája nem a build,
+hanem az a feltételezés, hogy a konténer elindítása és leállítása
+ugyanaz, mint egy processzé. A rendszergazdai szerződés itt válik el a
+fejlesztői buildtől: a konténerképek nem futnak, amíg explicit
+konfigurációval, erőforrás- és adatparaméterekkel nem hozunk létre
+belőlük egy futó konténert. A <code>docker run</code> kényelmes parancs
+elrejti a mögöttes lifecycle lépéseket, így a hibakeresésnél nem tudunk
+réteghatárt mutatni. Ez az alfejezet a konténer életciklusát a
+create/start/exec/stop/remove primitívektől a graceful shutdownig és a
+log retentionig vezeti végig, és megadja a readiness, a restart és a
+delete adathatásának szerződését.</p>
+<h3 data-number="38.2.1" id="definíció-és-működés"><span
+class="header-section-number">38.2.1</span> Definíció és működés</h3>
+<p>A konténer nem VM, hanem egy Linux processzhalmaz, amelyet a
+container runtime (Docker, Podman, containerd+shim) hoz létre az OCI
+runtime spec alapján. A state machine ezért processz-szemantikát tükröz,
+de a runtime config réteget ad hozzá:</p>
+<ul>
+<li><strong>Created</strong>: a konténer leírója létrejött, a
+fájlrendszerrétegek előkészítve, de processz még nem fut. Létrehozó
+parancs: <code>docker create</code> (nem a <code>docker run</code>, mert
+az create+start egyben).</li>
+<li><strong>Started / Running</strong>: a PID1 elindult a konténer
+namespace-ben. Létrehozó parancs: <code>docker start</code>.</li>
+<li><strong>Paused</strong>: a konténer cgroupja befagyasztva (cgroup
+freezer, cgroup v2-ben <code>cgroup.freeze=1</code>); a processzek nem
+futnak, de jelet nem kapnak (ez nem SIGSTOP, így a
+SIGSTOP/SIGCONT-kezelés sem fut le). Parancs: <code>docker pause</code>
+/ <code>unpause</code>.</li>
+<li><strong>Exited</strong>: a PID1 kilépett valamilyen exit kóddal, a
+runtime megtartja a konténer metaadatait és logjait, amíg explicit
+<code>docker rm</code> nem törli.</li>
+<li><strong>Dead</strong>: hibaállapot: a runtime nem tudta befejezni a
+konténer eltávolítását (például foglalt mount miatt). Kezelése: a hiba
+okának megszüntetése, majd <code>docker rm -f</code>.</li>
+</ul>
+<p>A <code>docker exec</code> nem hoz létre új konténert, hanem a már
+futó konténerbe injektál egy további processzt ugyanabban a
+namespace-ben. Ebből következik, hogy az exec indította processz nem él
+túl a konténer leállítását, és ugyanazt a PID namespace-t, hálózatot,
+IPC-t és mount namespace-t látja, mint a PID1.</p>
+<p>A konténer PID1-jének speciális Linux signal szemantikája van: a
+kernel nem alkalmazza az implicit SIGTERM/SIGINT kezelőt, mint más
+processzeknél, mert feltételezi, hogy a PID1 felelős az init szerepért.
+Ha a PID1 egy sima C++ program, amely nem telepít signal handlert, akkor
+a <code>SIGTERM</code> nem fog leállítani, csak a <code>SIGKILL</code>.
+A Docker/Podman <code>stop</code> ezt úgy oldja fel, hogy alapértelmezés
+szerint először <code>SIGTERM</code>-et küld, majd
+<code>--stop-timeout</code> (alapértelmezés 10 másodperc) letelte után
+<code>SIGKILL</code>-t. Ha a programnak graceful shutdownra kell
+képesnek lennie, akkor a C++ kódban a <code>SIGTERM</code>-et el kell
+kapnia, drainelnie kell a munkát, és nullás exit kóddal kilépnie. Ha a
+bináris nem módosítható, akkor a <code>docker run --init</code> opcióval
+a runtime egy kis init processzt (például <code>tini</code>) indít
+PID1-ként, amely továbbítja a signalt a valódi alkalmazásnak. Ez azonban
+csak azt biztosítja, hogy a SIGTERM hatásos legyen: a már nem PID 1
+alkalmazásra handler nélkül a kernel alapértelmezett akciója (terminate)
+érvényes, a processz azonnal meghal, drain nélkül, és a kilépési kód 143
+(128+15). A <code>--init</code> tehát a SIGKILL-ig tartó várakozást
+szünteti meg (gyors, de nem graceful leállás); graceful, 0-s kilépéshez
+a kódban kell SIGTERM-handler.</p>
+<figure id="fig-d187-stop-idovonal">
+<div class="fig-interactive"><iframe src="figures/html/d187-stop-idovonal.html" title="Bal panel, állapotgép: docker create után created, start után running, pause és unpause a running és a paused között, stop vagy a PID 1 kilépése után exited, exited-ből start vissza running-ba, rm után törölve, sikertelen eltávolításnál dead. Jobb panel, három idővonal 0–15 másodperc: A) handler van, SIGTERM t=0, draining kb. 0,1 s, graceful exit kb. 0,6 s, ExitCode 0. B) --init, handler nélkül: azonnali halál, nincs graceful exit, ExitCode 143. C) PID 1 handler nélkül: a SIGTERM hatástalan, 15 s-nál SIGKILL, ExitCode 137." loading="lazy" style="width:100%;border:0;height:560px"></iframe><noscript><img src="figures/img/d187-stop-idovonal.png" style="width:100.0%"
+alt="Bal panel, állapotgép: docker create után created, start után running, pause és unpause a running és a paused között, stop vagy a PID 1 kilépése után exited, exited-ből start vissza running-ba, rm után törölve, sikertelen eltávolításnál dead. Jobb panel, három idővonal 0–15 másodperc: A) handler van, SIGTERM t=0, draining kb. 0,1 s, graceful exit kb. 0,6 s, ExitCode 0. B) --init, handler nélkül: azonnali halál, nincs graceful exit, ExitCode 143. C) PID 1 handler nélkül: a SIGTERM hatástalan, 15 s-nál SIGKILL, ExitCode 137." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d187-stop-idovonal.png" style="width:100.0%"
+alt="Bal panel, állapotgép: docker create után created, start után running, pause és unpause a running és a paused között, stop vagy a PID 1 kilépése után exited, exited-ből start vissza running-ba, rm után törölve, sikertelen eltávolításnál dead. Jobb panel, három idővonal 0–15 másodperc: A) handler van, SIGTERM t=0, draining kb. 0,1 s, graceful exit kb. 0,6 s, ExitCode 0. B) --init, handler nélkül: azonnali halál, nincs graceful exit, ExitCode 143. C) PID 1 handler nélkül: a SIGTERM hatástalan, 15 s-nál SIGKILL, ExitCode 137." /></details></div>
+<figcaption>Konténer-állapotgép és a docker stop –time 15 három
+kimenete: handlerrel ExitCode 0, –init-tel handler nélkül 143, PID
+1-ként handler nélkül SIGKILL után 137 (elméleti modell)</figcaption>
+</figure>
+<p>A konténer image-nek immutable-nek kell lennie: a futáshoz szükséges
+konfigurációt, titkokat és adatokat a konténer launch specjéből adunk,
+nem sütjük be a buildbe. A build-time <code>ARG</code>-ok a build
+engedélyezett paraméterei, a runtime <code>ENV</code>-ok a futás
+környezetét adják. A titkokat nem <code>ENV</code>-ben, hanem secret
+mounttal, tmpfs mounttal vagy legalább read-only volume-ként
+szolgáltatjuk. A 12-factor app elv itt a config és a code elválasztását
+jelenti: ugyanaz a digest, különböző környezetekben más-más config
+mounttal.</p>
+<p>A resource policy a host kernel cgroup v2 rétegét használja:
+<code>--memory</code>, <code>--cpus</code>, <code>--pids-limit</code>,
+<code>--device</code>, <code>--cap-drop</code> és
+<code>--cap-add</code>. A default root konténer túl gyakran kap minden
+capabilityt; a legkisebb privilege elve szerint
+<code>--cap-drop ALL</code> és csak a szükséges <code>--cap-add</code>
+megengedett. A <code>--user UID[:GID]</code> a konténer processz user
+namespace nélkül is fontos, mert a host UID/GID látszik. A mount policy
+szempontjából a <code>--read-only --tmpfs /tmp</code> + named volume
+kombináció az ajánlott alap: a root filesystem csak olvasható, a
+hagyományos írási pontok tmpfs-en, a tartós adat néven nevezett
+volume-on.</p>
+<p>A healthcheck és a restart policy különböző réteg, nem felcserélhető.
+A Docker <code>HEALTHCHECK</code> a futó konténerben futtat egy
+parancsot, és a <code>starting</code>, <code>healthy</code>,
+<code>unhealthy</code> állapotot kezeli. A
+<code>docker run --restart</code> (no, on-failure, always,
+unless-stopped) csak a konténer exit eseményére reagál, tehát ha a
+processz fut, de a szolgáltatás logikailag nem működik, a restart policy
+nem segít. A compose spec
+<code>depends_on: condition: service_healthy</code> ilyenkor biztosít
+startup dependency-t, de ez csak compose környezetben van. A mi baseline
+laborunkban a healthcheck inkább a monitoring és readiness kapuja, mint
+automatizált restart ok.</p>
+<p>A graceful stop szerződés a <code>docker stop --time</code> és a
+containerd shim közötti interakció: a timeout elérése előtt a PID1-nek
+abba kell hagynia az új kapcsolatok fogadását (a listening socket
+bezárása), be kell fejeznie vagy le kell zárnia a folyamatban lévő
+kéréseket, ki kell írnia a szükséges állapotot, majd ki kell lépnie. Ha
+ez nem történik meg, a SIGKILL a még nyitott kapcsolatokat megszakítja,
+a félkész állapot elveszhet, és a logból hiányzik a leállás oka. A log
+retention a json-file driver esetén a host
+<code>/var/lib/docker/containers/&lt;id&gt;/</code> alatt van, és
+<code>--log-opt max-size</code>/<code>max-file</code> paraméterekkel
+korlátozható. A <code>docker rm</code> csak a logot és a konténer
+metaadatait törli; a named volume-ok addig megmaradnak, amíg
+<code>docker volume rm</code> nem törli őket.</p>
+<h3 data-number="38.2.2" id="kidolgozott-példa"><span
+class="header-section-number">38.2.2</span> Kidolgozott példa</h3>
+<p>A következő példa egy minimális, read-only konténer, amely graceful
+shutdownt és healthchecket valósít meg. A C++ program
+<code>SIGTERM</code>-et fogad, <code>SIGINT</code>-et kezel, és
+fájl-alapú readiness-jelet ad: a fő ciklus másodpercenként frissíti a
+<code>/tmp/ready</code> fájlt. HTTP-végpontot a vázlat nem nyit; a
+valódi szolgáltatásban ugyanezt a szerepet egy <code>/healthz</code>
+végpont töltené be.</p>
+<p>Dockerfile:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode dockerfile"><code class="sourceCode dockerfile"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># </span><span class="cv">syntax=docker/dockerfile:1</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> ubuntu:24.04 <span class="kw">AS</span> builder</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="ex">apt-get</span> update <span class="kw">&amp;&amp;</span> <span class="ex">apt-get</span> install <span class="at">-y</span> <span class="at">--no-install-recommends</span> build-essential</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="kw">COPY</span> lab-app.cpp /src/lab-app.cpp</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="ex">g++</span> <span class="at">-std</span><span class="op">=</span>c++20 <span class="at">-Wall</span> <span class="at">-Wextra</span> <span class="at">-O2</span> /src/lab-app.cpp <span class="at">-o</span> /lab-app</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> ubuntu:24.04</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="ex">apt-get</span> update <span class="dt">\</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">&amp;&amp;</span> <span class="ex">apt-get</span> install <span class="at">-y</span> <span class="at">--no-install-recommends</span> libstdc++6 <span class="dt">\</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">&amp;&amp;</span> <span class="fu">rm</span> <span class="at">-rf</span> /var/lib/apt/lists/<span class="pp">*</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="kw">COPY</span> <span class="op">--from=builder</span> /lab-app /usr/local/bin/lab-app</span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="kw">USER</span> 1001:1001</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPOSE</span> 8080</span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="kw">ENTRYPOINT</span> [<span class="st">&quot;/usr/local/bin/lab-app&quot;</span>]</span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="kw">HEALTHCHECK</span> <span class="op">--interval=5s</span> <span class="op">--timeout=3s</span> <span class="op">--start-period=10s</span> <span class="op">--retries=2</span> \</span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>  <span class="kw">CMD</span> [<span class="st">&quot;/usr/local/bin/lab-app&quot;</span>, <span class="st">&quot;--healthcheck&quot;</span>]</span></code></pre></div>
+<p>A C++ program vázlata (a valódi implementation nem cél, a signal
+kezelés és a readiness a lényeg). A <code>--healthcheck</code> ágat a
+Docker <strong>új processzben</strong> futtatja, amely a fő processz
+memóriáját (például egy <code>running</code> változót) nem látja; ezért
+a fő ciklus egy fájlon keresztül jelzi az állapotát, és a healthcheck
+ennek frissességét vizsgálja:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;atomic&gt;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;chrono&gt;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;csignal&gt;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;filesystem&gt;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fstream&gt;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string&gt;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;thread&gt;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="kw">namespace</span> fs <span class="op">=</span> <span class="bu">std::</span>filesystem<span class="op">;</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="kw">constexpr</span> <span class="at">const</span> <span class="dt">char</span><span class="op">*</span> kReadyFile <span class="op">=</span> <span class="st">&quot;/tmp/ready&quot;</span><span class="op">;</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="dt">bool</span><span class="op">&gt;</span> running<span class="op">{</span><span class="kw">true</span><span class="op">};</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> handle_signal<span class="op">(</span><span class="dt">int</span><span class="op">)</span> <span class="op">{</span> running<span class="op">.</span>store<span class="op">(</span><span class="kw">false</span><span class="op">);</span> <span class="op">}</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="co">// Külön processzben fut: 0, ha a ready-fájl 10 s-nál frissebb.</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> healthcheck<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>error_code ec<span class="op">;</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="kw">auto</span> mtime <span class="op">=</span> fs<span class="op">::</span>last_write_time<span class="op">(</span>kReadyFile<span class="op">,</span> ec<span class="op">);</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ec<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span>  <span class="co">// nincs ready-fájl: nem kész vagy leáll</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="kw">auto</span> age <span class="op">=</span> fs<span class="op">::</span><span class="dt">file_time_type</span><span class="op">::</span>clock<span class="op">::</span>now<span class="op">()</span> <span class="op">-</span> mtime<span class="op">;</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> age <span class="op">&lt;</span> <span class="bu">std::</span>chrono::seconds<span class="op">(</span><span class="dv">10</span><span class="op">)</span> <span class="op">?</span> <span class="dv">0</span> <span class="op">:</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">int</span> argc<span class="op">,</span> <span class="dt">char</span><span class="op">**</span> argv<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>argc <span class="op">&gt;</span> <span class="dv">1</span> <span class="op">&amp;&amp;</span> <span class="bu">std::</span>string<span class="op">{</span>argv<span class="op">[</span><span class="dv">1</span><span class="op">]}</span> <span class="op">==</span> <span class="st">&quot;--healthcheck&quot;</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> healthcheck<span class="op">();</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>signal<span class="op">(</span>SIGTERM<span class="op">,</span> handle_signal<span class="op">);</span></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>signal<span class="op">(</span>SIGINT<span class="op">,</span> handle_signal<span class="op">);</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>    <span class="co">// a valódi szolgáltatás munkaciklusa; itt csak szimuláljuk</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">unsigned</span> tick <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> running<span class="op">.</span>load<span class="op">();</span> <span class="op">++</span>tick<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>tick <span class="op">%</span> <span class="dv">10</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>ofstream<span class="op">(</span>kReadyFile<span class="op">)</span> <span class="op">&lt;&lt;</span> <span class="st">&quot;ok</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span>  <span class="co">// readiness-jel</span></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>this_thread::sleep_for<span class="op">(</span><span class="bu">std::</span>chrono::milliseconds<span class="op">(</span><span class="dv">100</span><span class="op">));</span></span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>error_code ec<span class="op">;</span></span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true" tabindex="-1"></a>    fs<span class="op">::</span>remove<span class="op">(</span>kReadyFile<span class="op">,</span> ec<span class="op">);</span>  <span class="co">// drain alatt már nem ready</span></span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;draining...</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb2-45"><a href="#cb2-45" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>this_thread::sleep_for<span class="op">(</span><span class="bu">std::</span>chrono::milliseconds<span class="op">(</span><span class="dv">500</span><span class="op">));</span></span>
+<span id="cb2-46"><a href="#cb2-46" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;graceful exit</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb2-47"><a href="#cb2-47" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-48"><a href="#cb2-48" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A build és a futtatás a 38. fejezet kanonikus labhostján,
+<code>lab-vm1</code>, a <code>labuser</code> (UID 1000) felhasználóval,
+a labor repo <code>lab-cpp-app</code> mappájában. A <code>sudo</code>
+nélküli <code>docker</code> parancsokhoz a <code>labuser</code> a
+<code>docker</code> csoport tagja – ez a <a href="d186.html">d186</a>
+szerint hostszintű root jogosultság, ezért csak eldobható labor-VM-en
+elfogadható kivétel; élesben <code>sudo docker</code> vagy rootless
+Podman:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-vm1, account: labuser, uid: 1000</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> /opt/lab-cpp-app</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> build <span class="at">-t</span> lab-cpp-app:1.0.0 .</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> volume create lab-cpp-app-data</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> run <span class="at">-d</span> <span class="dt">\</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--name</span> lab-cpp-app-prod <span class="dt">\</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--restart</span> unless-stopped <span class="dt">\</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--read-only</span> <span class="dt">\</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--tmpfs</span> /tmp:rw,noexec,nosuid,size=16m <span class="dt">\</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--cap-drop</span> ALL <span class="dt">\</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">--user</span> 1001:1001 <span class="dt">\</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>  <span class="at">--env</span> APP_LISTEN=0.0.0.0:8080 <span class="dt">\</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>  <span class="at">--publish</span> 127.0.0.1:8080:8080 <span class="dt">\</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>  <span class="at">--volume</span> lab-cpp-app-data:/var/lib/lab-cpp-app:rw <span class="dt">\</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>  <span class="at">--log-opt</span> max-size=10m <span class="dt">\</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>  <span class="at">--log-opt</span> max-file=3 <span class="dt">\</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>  lab-cpp-app:1.0.0</span></code></pre></div>
+<p>Várt kimenet (szemléltető, nem futtatott): a
+<code>docker inspect --format '{{.State.Health.Status}}' lab-cpp-app-prod</code>
+10 másodperc után <code>healthy</code>; ha a fő ciklust megállítjuk
+(<code>docker kill -s STOP lab-cpp-app-prod</code>), a ready-fájl
+elöregszik, és két sikertelen próba után a státusz
+<code>unhealthy</code> lesz (<code>docker kill -s CONT</code> után
+visszaáll). A <code>docker stop --time 15 lab-cpp-app-prod</code> nyomán
+a logban a <code>draining...</code> és <code>graceful exit</code> sor
+jelenik meg, a konténer <code>exited</code> állapotba kerül
+<code>ExitCode=0</code>-val, a named volume megmarad. A vázlat nem nyit
+portot, ezért a <code>--publish</code> és az <code>APP_LISTEN</code>
+csak a valódi HTTP-szolgáltatáshoz tartozó helyet mutatja;
+<code>curl</code> próba erre a vázlatra nem értelmezhető. Annak
+ellenőrzése, hogy a konténer valóban read-only és nem ír a rootba:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> exec lab-cpp-app-prod touch /should-fail</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co"># várt: &quot;Read-only file system&quot;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> exec lab-cpp-app-prod touch /tmp/should-work</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="co"># várt: sikeres</span></span></code></pre></div>
+<h3 data-number="38.2.3" id="hibák-és-ellenpróbák"><span
+class="header-section-number">38.2.3</span> Hibák és ellenpróbák</h3>
+<p>A leggyakoribb hiba: a PID1 nem kezeli a SIGTERM-et, ezért a
+<code>docker stop</code> 10 másodperc után SIGKILL-t küld, és a drain, a
+transaction completion, a külső state update elveszik. Ellenpróba:
+<code>docker stop --time 30 lab-cpp-app-prod</code>, és közben a logot
+figyeljük; ha a <code>graceful exit</code> nem jelenik meg, a konténer a
+SIGKILL miatt halt meg, a <code>docker inspect</code>
+<code>ExitCode=137</code>. A javítás: SIGTERM-handler a kódban
+(graceful, <code>ExitCode=0</code>). A <code>--init</code> csak
+részmegoldás: a leállás gyors lesz, de handler nélkül drain nincs, és
+<code>ExitCode=143</code>.</p>
+<p>A másik tipikus hiba a <code>docker rm</code>-el az adatvesztés. A
+<code>docker run</code> névtelen volume-okkal létrehozott konténer
+<code>docker rm</code>-je nem törli az implicit volume-ot, de ha
+<code>docker rm -v</code>-t használunk, vagy a
+<code>docker compose down -v</code>, a volume eltűnik. Az explicit named
+volume külön életciklust él, és a <code>docker volume inspect</code>
+mutatja a független state-et. A recreate során (<code>docker rm</code> +
+<code>docker run</code> ugyanazzal a <code>--volume</code>) a named
+volume megőrzi az adatot.</p>
+<p>A healthcheck hibás parancs vagy túl korai start-period esetén a
+konténer <code>starting</code>,<code>unhealthy</code> váltakozásában
+ragad. A restart policy és a healthcheck félreértése oda vezet, hogy a
+<code>--restart always</code> nem indítja újra a logikailag egészséges,
+de hibás endpointot mutató processzt. A diagnosztika:
+<code>docker inspect --format '{{json .State.Health}}'</code>,
+<code>docker logs -f</code>.</p>
+<p>A log retention hiánya a host lemez telítődéséhez vezet: a
+<code>--log-opt max-size</code> nélkül a json-file log korlát nélkül nő,
+és a daemon újraindítása ezen nem változtat (nem rotál, nem csonkol).
+Host-szinten a <code>/etc/docker/daemon.json</code>
+<code>log-opts</code> beállítása ad alapértelmezést (például
+<code>"log-driver": "json-file", "log-opts": {"max-size": "10m", "max-file": "3"}</code>),
+de ez csak az újonnan létrehozott konténerekre hat; a <code>local</code>
+log driver alapból rotál. A host-monitoring akkor mutat
+<code>No space left on device</code>, ha a konténer stdoutja nagy.</p>
+<h3 data-number="38.2.4" id="feladatok"><span
+class="header-section-number">38.2.4</span> Feladatok</h3>
+<ol type="1">
+<li><p><strong>Magyarázó feladat</strong>: Adja meg, mi a különbség a
+<code>docker create</code>, <code>docker start</code>,
+<code>docker exec</code>, <code>docker stop</code> és
+<code>docker rm</code> célja, és milyen host erőforrás (namespace,
+cgroup, mount, network) mikor jön létre, mikor szűnik meg. Indokolja,
+miért fontos a PID1 signal forwarding a <code>stop</code>
+idején.</p></li>
+<li><p><strong>Adminisztrációs/konfigurációs feladat</strong>: Készítsen
+egy <code>lab-cpp-app</code> Dockerfile-t a fenti C++ mintából, amelyben
+a program <code>SIGTERM</code>-et kezel, és a fájl-alapú readiness-jelre
+épülő <code>HEALTHCHECK</code>-et ad. Futtassa read-only,
+<code>--cap-drop ALL</code>, named volume-lal. A feltétel: a
+<code>docker exec lab-cpp-app-prod touch /should-fail</code> parancsnak
+<code>Read-only file system</code> hibát, a
+<code>docker exec lab-cpp-app-prod cat /var/lib/lab-cpp-app/testfile</code>
+a named volume tartalmát kell mutatnia. Ellenőrizze a healthchecket,
+írja be a parancsokat.</p></li>
+<li><p><strong>Diagnosztikai/failure feladat</strong>: A konténer most
+nem áll le 10 másodperc alatt: a
+<code>docker stop lab-cpp-app-prod</code> mindig <code>SIGKILL</code>-t
+küld. A logban nincs <code>graceful exit</code>. Adjon adatgyűjtési
+lépéseket, azonosítsa a hibát, majd hasonlítsa össze a
+<code>--init</code> opciót és a kód módosítását. Postcondition a
+kódjavítás után: a <code>docker stop --time 15</code> után a konténer
+exit code 0, a logban a <code>graceful exit</code> sor, a named volume
+sértetlen.</p></li>
+</ol>
+<h3 data-number="38.2.5" id="megoldások"><span
+class="header-section-number">38.2.5</span> Megoldások</h3>
+<ol type="1">
+<li><p>A <code>create</code> a konténer konfigurációját (metaadat,
+config struktúra) és az írható réteget készíti el, de nem indít
+processzt, és namespace-t vagy cgroupot sem hoz létre. A
+<code>start</code> (Docker alatt containerd → shim →
+<code>runc create</code>/<code>start</code>) hozza létre a
+namespace-eket (mount, PID, hálózati névtér a veth-párral), a cgroupot,
+majd elindítja a PID1-et. A <code>stop</code> után a processzek véget
+érnek, a cgroup és a hálózati névtér felszámolódik; az <code>rm</code>
+az írható réteget, a metaadatot és a logot törli. Az <code>exec</code> a
+futó konténerbe injektál processzt, nem hoz létre új namespacet. A
+<code>stop</code> először SIGTERM, majd timeout után SIGKILL. A
+<code>rm</code> törli a konténer metaadatait, logjait; a named volume-ot
+nem. A PID1 signal forwarding nélkül a konténer nem tud graceful
+shutdown-t végrehajtani, mert a kernel nem alkalmaz implicit handlert a
+PID1-re; a <code>--init</code> ezt a hatástalanságot szünteti meg (de
+handler nélkül 143-mal, drain nélkül lép ki), a graceful leálláshoz a
+program saját kezelése kell.</p></li>
+<li><p>A megoldás vázlata: a fenti Dockerfile és run parancs. A named
+volume létrehozása: <code>docker volume create lab-cpp-app-data</code>,
+majd a volume-on elhelyezni egy <code>testfile</code> fájlt külön
+<code>docker run --rm --volume lab-cpp-app-data:/mnt alpine sh -c 'echo ok &gt; /mnt/testfile'</code>
+paranccsal. A konténer futtatása a fent megadott paraméterekkel.
+Ellenőrzés:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> exec lab-cpp-app-prod sh <span class="at">-c</span> <span class="st">&#39;cat /var/lib/lab-cpp-app/testfile&#39;</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co"># várt: ok</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> exec lab-cpp-app-prod touch /should-fail</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="co"># várt: Read-only file system</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> inspect <span class="at">--format</span> <span class="st">&#39;{{.State.Health.Status}}&#39;</span> lab-cpp-app-prod</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="co"># várt: healthy</span></span></code></pre></div>
+<p>A <code>docker rm</code> előtti <code>docker stop</code> után a named
+volume megmarad: <code>docker volume inspect lab-cpp-app-data</code>
+<code>CreatedAt</code> nem változik a rm során.</p></li>
+<li><p>Adatgyűjtés:
+<code>docker inspect --format '{{json .State}}' lab-cpp-app-prod</code>,
+<code>docker logs --tail 50 lab-cpp-app-prod</code>. A hiba a SIGTERM
+handler hiánya (PID 1-ként a handler nélküli SIGTERM hatástalan, 10 s
+után jön a SIGKILL, <code>ExitCode=137</code>). Két ág:</p></li>
+</ol>
+<ul>
+<li><strong><code>--init</code> (gyors, de nem graceful):</strong>
+<code>docker rm -f lab-cpp-app-prod</code>, majd a run parancsban
+<code>--init</code> hozzáadásával újra létrehozni. A tini továbbítja a
+SIGTERM-et, a handler nélküli alkalmazás azonnal meghal: a stop jóval 15
+s alatt lezajlik, de <code>ExitCode=143</code>, és a logban nincs
+<code>graceful exit</code>. Ez a postconditiont nem teljesíti.</li>
+<li><strong>Kódjavítás (graceful):</strong> a C++ kódban
+<code>std::signal(SIGTERM, handle_signal);</code> és a drain-ág
+behelyezése, rebuild, újralétrehozás. Postcondition:
+<code>docker stop --time 15 lab-cpp-app-prod</code> után a
+<code>docker inspect --format '{{.State.ExitCode}}' lab-cpp-app-prod</code>
+0, a logban a <code>graceful exit</code> sor, a volume
+<code>docker volume inspect lab-cpp-app-data</code> továbbra is
+megvan.</li>
+</ul>
+<h3 data-number="38.2.6" id="rövid-összefoglaló"><span
+class="header-section-number">38.2.6</span> Rövid összefoglaló</h3>
+<p>A konténer életciklusa create/start/exec/stop/remove primitívekből
+áll, és a runtime process-szemantikát használ. A <code>docker run</code>
+csak gyorsított create+start; a pontos működtetéshez explicit
+<code>docker create</code>, <code>docker start</code> és
+<code>docker stop --time</code> szükséges. A PID1 signal kezelése a
+graceful shutdown feltétele: ha a program nem kezeli a SIGTERM-et, a
+<code>--init</code> csak gyors (143-as) leállást ad, graceful leálláshoz
+a C++ handler beépítése kötelező. A config, titok és adat nem része az
+immutable image-nek; read-only root, tmpfs és named volume adja a tartós
+adat egyszerű modelljét. A healthcheck az alkalmazás-logikai
+readiness-t, a restart policy a processz-exit eseményt kezeli, ezért nem
+felcserélhetők.</p>
+<p>Továbbhasznált definíciók:</p>
+<ul>
+<li><strong>Container state machine</strong>: a konténer állapotai:
+created, running, paused, exited, dead; a runtime ezeken keresztül
+validálja a lifecycle parancsokat.</li>
+<li><strong>Graceful shutdown</strong>: a stop során a PID1-nek SIGTERM
+hatására drainel, leállítja az új kéréseket, befejezi a folyamatban
+lévőket, majd nullás exit kóddal kilép, mielőtt a timeout SIGKILL-t
+ad.</li>
+<li><strong>Immutable image</strong>: a konténerkép nem tartalmaz
+környezet-specifikus konfigurációt vagy titkot; a runtime config env,
+mount és secret paraméterekkel szolgálja ki.</li>
+</ul>
+<h3 data-number="38.2.7" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">38.2.7</span> Források és ellenőrzési
+hiányok</h3>
+<p>Ez a lecke a megadott kiinduló dokumentációs hivatkozásokra
+támaszkodik, de a generálás időpontjában nem történt webes ellenőrzés. A
+parancsok szintaktikája és a verzió-specifikus viselkedés (például a
+<code>--init</code>, <code>--stop-timeout</code>,
+<code>HEALTHCHECK</code> pontos működése, a log driver defaultja) a
+használt Docker/Podman verziójában ellenőrizendő. A kidolgozott példa
+parancsai nem lettek ténylegesen futtatva; a kimenet várt/illusztratív.
+A Docker vs Podman CLI eltérések a példában nincsenek külön feltüntetve,
+de a koncepcionális modell azonos. A containerd közvetlen
+<code>ctr</code> lifecycle parancsai külön réteget képeznek, és itt nem
+kerültek kidolgozásra.</p>
+<ul>
+<li><a href="https://docs.docker.com/">Docker dokumentáció</a></li>
+<li><a href="https://docs.podman.io/">Podman dokumentáció</a></li>
+<li><a href="https://containerd.io/docs/">containerd
+dokumentáció</a></li>
+<li><a href="https://opencontainers.org/">Open Container
+Initiative</a></li>
+</ul>
+<p>Állításonkénti normatív források (verzióprofil: Ubuntu 24.04 LTS,
+Docker Engine a labor csomagverziójával, cgroup v2):</p>
+<ul>
+<li><code>docker container run</code> (<code>--init</code>,
+<code>--read-only</code>, <code>--tmpfs</code>, <code>--restart</code>,
+<code>--stop-timeout</code>, <code>--log-opt</code>): <a
+href="https://docs.docker.com/reference/cli/docker/container/run/"
+class="uri">https://docs.docker.com/reference/cli/docker/container/run/</a></li>
+<li><code>docker container stop</code> (SIGTERM, majd SIGKILL a timeout
+után): <a
+href="https://docs.docker.com/reference/cli/docker/container/stop/"
+class="uri">https://docs.docker.com/reference/cli/docker/container/stop/</a></li>
+<li>Dockerfile <code>HEALTHCHECK</code>: <a
+href="https://docs.docker.com/reference/dockerfile/#healthcheck"
+class="uri">https://docs.docker.com/reference/dockerfile/#healthcheck</a></li>
+<li>json-file és local log driver, <code>daemon.json</code>
+alapértelmezés: <a
+href="https://docs.docker.com/engine/logging/drivers/json-file/"
+class="uri">https://docs.docker.com/engine/logging/drivers/json-file/</a>,
+<a href="https://docs.docker.com/engine/logging/drivers/local/"
+class="uri">https://docs.docker.com/engine/logging/drivers/local/</a></li>
+<li>cgroup v2 freezer (<code>cgroup.freeze</code>): <a
+href="https://docs.kernel.org/admin-guide/cgroup-v2.html"
+class="uri">https://docs.kernel.org/admin-guide/cgroup-v2.html</a></li>
+<li>PID 1 és a jelek: <code>pid_namespaces(7)</code>: <a
+href="https://man7.org/linux/man-pages/man7/pid_namespaces.7.html"
+class="uri">https://man7.org/linux/man-pages/man7/pid_namespaces.7.html</a>;
+tini: <a href="https://github.com/krallin/tini"
+class="uri">https://github.com/krallin/tini</a></li>
+</ul>
+<p>A példák laborban ellenőrizendők; dátumozott futtatási napló még nem
+készült.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d186.html">← 38.1 Engine, runtime, shim és CRI</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d188.html">38.3 Container networking, volume és host boundary →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

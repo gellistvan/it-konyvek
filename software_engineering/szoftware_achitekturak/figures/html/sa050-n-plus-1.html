@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>N+1 lekérdezés és DataLoader</title>
+<style>
+:root{--fg:#111;--bg:#fff;--muted:#666;--hl:#1f4e79;--hl2:#c55a11;--cell:#fff;--cellhl:#d9d9d9;--line:#000;--code:#f3f3f3}
+@media (prefers-color-scheme:dark){:root{--fg:#eee;--bg:#1b1b1b;--muted:#aaa;--hl:#8fb8e8;--hl2:#f0a060;--cell:#262626;--cellhl:#4a4a4a;--line:#ddd;--code:#2a2a2a}}
+*{box-sizing:border-box}
+body{margin:0;padding:10px;font:14px/1.45 system-ui,sans-serif;color:var(--fg);background:var(--bg)}
+.ctl{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:6px}
+button{font:inherit;padding:3px 10px;cursor:pointer}
+input[type=range]{flex:1;min-width:120px}
+#status{margin:4px 0 6px;min-height:2.9em}
+/* A pszeudokód a rajz ALATT, teljes szélességben (hosszú sorok ne görgessenek oldalra) */
+.wrap{display:flex;flex-direction:column;gap:10px;align-items:stretch}
+svg{width:100%;height:auto;display:block}
+pre#code{width:100%;margin:0;padding:6px 8px;background:var(--code);font:12.5px/1.5 ui-monospace,monospace;white-space:pre;overflow-x:auto}
+pre#code span{display:block;padding:0 4px}
+pre#code span.on{outline:2px solid var(--hl);font-weight:bold}
+svg text:not([fill]){fill:var(--fg);}
+svg text{font-family:system-ui,sans-serif}
+.small{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="ctl" role="group" aria-label="Lejátszás vezérlői">
+  <button id="first" title="Első lépés">⏮</button>
+  <button id="prev" title="Előző lépés">◀ Lépés</button>
+  <button id="play" title="Lejátszás / szünet">▶ Lejátszás</button>
+  <button id="next" title="Következő lépés">Lépés ▶</button>
+  <input id="pos" type="range" min="0" max="0" value="0" aria-label="Lépés kiválasztása">
+  <span id="cnt" class="small"></span>
+</div>
+<div class="ctl"><label>N rendelés: <input type="range" id="nn" min="1" max="20" value="4" style="width:140px"> <b id="nv">4</b></label> <label>egyedi vevők: <input type="range" id="uu" min="1" max="4" value="3" style="width:110px"> <b id="uv">3 (arány 0,75)</b></label> <label><input type="checkbox" id="sh"> megosztott cache (hibás)</label></div>
+<div id="status" aria-live="polite"></div>
+<div class="wrap">
+  <svg id="v" viewBox="0 0 560 300" role="img" aria-label="Naiv resolverrel N plusz 1, DataLoaderrel 2 adatbázis-hívás; a DataLoader kérésenkénti, két tenant nem osztozhat a cache-en."></svg>
+  <pre id="code" aria-label="Pszeudokód"></pre>
+</div>
+<p class="small">DB-hívások számlálása a 14.1.3 példáján (nem mérés). A naiv változat minden rendeléshez külön SELECT-et küld; a DataLoader a kérés végéig gyűjti és deduplikálja a kulcsokat.</p>
+<script>
+// ---- Adat: lépések (a Python-szkript számolja ki és illeszti be, a könyv példájával egyezően) ----
+// Minden lépés: {msg: "állapotsor szövege", line: kiemelt pszeudokódsor indexe vagy -1, ...saját mezők}
+let STEPS = [{"msg": "A kliens elküldi a rendelesek query-t; 1. DB-hívás: SELECT … FROM rendeles (4 sor).", "j": 0, "naive": 1, "dl": 1, "queued": [], "ids": ["V1", "V2", "V1", "V3"], "done": false, "shared": false}, {"msg": "Rendeles.vevo resolver a(z) 1. rendelésre (V1): naiv változat → 2. DB-hívás; DataLoader → load(V1) a kötegbe kerül.", "j": 1, "naive": 2, "dl": 1, "queued": ["V1"], "ids": ["V1", "V2", "V1", "V3"], "done": false, "shared": false}, {"msg": "Rendeles.vevo resolver a(z) 2. rendelésre (V2): naiv változat → 3. DB-hívás; DataLoader → load(V2) a kötegbe kerül.", "j": 2, "naive": 3, "dl": 1, "queued": ["V1", "V2"], "ids": ["V1", "V2", "V1", "V3"], "done": false, "shared": false}, {"msg": "Rendeles.vevo resolver a(z) 3. rendelésre (V1): naiv változat → 4. DB-hívás; DataLoader → load(V1) már a kötegben (deduplikálva).", "j": 3, "naive": 4, "dl": 1, "queued": ["V1", "V2"], "ids": ["V1", "V2", "V1", "V3"], "done": false, "shared": false}, {"msg": "Rendeles.vevo resolver a(z) 4. rendelésre (V3): naiv változat → 5. DB-hívás; DataLoader → load(V3) a kötegbe kerül.", "j": 4, "naive": 5, "dl": 1, "queued": ["V1", "V2", "V3"], "ids": ["V1", "V2", "V1", "V3"], "done": false, "shared": false}, {"msg": "A kötegelés lefut: SELECT … FROM vevo WHERE id IN (V1, V2, V3). DB-hívások: naiv 5, DataLoader 2. Kérés vége: a DataLoader cache-e eldobva.", "j": 4, "naive": 5, "dl": 2, "queued": ["V1", "V2", "V3"], "ids": ["V1", "V2", "V1", "V3"], "done": true, "shared": false}];
+const CODE = [];          // pszeudokód sorai (üres lista: a panel elrejtve)
+
+// ---- Rajzolás: ezt a függvényt kell az ábrához igazítani ----
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, text){const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);if(text!==undefined)e.textContent=text;svg.appendChild(e);return e;}
+const svg = document.getElementById("v");
+function css(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim();}
+function render(s){
+  // Példa: tömb cellákként, s.a = értékek, s.hl = kiemelt indexek
+  svg.innerHTML = "";
+  const a = s.a || [], w = 48, x0 = (560 - a.length * w) / 2, y0 = 110;
+  a.forEach((v, i) => {
+    const on = (s.hl || []).includes(i);
+    el("rect", {x: x0 + i * w, y: y0, width: w, height: w, fill: on ? css("--cellhl") : css("--cell"), stroke: css("--line"), "stroke-width": on ? 3 : 1.2});
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w / 2 + 6, "text-anchor": "middle", "font-size": 18}, String(v));
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w + 18, "text-anchor": "middle", "font-size": 12, fill: css("--muted")}, String(i));
+  });
+}
+
+function defs0(){
+  const d = el("defs", {});
+  const ln = css("--line"), mu = css("--muted"), hl = css("--hl"), h2 = css("--hl2");
+  d.innerHTML = `<pattern id="hat" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" stroke="${mu}" stroke-width="1.6"/></pattern>`
+   + `<pattern id="dots" width="6" height="6" patternUnits="userSpaceOnUse"><circle cx="3" cy="3" r="1" fill="${mu}"/></pattern>`
+   + `<marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="${ln}"/></marker>`
+   + `<marker id="arh" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="${hl}"/></marker>`
+   + `<marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="${h2}"/></marker>`;
+}
+function R(x, y, w, h, a){ return el("rect", Object.assign({x: x, y: y, width: w, height: h, fill: css("--cell"), stroke: css("--line"), "stroke-width": 1.2, rx: 4}, a || {})); }
+function T(x, y, t, a){
+  const lines = String(t).split("\n"), fs = (a && a["font-size"]) || 12, out = [];
+  lines.forEach((s, i) => out.push(el("text", Object.assign({x: x, y: y + i * fs * 1.2, "font-size": fs}, a || {}), s)));
+  return out;
+}
+function L(x1, y1, x2, y2, a){ return el("line", Object.assign({x1: x1, y1: y1, x2: x2, y2: y2, stroke: css("--line"), "stroke-width": 1.3}, a || {})); }
+function A(x1, y1, x2, y2, a){ return L(x1, y1, x2, y2, Object.assign({"marker-end": "url(#ar)"}, a || {})); }
+function X(cx, cy, r, a){ const o = Object.assign({stroke: css("--hl2"), "stroke-width": 3}, a || {}); L(cx - r, cy - r, cx + r, cy + r, o); L(cx - r, cy + r, cx + r, cy - r, o); }
+
+function vevok(n, u){ if (n === 4 && u === 3) return ["V1", "V2", "V1", "V3"]; const a = []; for (let i = 0; i < n; i++) a.push("V" + ((i % u) + 1)); return a; }
+function trace(n, u, shared){
+  const ids = vevok(n, u), st = [{msg: "A kliens elküldi a rendelesek query-t; 1. DB-hívás: SELECT … FROM rendeles (" + n + " sor).", j: 0, naive: 1, dl: 1, queued: [], ids: ids, done: false, shared: shared}];
+  const q = [];
+  ids.forEach((v, i) => { const j = i + 1, hit = q.includes(v); if (!hit) q.push(v);
+    st.push({msg: "Rendeles.vevo resolver a(z) " + j + ". rendelésre (" + v + "): naiv változat → " + (j + 1) + ". DB-hívás; DataLoader → load(" + v + ") " + (hit ? "már a kötegben (deduplikálva)" : "a kötegbe kerül") + ".", j: j, naive: 1 + j, dl: 1, queued: q.slice(), ids: ids, done: false, shared: shared}); });
+  st.push({msg: "A kötegelés lefut: SELECT … FROM vevo WHERE id IN (" + q.join(", ") + "). DB-hívások: naiv " + (1 + n) + ", DataLoader " + (1 + (n ? 1 : 0)) + ". Kérés vége: a DataLoader cache-e eldobva.", j: n, naive: 1 + n, dl: 1 + (n ? 1 : 0), queued: q.slice(), ids: ids, done: true, shared: shared});
+  return st;
+}
+function render(s){
+  svg.setAttribute("viewBox", "0 0 660 330");
+  svg.innerHTML = ""; defs0();
+  const n = s.ids.length, cw = Math.min(30, 600 / Math.max(n, 1));
+  T(10, 18, "rendelések és vevőik (az aktuális resolverhívás kiemelve):", {"font-size": 12});
+  s.ids.forEach((v, i) => { const x = 10 + i * cw, on = i + 1 === s.j && !s.done;
+    R(x, 26, cw - 3, 34, {rx: 2, fill: on ? css("--cellhl") : css("--cell"), "stroke-width": on ? 2.5 : 1});
+    T(x + (cw - 3) / 2, 40, String(i + 1), {"font-size": 10, "text-anchor": "middle", fill: css("--muted")});
+    T(x + (cw - 3) / 2, 55, v, {"font-size": cw > 24 ? 11 : 9, "text-anchor": "middle"}); });
+  // naiv sáv
+  T(10, 92, "(a) naiv: DB-hívások = " + s.naive, {"font-size": 13, "font-weight": "bold"});
+  for (let i = 0; i < s.naive; i++) { const x = 10 + i * cw; R(x, 100, cw - 3, 24, {rx: 2, fill: css("--fg")}); T(x + (cw - 3) / 2, 117, String(i + 1), {"font-size": cw > 24 ? 11 : 8, "text-anchor": "middle", fill: css("--bg")}); }
+  // DataLoader sáv
+  T(10, 152, "(b) DataLoader: DB-hívások = " + s.dl, {"font-size": 13, "font-weight": "bold"});
+  for (let i = 0; i < s.dl; i++) { const x = 10 + i * 36; R(x, 160, 33, 24, {rx: 2, fill: css("--fg")}); T(x + 16, 177, String(i + 1), {"font-size": 11, "text-anchor": "middle", fill: css("--bg")}); }
+  R(90, 158, 560, 30, {rx: 3, fill: s.done ? "url(#hat)" : css("--cell"), "stroke-dasharray": s.done ? "5 3" : ""});
+  T(98, 178, (s.done ? "kérés vége – cache eldobva; volt: " : "DataLoader (kérésenkénti) köteg: ") + "{" + s.queued.join(", ") + "}", {"font-size": 12});
+  // tenant sáv
+  T(10, 220, "(c) két tenant kérése:", {"font-size": 13, "font-weight": "bold"});
+  R(10, 230, 120, 28, {}); T(70, 249, "A tenant kérése", {"font-size": 12, "text-anchor": "middle"});
+  R(10, 282, 120, 28, {}); T(70, 301, "B tenant kérése", {"font-size": 12, "text-anchor": "middle"});
+  R(250, 230, 200, 28, {fill: css("--cellhl")}); T(350, 249, "DataLoader-A cache: V1 (A)", {"font-size": 12, "text-anchor": "middle"});
+  if (!s.shared) {
+    R(250, 282, 200, 28, {fill: css("--cellhl")}); T(350, 301, "DataLoader-B (külön példány)", {"font-size": 12, "text-anchor": "middle"});
+    A(130, 244, 248, 244); A(130, 296, 248, 296);
+    T(470, 272, "helyes: kérésenkénti példány,", {"font-size": 12}); T(470, 288, "nincs átjárás", {"font-size": 12});
+  } else {
+    A(130, 244, 248, 244);
+    el("line", {x1: 130, y1: 296, x2: 250, y2: 252, stroke: css("--hl2"), "stroke-width": 3, "marker-end": "url(#ar2)"});
+    R(250, 282, 200, 28, {fill: "url(#hat)", stroke: css("--hl2"), "stroke-width": 2.5});
+    T(350, 301, "HIBA: B az A cache-éből kap V1-et", {"font-size": 12, "text-anchor": "middle", "font-weight": "bold"});
+    T(470, 240, "megosztott cache: a B tenant", {"font-size": 12, fill: css("--hl2")}); T(470, 256, "az A jogosultságával betöltött", {"font-size": 12, fill: css("--hl2")}); T(470, 272, "vevőt látja (adatszivárgás)", {"font-size": 12, fill: css("--hl2")});
+  }
+}
+function recompute(){
+  const nE = document.getElementById("nn"), uE = document.getElementById("uu");
+  const n = +nE.value; uE.max = n; if (+uE.value > n) uE.value = n; const u = +uE.value;
+  document.getElementById("nv").textContent = n; document.getElementById("uv").textContent = u + " (arány " + (u / n).toFixed(2).replace(".", ",") + ")";
+  setSteps(trace(n, u, document.getElementById("sh").checked));
+}
+["nn", "uu", "sh"].forEach(id => document.getElementById(id).addEventListener("input", recompute));
+
+
+// ---- Vezérlés (általában nem kell módosítani) ----
+let k = 0, timer = null;
+const pos = document.getElementById("pos"), status = document.getElementById("status");
+const codeEl = document.getElementById("code");
+if (!CODE.length) codeEl.style.display = "none";
+else codeEl.innerHTML = CODE.map((l, i) => `<span id="L${i}">${l.replace(/&/g,"&amp;").replace(/</g,"&lt;")}</span>`).join("");
+pos.max = STEPS.length - 1;
+// Új lépéssor betöltése (pl. saját bemenetből számolva): setSteps(lista)
+function setSteps(list){ stop(); STEPS = list; pos.max = STEPS.length - 1; show(0); }
+function show(i){
+  k = Math.max(0, Math.min(STEPS.length - 1, i));
+  const s = STEPS[k];
+  pos.value = k;
+  document.getElementById("cnt").textContent = `${k + 1}/${STEPS.length}`;
+  status.textContent = s.msg || "";
+  codeEl.querySelectorAll("span").forEach(x => x.classList.remove("on"));
+  if (s.line !== undefined && s.line >= 0) { const L = document.getElementById("L" + s.line); if (L) L.classList.add("on"); }
+  render(s);
+}
+function stop(){ if (timer) { clearInterval(timer); timer = null; } document.getElementById("play").textContent = "▶ Lejátszás"; }
+document.getElementById("first").onclick = () => { stop(); show(0); };
+document.getElementById("prev").onclick = () => { stop(); show(k - 1); };
+document.getElementById("next").onclick = () => { stop(); show(k + 1); };
+document.getElementById("play").onclick = () => {
+  if (timer) { stop(); return; }
+  if (k >= STEPS.length - 1) show(0);
+  document.getElementById("play").textContent = "⏸ Szünet";
+  timer = setInterval(() => { if (k >= STEPS.length - 1) stop(); else show(k + 1); }, 1200);
+};
+pos.oninput = () => { stop(); show(+pos.value); };
+document.addEventListener("keydown", e => { if (e.key === "ArrowRight") { stop(); show(k + 1); } if (e.key === "ArrowLeft") { stop(); show(k - 1); } });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => show(k));
+show(0);
+</script>
+<script>(function(){function s(){var b=document.body;parent.postMessage({figResize:Math.ceil(b.getBoundingClientRect().height)},"*")}addEventListener("load",s);addEventListener("resize",s);if(window.ResizeObserver)new ResizeObserver(s).observe(document.body);s()})()</script></body>
+</html>

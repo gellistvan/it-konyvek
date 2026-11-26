@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>9.3 OOM, PSI és memóriahibák működtetése – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch09">9 Linux virtuális memória és erőforrásnyomás</a></p>
+<div class="links"><a class="prev" rel="prev" href="d042.html">← 9.2 Page cache, reclaim, swap és overcommit</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d044.html">9.4 cgroup v2 erőforrásmodell →</a></div>
+</nav>
+<h2 data-number="9.3" id="d043"><span
+class="header-section-number">9.3</span> OOM, PSI és memóriahibák
+működtetése</h2>
+<h3 data-number="9.3.1" id="motiváció"><span
+class="header-section-number">9.3.1</span> Motiváció</h3>
+<p>Egy konténeres szolgáltatás időnként <code>OOMKilled</code>
+állapottal meghal, majd automatikusan újraindul. A fejlesztő gyakran a
+host <code>free -h</code> kimenetét nézi, és azt látja, hogy van még
+szabad memória, ezért nem érti, miért állt le a folyamat. Az OOM (Out Of
+Memory) döntés soha nem csak a host teljes memóriájáról szól: a kernel
+saját reclaim algoritmusa, a cgroup limit, a systemd-oomd policy és az
+alkalmazás memóriakezelése együtt határozza meg, melyik folyamat kap
+SIGKILL jelet. A d043 alfejezetben a kernel-, cgroup- és userspace OOM
+döntések okát és következményét választjuk szét, hogy a hibából pontos
+recovery és capacity terv készülhessen.</p>
+<h3 data-number="9.3.2" id="definíciók-és-működés"><span
+class="header-section-number">9.3.2</span> Definíciók és működés</h3>
+<h4 data-number="9.3.2.1" id="kernel-oom-killer-és-badness"><span
+class="header-section-number">9.3.2.1</span> Kernel OOM killer és
+badness</h4>
+<p>Az <strong>OOM állapot</strong> akkor következik be, amikor a kernel
+a memória-visszavevés (reclaim) és lapkiírás ellenére sem tud elegendő
+fizikai lapot biztosítani a folyamatoknak. A kernel először a page cache
+tisztításával, lapok evictálásával és swapre írással próbál
+felszabadítani. Ha ez kevés, a <code>out_of_memory()</code> útvonal
+kiválaszt egy vagy több áldozatot.</p>
+<p>A kiválasztást a <strong>badness</strong> pontszám vezérli. Minden
+processzhez tartozik egy <code>oom_score</code> érték, amely magasabb,
+ha a folyamat sok névtelen lapot (anon), swapet és page table-t foglal.
+A <code>oom_score_adj</code> folyamatonkénti finomhangolást ad: -1000 az
+<code>OOM_SCORE_ADJ_MIN</code>, amely kizárja a folyamatot az OOM
+gyilkos jelöltek közül; +1000 az <code>OOM_SCORE_ADJ_MAX</code>, amely
+erősen jelöli. A kernel az OOM pillanatában a legrosszabb pontszámú
+folyamatok közül választ, és SIGKILL jelet küld, amelyet a folyamat nem
+tud elkapni, blokkolni vagy C++ destructorral kezelni.</p>
+<p>A <code>/proc/PID/oom_score</code> aktuális értéke olvasható; a
+<code>/proc/PID/oom_score_adj</code> írható, ha van jogosultság. Gyakori
+rendszerpolicy az, hogy a service manager -600 vagy -1000 értéket ad a
+kritikus systemd unitoknak, hogy a felhasználói workload legyen előbb
+áldozat.</p>
+<h4 data-number="9.3.2.2" id="cgroup-memory-limit-és-local-oom"><span
+class="header-section-number">9.3.2.2</span> Cgroup memory limit és
+local OOM</h4>
+<p>A cgroup v2 memory controller korlátot ad egy processzcsoportnak a
+<code>memory.max</code> fájlon keresztül. Ha a csoport memóriahasználata
+eléri ezt a kemény limitet, a kernel először csak a csoport
+<em>saját</em> lapjait vonja vissza. Ha ez sikertelen, <strong>local
+OOM</strong> következik: az áldozatot a limitált cgroupon belül
+választja ki a kernel. Ekkor a host memória lehet bőven szabad, a
+<code>free -h</code> nem mutatja a problémát, de a konténer vagy unit
+OOM kill-t kap.</p>
+<p>A <code>memory.max</code> egyetlen bájtérték; a
+<code>memory.current</code> az aktuális használat, a
+<code>memory.high</code> pedig egy lágy felső korlát. A
+<code>memory.high</code> átlépése nem okoz azonnali killt, de
+felgyorsítja a reclaim-et, így visszafogja a csoportot. A
+<code>memory.events</code> fontos eseményszámlálói: <code>oom</code>,
+<code>oom_kill</code> és <code>oom_group_kill</code>. Ha a cgroupban OOM
+történt, az <code>oom_kill</code> növekszik. A <code>memory.stat</code>
+részletes szeleteket ad: <code>anon</code>, <code>file</code>,
+<code>kernel</code>, <code>slab</code>, <code>sock</code>,
+<code>shadow</code>, <code>swap</code>, <code>pagetables</code> stb. A
+<code>memory.peak</code> a csoport eddigi legnagyobb használatát
+mutatja; ez kifejezetten hasznos a capacity tervezéshez.</p>
+<p>A <code>MemoryMax=64M</code> systemd direktíva a scope/service unitra
+a cgroup <code>memory.max=64M</code>-et állít. A
+<code>MemorySwapMax=0</code> tiltja a swap-használatot a unitban, így a
+limitet túllépő névtelen memória gyorsabban vezet local OOM-hoz.</p>
+<figure id="fig-d043-oom-utak">
+<div class="fig-interactive"><iframe src="figures/html/d043-oom-utak.html" title="Bal oldalt három sáv: a cgroup memory.current a 48 MiB-os memory.high és a 64 MiB-os memory.max küszöbbel, a host szabad memóriája a min és low watermarkkal, a cgroup memory.pressure a systemd-oomd limitjével. Jobb oldalt három oszlop. Host globális OOM: a szabad memória a min watermark alatt és a reclaim sikertelen, a kernel a teljes host legnagyobb oom_score-ú processzét öli, nyom: Out of memory sor, CONSTRAINT_NONE. Memcg local OOM: a memory.current eléri a memory.max-ot, a kernel a cgroupon belül választ, nyom: memory.events oom_kill, Memory cgroup out of memory sor, CONSTRAINT_MEMCG. Systemd-oomd: tartós memory.pressure vagy swap-telítettség, a daemon a teljes cgroupot öli, nyom: a systemd-oomd naplója, kernel-OOM-sor nincs." loading="lazy" style="width:100%;border:0;height:700px"></iframe><noscript><img src="figures/img/d043-oom-utak.png" style="width:100.0%"
+alt="Bal oldalt három sáv: a cgroup memory.current a 48 MiB-os memory.high és a 64 MiB-os memory.max küszöbbel, a host szabad memóriája a min és low watermarkkal, a cgroup memory.pressure a systemd-oomd limitjével. Jobb oldalt három oszlop. Host globális OOM: a szabad memória a min watermark alatt és a reclaim sikertelen, a kernel a teljes host legnagyobb oom_score-ú processzét öli, nyom: Out of memory sor, CONSTRAINT_NONE. Memcg local OOM: a memory.current eléri a memory.max-ot, a kernel a cgroupon belül választ, nyom: memory.events oom_kill, Memory cgroup out of memory sor, CONSTRAINT_MEMCG. Systemd-oomd: tartós memory.pressure vagy swap-telítettség, a daemon a teljes cgroupot öli, nyom: a systemd-oomd naplója, kernel-OOM-sor nincs." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d043-oom-utak.png" style="width:100.0%"
+alt="Bal oldalt három sáv: a cgroup memory.current a 48 MiB-os memory.high és a 64 MiB-os memory.max küszöbbel, a host szabad memóriája a min és low watermarkkal, a cgroup memory.pressure a systemd-oomd limitjével. Jobb oldalt három oszlop. Host globális OOM: a szabad memória a min watermark alatt és a reclaim sikertelen, a kernel a teljes host legnagyobb oom_score-ú processzét öli, nyom: Out of memory sor, CONSTRAINT_NONE. Memcg local OOM: a memory.current eléri a memory.max-ot, a kernel a cgroupon belül választ, nyom: memory.events oom_kill, Memory cgroup out of memory sor, CONSTRAINT_MEMCG. Systemd-oomd: tartós memory.pressure vagy swap-telítettség, a daemon a teljes cgroupot öli, nyom: a systemd-oomd naplója, kernel-OOM-sor nincs." /></details></div>
+<figcaption>Ki öl és miért: a host globális OOM, a memcg local OOM és a
+systemd-oomd triggere, döntéshozója és nyoma (a memory.high, a
+watermarkok és az oomd-limit illusztratív)</figcaption>
+</figure>
+<h4 data-number="9.3.2.3" id="psi-pressure-és-stalls"><span
+class="header-section-number">9.3.2.3</span> PSI pressure és stalls</h4>
+<p>A <strong>PSI (Pressure Stall Information)</strong> azt méri, hogy a
+feladatok mennyi időt várakoztak egy adott erőforrásra. A
+<code>/proc/pressure/memory</code>, <code>/proc/pressure/cpu</code> és
+<code>/proc/pressure/io</code> fájlokban a <code>some</code> és
+<code>full</code> sorok tíz, hatvan és háromszáz másodperces átlagokat
+adnak. A <code>some</code> azt mutatja, hogy legalább egy task állt; a
+<code>full</code> azt, hogy az összes task állt. A memória PSI
+például:</p>
+<pre class="text"><code>some avg10=0.00 avg60=0.12 avg300=0.08 total=12345678
+full avg10=0.00 avg60=0.02 avg300=0.01 total=9876543</code></pre>
+<p>A százalékos érték az időablak azon hányada, amikor a processz(ek)
+memória reclaim miatt várakoztak. A PSI memória jel korai előrejelzője a
+romló node-állapotnak: ha a <code>some</code> folyamatosan emelkedik, a
+rendszer lassul, de még nincs OOM kill. A cgroup v2 a hierarchia minden
+szintjén ad <code>memory.pressure</code>, <code>cpu.pressure</code> és
+<code>io.pressure</code> fájlokat, így konténerenként is eldönthető,
+melyik unit okozza a memórianyomást.</p>
+<h4 data-number="9.3.2.4" id="systemd-oomd"><span
+class="header-section-number">9.3.2.4</span> systemd-oomd</h4>
+<p>A <strong>systemd-oomd</strong> egy userspace daemon, amely a cgroup
+v2 memória-nyomást figyeli, és a kernel OOM killer előtt vagy helyett
+avatkozik be a systemd által kezelt unitoknál. A kernel OOM kiválasztása
+pillanatnyi és néha nem a legjobb üzemeltetési cél szerint dönt; a
+systemd-oomd policy alapú. A unitok <code>ManagedOOMSwap=</code> és
+<code>ManagedOOMMemoryPressure=</code> direktívái szabályozhatják, hogy
+a unit engedélyezze-e a systemd-oomd beavatkozást. A daemon a cgroup
+<code>memory.pressure</code> és a swap-használat alapján dönt, és
+<code>SIGKILL</code> jelet küld a leginkább nyomást okozó cgroupnak vagy
+annak egy folyamatának.</p>
+<p>A systemd-oomd pontos policy-je, alapértelmezése és a direktívák
+elérhetősége <strong>verziófüggő</strong>; az Ubuntu Server 24.04 LTS
+adott rendszerén a <code>systemd --version</code>, a
+<code>/etc/systemd/oomd.conf</code> és a kiadási jegyzék ellenőrzendő. A
+példában szereplő állítások a mechanizmust írják le, de a pontos
+alapértelmezett engedélyezettséget a labhoston mérni kell.</p>
+<h4 data-number="9.3.2.5" id="restart-loop-és-adatvesztés"><span
+class="header-section-number">9.3.2.5</span> Restart loop és
+adatvesztés</h4>
+<p>Ha egy systemd service <code>Restart=always</code> beállítással fut,
+a systemd OOM kill után azonnal újraindítja. A folyamat minden
+indításnál újra elfogyasztja a memóriát, ismét killt kap, így
+<strong>restart loop</strong> alakul ki. A jelenség gyakran úgy jelenik
+meg, mint „a szolgáltatás nem indul”, pedig a valódi ok a cgroup
+limithez viszonyított túlzott memóriaigény.</p>
+<p>A SIGKILL következménye adatvesztés is lehet: a folyamat nem tudja
+elvégzni a normál cleanup műveleteket. Elvész a processz memóriájában
+lévő, még <code>write()</code>-tal át nem adott adat
+(stdio/<code>std::ofstream</code> puffer, alkalmazásszintű batch),
+félbemaradhat egy többlépéses frissítés, és a nyitott hálózati
+kapcsolatok megszakadnak. A már <code>write()</code>-olt, de nem
+fsync-elt adat viszont a page cache-ben megmarad, a kernel később
+kiírja: az fsync hiánya a host összeomlásakor vagy áramszünetkor okoz
+veszteséget (lásd 10.2). A processz-kill és a host-crash tehát két külön
+veszteségi felület. A d043 szempontjából a recovery tervnek explicit
+módon kezelnie kell az adatvesztési felületet, különösen adatbázis vagy
+tranzakciós szolgáltatás esetén. A cél nem a kernel gyilkolás
+megakadályozása, hanem a limithiány vagy a memória hiba megszüntetése,
+és a tartósságot garantáló írási út megerősítése.</p>
+<h3 data-number="9.3.3" id="kidolgozott-példa"><span
+class="header-section-number">9.3.3</span> Kidolgozott példa</h3>
+<p>A példát a <code>labvm1</code> labhoston, <code>labuser</code> UID
+1000 felhasználóval futó izolált laborban mutatjuk be. Cél: cgroup local
+OOM bizonyítása úgy, hogy a host memória bőven szabad marad, a unit
+limitje mégis killt okoz.</p>
+<p>Előfeltételek: a <code>labvm1</code> hoston cgroup v2 van mountolva
+(<code>findmnt -t cgroup2</code>), systemd elérhető, <code>g++</code>
+telepített. A labusernek sudo joga van a labor parancsokhoz; a
+létrehozandó unit és cgroup név <code>oomdemo</code> prefixet kap, és
+csak a labor saját objektumaira terjed ki.</p>
+<p>Először egy egyszerű memóriafogyasztó C++ program, amely 1 MiB-os
+blokkokban foglal:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// memhog.cpp</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstddef&gt;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;unistd.h&gt;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="bu">std::</span>size_t block <span class="op">=</span> <span class="dv">1</span><span class="bu">u</span> <span class="op">&lt;&lt;</span> <span class="dv">20</span><span class="op">;</span> <span class="co">// 1 MiB</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">char</span><span class="op">&gt;&gt;</span> buffers<span class="op">;</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">1000</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>        buffers<span class="op">.</span>emplace_back<span class="op">(</span>block<span class="op">,</span> <span class="ch">&#39;A&#39;</span><span class="op">);</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">((</span>i <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">%</span> <span class="dv">10</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="op">(</span>i <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">&lt;&lt;</span> <span class="st">&quot; MiB allocated&quot;</span> <span class="op">&lt;&lt;</span> <span class="bu">std::</span>endl<span class="op">;</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    pause<span class="op">();</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A transient scope az utolsó processze halálakor leáll, és a systemd
+eltávolítja a cgroup-könyvtárát; a kill után a
+<code>…/oomdemo.scope/memory.events</code> már nem olvasható („No such
+file or directory”). Ezért az alapállapotot a szülő slice hierarchikus
+számlálójából előre mentjük, a bizonyítékot pedig a szülőből, a unit
+eredményéből és a kernelnaplóból gyűjtjük. Fordítás, alapállapot és
+futtatás egy 64 MiB-es memory limitezésű scope alatt (a
+<code>systemd-run --scope</code> előtérben fut, így a kilépési kódja a
+programé):</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm1; user: labuser; cwd: /tmp</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">g++</span> <span class="at">-std</span><span class="op">=</span>c++20 <span class="at">-O2</span> <span class="at">-Wall</span> memhog.cpp <span class="at">-o</span> memhog</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm1; user: labuser (sudo); unit: oomdemo.scope</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/cgroup/system.slice/memory.events   <span class="co"># alapállapot</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemd-run <span class="at">--unit</span><span class="op">=</span>oomdemo <span class="at">--scope</span> <span class="dt">\</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">-p</span> MemoryMax=64M <span class="at">-p</span> MemorySwapMax=0 <span class="dt">\</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--uid</span><span class="op">=</span><span class="va">$(</span><span class="fu">id</span> <span class="at">-u</span> labuser<span class="va">)</span> <span class="at">--gid</span><span class="op">=</span><span class="va">$(</span><span class="fu">id</span> <span class="at">-g</span> labuser<span class="va">)</span> <span class="dt">\</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>  /tmp/memhog</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;exit=</span><span class="va">$?</span><span class="st">&quot;</span></span></code></pre></div>
+<p>A fentiek a <code>MemoryMax=64M</code> miatt a cgroup
+<code>memory.max</code> értékét 64 MiB-re állítják, a swapot pedig
+tiltják a unitban. A program a 64 MiB körüli allokációknál eléri a
+limitet, a reclaim nem tud több anon lapot felszabadítani, ezért a
+kernel a cgroupon belüli folyamatot SIGKILL-lel megszakítja. Ha a scope
+futása közben egy második terminálból nézzük, a
+<code>/sys/fs/cgroup/system.slice/oomdemo.scope/memory.current</code> és
+<code>memory.stat</code> még olvasható.</p>
+<p>A bizonyíték a kill után:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm1; user: labuser (sudo)</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/cgroup/system.slice/memory.events   <span class="co"># oom_kill +1</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> show oomdemo.scope <span class="at">-p</span> Result <span class="at">-p</span> ActiveState</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> journalctl <span class="at">-k</span> <span class="at">-g</span> <span class="st">&#39;Memory cgroup out of memory&#39;</span> <span class="at">-n</span> 5 <span class="at">--no-pager</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> journalctl <span class="at">-k</span> <span class="at">-g</span> <span class="st">&#39;oom-kill&#39;</span> <span class="at">-n</span> 5 <span class="at">--no-pager</span></span></code></pre></div>
+<p>Várható kimenet (illusztratív, nem mért): a program kimenete TTY-n
+kb. „60 MiB allocated” után megáll (a <code>std::endl</code> miatt
+fájlba irányítva sem vész el); <code>exit=137</code> (128+9, azaz
+SIGKILL). A szülő slice <code>memory.events</code> <code>oom_kill</code>
+értéke eggyel nagyobb az alapállapotnál (a szülő számlálója a
+leszármazottakat is tartalmazza). A <code>systemctl show</code>
+<code>Result=oom-kill</code> értéket ad (ha a unit már nincs betöltve, a
+<code>journalctl -u oomdemo.scope</code> mutatja ugyanezt). A
+kernelnapló „Memory cgroup out of memory: Killed process …” sora és az
+<code>oom-kill:</code> sor <code>constraint=CONSTRAINT_MEMCG</code>,
+<code>oom_memcg=/system.slice/oomdemo.scope</code> mezője igazolja a
+local OOM-ot.</p>
+<p>A host globális memóriája közben nem merül ki:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm1; user: labuser</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">free</span> <span class="at">-h</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/pressure/memory</span></code></pre></div>
+<p>A <code>free -h</code> várhatóan bőven mutat szabad memóriát, ami
+bizonyítja, hogy a cgroup limit okozta a local OOM-ot, nem a host
+kapacitáshiánya.</p>
+<p>A példa utáni rollback egyszerű: a cgroup a kill után már megszűnt,
+csak a failed állapotú unitot kell törölni (ha a scope még futna, előbb
+<code>stop</code>):</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm1; user: labuser (sudo)</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl stop oomdemo.scope <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="fu">true</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl reset-failed oomdemo.scope <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="fu">true</span></span></code></pre></div>
+<h3 data-number="9.3.4" id="hibák-és-ellenpróbák"><span
+class="header-section-number">9.3.4</span> Hibák és ellenpróbák</h3>
+<h4 data-number="9.3.4.1"
+id="tünet-a-szolgáltatás-oomkilled-de-a-hoston-van-szabad-memória"><span
+class="header-section-number">9.3.4.1</span> Tünet: a szolgáltatás
+OOMKilled, de a hoston van szabad memória</h4>
+<p>Ez a leggyakoribb eset. A hibás hipotézis: „elfogyott a node
+memóriája”. A helyes adatgyűjtés a cgroup <code>memory.events</code> és
+<code>memory.max</code> ellenőrzése:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: a konténer vagy unit cgroupja; user: root vagy sudo</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/cgroup/system.slice/.../memory.events</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/cgroup/system.slice/.../memory.max</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/cgroup/system.slice/.../memory.peak</span></code></pre></div>
+<p>Ha a <code>memory.events</code> <code>max</code> és
+<code>oom_kill</code> számlálója nő, és a <code>memory.peak</code> ≈
+<code>memory.max</code> (nagyobb nem lehet, mert a kernel a limit fölé
+nem engedi a csoportot), a csoport a limitbe ütközött. Hogy ez kevés
+limit vagy leak, azt csak a limit ideiglenes emelése (vagy laborban
+<code>MemoryHigh=</code> + <code>MemoryMax=infinity</code>) után a
+<code>memory.current</code> időbeli trendje dönti el: plató →
+kapacitáskérdés, a limitet növelni kell; terheléstől független
+folyamatos növekedés → leak, a workload memóriakezelését kell javítani.
+A host PSI-t is meg kell nézni: ha a host
+<code>/proc/pressure/memory</code> <code>some</code> értékei alacsonyak,
+a host valóban nincs nyomás alatt; ha magasak, akkor a host szintű
+reclaim is közrejátszik.</p>
+<h4 data-number="9.3.4.2"
+id="tünet-restart-loop-a-szolgáltatás-folyamatosan-újraindul"><span
+class="header-section-number">9.3.4.2</span> Tünet: restart loop, a
+szolgáltatás folyamatosan újraindul</h4>
+<p>A <code>systemctl status</code> egymást követő
+<code>failed (Result: oom-kill)</code> bejegyzéseket mutat. A restart
+loop gyakran elrejti a tényleges hibát. Első lépés a futó (loopoló)
+service cgroupjának <code>memory.events</code>, <code>memory.peak</code>
+és <code>memory.current</code> mentése, mert a
+<code>systemctl stop</code> után a cgroup-könyvtár megszűnik, és vele a
+bizonyíték. Csak ezután állítsuk meg a loopot a <code>Restart=no</code>
+ideiglenes drop-innal vagy <code>systemctl stop</code>-pal, hogy a
+diagnosztika ne versenyezzen az újraindítással. A mentett számlálók, a
+szülő slice <code>memory.events</code>-e és a naplók elemzése mutatja,
+hogy a memória fogyás lineáris-e (leak), vagy az indulás pillanatában
+ugrik-e meg (túl nagy kezdeti buffer). A megoldás lehet a memory limit
+emelése, a programban a buffer csökkentése vagy a leak javítása.</p>
+<h4 data-number="9.3.4.3"
+id="ellentpróba-a-limit-növelése-nem-mindig-megoldás"><span
+class="header-section-number">9.3.4.3</span> Ellentpróba: a limit
+növelése nem mindig megoldás</h4>
+<p>Limit alatt a <code>memory.peak</code> leak és kevés limit esetén is
+a <code>memory.max</code>-nál áll meg, ezért önmagában nem különít el.
+Ha emelt limit mellett a <code>memory.current</code> folyamatosan nő, a
+limit emelése csak késlelteti a killt, nem oldja meg a problémát. A leak
+proof: ugyanazt a workloadot egy nagyobb limit alatt futtatva a
+használat várhatóan hamarosan eléri az új limitet. Ezért a recovery
+tervnek két ága van: ha emelt limit mellett a
+<code>memory.current</code> platóra áll, kapacitás növelés; ha tovább
+növekszik, alkalmazásszintű memória hibaelhárítás.</p>
+<h3 data-number="9.3.5" id="feladatok"><span
+class="header-section-number">9.3.5</span> Feladatok</h3>
+<h4 data-number="9.3.5.1"
+id="feladat-magyarázó-két-oom-szint-elkülönítése"><span
+class="header-section-number">9.3.5.1</span> 1. Feladat: magyarázó – két
+OOM szint elkülönítése</h4>
+<p>Írd le, mi a különbség a kernel globális OOM killer és a cgroup local
+OOM között. Adj konkrét példát, amikor a host <code>free -h</code> bőven
+szabad memóriát mutat, de egy konténer mégis OOM kill-t kap. Melyik
+<code>/proc</code> vagy cgroup fájlok bizonyítanák az okot?</p>
+<h4 data-number="9.3.5.2"
+id="feladat-adminisztrációskonfigurációs-limit-változtatás-és-megfigyelés"><span
+class="header-section-number">9.3.5.2</span> 2. Feladat:
+adminisztrációs/konfigurációs – limit változtatás és megfigyelés</h4>
+<p>Készíts egy módosított <code>memhog_stable.cpp</code> programot,
+amely 200 MiB-ot allokál és érint, majd <code>pause()</code>-ig vár.
+Futtasd <code>systemd-run --scope</code> alatt
+<code>MemoryMax=256M</code> és <code>MemoryMax=128M</code> limitekkel.
+Rögzítsd a <code>memory.events</code>, <code>memory.peak</code> és a
+processz kilépési kódját mindkét esetben. A végeredményből igazold, hogy
+a 256 MiB-es korlát alatt a folyamat fut, a 128 MiB-es alatt
+elpusztul.</p>
+<h4 data-number="9.3.5.3"
+id="feladat-diagnosztikaifailurerecovery-restart-loop-megszüntetése"><span
+class="header-section-number">9.3.5.3</span> 3. Feladat:
+diagnosztikai/failure/recovery – restart loop megszüntetése</h4>
+<p>Adott egy systemd service <code>app-demo.service</code>,
+<code>Restart=always</code> beállítással, <code>MemoryMax=512M</code>
+limittel. A journal szerint a service folyamatosan <code>oom-kill</code>
+eredménnyel áll le. A host memória bőven szabad. Készíts diagnosztikai
+tervet: milyen parancsokkal állapítod meg, hogy a memória fogyás leak
+vagy túl alacsony limit? Írj recovery lépéseket, és add meg a várt
+postconditiont.</p>
+<h3 data-number="9.3.6" id="megoldások"><span
+class="header-section-number">9.3.6</span> Megoldások</h3>
+<h4 data-number="9.3.6.1" id="feladat-megoldása"><span
+class="header-section-number">9.3.6.1</span> 1. Feladat megoldása</h4>
+<p>A kernel globális OOM akkor aktív, ha a host szintű reclaim sem tud
+elegendő lapot adni. Ekkor a <code>dmesg -T | grep -i oom</code> (vagy
+<code>journalctl -k -g 'oom-kill'</code>) az „Out of memory: Killed
+process …” sort és a kiválasztott processzt mutatja, az
+<code>oom-kill:</code> sorban <code>constraint=CONSTRAINT_NONE</code>
+áll. A cgroup local OOM akkor következik be, ha egy adott cgroup eléri a
+<code>memory.max</code> limitjét, és a csoport saját reclaimje
+sikertelen. Az áldozat kiválasztása a csoporton belül történik; a host
+nem feltétlenül terhelt. Bizonyíték: a csoport (vagy – ha a unit már
+megszűnt – a szülő slice) <code>memory.events</code> fájljában a
+<code>max</code> és az <code>oom_kill</code> növekszik, a
+<code>memory.peak</code> ≈ <code>memory.max</code>, a kernelnapló
+„Memory cgroup out of memory: Killed process …” sort ír, és az
+<code>oom-kill:</code> sor <code>constraint=CONSTRAINT_MEMCG</code>-t és
+az <code>oom_memcg=/system.slice/…</code> útvonalat mutatja. A
+<code>/proc/vmstat</code> <code>oom_kill</code> számlálója mindkét
+esetben nő, ezért nem elkülönítő. Példa: a konténer
+<code>memory.max=256M</code>, a workload 512 MiB-ot akar, a hostnak 100
+GiB szabad memóriája van; a kernel a konténerben lévő processzt
+gyilkolja le.</p>
+<h4 data-number="9.3.6.2" id="feladat-megoldása-1"><span
+class="header-section-number">9.3.6.2</span> 2. Feladat megoldása</h4>
+<p>A <code>memhog_stable.cpp</code>:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// memhog_stable.cpp</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstddef&gt;</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;unistd.h&gt;</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="bu">std::</span>size_t target <span class="op">=</span> <span class="dv">200</span><span class="bu">ull</span> <span class="op">*</span> <span class="dv">1024</span><span class="bu">u</span> <span class="op">*</span> <span class="dv">1024</span><span class="bu">u</span><span class="op">;</span> <span class="co">// 200 MiB</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">char</span><span class="op">&gt;</span> buffer<span class="op">(</span>target<span class="op">,</span> <span class="ch">&#39;A&#39;</span><span class="op">);</span>             <span class="co">// minden lap érintve</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">// a pointer kiírása megakadályozza, hogy a fordító elhagyja a puffert</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;allocated </span><span class="sc">%zu</span><span class="st"> MiB at </span><span class="sc">%p\n</span><span class="st">&quot;</span><span class="op">,</span> target <span class="op">&gt;&gt;</span> <span class="dv">20</span><span class="op">,</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>                <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">void</span><span class="op">*&gt;(</span>buffer<span class="op">.</span>data<span class="op">()));</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>fflush<span class="op">(</span>stdout<span class="op">);</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>    pause<span class="op">();</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A 200 MiB-os méret szándékos: 256 MiB-os limit alatt kb. 50 MiB
+tartalékot hagy a kódnak, a könyvtáraknak, a page table-öknek és a
+kernelmemóriának.</p>
+<p>Fordítás:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm1; user: labuser; cwd: /tmp</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="ex">g++</span> <span class="at">-std</span><span class="op">=</span>c++20 <span class="at">-O2</span> <span class="at">-Wall</span> memhog_stable.cpp <span class="at">-o</span> memhog_stable</span></code></pre></div>
+<p>Futtatás 256 MiB-es limit alatt:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm1; user: labuser (sudo)</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemd-run <span class="at">--unit</span><span class="op">=</span>oomstable256 <span class="at">--scope</span> <span class="dt">\</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-p</span> MemoryMax=256M <span class="at">-p</span> MemorySwapMax=0 <span class="dt">\</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--uid</span><span class="op">=</span><span class="va">$(</span><span class="fu">id</span> <span class="at">-u</span> labuser<span class="va">)</span> <span class="at">--gid</span><span class="op">=</span><span class="va">$(</span><span class="fu">id</span> <span class="at">-g</span> labuser<span class="va">)</span> <span class="dt">\</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>  /tmp/memhog_stable <span class="kw">&amp;</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="va">pid256</span><span class="op">=</span><span class="va">$!</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 2</span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> status oomstable256.scope <span class="at">--no-pager</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="va">cg</span><span class="op">=</span>/sys/fs/cgroup/system.slice/oomstable256.scope</span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="st">&quot;</span><span class="va">$cg</span><span class="st">/memory.events&quot;</span> <span class="st">&quot;</span><span class="va">$cg</span><span class="st">/memory.peak&quot;</span></span></code></pre></div>
+<p>Várhatóan a scope aktív marad, a processz fut,
+<code>memory.peak</code> körülbelül 205 MiB (200 MiB puffer + program és
+könyvtárak), <code>oom_kill 0</code>.</p>
+<p>Futtatás 128 MiB-es limit alatt; ez előtérben fut, hogy a kilépési
+kód kiolvasható legyen. A scope cgroupja a kill után megszűnik, ezért a
+bizonyítékot a szülő slice-ból és a unit eredményéből vesszük:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm1; user: labuser (sudo)</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/cgroup/system.slice/memory.events   <span class="co"># alapállapot</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemd-run <span class="at">--unit</span><span class="op">=</span>oomstable128 <span class="at">--scope</span> <span class="dt">\</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-p</span> MemoryMax=128M <span class="at">-p</span> MemorySwapMax=0 <span class="dt">\</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--uid</span><span class="op">=</span><span class="va">$(</span><span class="fu">id</span> <span class="at">-u</span> labuser<span class="va">)</span> <span class="at">--gid</span><span class="op">=</span><span class="va">$(</span><span class="fu">id</span> <span class="at">-g</span> labuser<span class="va">)</span> <span class="dt">\</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>  /tmp/memhog_stable</span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;exit=</span><span class="va">$?</span><span class="st">&quot;</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/cgroup/system.slice/memory.events   <span class="co"># oom_kill +1</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> show oomstable128.scope <span class="at">-p</span> Result</span></code></pre></div>
+<p>Ebben az esetben a kimenet <code>exit=137</code>, a unit eredménye
+<code>Result=oom-kill</code>, a szülő slice <code>oom_kill</code>
+számlálója eggyel nő. A postcondition: a <code>oomstable256.scope</code>
+futó, a <code>oomstable128.scope</code> meghalt; a cgroup fájlok és a
+unit eredménye igazolják, hogy a 128 MiB-es limit túl alacsony a 200
+MiB-es folyamatnak.</p>
+<p>Tisztítás:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm1; user: labuser (sudo)</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl stop oomstable256.scope oomstable128.scope</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl reset-failed oomstable256.scope oomstable128.scope</span></code></pre></div>
+<h4 data-number="9.3.6.3" id="feladat-megoldása-2"><span
+class="header-section-number">9.3.6.3</span> 3. Feladat megoldása</h4>
+<p>Diagnosztikai terv:</p>
+<ol type="1">
+<li>Mentsd a futó (loopoló) példány cgroup-állapotát, amíg a könyvtár
+létezik:
+<code>cd /sys/fs/cgroup/system.slice/app-demo.service &amp;&amp; cat memory.events memory.peak memory.current memory.max memory.pressure</code>.</li>
+<li>Csak ezután állítsd le a loopot:
+<code>sudo systemctl stop app-demo.service</code> (vagy
+<code>systemctl edit</code> → <code>[Service]</code>
+<code>Restart=no</code>, és figyeld meg a futó példányt). A leállítás
+után a cgroup-könyvtár megszűnik.</li>
+<li>Nézd a naplót:
+<code>journalctl -u app-demo.service -n 200 --no-pager</code>, és a
+kernel naplót: <code>sudo journalctl -k -g 'oom-kill'</code>
+(<code>constraint=CONSTRAINT_MEMCG</code> = local OOM).</li>
+<li>Mérj host PSI-t: <code>cat /proc/pressure/memory</code>.</li>
+<li>Döntés: a <code>memory.peak</code> limit alatt mindkét esetben 512
+MiB-nál áll meg, ezért nem különít el. Ideiglenesen emelt limit mellett
+(lásd lent) kövesd a <code>memory.current</code> trendjét: plató → a
+limit túl alacsony; terheléstől független folyamatos növekedés → leak
+gyanú.</li>
+</ol>
+<p>Recovery: ha a limit okozza, adj ki
+<code>systemctl edit app-demo.service</code>, módosítsd a
+<code>MemoryMax=512M</code> értéket például
+<code>MemoryMax=768M</code>-re, majd
+<code>sudo systemctl daemon-reload</code> és
+<code>sudo systemctl start app-demo.service</code>. Ellenőrizd a
+<code>memory.peak</code>-et és a PSI-t ismételten. Ha leak, indíts
+memória profilozást (valgrind vagy heaptrack) a C++ folyamatban, és
+javítsd az allokációt. A postcondition: a service 10 percig fut, a peak
+nem növekszik, a <code>oom_kill</code> számláló 0, a PSI
+<code>some</code> értéke alacsony.</p>
+<h3 data-number="9.3.7" id="rövid-összefoglaló"><span
+class="header-section-number">9.3.7</span> Rövid összefoglaló</h3>
+<p>A kernel OOM killer globális memóriahiánykor reclaim után választ
+áldozatot a <code>oom_score</code> és a <code>oom_score_adj</code>
+alapján. A cgroup v2 <code>memory.max</code> limit a csoport szintjén
+vált ki local OOM-ot, így a host bőven szabad memóriája ellenére kill
+történhet. A PSI a stall-idő (erőforrásra várakozás) arányaként jelzi a
+memórianyomást; a systemd-oomd ezt a jelet használja managed unitoknál,
+de támogatottsága verziófüggő. A diagnózis mindig a
+<code>memory.events</code>, <code>memory.peak</code>,
+<code>memory.stat</code> és a <code>/proc/pressure/memory</code> adatok
+összevetéséből származik. A restart loop alatt a SIGKILL adatvesztést is
+okozhat; a recovery a loop leállításából, a peak stabilizálásából és a
+limit vagy kód javításából áll. Továbbhasznált definíciók: <strong>OOM
+badness</strong>, <strong>cgroup local OOM</strong>, <strong>PSI
+pressure</strong>.</p>
+<h3 data-number="9.3.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">9.3.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>Forráskiindulópontok:</p>
+<ul>
+<li><a href="https://docs.kernel.org/">Linux kernel
+documentation</a></li>
+<li><a href="https://man7.org/linux/man-pages/">Linux man-pages</a></li>
+<li><a href="https://systemd.io/">systemd documentation</a></li>
+</ul>
+<p>Állításonkénti forrásindex (viszonyítási pont: Ubuntu Server 24.04
+LTS, 6.8-as GA kernel, systemd 255):</p>
+<ul>
+<li>cgroup v2 memory controller (<code>memory.max</code>,
+<code>memory.high</code>, <code>memory.peak</code>,
+<code>memory.events</code>, <code>memory.stat</code> kulcsai):
+https://docs.kernel.org/admin-guide/cgroup-v2.html – „Memory”
+szakasz.</li>
+<li>PSI formátum és szemantika (<code>some</code>/<code>full</code>,
+stall-idő): https://docs.kernel.org/accounting/psi.html.</li>
+<li><code>oom_score</code>, <code>oom_score_adj</code>:
+https://man7.org/linux/man-pages/man5/proc_pid_oom_score_adj.5.html.</li>
+<li><code>MemoryMax=</code>, <code>MemorySwapMax=</code>,
+<code>ManagedOOM*=</code>:
+https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html;
+systemd-oomd:
+https://www.freedesktop.org/software/systemd/man/latest/systemd-oomd.service.html
+és
+https://www.freedesktop.org/software/systemd/man/latest/oomd.conf.html
+(a „latest” oldal az újabb systemd-t írja le; a 255-ös eltérést a
+labhoston a <code>man</code> oldallal kell egyeztetni).</li>
+<li><code>systemd-run --scope</code>:
+https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html.</li>
+</ul>
+<p>A példák laborban ellenőrizendők; dátumozott futtatási napló
+(verziók, parancskimenet, sikeres és OOM-ág) még nem készült.</p>
+<p>Ezek ebben az írásban kiindulópontok, <strong>nem olvasott,
+ellenőrzött források</strong>. A systemd-oomd pontos engedélyezése,
+policyje, a <code>ManagedOOMSwap=</code> és
+<code>ManagedOOMMemoryPressure=</code> direktívák elérhetősége, valamint
+a systemd scope <code>MemoryMax=</code> viselkedése verziófüggő; az
+Ubuntu Server 24.04 LTS labhoston ellenőrizendő. A példákban szereplő
+memóriaértékek, PSI-számok és kilépési kódok illusztratívak, nem
+ténylegesen mért laberedmények. A cgroup v2 <code>memory.events</code>
+mezőinek pontos nevei és a <code>/proc/pressure/memory</code> formátuma
+a kernelverziótól függ; a labhoston mért adat az irányadó.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d042.html">← 9.2 Page cache, reclaim, swap és overcommit</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d044.html">9.4 cgroup v2 erőforrásmodell →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

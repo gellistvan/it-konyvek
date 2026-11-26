@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>9.5 Memória-, swap- és cgroup labor – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch09">9 Linux virtuális memória és erőforrásnyomás</a></p>
+<div class="links"><a class="prev" rel="prev" href="d044.html">← 9.4 cgroup v2 erőforrásmodell</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d046.html">10.1 Syscalltól az eszközig: I/O rétegek →</a></div>
+</nav>
+<h2 data-number="9.5" id="d045"><span
+class="header-section-number">9.5</span> Memória-, swap- és cgroup
+labor</h2>
+<h3 data-number="9.5.1" id="motiváció"><span
+class="header-section-number">9.5.1</span> Motiváció</h3>
+<p>Egy üzemeltetett Linux szolgáltatásnál a legkellemetlenebb
+memóriaproblémák ritkán reprodukálhatók a fejlesztői gépen. A host
+<em>free</em> kimenete még „elég memóriát” mutat, miközben a service
+belassul, vagy a cgroup OOM killer (out-of-memory killer) leöli a
+folyamatot. A feladat ilyenkor nem a host egészének kimerítése, hanem
+az, hogy egy korlátozott, megismételhető laborban megértsük, hogyan
+számolja el a Linux a memóriát <em>process</em> és <em>cgroup</em>
+nézetben, mi történik egy túl alacsony <code>MemoryMax</code> limitnél,
+és milyen bizonyítékokból lehet javítási tervet készíteni. A cél az
+alábbiakban az, hogy a szenior fejlesztő a C++ allocator és virtual
+memory hátterét a Linux üzemeltetési modelljéhez kösse anélkül, hogy a
+hostot veszélyeztetné.</p>
+<h3 data-number="9.5.2" id="definíció-és-működés"><span
+class="header-section-number">9.5.2</span> Definíció és működés</h3>
+<p>A <a href="d044.html">cgroup v2 erőforrásmodell</a> alfejezetben
+bevezetett cgroup v2 memóriamodell szerint a kernel minden cgroup
+számára karbantartja a <code>memory.current</code> számlálót: ez az
+adott cgroupba tartozó processzek és kernelstruktúrák által jelenleg
+foglalt, fizikailag lefoglalt memóriát jelenti. A <a
+href="d041.html">Lapozás, page fault, mmap és copy-on-write</a> és a <a
+href="d042.html">Page cache, reclaim, swap és overcommit</a> alfejezet
+alapján a virtuális címfoglalás <code>malloc</code>/<code>mmap</code>
+esetén nem azonnal fizikai lapfoglalás; a lapok demand-zero vagy
+file-backed módon akkor jönnek létre, amikor a processz címeire először
+írunk.</p>
+<p>A processz nézetben a leggyakrabban használt mutatók:</p>
+<ul>
+<li><strong>RSS (resident set size)</strong>: a processzhez tartozó,
+fizikai RAM-ban lévő lapok, swap nélkül.</li>
+<li><strong>PSS (proportional set size)</strong>: a megosztott lapok
+arányosított része; több processzt is tartalmazó mappingek vizsgálatánál
+igazságosabb.</li>
+<li><strong>USS (unique set size)</strong>: csak az adott processz által
+privát módon használt lapok.</li>
+</ul>
+<p>A cgroup nézet <code>memory.current</code> ettől eltér: tartalmazza
+az anon (névtelen) lapokat, a <code>file</code> (page cache) lapokat, a
+kernel stack, slab és socket memóriát is, még akkor is, ha azok nem
+jelennek meg a processz RSS-ében. Ezért a <code>ps</code> RSS és a
+cgroup <code>memory.current</code> összehasonlítása fontos diagnosztikai
+lépés.</p>
+<p>A kernel <strong>PSI (Pressure Stall Information)</strong> felülete a
+<code>/proc/pressure/memory</code> alatt azt mutatja, hogy a
+processz(ek) mennyi időt várakoztak memória-visszanyerésre (reclaim) az
+adott időablakban. A <code>some avg10=...</code> azt jelzi, hogy
+legalább egy processz stallolt; a <code>full avg10=...</code> azt, hogy
+minden processz. A PSI ezért jobb „lassulásmérő”, mint a pillanatnyi
+szabad memória.</p>
+<p>A systemd <code>MemoryHigh</code> és <code>MemoryMax</code>
+propertyket a cgroup v2 <code>memory.high</code> és
+<code>memory.max</code> írja be. A <code>MemoryHigh</code> egy puha
+limit, amelyik throttlingot és agresszív reclaimet indít; a
+<code>MemoryMax</code> kemény felső határ, amelynél a kernel a cgroupon
+belül OOM killt hajthat végre. A <code>Restart=on-failure</code> és a
+<code>StartLimitBurst</code>/<code>StartLimitIntervalSec</code> együtt
+szabályozza, hogy egy OOM miatt elhalt service ne jusson végtelen
+újraindulási ciklusba.</p>
+<p>A C++ allocator szempontjából a
+<code>malloc</code>/<code>new char[]</code> által visszaadott (nem
+inicializált) virtuális terület csak akkor válik RSS-sé, ha írunk bele.
+Figyelem: a <code>std::vector&lt;char&gt;(n)</code> konstruktor
+érték-inicializál, azaz nullával tölt, így már a konstruktor érinti a
+lapokat. Az ilyen foglalásokat a kernel gyakran <strong>demand-zero
+page</strong>-ként adja vissza: minden lap ugyanarra a nullás lapra
+mutat, amíg írás nem éri. Ezért a „memória fogy” állítás csak akkor
+igaz, ha a mért mutató a <code>memory.current</code> vagy a tényleges
+RSS, nem a processz virtuális mérete (<code>VSZ</code>,
+<code>VmSize</code>).</p>
+<p>A <strong>transparent hugepage (THP)</strong> a kernel 2 MiB-os
+(x86-64) lapokba is összefoghat anon mappingeket; a
+<code>AnonHugePages</code> az <code>smaps</code>-ban látható. Ez nem
+csökkenti a memóriaszámítást, de befolyásolja a reclaim és a mérési
+pontosságot. NUMA esetén a <code>numa_maps</code>/<code>numastat</code>
+megmutatja, hogy a memória melyik NUMA node-on van; egyetlen node-os
+laborban ez triviális, de a fogalmi modellt akkor is
+megfigyelhetjük.</p>
+<h3 data-number="9.5.3" id="kidolgozott-példa"><span
+class="header-section-number">9.5.3</span> Kidolgozott példa</h3>
+<p>A labor a <code>labhost1</code> nevű izolált Ubuntu Server 24.04 LTS
+labVM-en fut; a parancsokat <code>labuser</code> (UID 1000) adja, a
+rendszermódosításokhoz <code>sudo</code> van. A laborerőforrások
+<code>lab-</code> prefixet kapnak; a host memóriáját nem visszük a
+80%-os kihasználtság fölé.</p>
+<p>Előfeltétel: a <code>g++</code> telepítése és a <code>systemd</code>
+cgroup v2 mount ellenőrzése:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost1; labuser (uid=1000)</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">g++</span> <span class="at">--version</span> <span class="kw">|</span> <span class="fu">head</span> <span class="at">-n</span> 1</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="bu">test</span> <span class="st">&quot;</span><span class="va">$(</span><span class="fu">stat</span> <span class="at">-fc</span> %T /sys/fs/cgroup/<span class="va">)</span><span class="st">&quot;</span> = <span class="st">&quot;cgroup2fs&quot;</span> <span class="kw">&amp;&amp;</span> <span class="bu">echo</span> <span class="st">&quot;cgroup v2 OK&quot;</span></span></code></pre></div>
+<p>Készítsünk egy rövid, kizárólag a memóriaviselkedést vizsgáló
+programot, amely paraméterként MiB-ot kap, foglal, érinti a memóriát,
+majd 30 másodpercig fut. Ez nem új C++ nyelvi oktatás, hanem a Linux
+memóriamodellhez kötött mérőeszköz:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// lab_mem_alloc.cpp</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;chrono&gt;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstring&gt;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;memory&gt;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string&gt;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;thread&gt;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">int</span> argc<span class="op">,</span> <span class="dt">char</span> <span class="op">**</span>argv<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>argc <span class="op">!=</span> <span class="dv">2</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>cerr <span class="op">&lt;&lt;</span> <span class="st">&quot;usage: lab_mem_alloc MIB</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">2</span><span class="op">;</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="bu">std::</span>size_t mib <span class="op">=</span> <span class="bu">std::</span>stoull<span class="op">(</span>argv<span class="op">[</span><span class="dv">1</span><span class="op">]);</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="bu">std::</span>size_t bytes <span class="op">=</span> mib <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>    <span class="co">// default-init: csak virtuális cím (overcommit), nincs nullázás</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>unique_ptr<span class="op">&lt;</span><span class="dt">char</span><span class="op">[]&gt;</span> buffer<span class="op">(</span><span class="kw">new</span> <span class="dt">char</span><span class="op">[</span>bytes<span class="op">]);</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>    <span class="co">// touch: a lapok az írásnál válnak residentté</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>memset<span class="op">(</span>buffer<span class="op">.</span>get<span class="op">(),</span> <span class="bn">0x55</span><span class="op">,</span> bytes<span class="op">);</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    <span class="co">// a pointer kiírása megakadályozza, hogy a fordító elhagyja a puffert</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;touched </span><span class="sc">%zu</span><span class="st"> MiB at </span><span class="sc">%p\n</span><span class="st">&quot;</span><span class="op">,</span> mib<span class="op">,</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>                <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">void</span><span class="op">*&gt;(</span>buffer<span class="op">.</span>get<span class="op">()));</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>fflush<span class="op">(</span>stdout<span class="op">);</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>this_thread::sleep_for<span class="op">(</span><span class="bu">std::</span>chrono::seconds<span class="op">(</span><span class="dv">30</span><span class="op">));</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Fordítás és telepítés:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost1; labuser -&gt; sudo a telepítéshez</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">g++</span> <span class="at">-std</span><span class="op">=</span>c++20 <span class="at">-O2</span> <span class="at">-Wall</span> <span class="at">-Wextra</span> <span class="at">-o</span> lab_mem_alloc lab_mem_alloc.cpp</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> install <span class="at">-o</span> root <span class="at">-g</span> root <span class="at">-m</span> 0755 lab_mem_alloc /usr/local/bin/lab_mem_alloc</span></code></pre></div>
+<p>Indítsuk a programot systemd transient unitban, kemény 128 MiB
+korláttal; a program viszont 256 MiB-ot próbál foglalni és érinteni. Így
+a <code>MemoryMax</code> alatt várhatóan OOM kill következik be. A
+<code>Restart=on-failure</code> a crash loopot is demonstrálja, amit a
+<code>StartLimitBurst</code> korlátoz:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost1; labuser -&gt; sudo: rendszerszintű systemd-run</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemd-run <span class="dt">\</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--unit</span><span class="op">=</span>labmemtest <span class="dt">\</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--property</span><span class="op">=</span>MemoryHigh=96M <span class="dt">\</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--property</span><span class="op">=</span>MemoryMax=128M <span class="dt">\</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--property</span><span class="op">=</span>MemorySwapMax=0 <span class="dt">\</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--property</span><span class="op">=</span>Restart=on-failure <span class="dt">\</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--property</span><span class="op">=</span>StartLimitIntervalSec=30 <span class="dt">\</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--property</span><span class="op">=</span>StartLimitBurst=3 <span class="dt">\</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>  /usr/local/bin/lab_mem_alloc 256</span></code></pre></div>
+<p>A foglalás viselkedését külön terminálból figyeljük. A process- és
+cgroup nézetet egyszerre használjuk:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost1; labuser; csak olvasás</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> show labmemtest <span class="at">-p</span> MainPID <span class="at">-p</span> ControlGroup <span class="dt">\</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-p</span> MemoryCurrent <span class="at">-p</span> MemoryPeak <span class="at">-p</span> ActiveState <span class="at">-p</span> SubState <span class="at">-p</span> Result</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="va">PID</span><span class="op">=</span><span class="va">$(</span><span class="ex">systemctl</span> show <span class="at">-p</span> MainPID <span class="at">--value</span> labmemtest<span class="va">)</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="fu">ps</span> <span class="at">-o</span> pid,rss,vsz,cmd <span class="at">-p</span> <span class="st">&quot;</span><span class="va">$PID</span><span class="st">&quot;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;^(Rss|Pss|AnonHugePages)&#39;</span> <span class="st">&quot;/proc/</span><span class="va">$PID</span><span class="st">/smaps_rollup&quot;</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="va">CG</span><span class="op">=</span>/sys/fs/cgroup/system.slice/labmemtest.service</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;^anon |^file |^slab &#39;</span> <span class="st">&quot;</span><span class="va">$CG</span><span class="st">/memory.stat&quot;</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/pressure/memory</span></code></pre></div>
+<p>Az első sorban a <code>MainPID</code> még élhet, a
+<code>MemoryCurrent</code> folyamatosan nő, ahogy a <code>memset</code>
+ír. Illusztratív közbenső kimenet:</p>
+<pre class="text"><code>MainPID=11234
+ControlGroup=/system.slice/labmemtest.service
+MemoryCurrent=67108864
+MemoryPeak=67108864
+ActiveState=active
+SubState=running
+Result=success</code></pre>
+<figure id="fig-d045-oom-restart">
+<div class="fig-interactive"><iframe src="figures/html/d045-oom-restart.html" title="Felső panel: a memory.current az idő függvényében. Minden ciklusban gyors emelkedés 96 MiB-ig, fölötte lassú, pontozott szakasz 128 MiB-ig, ott kereszt jelöli az OOM killt és a görbe nullára esik. Három ciklus 2,08; 4,26 és 6,44 másodpercnél végződik killel, utána a görbe nullán marad. Alsó panel: a systemd állapota, három active (running) szakasz, köztük rövid activating (auto-restart), végül failed (start-limit-hit)." loading="lazy" style="width:100%;border:0;height:640px"></iframe><noscript><img src="figures/img/d045-oom-restart.png" style="width:95.0%"
+alt="Felső panel: a memory.current az idő függvényében. Minden ciklusban gyors emelkedés 96 MiB-ig, fölötte lassú, pontozott szakasz 128 MiB-ig, ott kereszt jelöli az OOM killt és a görbe nullára esik. Három ciklus 2,08; 4,26 és 6,44 másodpercnél végződik killel, utána a görbe nullán marad. Alsó panel: a systemd állapota, három active (running) szakasz, köztük rövid activating (auto-restart), végül failed (start-limit-hit)." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d045-oom-restart.png" style="width:95.0%"
+alt="Felső panel: a memory.current az idő függvényében. Minden ciklusban gyors emelkedés 96 MiB-ig, fölötte lassú, pontozott szakasz 128 MiB-ig, ott kereszt jelöli az OOM killt és a görbe nullára esik. Három ciklus 2,08; 4,26 és 6,44 másodpercnél végződik killel, utána a görbe nullán marad. Alsó panel: a systemd állapota, három active (running) szakasz, köztük rövid activating (auto-restart), végül failed (start-limit-hit)." /></details></div>
+<figcaption>MemoryHigh, MemoryMax és a restart-ciklus: a memory.current
+a 96 MiB fölött throttle-olva nő, 128 MiB-nál OOM kill, 100 ms
+auto-restart, a harmadik kill után start-limit-hit (számított modell,
+nem mérés)</figcaption>
+</figure>
+<p>A 128 MiB-on a kernel a cgroupban OOM killt hajt végre; a process
+<code>SIGKILL</code>-t kap, a systemd ezt <code>oom-kill</code>
+resultként mutatja. A <code>MemoryPeak</code> értéke a limithez közeli.
+A kill utáni restart-késleltetésben (alapértelmezés 100 ms) a minta
+például:</p>
+<pre class="text"><code>MainPID=0
+ControlGroup=/system.slice/labmemtest.service
+MemoryCurrent=0
+MemoryPeak=134217728
+ActiveState=activating
+SubState=auto-restart
+Result=oom-kill</code></pre>
+<p>A <code>MainPID=0</code> és a <code>SubState=auto-restart</code> azt
+jelzi, hogy a systemd a restart-késleltetésben van; ezért 0 a
+<code>MemoryCurrent</code>. Az újraindított processz már új PID-et kap,
+és a <code>MemoryCurrent</code> újra nőni kezd.</p>
+<p>A naplóban a kernel és a systemd nézet is látható:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost1; labuser; csak olvasás</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">-u</span> labmemtest <span class="at">-b</span> <span class="at">--no-pager</span> <span class="kw">|</span> <span class="fu">tail</span> <span class="at">-n</span> 30</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">-k</span> <span class="at">-b</span> <span class="at">--no-pager</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-i</span> <span class="st">&#39;Killed process&#39;</span> <span class="kw">|</span> <span class="fu">tail</span> <span class="at">-n</span> 5</span></code></pre></div>
+<p>Várható, nem mért, hibajelenséget mutató sorok:</p>
+<pre class="text"><code>labmemtest.service: A process of this unit has been killed by the OOM killer.
+Memory cgroup out of memory: Killed process 11234 (lab_mem_alloc) total-vm:...
+systemd[1]: labmemtest.service: Failed with result &#39;oom-kill&#39;.</code></pre>
+<p>A memória-limit és restart politika kapcsolatát a
+<code>systemctl status labmemtest</code> mutatja. Ha a unit többször
+elhal, a <code>StartLimitBurst</code> elérése után
+<code>start-limit-hit</code> állapotba kerül, és nem próbálkozik
+tovább:</p>
+<pre class="text"><code>systemd[1]: labmemtest.service: Start request repeated too quickly.
+systemd[1]: labmemtest.service: Failed with result &#39;start-limit-hit&#39;.</code></pre>
+<p>A THP/NUMA megfigyeléshez a futó PID-et használjuk, mielőtt a limit
+elérné:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost1; labuser; csak olvasás; ha a PID él</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="va">PID</span><span class="op">=</span><span class="va">$(</span><span class="ex">systemctl</span> show <span class="at">-p</span> MainPID <span class="at">--value</span> labmemtest<span class="va">)</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/kernel/mm/transparent_hugepage/enabled</span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;^(AnonHugePages|FilePmdMapped|ShmemPmdMapped)&#39;</span> /proc/<span class="va">$PID</span>/smaps <span class="dt">\</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>  <span class="kw">|</span> <span class="fu">head</span> <span class="at">-n</span> 5</span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/<span class="va">$PID</span>/numa_maps <span class="kw">|</span> <span class="fu">head</span> <span class="at">-n</span> 5</span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="co"># ha a numactl csomag telepítve van:</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="ex">numastat</span> <span class="at">-p</span> <span class="va">$PID</span></span></code></pre></div>
+<p>Az <code>/sys/kernel/mm/transparent_hugepage/enabled</code> tényleges
+kimenete a kernelprofil függvénye; a fájl mindig mindhárom opciót
+listázza, a kiválasztott szögletes zárójelben, például
+<code>always [madvise] never</code> vagy
+<code>[always] madvise never</code>. A <code>numa_maps</code> pedig
+legalább egy NUMA node-hoz rendeli a mappingeket; a labVM gyakran
+egyetlen node-ot lát.</p>
+<p>A kidolgozott példa végén csak a unitot takarítjuk; a
+<code>lab_mem_alloc</code> bináris és forrás a Feladatokhoz megmarad (a
+teljes cleanup az alfejezet végén, a Megoldások után áll):</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost1; labuser -&gt; sudo</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl stop labmemtest.service <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="fu">true</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl reset-failed labmemtest.service <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="fu">true</span></span></code></pre></div>
+<p>Postcondition: a <code>labmemtest.service</code> nem aktív, nem
+failed; a <code>/usr/local/bin/lab_mem_alloc</code> megmarad; a labor
+egyéb folyamatai és a host memóriaállapota nem károsodtak.</p>
+<h3 data-number="9.5.4" id="hibák-és-ellenpróbák"><span
+class="header-section-number">9.5.4</span> Hibák és ellenpróbák</h3>
+<p><strong>Tünet:</strong> a service OOM killt kap, de a
+<code>free -h</code> sok szabad memóriát mutat.<br />
+<strong>Hipotézis:</strong> a <code>MemoryMax</code> cgroup limit
+alacsony, nem a host memória fogyott el.<br />
+<strong>Adatgyűjtés:</strong>
+<code>systemctl show labmemtest -p MemoryMax</code>,
+<code>journalctl -k | grep 'Memory cgroup'</code>,
+<code>cat /sys/fs/cgroup/system.slice/labmemtest.service/memory.max</code>.<br />
+<strong>Egy változtatás:</strong> növeld a <code>MemoryMax</code>
+értéket a tényleges munkakészlet fölé, vagy csökkentsd a program által
+foglalt MiB-ot.<br />
+<strong>Verification:</strong> a process 30 másodpercig fut,
+<code>Result=success</code>, <code>MemoryPeak</code> a limit alatt
+marad.</p>
+<p><strong>Tünet:</strong> a <code>malloc</code>/<code>vector</code>
+hívás sikeres, mégis OOM kill jön később.<br />
+<strong>Hipotézis:</strong> a Linux overcommit miatt a
+<code>malloc</code>/<code>new char[]</code> csak virtuális címet foglal;
+a lapok az első írásnál (itt a <code>memset</code>-nél) jönnek létre, és
+ott ütköznek a cgroup limitbe. (A
+<code>std::vector&lt;char&gt;(n)</code> már a konstruktorban nulláz, ott
+maga a konstruktor ütközik a limitbe.)<br />
+<strong>Adatgyűjtés:</strong>
+<code>cat /proc/sys/vm/overcommit_memory</code>,
+<code>journalctl -k</code>.<br />
+<strong>Javítás:</strong> ne az allokáció visszatérését tekintsd
+sikernek; a tényleges lapérintést is mérni kell. A tervezésnél a
+<code>MemoryHigh</code>/<code>MemoryMax</code> headroomot a peak working
+setre kell igazítani.</p>
+<p><strong>Tünet:</strong> a service ismételten újraindul, majd
+<code>start-limit-hit</code> állapotba kerül.<br />
+<strong>Hipotézis:</strong> a <code>Restart=on-failure</code> OOM után
+is újraindul, de a túl alacsony limit miatt mindig újra elhal.<br />
+<strong>Adatgyűjtés:</strong> <code>systemctl status labmemtest</code>,
+<code>journalctl -u labmemtest -b</code>.<br />
+<strong>Javítás:</strong> változtass egyszerre egy dolgot: emeld a
+<code>MemoryMax</code>-ot a munkakészlet fölé, és
+<code>systemctl reset-failed labmemtest.service</code>; ne kapcsold ki
+globálisan a cgroup limitet.</p>
+<p><strong>Tünet:</strong> a process RSS nagyon alacsony, de a cgroup
+<code>memory.current</code> magas.<br />
+<strong>Hipotézis:</strong> a <code>memory.current</code> tartalmazza a
+page cache, slab és kernel stack memóriát, ami az RSS-ben nem jelenik
+meg.<br />
+<strong>Adatgyűjtés:</strong>
+<code>grep -E '^anon |^file |^slab ' /sys/fs/cgroup/.../memory.stat</code>.<br />
+<strong>Következmény:</strong> a service-es diagnosztikában ne csak a
+<code>ps</code> RSS-t figyeld; a cgroup <code>memory.current</code> az
+operatív számláló.</p>
+<p>A THP/NUMA megfigyelésnél gyakori hiba, hogy a mérést a service rövid
+élettartama miatt kihagyjuk. Érdemes a mérést a <code>MemoryHigh</code>
+alatt, a <code>memset</code> lefutása után, de a 30 másodperces sleep
+közben végezni. A másik hiba, hogy a <code>MemoryCurrent=0</code>
+értékből arra következtetünk, hogy nincs memóriafogyás; valójában a
+<code>MainPID=0</code> és <code>SubState=auto-restart</code> szerint a
+unit a kill utáni restart-késleltetésben van.</p>
+<h3 data-number="9.5.5" id="feladatok"><span
+class="header-section-number">9.5.5</span> Feladatok</h3>
+<h4 data-number="9.5.5.1" id="magyarázó-feladat"><span
+class="header-section-number">9.5.5.1</span> 1. Magyarázó feladat</h4>
+<p>Futtasd a <code>lab_mem_alloc</code> programot korlát nélkül
+<code>systemd-run</code>-ben, 128 MiB-tal, majd 256 MiB-tal is. Minden
+futásnál rögzítsd a process RSS-t (<code>ps</code>), a cgroup
+<code>memory.current</code> értéket és a <code>smaps_rollup</code>
+<code>Rss</code>/<code>Pss</code>/<code>AnonHugePages</code> értékeket.
+Magyarázd el, miért lehet a <code>memory.current</code> nagyobb a
+process RSS-nél, és miért nem elegendő az allokáció méretéből
+következtetni a fizikai memóriafoglalásra.</p>
+<h4 data-number="9.5.5.2"
+id="adminisztrációskonfigurációs-feladat"><span
+class="header-section-number">9.5.5.2</span> 2.
+Adminisztrációs/konfigurációs feladat</h4>
+<p>Készíts tartós systemd unitot <code>labmemtest-svc.service</code>
+néven, amely a <code>lab_mem_alloc</code> programot 192 MiB paraméterrel
+futtatja. Állíts be <code>MemoryHigh=224M</code>,
+<code>MemoryMax=256M</code>, <code>MemorySwapMax=0</code>,
+<code>Restart=on-failure</code>, <code>StartLimitIntervalSec=30</code>
+és <code>StartLimitBurst=3</code> értékeket (figyelj arra, melyik kulcs
+melyik unit-szakaszba tartozik). Indítsd el, és ellenőrizd, hogy a
+service 30 másodpercig fut, nem OOM-ol, és a <code>memory.current</code>
+a <code>MemoryHigh</code> alatt stabilizálódik. Írd le a pull
+request/runbook szintű állapotot: desired state, observed state, várt
+postcondition.</p>
+<h4 data-number="9.5.5.3"
+id="diagnosztikaifailurerecovery-feladat"><span
+class="header-section-number">9.5.5.3</span> 3.
+Diagnosztikai/failure/recovery feladat</h4>
+<p>A laborban a <code>labmemtest</code> service OOM-killt szenvedett,
+majd <code>start-limit-hit</code> állapotba került. Gyűjts bizonyítékot
+<code>journalctl</code>, <code>systemctl show</code>, PSI,
+<code>smaps</code> és <code>numa_maps</code> segítségével. Készíts
+root-cause alapú javítási tervet: döntsd el, hogy a
+<code>MemoryMax</code> növelése vagy a program munkakészletének
+csökkentése indokolt. Módosíts pontosan egy változót, indítsd újra a
+service-t, és ellenőrizd, hogy a 30 másodpercnyi futás OOM nélkül
+teljesül.</p>
+<h3 data-number="9.5.6" id="megoldások"><span
+class="header-section-number">9.5.6</span> Megoldások</h3>
+<h4 data-number="9.5.6.1" id="megoldás"><span
+class="header-section-number">9.5.6.1</span> 1. Megoldás</h4>
+<p>A korlát nélküli futtatáshoz:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost1; labuser -&gt; sudo</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemd-run <span class="at">--unit</span><span class="op">=</span>labmemtest-open <span class="dt">\</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--property</span><span class="op">=</span>MemoryMax=infinity /usr/local/bin/lab_mem_alloc 128</span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 5</span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> show labmemtest-open <span class="at">-p</span> MainPID <span class="at">-p</span> ControlGroup <span class="dt">\</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">-p</span> MemoryCurrent <span class="at">-p</span> MemoryPeak</span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a><span class="va">PID</span><span class="op">=</span><span class="va">$(</span><span class="ex">systemctl</span> show <span class="at">-p</span> MainPID <span class="at">--value</span> labmemtest-open<span class="va">)</span></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a><span class="fu">ps</span> <span class="at">-o</span> pid,rss,vsz,cmd <span class="at">-p</span> <span class="st">&quot;</span><span class="va">$PID</span><span class="st">&quot;</span></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;^(Rss|Pss|AnonHugePages)&#39;</span> /proc/<span class="va">$PID</span>/smaps_rollup</span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a><span class="va">CG</span><span class="op">=</span>/sys/fs/cgroup/system.slice/labmemtest-open.service</span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;^anon |^file |^slab &#39;</span> <span class="st">&quot;</span><span class="va">$CG</span><span class="st">/memory.stat&quot;</span></span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a><span class="co"># cleanup</span></span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl stop labmemtest-open.service</span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl reset-failed labmemtest-open.service</span></code></pre></div>
+<p>A 128 MiB toucholt lap után az RSS és a cgroup
+<code>memory.current</code> közelít egymáshoz, de a cgroup tartalmazhat
+néhány MiB kernel stacket/slab-et is. A 256 MiB-os változatnál a
+<code>memory.current</code> ~256 MiB körül lesz, a PSS/RSS szintén. A
+magyarázat: a <code>memory.current</code> a cgroup teljes
+memóriaéletciklusát tartalmazza; a process RSS csak a processhez rendelt
+anon/file resident lapokat; a shared lapok PSS körül látszanak. A
+<code>new char[]</code> nem garantál fizikai foglalást addig, amíg a
+<code>memset</code> nem ír a lapokra (a
+<code>std::vector&lt;char&gt;(n)</code> viszont már a konstruktorban
+nulláz és érint). Postcondition: a <code>labmemtest-open</code> unit nem
+fut; a <code>/usr/local/bin/lab_mem_alloc</code> megmarad a további
+feladatokhoz.</p>
+<h4 data-number="9.5.6.2" id="megoldás-1"><span
+class="header-section-number">9.5.6.2</span> 2. Megoldás</h4>
+<p>A tartós unit:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode ini"><code class="sourceCode ini"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co"># /etc/systemd/system/labmemtest-svc.service</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost1; labuser -&gt; sudo a telepítéshez</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="kw">[Unit]</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="dt">Description</span><span class="ot">=</span><span class="st">Lab memory-limited service</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="co"># a start-limit kulcsok a [Unit] szakaszba tartoznak</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a><span class="dt">StartLimitIntervalSec</span><span class="ot">=</span><span class="dv">30</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a><span class="dt">StartLimitBurst</span><span class="ot">=</span><span class="dv">3</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a><span class="kw">[Service]</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a><span class="dt">ExecStart</span><span class="ot">=</span><span class="st">/usr/local/bin/lab_mem_alloc 192</span></span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a><span class="dt">MemoryHigh</span><span class="ot">=</span><span class="st">224M</span></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a><span class="dt">MemoryMax</span><span class="ot">=</span><span class="st">256M</span></span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a><span class="dt">MemorySwapMax</span><span class="ot">=</span><span class="dv">0</span></span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a><span class="dt">Restart</span><span class="ot">=</span><span class="st">on-failure</span></span>
+<span id="cb14-15"><a href="#cb14-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-16"><a href="#cb14-16" aria-hidden="true" tabindex="-1"></a><span class="kw">[Install]</span></span>
+<span id="cb14-17"><a href="#cb14-17" aria-hidden="true" tabindex="-1"></a><span class="dt">WantedBy</span><span class="ot">=</span><span class="st">multi-user.target</span></span></code></pre></div>
+<p>Telepítés és indítás:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost1; labuser -&gt; sudo</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> install <span class="at">-o</span> root <span class="at">-g</span> root <span class="at">-m</span> 0755 lab_mem_alloc /usr/local/bin/lab_mem_alloc</span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cp labmemtest-svc.service /etc/systemd/system/</span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl daemon-reload</span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl start labmemtest-svc</span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 5</span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> status <span class="at">--no-pager</span> labmemtest-svc</span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> show labmemtest-svc <span class="at">-p</span> MainPID <span class="at">-p</span> MemoryCurrent <span class="dt">\</span></span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">-p</span> MemoryPeak <span class="at">-p</span> Result</span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a><span class="va">CG</span><span class="op">=</span>/sys/fs/cgroup/system.slice/labmemtest-svc.service</span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;^anon |^file |^slab &#39;</span> <span class="st">&quot;</span><span class="va">$CG</span><span class="st">/memory.stat&quot;</span></span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;^(high|max|oom_kill) &#39;</span> <span class="st">&quot;</span><span class="va">$CG</span><span class="st">/memory.events&quot;</span></span></code></pre></div>
+<p>A unitfájl telepítés előtt ellenőrizhető:
+<code>systemd-analyze verify labmemtest-svc.service</code> nem adhat
+„Unknown key” figyelmeztetést (ha a <code>StartLimit*</code> kulcsok a
+<code>[Service]</code> szakaszba kerülnének, a systemd figyelmen kívül
+hagyná őket).</p>
+<p>Desired state: aktív service, <code>Result=success</code>,
+<code>MemoryCurrent</code> 192–200 MiB, <code>MemoryHigh</code> 224 MiB,
+<code>MemoryMax</code> 256 MiB. Observed state: a systemd unit
+<code>active (running)</code>, <code>MainPID</code> stabil,
+<code>MemoryCurrent</code> ≈ 192 MiB ≤ <code>MemoryPeak</code> &lt;
+<code>MemoryHigh</code> (224 MiB), a <code>memory.events</code>
+<code>high 0</code>, <code>oom_kill 0</code>. Ellenpróba:
+<code>MemoryHigh=160M</code> mellett a 192 MiB-os, swap nélküli
+munkakészlet nem fér a puha limit alá; a <code>memory.events</code>
+<code>high</code> számlálója gyorsan nő, a <code>memory.pressure</code>
+<code>some avg10</code> megugrik, a futás lelassul – ez a throttle
+bizonyítéka, nem stabil állapot. A postcondition: a service 30 másodperc
+után kilépett, a unit <code>inactive (dead)</code>; a labor nem hagy
+futó processzt. A rollback:
+<code>sudo systemctl stop labmemtest-svc</code>,
+<code>sudo rm /etc/systemd/system/labmemtest-svc.service</code>,
+<code>sudo systemctl daemon-reload</code>.</p>
+<h4 data-number="9.5.6.3" id="megoldás-2"><span
+class="header-section-number">9.5.6.3</span> 3. Megoldás</h4>
+<p>Diagnosztikai lépések:</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost1; labuser; csak olvasás</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> status <span class="at">--no-pager</span> labmemtest</span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">-u</span> labmemtest <span class="at">-b</span> <span class="at">--no-pager</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;OOM|oom-kill|start-limit&#39;</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">-k</span> <span class="at">-b</span> <span class="at">--no-pager</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-i</span> <span class="st">&#39;Killed process&#39;</span> <span class="kw">|</span> <span class="fu">tail</span> <span class="at">-n</span> 5</span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/pressure/memory</span></code></pre></div>
+<p>A mért <code>MemoryPeak</code> a 128 MiB-os limitnél áll meg, a
+program 256 MiB-ot igényelt; tehát a hiba oka a limit és a working set
+eltérése. A javítási terv: egyetlen változó, a <code>MemoryMax</code>
+emelése 128 MiB-ról 320 MiB-ra; a program továbbra is 256 MiB-tal fut, a
+többi property (köztük a <code>MemoryHigh=96M</code>) változatlan. (A 96
+MiB-os <code>MemoryHigh</code> a 256 MiB-os munkakészletet
+throttle-olja; ha ez a futásidőt elfogadhatatlanul nyújtja, a
+<code>MemoryHigh</code> emelése egy második, külön mért lépés.) A
+transient unit nem fájlból él, ezért nem szerkesztjük: a failed állapot
+törlése után ugyanazzal a névvel, az egy módosított propertyvel indítjuk
+újra. A rollback: ugyanez a parancs <code>MemoryMax=128M</code>-mel.</p>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost1; labuser -&gt; sudo</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl stop labmemtest.service <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="fu">true</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl reset-failed labmemtest.service</span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemd-run <span class="at">--unit</span><span class="op">=</span>labmemtest <span class="dt">\</span></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--property</span><span class="op">=</span>MemoryHigh=96M <span class="dt">\</span></span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--property</span><span class="op">=</span>MemoryMax=320M <span class="dt">\</span></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--property</span><span class="op">=</span>MemorySwapMax=0 <span class="dt">\</span></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--property</span><span class="op">=</span>Restart=on-failure <span class="dt">\</span></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a>  /usr/local/bin/lab_mem_alloc 256</span></code></pre></div>
+<p>Ellenőrzés:</p>
+<div class="sourceCode" id="cb18"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 5</span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> show labmemtest <span class="at">-p</span> MemoryMax <span class="at">-p</span> MemoryPeak <span class="at">-p</span> Result</span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">-u</span> labmemtest <span class="at">-b</span> <span class="at">--no-pager</span> <span class="kw">|</span> <span class="fu">tail</span> <span class="at">-n</span> 20</span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 30</span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> show labmemtest <span class="at">-p</span> Result <span class="at">-p</span> ActiveState</span></code></pre></div>
+<p>Várható (illusztratív): <code>MemoryMax=335544320</code>,
+<code>MemoryPeak</code> ≈ 256–262 MiB, OOM-kill nincs, a 30 másodperc
+után <code>Result=success</code> és a unit inaktív. A PSI
+<code>some</code> értéke a <code>MemoryHigh</code> fölötti throttle
+miatt a foglalás alatt emelkedik, a futás után visszaesik.
+Postcondition: OOM nem következik be, a <code>start-limit</code>
+feloldódott, a <code>labmemtest</code> 256 MiB-tal sikeresen lefut.</p>
+<h4 data-number="9.5.6.4"
+id="labor-teljes-cleanup-a-feladatok-után"><span
+class="header-section-number">9.5.6.4</span> Labor teljes cleanup (a
+Feladatok után)</h4>
+<div class="sourceCode" id="cb19"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost1; labuser -&gt; sudo</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> u <span class="kw">in</span> labmemtest labmemtest-open labmemtest-svc<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a>  <span class="fu">sudo</span> systemctl stop <span class="st">&quot;</span><span class="va">$u</span><span class="st">.service&quot;</span> <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="fu">true</span></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a>  <span class="fu">sudo</span> systemctl reset-failed <span class="st">&quot;</span><span class="va">$u</span><span class="st">.service&quot;</span> <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="fu">true</span></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl disable labmemtest-svc.service <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="fu">true</span></span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rm <span class="at">-f</span> /etc/systemd/system/labmemtest-svc.service</span>
+<span id="cb19-8"><a href="#cb19-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl daemon-reload</span>
+<span id="cb19-9"><a href="#cb19-9" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rm <span class="at">-f</span> /usr/local/bin/lab_mem_alloc</span>
+<span id="cb19-10"><a href="#cb19-10" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">-f</span> lab_mem_alloc lab_mem_alloc.cpp labmemtest-svc.service</span></code></pre></div>
+<p>Postcondition: egyik <code>labmemtest*</code> unit sem aktív vagy
+failed, a <code>lab_mem_alloc</code> bináris és a unitfájl nem
+létezik.</p>
+<h3 data-number="9.5.7" id="rövid-összefoglaló"><span
+class="header-section-number">9.5.7</span> Rövid összefoglaló</h3>
+<p>A memóriaüzemeltetésben a processz RSS és a cgroup
+<code>memory.current</code> más kérdésre válaszol: az RSS az adott
+processz resident lapjait, a cgroup a teljes memóriaélettér számlálóját
+mutatja. A <code>MemoryMax</code> a cgroup v2 kemény limitje, a
+<code>MemoryHigh</code> puha throttling; a
+<code>Restart=on-failure</code> és <code>StartLimitBurst</code>
+együttesen kezeli a crash loopot. A labor a <code>lab_mem_alloc</code>
+C++ programmal, <code>systemd-run</code>/unit korlátokkal és
+<code>smaps</code>/PSI/NUMA megfigyeléssel bizonyítja, hogy a nem
+inicializált (<code>malloc</code>/<code>new char[]</code>) memória csak
+lapérintés után válik residentté, és hogy a túl alacsony limit OOM
+killhez, nem a host kimerüléséhez vezet. A javítási terv mindig egy
+változóra koncentráljon: emeljük a limitet, vagy csökkentsük a
+munkakészletet, és mérjük a cgroup <code>MemoryPeak</code>-ot.</p>
+<p>Továbbhasznált definíciók: <strong>RSS</strong> a processhez tartozó
+fizikai resident lapok; <strong>memory.current</strong> a cgroup
+aktuális, fizikailag foglalt memória mennyisége; <strong>OOM
+kill</strong> a kernel által a cgroup <code>memory.max</code>
+túllépésekor végrehajtott processz leállítás.</p>
+<h3 data-number="9.5.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">9.5.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>Az alábbi hivatkozások kiindulópontok, nem olvasott bizonyítékok
+ebben a kérésben:</p>
+<ul>
+<li><a href="https://docs.kernel.org/">Kernel cgroup v2
+dokumentáció</a></li>
+<li><a href="https://man7.org/linux/man-pages/">Linux proc man
+pages</a></li>
+<li><a href="https://systemd.io/">systemd dokumentáció</a></li>
+</ul>
+<p>Állításonkénti forrásindex (viszonyítási pont: Ubuntu Server 24.04
+LTS, 6.8-as GA kernel, systemd 255):</p>
+<ul>
+<li><code>memory.current</code>, <code>memory.high</code>,
+<code>memory.max</code>, <code>memory.peak</code>,
+<code>memory.stat</code>, <code>memory.events</code>:
+https://docs.kernel.org/admin-guide/cgroup-v2.html – „Memory”
+szakasz.</li>
+<li>PSI: https://docs.kernel.org/accounting/psi.html.</li>
+<li>THP (<code>enabled</code>, <code>AnonHugePages</code>,
+<code>FilePmdMapped</code>):
+https://docs.kernel.org/admin-guide/mm/transhuge.html;
+<code>smaps</code>/<code>smaps_rollup</code>:
+https://man7.org/linux/man-pages/man5/proc_pid_smaps.5.html;
+<code>numa_maps</code>:
+https://man7.org/linux/man-pages/man5/proc_pid_numa_maps.5.html.</li>
+<li><code>MemoryHigh=</code>, <code>MemoryMax=</code>,
+<code>MemorySwapMax=</code>:
+https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html;
+<code>Restart=</code>:
+https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html;
+<code>StartLimitIntervalSec=</code>, <code>StartLimitBurst=</code>
+(<code>[Unit]</code> szakasz):
+https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html;
+<code>systemd-run</code>:
+https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html.
+A „latest” oldalak újabb systemd-t írhatnak le; a 255-ös eltérést a
+labhoston a <code>man</code> oldallal kell egyeztetni.</li>
+</ul>
+<p>A példák laborban ellenőrizendők; dátumozott futtatási napló
+(verziók, parancskimenet, sikeres és OOM-ág) még nem készült.</p>
+<p>Ellenőrzési hiányok: nem ellenőriztem az aktuális
+<code>labhost1</code> kernel verzióját, systemd verzióját, a THP default
+politika (<code>/sys/kernel/mm/transparent_hugepage/enabled</code>)
+pontos értékét, a PSI elérhetőségét és a cgroup v2 systemd property
+backportokat az Ubuntu Server 24.04 LTS adott release-ében. A
+<code>systemd-run</code> transient unit
+<code>Restart</code>/<code>StartLimit*</code> property támogatását, a
+<code>smaps_rollup</code> pontos mezőit és a
+<code>numastat</code>/<code>numa_maps</code> kimenetet a labor
+indításakor az adott kernel ellenőrzése előtt nem veszem adottnak. A
+példában szereplő számok illusztratívak, nem tényleges mérések.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d044.html">← 9.4 cgroup v2 erőforrásmodell</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d046.html">10.1 Syscalltól az eszközig: I/O rétegek →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>etcd partíció: quorum, commit index, log-utolérés</title>
+<style>
+:root{--fg:#111;--bg:#fff;--muted:#666;--hl:#1f4e79;--hl2:#c55a11;--cell:#fff;--cellhl:#d9d9d9;--line:#000;--code:#f3f3f3}
+@media (prefers-color-scheme:dark){:root{--fg:#eee;--bg:#1b1b1b;--muted:#aaa;--hl:#8fb8e8;--hl2:#f0a060;--cell:#262626;--cellhl:#4a4a4a;--line:#ddd;--code:#2a2a2a}}
+*{box-sizing:border-box}
+body{margin:0;padding:10px;font:14px/1.45 system-ui,sans-serif;color:var(--fg);background:var(--bg)}
+.ctl{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:6px}
+button{font:inherit;padding:3px 10px;cursor:pointer}
+input[type=range]{flex:1;min-width:120px}
+#status{margin:4px 0 6px;min-height:2.9em}
+/* A pszeudokód a rajz ALATT, teljes szélességben (hosszú sorok ne görgessenek oldalra) */
+.wrap{display:flex;flex-direction:column;gap:10px;align-items:stretch}
+svg{width:100%;height:auto;display:block}
+pre#code{width:100%;margin:0;padding:6px 8px;background:var(--code);font:12.5px/1.5 ui-monospace,monospace;white-space:pre;overflow-x:auto}
+pre#code span{display:block;padding:0 4px}
+pre#code span.on{outline:2px solid var(--hl);font-weight:bold}
+svg text:not([fill]){fill:var(--fg);}
+svg text{font-family:system-ui,sans-serif}
+.small{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="ctl" role="group" aria-label="Lejátszás vezérlői">
+  <button id="first" title="Első lépés">⏮</button>
+  <button id="prev" title="Előző lépés">◀ Lépés</button>
+  <button id="play" title="Lejátszás / szünet">▶ Lejátszás</button>
+  <button id="next" title="Következő lépés">Lépés ▶</button>
+  <input id="pos" type="range" min="0" max="0" value="0" aria-label="Lépés kiválasztása">
+  <span id="cnt" class="small"></span>
+</div>
+<div class="ctl"><label>N: <select id="nn"><option>3</option><option>4</option><option>5</option></select></label> <button id="ana">quorum-elemzés (saját felosztás)</button> <span class="small">N=3 választásakor visszaáll a lépésenkénti példa.</span></div>
+<div id="status" aria-live="polite"></div>
+<div class="wrap">
+  <svg id="v" viewBox="0 0 560 300" role="img" aria-label="A 03-as tag izolálása után a 01–02 többség term 5-ben 10 bejegyzést commitol; a 03 régi, nem commitolt bejegyzése a gyógyuláskor felülíródik."></svg>
+  <pre id="code" aria-label="Pszeudokód"></pre>
+</div>
+<p class="small">Modell, illusztratív, nem mérés. Tömör négyzet: commitolt bejegyzés (benne a term), üres: nem commitolt; nyíl: commit index. Nem commitolt, eldobandó suffix csak a partíció előtti leaderen keletkezhet; a follower nem fűz saját kliensírást a logjához.</p>
+<script>
+// ---- Adat: lépések (a Python-szkript számolja ki és illeszti be, a könyv példájával egyezően) ----
+// Minden lépés: {msg: "állapotsor szövege", line: kiemelt pszeudokódsor indexe vagy -1, ...saját mezők}
+let STEPS = [{"term": [4, 4, 4], "role": ["follower", "follower", "leader"], "log": [[3, 3, 4, 4], [3, 3, 4, 4], [3, 3, 4, 4]], "commit": [4, 4, 4], "part": false, "msg": "1. Kezdet: term 4, leader lab-etcd-03, az 1–4. bejegyzés mindhárom tagon commitolt (commit index 4).", "reads": ["v4", "v4", "v4"], "line": 0, "guard": ["OK quorum: 3 reachable >= 2 required", "OK quorum: 3 reachable >= 2 required", "OK quorum: 3 reachable >= 2 required"]}, {"term": [4, 4, 4], "role": ["follower", "follower", "leader"], "log": [[3, 3, 4, 4], [3, 3, 4, 4], [3, 3, 4, 4, 4]], "commit": [4, 4, 4], "part": false, "msg": "2. A 03 (leader) fogad egy kliensírást: az 5. bejegyzés (term 4) csak helyben van, nem replikált – a kliens még nem kapott nyugtát.", "reads": ["v4", "v4", "v4"], "line": 1, "guard": ["OK quorum: 3 reachable >= 2 required", "OK quorum: 3 reachable >= 2 required", "OK quorum: 3 reachable >= 2 required"]}, {"term": [4, 4, 4], "role": ["follower", "follower", "leader"], "log": [[3, 3, 4, 4], [3, 3, 4, 4], [3, 3, 4, 4, 4]], "commit": [4, 4, 4], "part": true, "msg": "3. Partíció: a 03 izolálódik. A 03-nak nincs quorumja (1 < 2): nem commitolhat, CheckQuorum után lemond.", "reads": ["v4", "v4", "v4"], "line": 2, "guard": ["OK quorum: 2 reachable >= 2 required", "OK quorum: 2 reachable >= 2 required", "BLOCKED no quorum: 1 reachable < 2 required"]}, {"term": [5, 5, 4], "role": ["leader", "follower", "pre-candidate"], "log": [[3, 3, 4, 4], [3, 3, 4, 4], [3, 3, 4, 4, 4]], "commit": [4, 4, 4], "part": true, "msg": "4. Választás a többségben: term 5, leader lab-etcd-01 (2 szavazat ≥ 2). A 03 pre-candidate: PreVote mellett a termje nem nő.", "reads": ["v4", "v4", "hiba (timeout) / v4"], "line": 3, "guard": ["OK quorum: 2 reachable >= 2 required", "OK quorum: 2 reachable >= 2 required", "BLOCKED no quorum: 1 reachable < 2 required"]}, {"term": [5, 5, 4], "role": ["leader", "follower", "pre-candidate"], "log": [[3, 3, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5], [3, 3, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5], [3, 3, 4, 4, 4]], "commit": [14, 14, 4], "part": true, "msg": "5. A 01–02 többség 10 bejegyzést commitol (5–14), commit index 14; a 03 commit indexe 4 marad, a 03-ra küldött írások timeouttal hibáznak.", "reads": ["v14", "v14", "hiba (timeout) / v4"], "line": 4, "guard": ["OK quorum: 2 reachable >= 2 required", "OK quorum: 2 reachable >= 2 required", "BLOCKED no quorum: 1 reachable < 2 required"]}, {"term": [5, 5, 4], "role": ["leader", "follower", "pre-candidate"], "log": [[3, 3, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5], [3, 3, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5], [3, 3, 4, 4, 4]], "commit": [14, 14, 4], "part": true, "msg": "6. Olvasás a 03-on: a linearizable get timeouttal hibázik (nincs quorum), a --consistency=s régi értéket (v4) ad – stale read.", "reads": ["v14", "v14", "hiba (timeout) / v4"], "line": 5, "guard": ["OK quorum: 2 reachable >= 2 required", "OK quorum: 2 reachable >= 2 required", "BLOCKED no quorum: 1 reachable < 2 required"]}, {"term": [5, 5, 5], "role": ["leader", "follower", "follower"], "log": [[3, 3, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5], [3, 3, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5], [3, 3, 4, 4]], "commit": [14, 14, 4], "part": false, "msg": "7. Gyógyulás: a 03 megkapja a term 5-ös AppendEntries-t, follower lesz; az 5. indexen ütközés (term 4 ≠ 5) → a régi 5. bejegyzés törlődik.", "reads": ["v14", "v14", "v4 (utolérés folyamatban)"], "line": 6, "guard": ["OK quorum: 3 reachable >= 2 required", "OK quorum: 3 reachable >= 2 required", "OK quorum: 3 reachable >= 2 required"]}, {"term": [5, 5, 5], "role": ["leader", "follower", "follower"], "log": [[3, 3, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5], [3, 3, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5], [3, 3, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5]], "commit": [14, 14, 14], "part": false, "msg": "8. Utolérés: a 03 logja azonos (1–14), commit index mindhárom tagon 14; a régi, nem nyugtázott írás elveszett (a kliens sosem kapott rá sikert).", "reads": ["v14", "v14", "v14"], "line": 7, "guard": ["OK quorum: 3 reachable >= 2 required", "OK quorum: 3 reachable >= 2 required", "OK quorum: 3 reachable >= 2 required"]}];
+const CODE = ["term=4, leader=03, commitIndex=4 (mindhárom tag)", "03: append(index 5, term 4)  // csak helyben", "partíció: {01, 02} | {03};  quorum = ⌊3/2⌋ + 1 = 2", "01,02: election timeout → PreVote → term 5, leader 01", "leader 01: append 5..14, többség nyugtáz → commitIndex = 14", "03: etcdctl get lab/key → timeout;  --consistency=s → v4", "gyógyulás: AppendEntries(term 5) → 03 truncate(5..), follower", "03: append 5..14 → commitIndex = 14"];          // pszeudokód sorai (üres lista: a panel elrejtve)
+
+// ---- Rajzolás: ezt a függvényt kell az ábrához igazítani ----
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, text){const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);if(text!==undefined)e.textContent=text;svg.appendChild(e);return e;}
+const svg = document.getElementById("v");
+function css(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim();}
+function render(s){
+  // Példa: tömb cellákként, s.a = értékek, s.hl = kiemelt indexek
+  svg.innerHTML = "";
+  const a = s.a || [], w = 48, x0 = (560 - a.length * w) / 2, y0 = 110;
+  a.forEach((v, i) => {
+    const on = (s.hl || []).includes(i);
+    el("rect", {x: x0 + i * w, y: y0, width: w, height: w, fill: on ? css("--cellhl") : css("--cell"), stroke: css("--line"), "stroke-width": on ? 3 : 1.2});
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w / 2 + 6, "text-anchor": "middle", "font-size": 18}, String(v));
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w + 18, "text-anchor": "middle", "font-size": 12, fill: css("--muted")}, String(i));
+  });
+}
+
+function defs0(){
+  const d = el("defs", {});
+  const ln = css("--line"), mu = css("--muted"), hl = css("--hl"), h2 = css("--hl2");
+  d.innerHTML = `<pattern id="hat" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" stroke="${mu}" stroke-width="1.6"/></pattern>`
+   + `<pattern id="dots" width="6" height="6" patternUnits="userSpaceOnUse"><circle cx="3" cy="3" r="1" fill="${mu}"/></pattern>`
+   + `<marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="${ln}"/></marker>`
+   + `<marker id="arh" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="${hl}"/></marker>`
+   + `<marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="${h2}"/></marker>`;
+}
+function R(x, y, w, h, a){ return el("rect", Object.assign({x: x, y: y, width: Math.max(0, w), height: h, fill: css("--cell"), stroke: css("--line"), "stroke-width": 1.2, rx: 4}, a || {})); }
+function T(x, y, t, a){
+  const lines = String(t).split("\n"), fs = (a && a["font-size"]) || 12, out = [];
+  lines.forEach((s, i) => out.push(el("text", Object.assign({x: x, y: y + i * fs * 1.2, "font-size": fs}, a || {}), s)));
+  return out;
+}
+function L(x1, y1, x2, y2, a){ return el("line", Object.assign({x1: x1, y1: y1, x2: x2, y2: y2, stroke: css("--line"), "stroke-width": 1.3}, a || {})); }
+function A(x1, y1, x2, y2, a){ return L(x1, y1, x2, y2, Object.assign({"marker-end": "url(#ar)"}, a || {})); }
+function XM(cx, cy, r, a){ const o = Object.assign({stroke: css("--hl2"), "stroke-width": 3}, a || {}); L(cx - r, cy - r, cx + r, cy + r, o); L(cx - r, cy + r, cx + r, cy - r, o); }
+function DIA(cx, cy, r, a){ return el("polygon", Object.assign({points: [cx, cy - r, cx + r, cy, cx, cy + r, cx - r, cy].join(","), fill: css("--cell"), stroke: css("--line"), "stroke-width": 1.3}, a || {})); }
+function hu(x, d){ return Number(x).toFixed(d === undefined ? 2 : d).replace(".", ",").replace("-", "−"); }
+
+const SCEN = STEPS.slice();
+function guardTxt(total, reach){ const q = Math.floor(total / 2) + 1; return reach >= q ? "OK quorum: " + reach + " reachable >= " + q + " required" : "BLOCKED no quorum: " + reach + " reachable < " + q + " required"; }
+let NN = 3, SIDE = [0, 0, 1];
+function analysis(){
+  const q = Math.floor(NN / 2) + 1, a = SIDE.filter(x => x === 0).length, b = NN - a;
+  const wa = a >= q, wb = b >= q;
+  const msg = "N = " + NN + ", quorum = ⌊N/2⌋+1 = " + q + ". Oldal A: " + a + " tag – " + guardTxt(NN, a) + "; oldal B: " + b + " tag – " + guardTxt(NN, b) + ". "
+    + (wa ? "Az A oldal írhat." : wb ? "A B oldal írhat." : "Egyik oldal sem írhat.");
+  return {msg: msg, ana: true, line: 2};
+}
+function render(s){
+  svg.setAttribute("viewBox", "0 0 700 300"); svg.innerHTML = ""; defs0();
+  if (s.ana) {
+    for (let i = 0; i < NN; i++) { const x = 70 + i * 130, y = SIDE[i] ? 190 : 90;
+      const c = el("circle", {cx: x, cy: y, r: 32, fill: SIDE[i] ? "url(#hat)" : css("--cell"), stroke: css("--line"), "stroke-width": 1.5, style: "cursor:pointer"});
+      c.addEventListener("click", () => { SIDE[i] = 1 - SIDE[i]; setSteps([analysis()]); });
+      T(x, y + 5, "etcd-0" + (i + 1), {"font-size": 12, "text-anchor": "middle", "pointer-events": "none"}); }
+    L(20, 140, 680, 140, {"stroke-dasharray": "8 5", "stroke-width": 2});
+    T(24, 132, "A oldal", {"font-size": 12}); T(24, 160, "B oldal", {"font-size": 12});
+    T(24, 280, "Kattints egy tagra: átkerül a másik oldalra.", {"font-size": 12, fill: css("--muted")});
+    return;
+  }
+  const names = ["lab-etcd-01", "lab-etcd-02", "lab-etcd-03"];
+  for (let r = 0; r < 3; r++) { const y = 40 + r * 70;
+    T(10, y + 16, names[r] + (s.role[r] === "leader" ? " ★" : ""), {"font-size": 12, "font-weight": "bold"});
+    T(10, y + 32, "term " + s.term[r] + ", " + s.role[r], {"font-size": 11});
+    s.log[r].forEach((t, i) => { const on = i < s.commit[r];
+      R(150 + i * 34, y, 30, 30, {rx: 2, fill: on ? css("--fg") : css("--cell")});
+      T(165 + i * 34, y + 20, String(t), {"font-size": 12, "text-anchor": "middle", fill: on ? css("--bg") : css("--fg")}); });
+    const cx = 150 + s.commit[r] * 34 - 2; A(cx, y + 52, cx, y + 34);
+    T(640, y + 20, "get: " + s.reads[r], {"font-size": 10, "text-anchor": "end"}); }
+  if (s.part) { L(10, 170, 690, 170, {"stroke-dasharray": "8 5", "stroke-width": 2, stroke: css("--hl2")}); T(690, 165, "partíció", {"font-size": 11, "text-anchor": "end", fill: css("--hl2")}); }
+  T(10, 262, "guard (01/02): " + s.guard[0], {"font-size": 11}); T(10, 280, "guard (03): " + s.guard[2], {"font-size": 11});
+  for (let i = 0; i < 14; i++) T(165 + i * 34, 28, String(i + 1), {"font-size": 9, "text-anchor": "middle", fill: css("--muted")});
+}
+document.getElementById("nn").addEventListener("change", e => { NN = +e.target.value;
+  if (NN === 3) { SIDE = [0, 0, 1]; setSteps(SCEN); } else { SIDE = Array.from({length: NN}, (_, i) => i < Math.ceil(NN / 2) ? 0 : 1); setSteps([analysis()]); } });
+document.getElementById("ana").addEventListener("click", () => setSteps([analysis()]));
+
+
+// ---- Vezérlés (általában nem kell módosítani) ----
+let k = 0, timer = null;
+const pos = document.getElementById("pos"), status = document.getElementById("status");
+const codeEl = document.getElementById("code");
+if (!CODE.length) codeEl.style.display = "none";
+else codeEl.innerHTML = CODE.map((l, i) => `<span id="L${i}">${l.replace(/&/g,"&amp;").replace(/</g,"&lt;")}</span>`).join("");
+pos.max = STEPS.length - 1;
+// Új lépéssor betöltése (pl. saját bemenetből számolva): setSteps(lista)
+function setSteps(list){ stop(); STEPS = list; pos.max = STEPS.length - 1; show(0); }
+function show(i){
+  k = Math.max(0, Math.min(STEPS.length - 1, i));
+  const s = STEPS[k];
+  pos.value = k;
+  document.getElementById("cnt").textContent = `${k + 1}/${STEPS.length}`;
+  status.textContent = s.msg || "";
+  codeEl.querySelectorAll("span").forEach(x => x.classList.remove("on"));
+  if (s.line !== undefined && s.line >= 0) { const L = document.getElementById("L" + s.line); if (L) L.classList.add("on"); }
+  render(s);
+}
+function stop(){ if (timer) { clearInterval(timer); timer = null; } document.getElementById("play").textContent = "▶ Lejátszás"; }
+document.getElementById("first").onclick = () => { stop(); show(0); };
+document.getElementById("prev").onclick = () => { stop(); show(k - 1); };
+document.getElementById("next").onclick = () => { stop(); show(k + 1); };
+document.getElementById("play").onclick = () => {
+  if (timer) { stop(); return; }
+  if (k >= STEPS.length - 1) show(0);
+  document.getElementById("play").textContent = "⏸ Szünet";
+  timer = setInterval(() => { if (k >= STEPS.length - 1) stop(); else show(k + 1); }, 1500);
+};
+pos.oninput = () => { stop(); show(+pos.value); };
+document.addEventListener("keydown", e => { if (e.key === "ArrowRight") { stop(); show(k + 1); } if (e.key === "ArrowLeft") { stop(); show(k - 1); } });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => show(k));
+show(0);
+</script>
+<script>(function(){function s(){var b=document.body;parent.postMessage({figResize:Math.ceil(b.getBoundingClientRect().height)},"*")}addEventListener("load",s);addEventListener("resize",s);if(window.ResizeObserver)new ResizeObserver(s).observe(document.body);s()})()</script></body>
+</html>

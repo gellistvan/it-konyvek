@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>40.4 HPA/VPA/node autoscaling és budget – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch40">40 Kubernetes workload, scheduling és deployment</a></p>
+<div class="links"><a class="prev" rel="prev" href="d198.html">← 40.3 Probe, drain, rolling update és PDB</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d200.html">40.5 Workload rollout és scheduling labor →</a></div>
+</nav>
+<h2 data-number="40.4" id="d199"><span
+class="header-section-number">40.4</span> HPA/VPA/node autoscaling és
+budget</h2>
+<h3 data-number="40.4.1" id="motiváció"><span
+class="header-section-number">40.4.1</span> Motiváció</h3>
+<p>Egy C++ mikroszolgáltatás terhelése napszaki ciklusban ingadozik:
+reggel a replikák kihasználtsága a d008-ban tanult várakozási sor modell
+szerint
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>ρ</mi><mo>=</mo><mi>λ</mi><mi>/</mi><mi>μ</mi></mrow><annotation encoding="application/x-tex">\rho = \lambda/\mu</annotation></semantics></math>
+közelébe kerül, a latencia nemlineárisan nő. A statikus replikaszám vagy
+túl sok erőforrást pazarol éjszaka, vagy csúcsidőben sorban állást okoz.
+A Kubernetes autoscaling a kapacitást a terheléshez igazítja, de a
+döntést mérésre, késleltetésre és erőforrás-ownershipre kell alapozni.
+Ebben az alfejezetben a Horizontal Pod Autoscaler (HPA), a Vertical Pod
+Autoscaler (VPA) és a node autoscaler együttműködését, valamint a
+skálázási budgetet tanítjuk.</p>
+<h3 data-number="40.4.2" id="definíciók"><span
+class="header-section-number">40.4.2</span> Definíciók</h3>
+<p><strong>Horizontal Pod Autoscaler (HPA)</strong>: olyan Kubernetes
+erőforrás, amely a podok replikaszámát módosítja egy metrika aktuális
+értéke és egy célérték aránya alapján. A HPA a metrics API-ból olvas, és
+a <code>scale</code> alerőforráson keresztül állítja be a
+replikákat.</p>
+<p><strong>Vertical Pod Autoscaler (VPA)</strong>: olyan komponens,
+amely a podkonténerek CPU- és memória-request/limit értékét elemzi és
+módosítja. A VPA nem core Kubernetes, hanem a
+<code>kubernetes/autoscaler</code> projektből telepíthető; a támogatott
+verzió és API a telepített Kubernetes-verziótól függ, ezért
+ellenőrizendő.</p>
+<p><strong>Node autoscaler (Cluster Autoscaler)</strong>: olyan
+komponens, amely a node-ok számát növeli, ha podok Pending állapotba
+kerülnek erőforráshiány miatt, és csökkenti, ha node-ok hosszabb ideig
+kihasználatlanok. Cloud provider-specifikus.</p>
+<p><strong>Scale policy</strong>: a HPA <code>behavior</code> mezőjében
+megadott szabály, amely meghatározza, milyen gyorsan és milyen ablakban
+változhat a replikaszám. A cél a flapping (oszcilláló skálázás)
+elkerülése és a burst (hirtelen terhelés) kezelése.</p>
+<p><strong>Metric/target</strong>: a HPA által figyelt mérőszám és a
+hozzá tartozó célérték. A metric lehet resource metric (pl. CPU), custom
+metric vagy external metric. A target lehet átlagos érték
+(averageValue), átlagos utilization (averageUtilization) vagy érték
+(value).</p>
+<p><strong>Resource request</strong>: a konténer specifikációjában
+megadott, a scheduler által a node allocatable kapacitásából lefoglalt
+(ütemezési) erőforrásmennyiség. Ez nem dedikált, kizárólagos erőforrás
+és nem garantált teljesítmény: a CPU-request versengéskor a cgroup
+<code>cpu.weight</code> szerinti arányos részesedést adja, a
+memória-request alapértelmezésben csak ütemezési és eviction-szempont
+(lásd a Quota/limit/overcommit szakaszt). A HPA a CPU utilizationt a
+tényleges CPU-használat és a request hányadosaként számolja, ezért a
+request pontossága közvetlenül befolyásolja a skálázási döntést.</p>
+<p><strong>Quota/limit</strong>: a namespace szintre vonatkozó
+ResourceQuota korlátozza a requests/limits összegét, a podok számát és
+más erőforrásokat. A LimitRange a podokra és konténerekre vonatkozó
+default/min/max értékeket szabályozza.</p>
+<p><strong>Overcommit</strong>: az az állapot, amikor a node-okon a
+requests összege kisebb vagy egyenlő az allocatable kapacitásnál, de a
+limits összege meghaladja azt. Ez növeli a kihasználtságot, de ha minden
+pod eléri a limitjét, a node túlterhelődik, és az OOM killer leállít
+konténereket.</p>
+<p><strong>Load shedding</strong>: a d008-ban definiált túlterhelés
+elleni védekezés, amikor a felesleges terhelést a rendszer elutasítja
+vagy korlátozza, hogy a kritikus kérések kiszolgálhatóak maradjanak.</p>
+<h3 data-number="40.4.3"
+id="hpa-metrictargetresource-request-kapcsolat"><span
+class="header-section-number">40.4.3</span> HPA metric/target/resource
+request kapcsolat</h3>
+<p>A HPA a következő képletet használja a kívánt replikaszám
+kiszámításához:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">desiredReplicas</mtext><mo>=</mo><mrow><mo stretchy="true" form="prefix">⌈</mo><mtext mathvariant="normal">currentReplicas</mtext><mo>×</mo><mfrac><mtext mathvariant="normal">currentMetricValue</mtext><mtext mathvariant="normal">targetValue</mtext></mfrac><mo stretchy="true" form="postfix">⌉</mo></mrow></mrow><annotation encoding="application/x-tex"> \text{desiredReplicas} = \left\lceil \text{currentReplicas} \times \frac{\text{currentMetricValue}}{\text{targetValue}} \right\rceil </annotation></semantics></math></p>
+<p>Például ha a jelenlegi CPU utilization 80%, a target 50%, és 2
+replika fut, akkor a kívánt érték
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mo>×</mo><mn>80</mn><mi>/</mi><mn>50</mn><mo>=</mo><mn>3</mn><mo>,</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">2 \times 80/50 = 3{,}2</annotation></semantics></math>,
+felfelé kerekítve 4. A CPU utilizationt a HPA a podok átlagos
+CPU-használatának (<code>container_cpu_usage_seconds_total</code>) és a
+request összegének hányadosaként kapja. Ha a request 100m CPU, és a
+konténer átlagosan 40m CPU-t használ, akkor a utilization 40%. Ezért ha
+a request túl alacsony, a utilization mesterségesen magas, és a HPA
+feleslegesen skáláz; ha túl magas, a utilization alacsony, és a HPA nem
+skáláz, bár a tényleges CPU-használat közel van a limithez.</p>
+<p>A HPA a <code>metrics-server</code> által szolgáltatott resource
+metrikákat használja; custom metrikához a Prometheus Adapter vagy
+hasonló szükséges. A memória alapú skálázás lehetséges, de C++
+szolgáltatásnál ritkán jó jel: a folyamat memóriája terhelés után
+gyakran nem csökken (az allokátor megtartja a felszabadított memóriát, a
+heap fragmentálódik, a processz nem adja vissza a lapokat az OS-nek),
+ezért a HPA által látott memóriautilizáció magas marad, és a HPA nem
+skáláz vissza – a replikaszám a csúcson ragad, ami költséget okoz. (A
+kérésállapot elvesztése leskálázáskor a graceful shutdown kérdése, <a
+href="d198.html">d198</a>, nem a metrikáé.) A CPU jobb skálázási jel,
+mert a kérések befejezése után a CPU-használat csökken.</p>
+<h3 data-number="40.4.4" id="vpa-supporteviction-tradeoff"><span
+class="header-section-number">40.4.4</span> VPA support/eviction
+tradeoff</h3>
+<p>A VPA <code>updatePolicy.updateMode</code> mezőjének értékei a VPA
+1.x kiadásokban (a pontos lista a telepített VPA-verzió CRD-sémájából
+ellenőrizendő:
+<code>kubectl explain verticalpodautoscaler.spec.updatePolicy.updateMode</code>,
+és a projekt kompatibilitási táblája szerint):</p>
+<ul>
+<li><strong>Off</strong>: a VPA csak javaslatot ad
+(<code>status.recommendation</code>), nem módosít.</li>
+<li><strong>Initial</strong>: a podok létrehozásakor a javasolt
+request/limit értékeket alkalmazza (admission webhookkal), a futó
+podokat nem bántja.</li>
+<li><strong>Recreate</strong>: a futó podokat is módosítja: ha a
+javaslat jelentősen eltér, a VPA updater az Eviction API-n át (a PDB-t
+tiszteletben tartva) kilakoltatja a podot, és az újonnan létrejövő pod
+kapja az új értékeket.</li>
+<li><strong>Auto</strong>: történetileg az alapértelmezés; a jelenlegi
+kiadásokban a <code>Recreate</code> elavult (deprecated) aliasa.</li>
+<li><strong>InPlaceOrRecreate</strong>: újabb VPA-kiadásokban; előbb
+újraindítás nélküli, helyben végzett erőforrás-módosítással (in-place
+pod resize) próbálkozik, és csak ha ez nem lehetséges, kilakoltat.
+Előfeltétele a Kubernetes in-place pod resize képessége
+(<code>InPlacePodVerticalScaling</code>, a Kubernetes-verziótól függő
+feature-állapottal), ezért külön ellenőrizendő.</li>
+</ul>
+<p>Az eviction tradeoff: a pod újraindítása megszakítja a folyamatban
+lévő kéréseket, csökkenti a kapacitást a terhelés alatt, és a d008
+szerint átmeneti sorlengést okoz. In-place resize nélkül a request/limit
+módosítása csak a pod újralétrehozásával érvényesül; az in-place
+resize-zal a CPU általában újraindítás nélkül változtatható, a memória
+csökkentése viszont korlátozott, és a konténer
+<code>resizePolicy</code>-jától függően újraindítást igényelhet. A VPA
+tehát nem alkalmas hirtelen terhelés kezelésére; a HPA-val együtt
+használva ügyelni kell arra, hogy a VPA ne módosítsa a CPU-requestet,
+mert az eltorzítja a HPA utilization-alapú döntését. Gyakori minta: VPA
+memóriára, HPA CPU-ra vagy custom metrikára.</p>
+<h3 data-number="40.4.5" id="node-autoscaler-provision-delay"><span
+class="header-section-number">40.4.5</span> Node autoscaler provision
+delay</h3>
+<p>Amikor a HPA növeli a replikaszámot, de nincs elég node kapacitás, az
+új podok Pending állapotba kerülnek. A Cluster Autoscaler észleli a
+Pending podokat, és új node-ot indít. A késleltetés összetevői:</p>
+<ol type="1">
+<li>A Pending pod észlelése: a Cluster Autoscaler szinkronizációs
+ciklusa (általában 10 másodperc, verziófüggő).</li>
+<li>A node-csoport méretének növelése: a provider API hívása.</li>
+<li>A virtuális gép létrehozása és bootolása: 1-5 perc, cloud provider
+függő.</li>
+<li>A kubelet regisztrációja és a node Ready állapot elérése.</li>
+<li>A pod ütemezése és a konténer indítása.</li>
+</ol>
+<p>A teljes késleltetés gyakran 2-5 perc, de rosszabb esetben 10 perc is
+lehet. Ezalatt a meglévő podok terhelése nő, a sorok hossza a d008
+modell szerint nemlineárisan növeli a latenciát. Ezért a scale policynek
+előre kell jeleznie a terhelést, vagy burst kapacitást kell
+fenntartani.</p>
+<figure id="fig-d199-autoscaling-kesleltetes">
+<div class="fig-interactive"><iframe src="figures/html/d199-autoscaling-kesleltetes.html" title="A bejövő terhelés t = 0-kor kétszeresére ugrik. (1) Van szabad node-kapacitás: metrikagyűjtés 30 s, HPA szinkron 15 s, Pod indulás 20 s, a Pod kb. 65 s után Ready. (2) Új node kell: metrikagyűjtés, HPA szinkron, Cluster Autoscaler ciklus 10 s, provider API 15 s, VM boot 120 s, a leghosszabb szakasz, kubelet-regisztráció 30 s, Pod indulás; összesen kb. 240 s, 4 perc. (3) Ugyanez a példa 300 s-os scaleUp-stabilizációs ablakával: kb. 540 s, 9 perc. Mindhárom esetben a load shedding az ugrástól az új Podok Ready állapotáig aktív." loading="lazy" style="width:100%;border:0;height:460px"></iframe><noscript><img src="figures/img/d199-autoscaling-kesleltetes.png"
+style="width:100.0%"
+alt="A bejövő terhelés t = 0-kor kétszeresére ugrik. (1) Van szabad node-kapacitás: metrikagyűjtés 30 s, HPA szinkron 15 s, Pod indulás 20 s, a Pod kb. 65 s után Ready. (2) Új node kell: metrikagyűjtés, HPA szinkron, Cluster Autoscaler ciklus 10 s, provider API 15 s, VM boot 120 s, a leghosszabb szakasz, kubelet-regisztráció 30 s, Pod indulás; összesen kb. 240 s, 4 perc. (3) Ugyanez a példa 300 s-os scaleUp-stabilizációs ablakával: kb. 540 s, 9 perc. Mindhárom esetben a load shedding az ugrástól az új Podok Ready állapotáig aktív." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d199-autoscaling-kesleltetes.png"
+style="width:100.0%"
+alt="A bejövő terhelés t = 0-kor kétszeresére ugrik. (1) Van szabad node-kapacitás: metrikagyűjtés 30 s, HPA szinkron 15 s, Pod indulás 20 s, a Pod kb. 65 s után Ready. (2) Új node kell: metrikagyűjtés, HPA szinkron, Cluster Autoscaler ciklus 10 s, provider API 15 s, VM boot 120 s, a leghosszabb szakasz, kubelet-regisztráció 30 s, Pod indulás; összesen kb. 240 s, 4 perc. (3) Ugyanez a példa 300 s-os scaleUp-stabilizációs ablakával: kb. 540 s, 9 perc. Mindhárom esetben a load shedding az ugrástól az új Podok Ready állapotáig aktív." /></details></div>
+<figcaption>Az autoscaling reakcióideje három forgatókönyvben: szabad
+node-kapacitással, új node-dal, valamint új node-dal és a példa 300 s-os
+scaleUp-stabilizációs ablakával (modell, nem mérés)</figcaption>
+</figure>
+<h3 data-number="40.4.6" id="scale-cooldownstabilization-és-burst"><span
+class="header-section-number">40.4.6</span> Scale cooldown/stabilization
+és burst</h3>
+<p>A HPA <code>behavior</code> mezője két részből áll:
+<code>scaleUp</code> és <code>scaleDown</code>. Mindkettőben megadható
+<code>stabilizationWindowSeconds</code> és <code>policies</code>. A
+stabilizációs ablak azt jelenti, hogy a HPA nem a nyers metrikát, hanem
+az ablakban kiszámított korábbi ajánlásait (recommendation history)
+nézi: <strong>scaleDown</strong>-nál az ablakbeli
+<strong>legmagasabb</strong> ajánlást tartja meg, így nem csökkent túl
+korán, amíg az ablakban volt magasabb igény;
+<strong>scaleUp</strong>-nál az ablakbeli <strong>legkisebb</strong>
+ajánlást veszi, így egy rövid csúcs önmagában nem indít felskálázást. Az
+alapértelmezés scaleUp-ra 0 s (azonnali felskálázás), scaleDown-ra 300
+s. Ez akadályozza meg az oszcillációt (flapping): például ha a kívánt
+replikaszám 2 → 8 → 2 sorban változik, egy 300 s-os scaleDown-ablak
+mellett a HPA a terhelés visszaesése után még legalább 300 s-ig 8
+replikán marad. A stabilizációs ablaktól függetlenül a
+<code>policies</code> (rate limit) korlátozza, hogy egy adott időszakban
+mennyivel változhat a replikaszám; a HPA-vezérlő ezen felül a saját
+szinkronizációs periódusában (alapértelmezés 15 s) számol.</p>
+<p>A <code>policies</code> lista a skálázás sebességét szabályozza.
+Például:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">behavior</span><span class="kw">:</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">scaleUp</span><span class="kw">:</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">stabilizationWindowSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">300</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">policies</span><span class="kw">:</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">type</span><span class="kw">:</span><span class="at"> Percent</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">value</span><span class="kw">:</span><span class="at"> </span><span class="dv">100</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">periodSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">60</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">type</span><span class="kw">:</span><span class="at"> Pods</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">value</span><span class="kw">:</span><span class="at"> </span><span class="dv">4</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">periodSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">60</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">selectPolicy</span><span class="kw">:</span><span class="at"> Max</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">scaleDown</span><span class="kw">:</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">stabilizationWindowSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">600</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">policies</span><span class="kw">:</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">type</span><span class="kw">:</span><span class="at"> Pods</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">value</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">periodSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">120</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">selectPolicy</span><span class="kw">:</span><span class="at"> Min</span></span></code></pre></div>
+<p>A fenti konfigurációban a scaleUp 5 perc stabilizációs ablakot
+használ (a felskálázás csak akkor történik meg, ha az utolsó 5 perc
+minden ajánlása magasabb a jelenlegi replikaszámnál), és percenként
+legfeljebb 100% vagy 4 pod növelést enged (amelyik nagyobb). A scaleDown
+10 perc ablakot használ, és 2 percenként legfeljebb 1 pod csökkentést
+enged. Ez a konfiguráció felfelé is késleltet: hirtelen terhelésnél a
+300 s-os scaleUp-ablak a reakcióidőt ennyivel növeli (lásd az ábra 3.
+forgatókönyvét); burst-érzékeny szolgáltatásnál a scaleUp-ablak rövid
+(akár 0 s), a scaleDown-ablak hosszú legyen.</p>
+<h3 data-number="40.4.7" id="quotalimitovercommit"><span
+class="header-section-number">40.4.7</span> Quota/limit/overcommit</h3>
+<p>A namespace szintű ResourceQuota korlátozza a HPA által létrehozható
+podok számát és erőforrásait. Ha a HPA növelné a replikákat, de a quota
+kimerült, a HPA a Deployment <code>spec.replicas</code> mezőjét ugyanúgy
+megemeli, a podok létrehozását azonban a ReplicaSet-vezérlő próbálja, és
+a hiba <code>FailedCreate ... exceeded quota</code> eseményként a
+ReplicaSeten jelenik meg; a kívánt replikaszám így nem valósul meg. Ez a
+skálázási budget felső korlátja.</p>
+<p>A LimitRange beállíthat default request/limit értékeket, ha a podok
+nem adnak meg explicit értéket. A default request miatt a request
+nélküli konténer is beszámít az ütemezésbe és a quotába (request nélkül
+a scheduler 0-t foglalna neki, és alulbecsülné a terhelést); a default
+limit pedig megakadályozza, hogy a konténer korlát nélkül ténylegesen
+elhasználja a node erőforrásait. A request tehát a foglalást, a limit a
+felhasználási plafont állítja.</p>
+<p>A request és a limit hatását esetenként érdemes szétválasztani:</p>
+<ul>
+<li><strong>Scheduler-fit</strong>: a scheduler a requestek összegét
+veti össze az allocatable-lal.</li>
+<li><strong>CPU-részesedés</strong>: a CPU-request versengéskor
+<code>cpu.weight</code> szerinti arányos részesedést ad, nem fix
+throughputot; túlterhelt node-on minden konténer csak a súlyának
+megfelelő részt kapja.</li>
+<li><strong>CPU-limit</strong>: a <code>cpu.max</code> throttlingot
+okoz, a processz lassul, de nem hal meg.</li>
+<li><strong>Memória</strong>: node-nyomásnál a kubelet a request feletti
+használat, a prioritás és a request-arányos használat szerint evictál; a
+limit túllépése OOM-killt okoz.</li>
+<li><strong>Kizárólagos CPU</strong>: dedikált magokat csak a kubelet
+CPU manager <code>static</code> policyja ad, Guaranteed QoS-ű, egész
+számú CPU-t kérő konténernek.</li>
+</ul>
+<p>Az overcommit a scheduler szempontjából a requests alapján működik: a
+node allocatable kapacitása a sum(requests) &lt;= allocatable feltételt
+ellenőrzi. A limits összege meghaladhatja az allocatable-t, mert a
+konténerek ritkán használják a teljes limitet. Ez növeli a density-t
+(több pod egy node-on), de ha a tényleges használat meghaladja a
+kapacitást, előbb a kubelet node-pressure evictionje, végső esetben a
+kernel OOM killer lép közbe, amely az <code>oom_score</code> (a QoS
+szerinti <code>oom_score_adj</code>-dal súlyozott memóriahasználat)
+alapján választ áldozatot. A HPA nem látja a node szintű overcommitot,
+csak a saját metrikáit, ezért a request pontos beállítása a skálázási
+stabilitás alapja.</p>
+<h3 data-number="40.4.8"
+id="autoscaling-nem-helyettesíti-load-sheddinget"><span
+class="header-section-number">40.4.8</span> Autoscaling nem helyettesíti
+load sheddinget</h3>
+<p>A d008-ban tanultuk, hogy a korlátos sor, a timeout és a load
+shedding védi a rendszert a túlterheléstől. Az autoscaling a kapacitás
+növelésével reagál, de a node autoscaler provision delay miatt a
+reakcióidő perc nagyságrendű. Ha a terhelés hirtelen nő (pl. DDoS,
+hirtelen népszerűség), a HPA gyorsan növeli a replikákat, de a podok
+Pending állapotban maradnak, amíg az új node el nem készül. Ezalatt a
+meglévő podok sorai nőnek, a latencia meghaladja a timeoutot, és a
+rendszer összeomolhat.</p>
+<p>Ezért a skálázási policynek tartalmaznia kell egy load shedding
+komponenst: rate limiting, circuit breaker, request prioritás, vagy a
+túlterhelt podok által küldött backpressure. A HPA nem tudja megvédeni a
+rendszert a tranziensektől, csak a tartós terhelésváltozást követi. A
+helyes tervezés: a skálázás időállandója legyen kisebb, mint a terhelés
+változásának időállandója; ha ez nem teljesül, a load shedding a
+kötelező védelem.</p>
+<h3 data-number="40.4.9" id="kidolgozott-példa"><span
+class="header-section-number">40.4.9</span> Kidolgozott példa</h3>
+<p>Adott egy <code>lab-app</code> namespace a <code>lab-cluster</code>
+Kubernetes clusterben. A C++ szolgáltatás Deployment specifikációja:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> apps/v1</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Deployment</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-cpp-svc</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-app</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">replicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">selector</span><span class="kw">:</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">matchLabels</span><span class="kw">:</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">app</span><span class="kw">:</span><span class="at"> lab-cpp-svc</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">template</span><span class="kw">:</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">app</span><span class="kw">:</span><span class="at"> lab-cpp-svc</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">containers</span><span class="kw">:</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> cpp-server</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">image</span><span class="kw">:</span><span class="at"> registry.lab.example/lab-cpp-svc:1.0.0</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">requests</span><span class="kw">:</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">cpu</span><span class="kw">:</span><span class="at"> 100m</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">memory</span><span class="kw">:</span><span class="at"> 256Mi</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">limits</span><span class="kw">:</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">cpu</span><span class="kw">:</span><span class="at"> 200m</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">memory</span><span class="kw">:</span><span class="at"> 512Mi</span></span></code></pre></div>
+<p>A HPA célja, hogy a CPU utilization 50% körül maradjon, legalább 2,
+legfeljebb 10 replikával:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> autoscaling/v2</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> HorizontalPodAutoscaler</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-cpp-svc-hpa</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-app</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">scaleTargetRef</span><span class="kw">:</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> apps/v1</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">kind</span><span class="kw">:</span><span class="at"> Deployment</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-cpp-svc</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">minReplicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">maxReplicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">10</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">metrics</span><span class="kw">:</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">type</span><span class="kw">:</span><span class="at"> Resource</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">resource</span><span class="kw">:</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">name</span><span class="kw">:</span><span class="at"> cpu</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">target</span><span class="kw">:</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">type</span><span class="kw">:</span><span class="at"> Utilization</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">averageUtilization</span><span class="kw">:</span><span class="at"> </span><span class="dv">50</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">behavior</span><span class="kw">:</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">scaleUp</span><span class="kw">:</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">stabilizationWindowSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">300</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">policies</span><span class="kw">:</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">type</span><span class="kw">:</span><span class="at"> Percent</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">value</span><span class="kw">:</span><span class="at"> </span><span class="dv">100</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">periodSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">60</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">selectPolicy</span><span class="kw">:</span><span class="at"> Max</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">scaleDown</span><span class="kw">:</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">stabilizationWindowSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">600</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">policies</span><span class="kw">:</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">type</span><span class="kw">:</span><span class="at"> Pods</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">value</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">periodSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">120</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">selectPolicy</span><span class="kw">:</span><span class="at"> Min</span></span></code></pre></div>
+<p>A ResourceQuota korlátozza a namespace összes CPU requestjét 1
+core-ra és a podok számát 10-re:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> v1</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> ResourceQuota</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-app-quota</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-app</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">hard</span><span class="kw">:</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">requests.cpu</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;1&quot;</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">pods</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;10&quot;</span></span></code></pre></div>
+<p>Alkalmazás és ellenőrzés:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> apply <span class="at">-f</span> deploy.yaml <span class="at">-f</span> hpa.yaml <span class="at">-f</span> quota.yaml <span class="dt">\</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--context</span> lab-cluster <span class="at">--namespace</span> lab-app</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get hpa lab-cpp-svc-hpa <span class="dt">\</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--context</span> lab-cluster <span class="at">--namespace</span> lab-app <span class="at">-w</span></span></code></pre></div>
+<p>Várható kimenet (illusztratív, nem mért):</p>
+<pre class="text"><code>NAME             REFERENCE               TARGETS  MINPODS  MAXPODS  REPLICAS
+lab-cpp-svc-hpa  Deployment/lab-cpp-svc  42%/50%  2        10       2</code></pre>
+<p>Ha terhelést generálunk, például egy HTTP benchmarkkal, a CPU
+utilization 50% fölé emelkedik. A skálázási döntés a metrikából, a
+stabilizációs ablakból és a rate policyből együtt következik; nem egy
+előre rögzített számsor. Az alábbi táblázat egy egyszerűsített
+szimuláció eredménye (a fenti HPA-paraméterekkel: 15 s-os szinkron,
+10%-os tolerancia, a metrikagyűjtés késleltetését elhanyagolva; a teljes
+CPU-igény
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>t</mi><mo>&lt;</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">t &lt; 0</annotation></semantics></math>-ban
+84m,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0</mn><mo>≤</mo><mi>t</mi><mo>&lt;</mo><mn>600</mn></mrow><annotation encoding="application/x-tex">0 \le t &lt; 600</annotation></semantics></math>
+s között 180m,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>600</mn><mo>≤</mo><mi>t</mi><mo>&lt;</mo><mn>1500</mn></mrow><annotation encoding="application/x-tex">600 \le t &lt; 1500</annotation></semantics></math>
+s között 350m, utána ismét 84m; request 100m/pod). Ez szemléltetés, nem
+labormérés:</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+</colgroup>
+<thead>
+<tr>
+<th>Idő</th>
+<th>CPU-igény összesen</th>
+<th>Replika előtte</th>
+<th>Utilization előtte</th>
+<th>Nyers ajánlás</th>
+<th>Döntés</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>t</mi><mo>=</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">t = 0</annotation></semantics></math>
+s</td>
+<td>180m</td>
+<td>2</td>
+<td>90%</td>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">⌈</mo><mn>2</mn><mo>⋅</mo><mn>90</mn><mi>/</mi><mn>50</mn><mo stretchy="false" form="postfix">⌉</mo><mo>=</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">\lceil 2 \cdot 90/50 \rceil = 4</annotation></semantics></math></td>
+<td>a scaleUp-ablakban még 2-es ajánlások is vannak: marad 2</td>
+</tr>
+<tr>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>t</mi><mo>≈</mo><mn>285</mn></mrow><annotation encoding="application/x-tex">t \approx 285</annotation></semantics></math>
+s</td>
+<td>180m</td>
+<td>2</td>
+<td>90%</td>
+<td>4</td>
+<td>az ablak minden ajánlása 4: 2 → 4 (a 100%/60 s policy engedi)</td>
+</tr>
+<tr>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>t</mi><mo>=</mo><mn>600</mn></mrow><annotation encoding="application/x-tex">t = 600</annotation></semantics></math>
+s</td>
+<td>350m</td>
+<td>4</td>
+<td>88%</td>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">⌈</mo><mn>4</mn><mo>⋅</mo><mn>87</mn><mo>,</mo><mn>5</mn><mi>/</mi><mn>50</mn><mo stretchy="false" form="postfix">⌉</mo><mo>=</mo><mn>7</mn></mrow><annotation encoding="application/x-tex">\lceil 4 \cdot 87{,}5/50 \rceil = 7</annotation></semantics></math></td>
+<td>marad 4 (az ablakban még 4-es ajánlások)</td>
+</tr>
+<tr>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>t</mi><mo>≈</mo><mn>885</mn></mrow><annotation encoding="application/x-tex">t \approx 885</annotation></semantics></math>
+s</td>
+<td>350m</td>
+<td>4</td>
+<td>88%</td>
+<td>7</td>
+<td>4 → 7</td>
+</tr>
+<tr>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>t</mi><mo>=</mo><mn>1500</mn></mrow><annotation encoding="application/x-tex">t = 1500</annotation></semantics></math>
+s</td>
+<td>84m</td>
+<td>7</td>
+<td>12%</td>
+<td>2</td>
+<td>a 600 s-os scaleDown-ablak legmagasabb ajánlása 7: marad 7</td>
+</tr>
+<tr>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>t</mi><mo>≈</mo><mn>2085</mn></mrow><annotation encoding="application/x-tex">t \approx 2085</annotation></semantics></math>
+s</td>
+<td>84m</td>
+<td>7</td>
+<td>12%</td>
+<td>2</td>
+<td>7 → 6, majd 120 s-onként 1 podonként:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>t</mi><mo>≈</mo><mn>2565</mn></mrow><annotation encoding="application/x-tex">t \approx 2565</annotation></semantics></math>
+s-ra 2</td>
+</tr>
+</tbody>
+</table>
+<p>A tényleges laborban a metrikák késleltetése (metrics-server
+begyűjtési ciklusa) és a pod-indulás ideje ezt tovább tolja; a
+döntéseket a
+<code>kubectl describe hpa lab-cpp-svc-hpa --context lab-cluster --namespace lab-app</code>
+eseményei
+(<code>New size: 4; reason: cpu resource utilization (percentage of request) above target</code>)
+és a <code>Conditions</code> blokk (<code>AbleToScale</code>,
+<code>ScalingActive</code>, <code>ScalingLimited</code>) időbélyeggel
+mutatják. A postcondition: a replikaszám 2 és 10 között van, a CPU
+utilization 50% közelébe konvergál, és a ResourceQuota nem blokkolja a
+podok létrehozását (10 × 100m = 1 core, éppen a quota határa).</p>
+<h3 data-number="40.4.10" id="hibák-és-ellenpróbák"><span
+class="header-section-number">40.4.10</span> Hibák és ellenpróbák</h3>
+<p><strong>Hiba 1: Nincs metrics-server, a HPA nem kap
+metrikát.</strong> A <code>kubectl get hpa</code> a <code>TARGETS</code>
+oszlopban <code>&lt;unknown&gt;/50%</code> értéket mutat. A hipotézis
+az, hogy a metrics-server nem fut, vagy a metrics API nem érhető el.
+Adatgyűjtés: <code>kubectl get apiservices | grep metrics</code>.
+Ellenőrzés: a <code>v1beta1.metrics.k8s.io</code> APIService nem
+rendelkezik Healthy állapottal. Javítás: telepítsük a metrics-server-t a
+klaszterre.</p>
+<p><strong>Hiba 2: A request túl alacsony, a HPA túlskáláz.</strong> A
+pod CPU request 10m, de a tényleges használat 50m; a utilization 500%, a
+HPA folyamatosan a maxReplicas-ig skáláz. A hipotézis az, hogy a request
+nem tükrözi a valós igényt. Adatgyűjtés:
+<code>kubectl top pods --namespace lab-app</code>. Javítás: növeljük a
+requestet 100m-re, és figyeljük a HPA viselkedését. A VPA javaslata is
+segíthet.</p>
+<p><strong>Hiba 3: A node autoscaler késleltetése miatt Pending
+podok.</strong> A HPA növeli a replikákat, de az új podok Pending
+állapotban maradnak, mert nincs elég node. A hipotézis az, hogy a
+Cluster Autoscaler nem fut, vagy a node csoport elérte a maximális
+méretet. Adatgyűjtés:
+<code>kubectl describe pod &lt;pending-pod&gt; --namespace lab-app</code>
+és a Cluster Autoscaler logjai. Javítás: ellenőrizzük a node csoport max
+méretét, vagy előre skálázzuk a node-okat.</p>
+<p><strong>Hiba 4: Flapping a túl rövid stabilizációs ablak
+miatt.</strong> A metrika ingadozik, a replikaszám gyorsan oda-vissza
+változik. A hipotézis az, hogy a <code>stabilizationWindowSeconds</code>
+túl kicsi. Javítás: növeljük az ablakot, és lassítsuk a scaleDown-t.</p>
+<p><strong>Hiba 5: A VPA evictionje megszakítja a kéréseket.</strong> A
+VPA <code>Recreate</code> (vagy az elavult <code>Auto</code>) módban
+módosítja a CPU requestet, a podokat evictionnel újraindítja, és a
+folyamatban lévő kérések megszakadnak. A hipotézis az, hogy a VPA és a
+HPA ugyanarra a metrikára vonatkozik. Javítás: a VPA-t memóriára, a
+HPA-t CPU-ra konfiguráljuk, vagy a VPA-t Off módban hagyjuk.</p>
+<h3 data-number="40.4.11" id="feladatok"><span
+class="header-section-number">40.4.11</span> Feladatok</h3>
+<h4 data-number="40.4.11.1" id="magyarázó-feladat"><span
+class="header-section-number">40.4.11.1</span> 1. Magyarázó feladat</h4>
+<p>Adott egy <code>autoscaling/v2</code> HPA:
+<code>minReplicas: 3</code>, <code>maxReplicas: 12</code>, CPU-metrika
+<code>target.type: Utilization</code>,
+<code>averageUtilization: 60</code> (az <code>autoscaling/v1</code>
+<code>targetCPUUtilizationPercentage: 60</code> mezőjének megfelelője).
+A Deployment podjainak CPU requestje 200m. A jelenlegi replicaszám 3, a
+podok átlagos CPU-használata 180m. Számítsa ki a desiredReplicas
+értékét, és magyarázza el, miért fontos a request pontos beállítása. Mi
+történne, ha a request 100m lenne?</p>
+<h4 data-number="40.4.11.2" id="adminisztrációs-feladat"><span
+class="header-section-number">40.4.11.2</span> 2. Adminisztrációs
+feladat</h4>
+<p>Hozzon létre egy <code>lab-web</code> namespace-t a
+<code>lab-cluster</code> kontextusban. Hozzon létre egy Deploymentet
+<code>lab-web-app</code> néven, 2 replikával, CPU request 100m, limit
+250m. Hozzon létre egy HPA-t, amely a CPU utilizationt 60%-on tartja, 2
+és 8 replika között, scaleUp stabilizációs ablak 180 másodperc,
+scaleDown 300 másodperc, scaleUp policy 50% per 60 sec, scaleDown policy
+1 pod per 60 sec. Hozzon létre ResourceQuota-t, amely a namespace-ben a
+podok számát 10-re, a CPU requestek összegét 1 core-ra korlátozza.
+Ellenőrizze a HPA állapotát, és írja le a postconditiont.</p>
+<h4 data-number="40.4.11.3" id="diagnosztikai-feladat"><span
+class="header-section-number">40.4.11.3</span> 3. Diagnosztikai
+feladat</h4>
+<p>A <code>lab-app</code> namespace-ben a HPA nem skáláz, bár a CPU
+utilization 90% fölött van. A <code>kubectl get hpa</code> a TARGETS
+oszlopban <code>90%/60%</code> értéket mutat, de a REPLICAS 2 marad. A
+podok Running állapotban vannak. Hipotéziseket fogalmazzon meg, gyűjtsön
+adatokat a diagnózishoz, hajtson végre egy változtatást, és
+ellenőrizze.</p>
+<h3 data-number="40.4.12" id="megoldások"><span
+class="header-section-number">40.4.12</span> Megoldások</h3>
+<h4 data-number="40.4.12.1" id="megoldás"><span
+class="header-section-number">40.4.12.1</span> 1. Megoldás</h4>
+<p>A jelenlegi utilization:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>180</mn><mi>/</mi><mn>200</mn><mo>=</mo><mn>0</mn><mo>,</mo><mn>9</mn><mo>=</mo><mn>90</mn><mi>%</mi></mrow><annotation encoding="application/x-tex">180/200 = 0{,}9 = 90\%</annotation></semantics></math>.
+A képlet:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">desiredReplicas</mtext><mo>=</mo><mo stretchy="false" form="prefix">⌈</mo><mn>3</mn><mo>×</mo><mn>90</mn><mi>/</mi><mn>60</mn><mo stretchy="false" form="postfix">⌉</mo><mo>=</mo><mo stretchy="false" form="prefix">⌈</mo><mn>4</mn><mo>,</mo><mn>5</mn><mo stretchy="false" form="postfix">⌉</mo><mo>=</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">\text{desiredReplicas} = \lceil 3 \times 90/60 \rceil = \lceil 4{,}5 \rceil = 5</annotation></semantics></math>.
+Ha a request 100m lenne, a utilization
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>180</mn><mi>/</mi><mn>100</mn><mo>=</mo><mn>180</mn><mi>%</mi></mrow><annotation encoding="application/x-tex">180/100 = 180\%</annotation></semantics></math>,
+a desiredReplicas
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">⌈</mo><mn>3</mn><mo>×</mo><mn>180</mn><mi>/</mi><mn>60</mn><mo stretchy="false" form="postfix">⌉</mo><mo>=</mo><mo stretchy="false" form="prefix">⌈</mo><mn>9</mn><mo stretchy="false" form="postfix">⌉</mo><mo>=</mo><mn>9</mn></mrow><annotation encoding="application/x-tex">\lceil 3 \times 180/60 \rceil = \lceil 9 \rceil = 9</annotation></semantics></math>.
+A request alacsonyra állítása mesterségesen magas utilizationt okoz, és
+a HPA feleslegesen skáláz, ami költséget és quota-használatot növel. A
+request a scheduler és a HPA közös alapja, ezért a valós átlagos
+használathoz közel kell lennie, némi headroommal.</p>
+<h4 data-number="40.4.12.2" id="megoldás-1"><span
+class="header-section-number">40.4.12.2</span> 2. Megoldás</h4>
+<p>A három manifest a feladat értékeivel (a Pod image a példa
+image-e):</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> apps/v1</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Deployment</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-web-app</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-web</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">replicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">selector</span><span class="kw">:</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">matchLabels</span><span class="kw">:</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">app</span><span class="kw">:</span><span class="at"> lab-web-app</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">template</span><span class="kw">:</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">app</span><span class="kw">:</span><span class="at"> lab-web-app</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">containers</span><span class="kw">:</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> web</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">image</span><span class="kw">:</span><span class="at"> registry.lab.example/lab-cpp-svc:1.0.0</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">requests</span><span class="kw">:</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">cpu</span><span class="kw">:</span><span class="at"> 100m</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">limits</span><span class="kw">:</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">cpu</span><span class="kw">:</span><span class="at"> 250m</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a><span class="pp">---</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> autoscaling/v2</span></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> HorizontalPodAutoscaler</span></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-web-app-hpa</span></span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-web</span></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">scaleTargetRef</span><span class="kw">:</span></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> apps/v1</span></span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">kind</span><span class="kw">:</span><span class="at"> Deployment</span></span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-web-app</span></span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">minReplicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">maxReplicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">8</span></span>
+<span id="cb7-37"><a href="#cb7-37" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">metrics</span><span class="kw">:</span></span>
+<span id="cb7-38"><a href="#cb7-38" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">type</span><span class="kw">:</span><span class="at"> Resource</span></span>
+<span id="cb7-39"><a href="#cb7-39" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">resource</span><span class="kw">:</span></span>
+<span id="cb7-40"><a href="#cb7-40" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">name</span><span class="kw">:</span><span class="at"> cpu</span></span>
+<span id="cb7-41"><a href="#cb7-41" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">target</span><span class="kw">:</span></span>
+<span id="cb7-42"><a href="#cb7-42" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">type</span><span class="kw">:</span><span class="at"> Utilization</span></span>
+<span id="cb7-43"><a href="#cb7-43" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">averageUtilization</span><span class="kw">:</span><span class="at"> </span><span class="dv">60</span></span>
+<span id="cb7-44"><a href="#cb7-44" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">behavior</span><span class="kw">:</span></span>
+<span id="cb7-45"><a href="#cb7-45" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">scaleUp</span><span class="kw">:</span></span>
+<span id="cb7-46"><a href="#cb7-46" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">stabilizationWindowSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">180</span></span>
+<span id="cb7-47"><a href="#cb7-47" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">policies</span><span class="kw">:</span></span>
+<span id="cb7-48"><a href="#cb7-48" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">type</span><span class="kw">:</span><span class="at"> Percent</span></span>
+<span id="cb7-49"><a href="#cb7-49" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">value</span><span class="kw">:</span><span class="at"> </span><span class="dv">50</span></span>
+<span id="cb7-50"><a href="#cb7-50" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">periodSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">60</span></span>
+<span id="cb7-51"><a href="#cb7-51" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">scaleDown</span><span class="kw">:</span></span>
+<span id="cb7-52"><a href="#cb7-52" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">stabilizationWindowSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">300</span></span>
+<span id="cb7-53"><a href="#cb7-53" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">policies</span><span class="kw">:</span></span>
+<span id="cb7-54"><a href="#cb7-54" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">type</span><span class="kw">:</span><span class="at"> Pods</span></span>
+<span id="cb7-55"><a href="#cb7-55" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">value</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb7-56"><a href="#cb7-56" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">periodSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">60</span></span>
+<span id="cb7-57"><a href="#cb7-57" aria-hidden="true" tabindex="-1"></a><span class="pp">---</span></span>
+<span id="cb7-58"><a href="#cb7-58" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> v1</span></span>
+<span id="cb7-59"><a href="#cb7-59" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> ResourceQuota</span></span>
+<span id="cb7-60"><a href="#cb7-60" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb7-61"><a href="#cb7-61" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-web-quota</span></span>
+<span id="cb7-62"><a href="#cb7-62" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-web</span></span>
+<span id="cb7-63"><a href="#cb7-63" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb7-64"><a href="#cb7-64" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">hard</span><span class="kw">:</span></span>
+<span id="cb7-65"><a href="#cb7-65" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">pods</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;10&quot;</span></span>
+<span id="cb7-66"><a href="#cb7-66" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">requests.cpu</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;1&quot;</span></span></code></pre></div>
+<p>Quota-összevetés:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>8</mn><mo>×</mo><mn>100</mn><mtext mathvariant="normal">m</mtext><mo>=</mo><mn>800</mn><mtext mathvariant="normal">m</mtext><mo>≤</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">8 \times 100\text{m} = 800\text{m} \le 1</annotation></semantics></math>
+core és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>8</mn><mo>≤</mo><mn>10</mn></mrow><annotation encoding="application/x-tex">8 \le 10</annotation></semantics></math>
+pod, tehát a quota a <code>maxReplicas</code>-t engedi. Alkalmazás után
+<code>kubectl get hpa lab-web-app-hpa --context lab-cluster --namespace lab-web</code>
+és
+<code>kubectl get resourcequota lab-web-quota --context lab-cluster --namespace lab-web</code>.
+Postcondition: a HPA <code>TARGETS</code> értéke ismert, a replikaszám 2
+és 8 között van, a ResourceQuota a podok és CPU requestek limitjét
+érvényesíti. A quota ellenőrzése:
+<code>kubectl describe resourcequota lab-web-quota --context lab-cluster --namespace lab-web</code>.</p>
+<h4 data-number="40.4.12.3" id="megoldás-2"><span
+class="header-section-number">40.4.12.3</span> 3. Megoldás</h4>
+<p>Lehetséges hipotézisek: - A HPA <code>scaleUp</code> policy túl
+lassú, pl. <code>periodSeconds</code> nagy, vagy
+<code>stabilizationWindowSeconds</code> túl hosszú. - A ResourceQuota
+kimerült, ezért a podok nem jönnek létre. - A Deployment
+<code>replicas</code> mezője külső forrásból (pl. GitOps) felülírja a
+HPA-t.</p>
+<p>Adatgyűjtés:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">k()</span> <span class="kw">{</span> <span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">--namespace</span> lab-app <span class="st">&quot;</span><span class="va">$@</span><span class="st">&quot;</span><span class="kw">;</span> <span class="kw">}</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="co"># HPA Conditions (AbleToScale, ScalingActive, ScalingLimited) és események</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="ex">k</span> describe hpa lab-cpp-svc-hpa</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="co"># eltérés = a HPA döntött, de a Podok nem jöttek létre</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="ex">k</span> get deploy lab-cpp-svc <span class="at">-o</span> jsonpath=<span class="st">&#39;{.spec.replicas} {.status.replicas}{&quot;\n&quot;}&#39;</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="co"># quota-elutasítás a ReplicaSet eseményeként jelenik meg</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="ex">k</span> get events <span class="at">--field-selector</span> involvedObject.kind=ReplicaSet,reason=FailedCreate</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="ex">k</span> describe resourcequota lab-app-quota   <span class="co"># Used / Hard</span></span></code></pre></div>
+<p>Döntési szabály: (1) ha a Deployment <code>spec.replicas</code> nem
+nőtt, a HPA-oldalon van az ok – a <code>Conditions</code> megnevezi
+(például <code>ScalingLimited</code> a stabilizációs ablak vagy a policy
+miatt, <code>ScalingActive=False</code> metrikahibánál), illetve egy
+külső író (GitOps) visszaírja a <code>replicas</code> mezőt; (2) ha a
+<code>spec.replicas</code> nőtt, de a Pod nem jött létre, quota vagy
+admission az ok
+(<code>FailedCreate ... exceeded quota: lab-app-quota</code>); (3) ha a
+Pod létrejött, de <code>Pending</code>, kapacitáshiány – Cluster
+Autoscaler. A példa adataival (quota <code>requests.cpu: 1</code>,
+100m/pod) 2 replikánál a quota csak akkor merülhet ki, ha más Podok is
+fogyasztják; ezt a <code>describe resourcequota</code> <code>Used</code>
+oszlopa mutatja. A javítás egy változtatás az azonosított okra: a quota
+emelése vagy a requestek csökkentése, illetve a <code>behavior</code>
+módosítása. Utána ellenőrizzük a HPA állapotát és a podok számát.</p>
+<h3 data-number="40.4.13" id="rövid-összefoglaló"><span
+class="header-section-number">40.4.13</span> Rövid összefoglaló</h3>
+<p>A Kubernetes autoscaling három rétegben működik: a HPA a
+podreplikákat skálázza a metrika és a célérték aránya alapján; a VPA a
+request/limit értékeket igazítja, de eviction tradeoffal jár; a Cluster
+Autoscaler új node-okat indít, ami több perces késleltetést okoz. A
+scale policy stabilizációs ablakkal és sebességkorláttal véd a flapping
+ellen, a ResourceQuota pedig a skálázási budget felső korlátját adja. Az
+autoscaling nem helyettesíti a load sheddinget, mert a node provision
+lassú a tranziensekhez képest. Továbbhasznált definíciók:
+<strong>HPA</strong> mint metrikaarányos replikaskálázó;
+<strong>VPA</strong> mint request/limit módosító; <strong>load
+shedding</strong> mint túlterhelés elleni védelem.</p>
+<h3 data-number="40.4.14" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">40.4.14</span> Források és ellenőrzési
+hiányok</h3>
+<p>Az alábbi hivatkozások kiindulópontok, de ebben a környezetben nem
+történt ellenőrzött olvasás vagy verzióvalidálás:</p>
+<ul>
+<li><a
+href="https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/">Kubernetes
+Documentation: Horizontal Pod Autoscaling</a></li>
+<li><a
+href="https://kubernetes.io/docs/concepts/workloads/autoscaling/">Kubernetes
+Documentation: Autoscaling</a></li>
+<li><a href="https://helm.sh/docs/">Helm Documentation</a></li>
+</ul>
+<p>Állításonkénti normatív források (verzióprofil: a labor Kubernetes
+stabil minor verziója, <code>autoscaling/v2</code> HPA, a telepített VPA
+1.x és Cluster Autoscaler kiadás – <code>kubectl version</code> és a
+komponensek image-tagjei rögzítendők):</p>
+<ul>
+<li>HPA algoritmus, stabilizációs ablak (scaleUp: minimum, scaleDown:
+maximum ajánlás), <code>behavior</code> policies,
+<code>Conditions</code>: a fenti Horizontal Pod Autoscaling oldal
+„Algorithm details” és „Configurable scaling behavior” szakasza</li>
+<li>Vertical Pod Autoscaler (update módok, kompatibilitási tábla): <a
+href="https://github.com/kubernetes/autoscaler/tree/master/vertical-pod-autoscaler"
+class="uri">https://github.com/kubernetes/autoscaler/tree/master/vertical-pod-autoscaler</a></li>
+<li>In-place pod resize: <a
+href="https://kubernetes.io/docs/tasks/configure-pod-container/resize-container-resources/"
+class="uri">https://kubernetes.io/docs/tasks/configure-pod-container/resize-container-resources/</a></li>
+<li>ResourceQuota és LimitRange: <a
+href="https://kubernetes.io/docs/concepts/policy/resource-quotas/"
+class="uri">https://kubernetes.io/docs/concepts/policy/resource-quotas/</a>,
+<a href="https://kubernetes.io/docs/concepts/policy/limit-range/"
+class="uri">https://kubernetes.io/docs/concepts/policy/limit-range/</a></li>
+<li>CPU manager <code>static</code> policy: <a
+href="https://kubernetes.io/docs/tasks/administer-cluster/cpu-management-policies/"
+class="uri">https://kubernetes.io/docs/tasks/administer-cluster/cpu-management-policies/</a></li>
+<li>Cluster Autoscaler: <a
+href="https://github.com/kubernetes/autoscaler/tree/master/cluster-autoscaler"
+class="uri">https://github.com/kubernetes/autoscaler/tree/master/cluster-autoscaler</a></li>
+</ul>
+<p>A kidolgozott példa idősora egyszerűsített szimulációból származik,
+nem labormérés; a példák laborclusterben ellenőrizendők, dátumozott
+futtatási napló még nem készült.</p>
+<p>A HPA <code>autoscaling/v2</code> API pontos verziója, a VPA és
+Cluster Autoscaler támogatott kiadása, valamint a metrics-server
+elérhetősége a telepített Kubernetes-verziótól függ. A példa YAML mezőit
+a generáláskor támogatott stabil Kubernetes minorhoz kell ellenőrizni;
+az itt bemutatott értékek a fogalmi modellt illusztrálják, nem állítják
+aktuális támogatottságukat. A kidolgozott példa kimenete hipotetikus,
+nem laboratóriumban mért eredmény.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d198.html">← 40.3 Probe, drain, rolling update és PDB</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d200.html">40.5 Workload rollout és scheduling labor →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

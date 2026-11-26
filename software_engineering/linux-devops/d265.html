@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>53.5 Stateful service és recovery incidenslabor – Linux és
+DevOps rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch53">53 Database, cache és messaging működtetése</a></p>
+<div class="links"><a class="prev" rel="prev" href="d264.html">← 53.4 Queue, stream, acknowledgement és delivery</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d266.html">54.1 Redundancia, failure domain és graceful degradation →</a></div>
+</nav>
+<h2 data-number="53.5" id="d265"><span
+class="header-section-number">53.5</span> Stateful service és recovery
+incidenslabor</h2>
+<p>A stateful szolgáltatások üzemeltetése nem ér véget a processz
+újraindításával: a PostgreSQL-ben lévő tranzakciós állapot, a Redis
+cache-ben lévő nem tartós adat, és a RabbitMQ queue-ban lévő
+kézbesítetlen üzenet más-más recovery-szerződést igényel. Ez a labor
+három hibamódot kapcsol össze egy alkalmazás adatútján:
+kapcsolatkimerülést, fogyasztói lemaradást és lemeznyomást. A cél, hogy
+a tanuló a tünet mögötti erőforrás- és alkalmazásállapotot
+különválassza, majd a helyreállítást a domain-invariánshoz kösse.</p>
+<h3 data-number="53.5.1" id="definíció-és-működés"><span
+class="header-section-number">53.5.1</span> Definíció és működés</h3>
+<p>A <strong>stateful service contract</strong> egy szolgáltatás
+üzemeltetési szerződése, amely rögzíti az identitást, a tartós adatot, a
+backup/recovery módot és a kapacitáskorlátokat. A <strong>domain
+invariant</strong> olyan alkalmazási igazság, amelynek a hiba és a
+recovery során is teljesülnie kell: például egy rendelésazonosító
+legfeljebb egyszer kerül be a végleges tárolóba, miközben a queue
+legalább egyszer kézbesítheti az üzenetet.</p>
+<p>A három szolgáltatás eltérő tartóssági szintet ad. A PostgreSQL a
+tranzakciókat WAL-ba írja, és csak akkor tekinti committed-nek, ha a WAL
+flush megtörtént. A PITR (point-in-time recovery) a base backup és a
+WAL-szegmensek visszajátszásával egy adott időpontra állít helyre; ezért
+a DB restore utáni smoke test nem csupán a séma meglétét, hanem a
+várható tranzakciós tartalmat is ellenőrzi. A Redis alapbeállítása
+cache: az adat nem tartós, és a <code>maxmemory-policy</code> szerint
+evictálhat. A cache loss elfogadható, ha a cache-ből hiányzó kulcsot a
+DB-ből újra lehet tölteni, de a laborban ez akkor igazolható, ha a
+repopulation után a cache találati aránya visszaáll. A RabbitMQ queue
+legalább egyszer (at-least-once) szemantikát ad: ha a consumer ack előtt
+elhal, az üzenet újra kézbesül. A termelő és a consumer közötti
+idempotens feldolgozás a domain invariant része.</p>
+<p>A diagnosztika során a <strong>resource state</strong> és az
+<strong>application state</strong> elkülönítése: a kapcsolatkimerülés
+lehet erőforrás-limit (<code>max_connections</code>) vagy alkalmazás
+kapcsolatszivárgás; a lemeznyomás lehet a WAL, a queue paging vagy a
+Redis RDB snapshot következménye. Az incident timeline-ban minden
+méréshez forrás, időbélyeg és mért érték tartozik.</p>
+<h3 data-number="53.5.2" id="labprofil"><span
+class="header-section-number">53.5.2</span> Labprofil</h3>
+<p>A labor egy izolált VM-en fut, a szolgáltatások saját identitással és
+<code>lab-</code> prefixszel. Az inventory alapját az alábbi táblázat
+mutatja:</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Komponens</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Labhost</td>
+<td><code>labvm01</code>, UID <code>labadmin</code></td>
+</tr>
+<tr>
+<td>PostgreSQL</td>
+<td>unit: <code>lab-postgres</code>, port: <code>5432/tcp</code>,
+socket: <code>/run/lab-postgresql</code>, db: <code>labdb</code> (séma:
+<code>public</code>, tábla: <code>orders</code>), user:
+<code>labapp</code>, admin: <code>postgres</code> szuperuser
+(fenntartott slot), data dir: <code>/var/lib/lab-postgres</code></td>
+</tr>
+<tr>
+<td>PITR-instance</td>
+<td><code>labdb-recovery</code>: port <code>5433/tcp</code>, socket:
+<code>/run/lab-postgresql-recovery</code>, eldobható</td>
+</tr>
+<tr>
+<td>Redis</td>
+<td>unit: <code>lab-redis</code>, port: <code>6379/tcp</code>, data dir:
+<code>/var/lib/lab-redis</code> — külön, 1 GiB-os ext4 loopback FS-en
+(<code>lab-redis-fs</code>, image:
+<code>/var/lib/lab-disks/lab-redis.img</code>), a gyökér-FS-től
+független</td>
+</tr>
+<tr>
+<td>RabbitMQ</td>
+<td>unit: <code>lab-rabbitmq</code>, port: <code>5672/tcp</code>, queue:
+<code>lab-orders</code></td>
+</tr>
+<tr>
+<td>Backup</td>
+<td>restic repo a <code>lab-backup</code> VM-en:
+<code>sftp:lab-backup:/srv/restic/lab-stateful</code> (külön failure
+domain: a <code>labvm01</code> elvesztése nem viszi el), manifest:
+<code>/etc/lab-backup/manifest.yaml</code></td>
+</tr>
+<tr>
+<td>Application</td>
+<td>dummy HTTP API: <code>lab-api:8080</code>, ír a DB-be, olvas
+cache-ből, publikál queue-ba</td>
+</tr>
+<tr>
+<td>SLO</td>
+<td><code>lab-svc</code>: 30 perces ablakban p95 &lt; 200 ms, hibás
+kérések aránya &lt; 1% (a 30 perces ablak a riasztási/burn-rate
+ablak)</td>
+</tr>
+<tr>
+<td>Error budget</td>
+<td>30 napos gördülő ablak, hibaarány-SLO 99% → budget = 1% · 43 200
+perc = 432 perc-egyenérték</td>
+</tr>
+</tbody>
+</table>
+<p>A service accountok: <code>labdb</code>, <code>labcache</code>,
+<code>labqueue</code>. A hitelesítő adat dummy: a <code>labdb</code> és
+a <code>labqueue</code> jelszava <code>dummy-password</code>, amelyet a
+labmanifest jelöl. A labprofil rögzíti a backup ütemezést: naponta
+02:00-kor <code>pg_basebackup</code> és WAL archive; Redis RDB snapshot
+03:00-kor; RabbitMQ definitions export 02:30-kor. A restic a
+<code>/var/lib/lab-backup/pg-base</code> (<code>pg_basebackup</code>
+kimenet), a <code>/var/lib/lab-backup/wal-archive</code>, a
+<code>/var/lib/lab-redis/dump.rdb</code> és a RabbitMQ definitions
+export könyvtárát menti; az élő PostgreSQL-adatkönyvtárat nem (azt a
+base backup + WAL védi).</p>
+<h3 data-number="53.5.3" id="fixture-ök"><span
+class="header-section-number">53.5.3</span> Fixture-ök</h3>
+<p>A labor négy hibamódot használ:</p>
+<ol type="1">
+<li><strong>Connection exhaustion</strong>: a PostgreSQL
+<code>max_connections</code> limitjét 10-re csökkentjük (restarttal; a
+<code>superuser_reserved_connections</code> alapértéke 3, így nem
+szuperuser kliensnek 7 slot jut), az alkalmazás connection pool-ja 20
+kapcsolatot nyit. Az eredmény: a <code>lab-api</code> HTTP 503-at vagy
+timeout-ot ad, a <code>pg_stat_activity</code> telített.</li>
+<li><strong>Queue consumer lag</strong>: a <code>lab-orders</code> queue
+consumerét leállítjuk, a termelő 100 üzenetet küld. Az üzenetek
+felhalmozódnak, a queue depth és a memória/disk használat nő.</li>
+<li><strong>Disk pressure</strong>: a Redis dedikált lab-FS-én
+(<code>/var/lib/lab-redis</code>) a fixture egy <code>lab-</code>
+prefixű fájlt hoz létre, amely a szabad helyből számolva kb. 4 MiB-ot
+hagy (kevesebbet, mint a várható RDB). A <code>df</code> ≈ 100%-ot
+mutat, a Redis <code>BGSAVE</code> a háttérben meghiúsul, és a
+<code>stop-writes-on-bgsave-error yes</code> miatt a következő írások
+<code>MISCONF</code> hibát adnak.</li>
+<li><strong>Cache loss és message duplication</strong>: a Redis-t
+<code>FLUSHALL</code>-lal töröljük; a queue consumer ack előtt elhal,
+így az üzenetek újra kézbesülnek. A feldolgozó idempotencia-kulcs nélkül
+duplikátumot ír a DB-be.</li>
+</ol>
+<h3 data-number="53.5.4" id="kidolgozott-példa"><span
+class="header-section-number">53.5.4</span> Kidolgozott példa</h3>
+<p>A példában a <code>lab-api</code> felhasználói hibákat jelez. A
+diagnosztika lépései a következők.</p>
+<h4 data-number="53.5.4.1" id="tünet-és-kezdeti-adatgyűjtés"><span
+class="header-section-number">53.5.4.1</span> 1. Tünet és kezdeti
+adatgyűjtés</h4>
+<p>A <code>lab-api</code> 09:00-kor 503-as válaszokat ad. A
+<code>lab-admin</code> SSH-n <code>labvm01</code>-re lép, és az
+alkalmazás naplóját ellenőrzi:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, UID: labadmin</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">-u</span> lab-api <span class="at">--since</span> <span class="st">&quot;09:00&quot;</span> <span class="at">--no-pager</span> <span class="kw">|</span> <span class="fu">tail</span> <span class="at">-n</span> 50</span></code></pre></div>
+<p>Várt kimenet részlet:</p>
+<pre><code>lab-api: ERROR db connection failed: too many connections</code></pre>
+<p>Ez a DB erőforráslimitre utal. Ellenőrizzük a PostgreSQL aktív
+kapcsolatait:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, UID: labadmin</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="at">-h</span> /run/lab-postgresql <span class="at">-d</span> labdb <span class="at">-c</span> <span class="st">&quot;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="st">SELECT state, count(*) AS n,</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="st">       current_setting(&#39;max_connections&#39;)::int AS max_conn</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="st">FROM pg_stat_activity</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="st">WHERE backend_type = &#39;client backend&#39;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="st">GROUP BY state ORDER BY n DESC;&quot;</span></span></code></pre></div>
+<p>A <code>postgres</code> szuperuser a fenntartott slotokon akkor is
+belép, ha az alkalmazás a többit telítette. Várt (illusztratív)
+kimenet:</p>
+<pre><code>        state        | n | max_conn
+---------------------+---+----------
+ idle in transaction | 7 |       10
+ active              | 1 |       10</code></pre>
+<p>Az <code>active</code> sor maga a diagnosztikai session. A hipotézis:
+a <code>max_connections</code> nem elegendő, vagy a kapcsolatok
+szivárognak. A kimenetből kiderül, hogy az alkalmazás kapcsolatai
+<code>idle in transaction</code> állapotban vannak, ami az alkalmazás
+hosszú tranzakciójára utal. A laborban a <code>max_connections</code>
+20-ra állítása azonnali mitigáció, de a valódi javítás a tranzakció
+lerövidítése.</p>
+<h4 data-number="53.5.4.2" id="kapcsolat-helyreállítás"><span
+class="header-section-number">53.5.4.2</span> 2. Kapcsolat
+helyreállítás</h4>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, UID: labadmin</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="at">-h</span> /run/lab-postgresql <span class="dt">\</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-c</span> <span class="st">&quot;ALTER SYSTEM SET max_connections = 20;&quot;</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart lab-postgres</span></code></pre></div>
+<p>A <code>max_connections</code> postmaster-kontextusú paraméter: csak
+restarttal lép életbe (reload után a régi érték marad, és a
+<code>pg_settings.pending_restart</code> igaz). A restart megszakítja a
+meglévő kapcsolatokat — ezt a timeline rögzíti. Ellenőrzés:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, UID: labadmin</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="at">-h</span> /run/lab-postgresql <span class="at">-Atc</span> <span class="st">&quot;SHOW max_connections;&quot;</span> <span class="dt">\</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-c</span> <span class="st">&quot;SELECT pending_restart FROM pg_settings WHERE name=&#39;max_connections&#39;;&quot;</span></span></code></pre></div>
+<p>Várt kimenet: <code>20</code>, majd <code>f</code>.</p>
+<p>A <code>lab-api</code> most 200-at ad. De a disk pressure még
+09:10-kor jelentkezik: a Redis <code>BGSAVE</code> hiba:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, UID: labadmin</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">-u</span> lab-redis <span class="at">--since</span> <span class="st">&quot;09:10&quot;</span> <span class="at">--no-pager</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&quot;BGSAVE|disk&quot;</span></span></code></pre></div>
+<h4 data-number="53.5.4.3" id="disk-pressure"><span
+class="header-section-number">53.5.4.3</span> 3. Disk pressure</h4>
+<p>A <code>df</code> ellenőrzése:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, UID: labadmin</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-h</span> /var/lib/lab-redis</span></code></pre></div>
+<p>Várt: ≈ 100%-os használat (ext4-en a nem root folyamat akkor nem tud
+írni, amikor a <code>df</code> 100%-ot mutat — a root-foglalás ilyenkor
+még a rootnak hagy helyet; 95%-nál a <code>BGSAVE</code> még
+sikerülhet).</p>
+<p>A fájlrendszer megtelt; a Redis nem tud snapshotot írni. A hiba
+nyoma: <code>redis-cli INFO persistence</code> →
+<code>rdb_last_bgsave_status:err</code>, a naplóban
+<code>No space left on device</code>. A laborban a nagy fájlt a cleanup
+script azonosítja. A diagnosztika:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, UID: labadmin</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> du <span class="at">-sh</span> /var/lib/lab-redis/<span class="pp">*</span> <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">|</span> <span class="fu">sort</span> <span class="at">-h</span> <span class="kw">|</span> <span class="fu">tail</span> <span class="at">-n</span> 5</span></code></pre></div>
+<p>A legnagyobb fájl a
+<code>/var/lib/lab-redis/tmp/lab-bigfile.bin</code>, amelyet a
+laborfixture hozott létre. A mitigáció: a fixture fájljának név szerinti
+törlése, majd a Redis BGSAVE újra:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, UID: labadmin</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rm /var/lib/lab-redis/tmp/lab-bigfile.bin</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> labcache redis-cli <span class="at">-h</span> 127.0.0.1 <span class="at">-p</span> 6379 BGSAVE</span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 2</span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> labcache redis-cli <span class="at">-h</span> 127.0.0.1 <span class="at">-p</span> 6379 INFO persistence <span class="dt">\</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>  <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;rdb_last_bgsave_status|rdb_bgsave_in_progress&#39;</span></span></code></pre></div>
+<p>A <code>BGSAVE</code> azonnal
+<code>Background saving started</code>-et ad (ez még nem bizonyítja a
+sikert). Ellenőrzés: <code>rdb_last_bgsave_status:ok</code>,
+<code>rdb_bgsave_in_progress:0</code>, a <code>LASTSAVE</code> időbélyeg
+frissül, és egy próbaírás (<code>SET lab:probe 1</code>)
+<code>OK</code>.</p>
+<h4 data-number="53.5.4.4" id="queue-lag-és-message-duplication"><span
+class="header-section-number">53.5.4.4</span> 4. Queue lag és message
+duplication</h4>
+<p>09:20-kor a queue depth nő. A RabbitMQ management API-ból:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, UID: labadmin</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> <span class="at">-u</span> labqueue:dummy-password <span class="dt">\</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>  <span class="st">&quot;http://127.0.0.1:15672/api/queues/%2F/lab-orders&quot;</span> <span class="dt">\</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>  <span class="kw">|</span> <span class="ex">jq</span> <span class="st">&#39;{messages_ready, messages_unacknowledged, consumers, memory}&#39;</span></span></code></pre></div>
+<p>Várt (illusztratív) kimenet:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;messages_ready&quot;</span><span class="fu">:</span> <span class="dv">100</span><span class="fu">,</span> <span class="dt">&quot;messages_unacknowledged&quot;</span><span class="fu">:</span> <span class="dv">0</span><span class="fu">,</span> <span class="dt">&quot;consumers&quot;</span><span class="fu">:</span> <span class="dv">0</span><span class="fu">,</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a> <span class="dt">&quot;memory&quot;</span><span class="fu">:</span> <span class="dv">52428800</span><span class="fu">}</span></span></code></pre></div>
+<p>A consumer leállt (<code>consumers: 0</code>): a csatornája bezárult,
+ezért a broker az ack nélküli üzeneteket azonnal visszatette
+<code>ready</code> állapotba. (Élő, de beragadt consumernél lenne
+<code>messages_unacknowledged</code> &gt; 0 — ez más diagnózis, lásd
+53.4.) A labor consumer-scriptje
+(<code>/usr/local/bin/lab-orders-consumer</code>) egy
+<code>SIGTERM</code> után elhalt. Újraindítás:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, UID: labadmin</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart lab-orders-consumer</span></code></pre></div>
+<p>A broker az ack nélkül maradt üzeneteket újra kézbesíti az
+újraindított consumernek. A <code>labdb</code> adatbázis
+<code>orders</code> táblájában a <code>processing_id</code> alapján kell
+deduplikálni:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode sql"><code class="sourceCode sql"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> processing_id, <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> orders</span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="kw">GROUP</span> <span class="kw">BY</span> processing_id <span class="kw">HAVING</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="op">&gt;</span> <span class="dv">1</span>;</span></code></pre></div>
+<p>Várt: nincs sor. A laborban a consumer idempotens: a feldolgozás
+előtt
+<code>INSERT ... ON CONFLICT (processing_id) DO NOTHING</code>.</p>
+<p>Ha duplikátum keletkezik, akkor a domain invariant sérült. A recovery
+nem a duplikátumok törlésével kezdődik, hanem a feldolgozó
+idempotencia-javításával, majd a duplikátumok tranzakcionális
+eltávolításával.</p>
+<h4 data-number="53.5.4.5" id="backuppitr-és-data-smoke-test"><span
+class="header-section-number">53.5.4.5</span> 5. Backup/PITR és data
+smoke test</h4>
+<p>A disk pressure után a labbackup ellenőrzi a legutóbbi snapshotot. A
+<code>restic check</code> csak a repository szerkezetét vizsgálja; a
+csomagadatok egy részét a <code>--read-data-subset</code> olvassa
+vissza, a backup pedig csak egy sikeres, integritásellenőrzött restore
+után számít demonstrált recoverynek:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, UID: labadmin</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">RESTIC_REPOSITORY</span><span class="op">=</span>sftp:lab-backup:/srv/restic/lab-stateful</span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-E</span> restic check <span class="at">--read-data-subset</span><span class="op">=</span>10%</span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-E</span> restic restore latest <span class="at">--target</span> /var/tmp/lab-restore-check <span class="dt">\</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--include</span> /var/lib/lab-backup/pg-base</span></code></pre></div>
+<p>A várt kimenet: <code>no errors were found</code>, majd a
+visszaállított fájlok ellenőrzőösszege egyezik a manifestben rögzítettel
+(a restic a teljes eredeti útvonalat hozza létre a <code>--target</code>
+alatt).</p>
+<p>A PITR teszteléséhez a labban külön <code>labdb-recovery</code>
+instance áll (port 5433, saját socket), amely a restic-ből a base
+backup-ot és a WAL-t játssza vissza egy megadott időpontra. A parancs a
+labbackup wrapperrel (a wrapper tartalma a labor manifestjében
+rögzítendő; lépései a 53.2 PITR-műveletsorát követik):</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, UID: labadmin</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> /usr/local/bin/lab-pitr-restore <span class="dt">\</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--manifest</span> /etc/lab-backup/manifest.yaml <span class="dt">\</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--target-time</span> <span class="st">&#39;2025-01-01 09:15:00+00&#39;</span> <span class="dt">\</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--recovery-instance</span> labdb-recovery</span></code></pre></div>
+<p>Várt: az instance elindul, és a visszaállított instance-on lefut a
+smoke test. A smoke test a recovery instance-hoz csatlakozik, nem az élő
+<code>lab-postgres</code>-hez:</p>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, UID: labadmin</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="at">-h</span> /run/lab-postgresql-recovery <span class="at">-p</span> 5433 <span class="at">-d</span> labdb <span class="at">-Atc</span> <span class="st">&quot;</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="st">SELECT pg_is_in_recovery(), count(*) FROM orders</span></span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a><span class="st">WHERE created_at &lt; &#39;2025-01-01 09:15:00+00&#39;;&quot;</span></span></code></pre></div>
+<p>A count egyezik a backup manifestben rögzített
+<code>expected_orders</code> értékkel.</p>
+<h4 data-number="53.5.4.6" id="incident-timeline-és-slo"><span
+class="header-section-number">53.5.4.6</span> 6. Incident timeline és
+SLO</h4>
+<p>Az incidens timeline:</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Időpont</th>
+<th>Esemény</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>09:00</td>
+<td>Első 503, alert: <code>lab-svc</code> p95 hiba</td>
+</tr>
+<tr>
+<td>09:03</td>
+<td>Diagnosis: DB connection exhausted</td>
+</tr>
+<tr>
+<td>09:05</td>
+<td>Mitigation: <code>max_connections</code> 20, restart (a meglévő
+kapcsolatok megszakadnak)</td>
+</tr>
+<tr>
+<td>09:10</td>
+<td>Redis BGSAVE hiba; disk pressure</td>
+</tr>
+<tr>
+<td>09:12</td>
+<td>Cleanup: <code>lab-bigfile.bin</code> törlése</td>
+</tr>
+<tr>
+<td>09:20</td>
+<td>Queue lag észlelés</td>
+</tr>
+<tr>
+<td>09:25</td>
+<td>Consumer restart</td>
+</tr>
+<tr>
+<td>09:40</td>
+<td>PITR restore teszt és data smoke test</td>
+</tr>
+<tr>
+<td>09:45</td>
+<td>Utóteszt: <code>lab-api</code> p95 &lt; 200 ms, error budget
+csökkenés</td>
+</tr>
+</tbody>
+</table>
+<p>Az SLO-számítás a timeline-ból: 09:00–09:05 között a DB-hiba miatt a
+hibaarány 100% → 5 perc-egyenérték; 09:05–09:20 között a (hipotetikus, a
+laborban mérendő) hibaarány 2% →
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>15</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>02</mn><mo>=</mo><mn>0</mn><mo>,</mo><mn>3</mn></mrow><annotation encoding="application/x-tex">15 \cdot 0{,}02 = 0{,}3</annotation></semantics></math>
+perc-egyenérték. Az error budget nevezője a 432 perc-egyenérték (nem a
+hónap 43 200 perce): az 5 perc teljes hiba
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>5</mn><mi>/</mi><mn>432</mn><mo>≈</mo><mn>1</mn><mo>,</mo><mn>16</mn><mi>%</mi></mrow><annotation encoding="application/x-tex">5/432 \approx 1{,}16\%</annotation></semantics></math>-ot,
+a teljes incidens
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>5</mn><mo>,</mo><mn>3</mn><mi>/</mi><mn>432</mn><mo>≈</mo><mn>1</mn><mo>,</mo><mn>23</mn><mi>%</mi></mrow><annotation encoding="application/x-tex">5{,}3/432 \approx 1{,}23\%</annotation></semantics></math>-ot
+fogyaszt. (Összevetésként: egy 20 perces teljes kiesés
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>20</mn><mi>/</mi><mn>432</mn><mo>≈</mo><mn>4</mn><mo>,</mo><mn>6</mn><mi>%</mi></mrow><annotation encoding="application/x-tex">20/432 \approx 4{,}6\%</annotation></semantics></math>
+lenne.) A 09:00–09:30 ablak hibaaránya
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>5</mn><mo>,</mo><mn>3</mn><mi>/</mi><mn>30</mn><mo>≈</mo><mn>17</mn><mo>,</mo><mn>7</mn><mi>%</mi><mo>&gt;</mo><mn>1</mn><mi>%</mi></mrow><annotation encoding="application/x-tex">5{,}3/30 \approx 17{,}7\% &gt; 1\%</annotation></semantics></math>:
+az ablak SLO-ja sérült.</p>
+<p>Az alábbi ábra a timeline eseményeihez köti a hibaarányt és a
+halmozott error-budget-fogyást. A budget nevezője a 30 napos, 99%-os
+SLO-hoz tartozó 1% · 43 200 perc = 432 perc-egyenérték: 09:00–09:05
+között a 100%-os hiba 5/432 ≈ 1,16%-ot, a 09:05–09:20 közötti
+(hipotetikus) 2% további 15 · 0,02/432 ≈ 0,07%-ot fogyaszt, összesen ≈
+1,23%-ot; a 09:00–09:30 ablak hibaaránya ≈ 17,7%, tehát az ablak SLO-ja
+sérült.</p>
+<figure id="fig-d265-incident-budget">
+<div class="fig-interactive"><iframe src="figures/html/d265-incident-budget.html" title="Felső panel: 5 perc 100%-os hiba, majd 15 perc 2%; alsó panel: a 30 napos budget kb. 1,2%-a fogy el." loading="lazy" style="width:100%;border:0;height:600px"></iframe><noscript><img src="figures/img/d265-incident-budget.png" style="width:95.0%"
+alt="Felső panel: 5 perc 100%-os hiba, majd 15 perc 2%; alsó panel: a 30 napos budget kb. 1,2%-a fogy el." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d265-incident-budget.png" style="width:95.0%"
+alt="Felső panel: 5 perc 100%-os hiba, majd 15 perc 2%; alsó panel: a 30 napos budget kb. 1,2%-a fogy el." /></details></div>
+<figcaption>lab-svc incidens (számított modell, nem mérés): felül a
+hibaarány lépcsőfüggvénye az 1%-os SLO-küszöbbel, alul a 432 perces 30
+napos budget halmozott fogyása – 09:05-ig ≈ 1,16%, 09:20-ig ≈
+1,23%</figcaption>
+</figure>
+<h3 data-number="53.5.5" id="hibák-és-ellenpróbák"><span
+class="header-section-number">53.5.5</span> Hibák és ellenpróbák</h3>
+<p>Gyakori hiba, hogy a tanuló a <code>FLUSHALL</code>-t production
+cache-en futtatja, vagy a <code>rm -rf /var/lib/postgresql/*</code>-t a
+recovery során. A laborban a cache flush csak a <code>lab-redis</code>
+instance-on megengedett, és a DB adatkönyvtárat soha nem töröljük a PITR
+előtt.</p>
+<p>Egy másik hiba a connection limit emelése a connection leak
+diagnosztizálása nélkül. A <code>max_connections</code> növelése
+memóriát fogyaszt, és elrejti a szivárgást; a
+<code>pg_stat_activity</code>-ben az <code>idle in transaction</code>
+állapotú kapcsolatok tartósan nyitva maradnak. A laborban a mitigáció
+után a hibás tranzakciót is be kell zárni.</p>
+<p>A message duplication javításakor a duplikátumok törlése önmagában
+nem megoldás, ha a fogyasztó továbbra is nem idempotens. Előbb a
+consumer-t kell javítani, majd a duplikátumokat tranzakcionálisan
+eltávolítani.</p>
+<p>A disk pressure esetén a Redis és a PostgreSQL adatkönyvtárának a
+<code>rm -rf</code> parancs használata a labban tilos; csak a fixture
+által létrehozott fájlokat szabad törölni. A cleanup script
+<code>lab-cleanup</code> csak a <code>lab-</code> prefixű fájlokat
+érinti.</p>
+<h3 data-number="53.5.6" id="feladatok"><span
+class="header-section-number">53.5.6</span> Feladatok</h3>
+<h4 data-number="53.5.6.1"
+id="fogalomtérkép-a-három-service-recovery-szerződéséről"><span
+class="header-section-number">53.5.6.1</span> 1. Fogalomtérkép a három
+service recovery-szerződéséről</h4>
+<ul>
+<li>Sorolja fel a <code>labdb</code>, <code>labcache</code> és
+<code>labqueue</code> tartóssági szintjét, megengedett adatvesztését és
+recovery-módját.</li>
+<li>Adja meg mindegyiknél a domain invariánst.</li>
+</ul>
+<h4 data-number="53.5.6.2"
+id="labfixture-beállítása-és-disk-pressure-incidens"><span
+class="header-section-number">53.5.6.2</span> 2. Labfixture beállítása
+és disk pressure incidens</h4>
+<ul>
+<li>Csökkentse a <code>labdb</code> <code>max_connections</code>-ét
+10-re, állítsa le a <code>lab-orders-consumer</code>-t, majd a dedikált
+<code>lab-redis-fs</code>-en hozza létre a szabad helyből számolt méretű
+<code>lab-bigfile.bin</code> fixture-fájlt.</li>
+<li>Hajtsa végre a backupot a manifest szerint.</li>
+<li>Indukálja a disk pressure hatást, állítsa helyre a Redis
+<code>BGSAVE</code>-t, és ellenőrizze a backup integritást.</li>
+</ul>
+<h4 data-number="53.5.6.3"
+id="összetett-incidens-diagnosztika-és-recovery"><span
+class="header-section-number">53.5.6.3</span> 3. Összetett incidens
+diagnosztika és recovery</h4>
+<ul>
+<li>A <code>lab-api</code> 503-at és duplicate rendelést jelez. A queue
+depth magas, a DB kapcsolat limit elérte, a Redis cache üres.</li>
+<li>Készítsen incident timeline-t, hajtsa végre a recovery-t, és
+igazolja a data smoke test-tel, hogy a domain invariáns teljesül.</li>
+<li>Utána számolja ki a <code>lab-svc</code> SLO-hatását.</li>
+</ul>
+<h3 data-number="53.5.7" id="megoldások"><span
+class="header-section-number">53.5.7</span> Megoldások</h3>
+<h4 data-number="53.5.7.1" id="fogalomtérkép"><span
+class="header-section-number">53.5.7.1</span> 1. Fogalomtérkép</h4>
+<ul>
+<li><code>labdb</code> (PostgreSQL): tartós, WAL-alapú tranzakciók;
+adatvesztés csak a committed tranzakciókban megengedett az RPO-n belül;
+recovery: PITR. Domain invariant: minden committed tranzakció
+visszaállítható a PITR időpontig.</li>
+<li><code>labcache</code> (Redis): nem tartós, eviction megengedett;
+adatvesztés teljes cache loss esetén is megengedett, mert a DB-ből
+újraépíthető; domain invariant: a cache-ből hiányzó kulcs mindig
+megbízhatóan betölthető a DB-ből.</li>
+<li><code>labqueue</code> (RabbitMQ): legalább egyszer kézbesítés;
+üzenetvesztés nem megengedett a durable queue és publisher confirm
+mellett; duplikáció megengedett, de az idempotens consumer-rel a
+deduplikált hatás garantált. Domain invariant: minden egyes
+<code>processing_id</code> legfeljebb egyszer kerül a DB
+<code>orders</code> táblába.</li>
+</ul>
+<h4 data-number="53.5.7.2" id="fixture-setup-és-disk-pressure"><span
+class="header-section-number">53.5.7.2</span> 2. Fixture setup és disk
+pressure</h4>
+<p>A parancsok a labhost-on:</p>
+<div class="sourceCode" id="cb18"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, UID: labadmin</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="at">-h</span> /run/lab-postgresql <span class="dt">\</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-c</span> <span class="st">&quot;ALTER SYSTEM SET max_connections = 10;&quot;</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart lab-postgres</span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl stop lab-orders-consumer</span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> /usr/local/bin/lab-backup <span class="at">--manifest</span> /etc/lab-backup/manifest.yaml</span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a><span class="co"># disk pressure csak a dedikált lab-redis-fs-en, a szabad helyből számolva</span></span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a><span class="ex">findmnt</span> /var/lib/lab-redis</span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> install <span class="at">-d</span> <span class="at">-o</span> labcache /var/lib/lab-redis/tmp</span>
+<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a><span class="va">avail</span><span class="op">=</span><span class="va">$(</span><span class="fu">df</span> <span class="at">--output</span><span class="op">=</span>avail <span class="at">-B1</span> /var/lib/lab-redis <span class="kw">|</span> <span class="fu">tail</span> <span class="at">-1</span><span class="va">)</span></span>
+<span id="cb18-11"><a href="#cb18-11" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> fallocate <span class="at">-l</span> <span class="va">$((</span> <span class="va">avail</span> <span class="op">-</span> <span class="dv">4</span><span class="op">*</span><span class="dv">1024</span><span class="op">*</span><span class="dv">1024</span> <span class="va">))</span> <span class="dt">\</span></span>
+<span id="cb18-12"><a href="#cb18-12" aria-hidden="true" tabindex="-1"></a>  /var/lib/lab-redis/tmp/lab-bigfile.bin</span>
+<span id="cb18-13"><a href="#cb18-13" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-h</span> /var/lib/lab-redis</span></code></pre></div>
+<p>A <code>findmnt</code> igazolja, hogy a
+<code>/var/lib/lab-redis</code> a <code>lab-redis-fs</code> loopback FS
+(ha nem, a fixture nem futhat). A Redis BGSAVE hiba ellenőrzése:</p>
+<div class="sourceCode" id="cb19"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, UID: labadmin</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">REDISCLI_AUTH</span><span class="op">=</span>dummy-password</span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a><span class="ex">redis-cli</span> <span class="at">-h</span> 127.0.0.1 <span class="at">-p</span> 6379 BGSAVE</span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 2</span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a><span class="ex">redis-cli</span> <span class="at">-h</span> 127.0.0.1 <span class="at">-p</span> 6379 INFO persistence <span class="dt">\</span></span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a>  <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;rdb_last_bgsave_status|rdb_bgsave_in_progress&#39;</span></span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a><span class="ex">redis-cli</span> <span class="at">-h</span> 127.0.0.1 <span class="at">-p</span> 6379 SET lab:probe 1</span></code></pre></div>
+<p>Várt kimenet: a <code>BGSAVE</code> azonnal
+<code>Background saving started</code>-et ad, mert forkol; a mentés a
+gyermekfolyamatban hiúsul meg, ezért
+<code>rdb_last_bgsave_status:err</code>. A <code>MISCONF</code> hibát
+nem a <code>BGSAVE</code>, hanem a következő írás (<code>SET</code>)
+kapja: <code>(error) MISCONF …</code> — a pontos szöveget a telepített
+Redis-verzió kimenetéből kell rögzíteni.</p>
+<p>Helyreállítás:</p>
+<div class="sourceCode" id="cb20"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, UID: labadmin</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rm /var/lib/lab-redis/tmp/lab-bigfile.bin</span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a><span class="ex">redis-cli</span> <span class="at">-h</span> 127.0.0.1 <span class="at">-p</span> 6379 BGSAVE</span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 2</span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a><span class="ex">redis-cli</span> <span class="at">-h</span> 127.0.0.1 <span class="at">-p</span> 6379 INFO persistence <span class="kw">|</span> <span class="fu">grep</span> rdb_last_bgsave_status</span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a><span class="ex">redis-cli</span> <span class="at">-h</span> 127.0.0.1 <span class="at">-p</span> 6379 SET lab:probe 1</span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">RESTIC_REPOSITORY</span><span class="op">=</span>sftp:lab-backup:/srv/restic/lab-stateful</span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-E</span> restic check <span class="at">--read-data-subset</span><span class="op">=</span>10%</span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-E</span> restic restore latest <span class="at">--target</span> /var/tmp/lab-restore-check <span class="dt">\</span></span>
+<span id="cb20-10"><a href="#cb20-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--include</span> /var/lib/lab-backup/pg-base</span></code></pre></div>
+<p>A postcondition: <code>rdb_last_bgsave_status:ok</code>, a
+<code>SET</code> → <code>OK</code>, a restic <code>check</code>
+hibamentes, a próba-restore fájljainak ellenőrzőösszege egyezik a
+manifesttel, és a <code>lab-bigfile.bin</code> nem létezik.</p>
+<h4 data-number="53.5.7.3" id="összetett-incidens"><span
+class="header-section-number">53.5.7.3</span> 3. Összetett incidens</h4>
+<p>A diagnosztika parancsai:</p>
+<ul>
+<li>DB kapcsolatok: a kliens-backendek száma eléri a
+<code>max_connections</code> értékét (10, ebből 7 nem szuperuser slot),
+sok <code>idle in transaction</code>.</li>
+<li>Queue depth: <code>curl</code> a RabbitMQ management API-ra,
+<code>messages_ready</code> &gt; 50.</li>
+<li>Cache: <code>redis-cli DBSIZE</code> 0.</li>
+</ul>
+<p>A recovery sorrend:</p>
+<ol type="1">
+<li>DB: az <code>idle in transaction</code> sessionök lezárása
+(<code>pg_terminate_backend</code>), és <code>max_connections</code> 20
+restarttal.</li>
+<li>A consumer leállítva marad; az idempotens verzió
+(<code>INSERT ... ON CONFLICT (processing_id) DO NOTHING</code>)
+telepítése.</li>
+<li>Duplikátumok eltávolítása egy tranzakcióban:</li>
+</ol>
+<div class="sourceCode" id="cb21"><pre
+class="sourceCode sql"><code class="sourceCode sql"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="kw">DELETE</span> <span class="kw">FROM</span> orders o <span class="kw">USING</span> orders d</span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a> <span class="kw">WHERE</span> o.processing_id <span class="op">=</span> d.processing_id <span class="kw">AND</span> o.ctid <span class="op">&gt;</span> d.ctid;</span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">TABLE</span> orders</span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a>  <span class="kw">ADD</span> <span class="kw">CONSTRAINT</span> orders_processing_id_key <span class="kw">UNIQUE</span> (processing_id);</span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span></code></pre></div>
+<ol start="4" type="1">
+<li>A consumer indítása, a backlog lefogyásának ellenőrzése.</li>
+<li>Cache repopulation a DB-ből.</li>
+<li>Data smoke test: az <code>orders</code>-ben a
+<code>processing_id</code> egyedi, és a count egyezik a
+manifesttel.</li>
+</ol>
+<p>A timeline-t a fenti táblázathoz hasonlóan kell kitölteni. Az
+SLO-hatás ugyanazzal a képlettel: ha a kitöltött timeline szerint pl. 15
+percig volt teljes (100%-os) hiba (első 503-tól a
+kapcsolat-mitigációig), az a 432 perc-egyenértékű budget
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>15</mn><mi>/</mi><mn>432</mn><mo>≈</mo><mn>3</mn><mo>,</mo><mn>5</mn><mi>%</mi></mrow><annotation encoding="application/x-tex">15/432 \approx 3{,}5\%</annotation></semantics></math>-a;
+a 30 perces ablak hibaaránya ekkor
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>15</mn><mi>/</mi><mn>30</mn><mo>=</mo><mn>50</mn><mi>%</mi><mo>&gt;</mo><mn>1</mn><mi>%</mi></mrow><annotation encoding="application/x-tex">15/30 = 50\% &gt; 1\%</annotation></semantics></math>,
+az ablak SLO-ja sérült. A percszámot mindig a saját timeline-ból kell
+levezetni.</p>
+<h3 data-number="53.5.8" id="rövid-összefoglaló"><span
+class="header-section-number">53.5.8</span> Rövid összefoglaló</h3>
+<p>A stateful service recovery a tartóssági szint és a domain invariant
+mentén különül el: a PostgreSQL PITR-re állítható vissza és tranzakciós
+integritást igényel; a Redis cache loss esetén a DB-ből újraépíthető; a
+RabbitMQ legalább egyszer kézbesít, ezért a consumer idempotenciája
+kötelező. A diagnosztika a resource state és az application state
+különválasztásával indul, majd a mitigáció a kapacitás növelése vagy a
+hibás erőforrás eltávolítása. A labban a connection exhaustion, a queue
+lag és a disk pressure fixture-k a teljes incident timeline-t
+gyakoroltatják a backup és a data smoke test integrálásával. A recovery
+sikerességét a domain invariant ellenőrzése és a SLO-hatás utótesztje
+adja.</p>
+<p><strong>Továbbhasznált definíciók:</strong><br />
+- <strong>Domain invariant:</strong> az alkalmazás által megkövetelt, a
+hiba és a recovery során is érvényes állapotfeltétel, például az üzenet
+feldolgozásának idempotens hatása.<br />
+- <strong>At-least-once delivery:</strong> a queue olyan szemantikája,
+amelyben az üzenet elvesztése nem megengedett, de a duplikált kézbesítés
+lehetséges.<br />
+- <strong>PITR:</strong> a DB base backup és WAL-szegmensek
+visszajátszásával egy adott időpontra történő helyreállítás.</p>
+<h3 data-number="53.5.9" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">53.5.9</span> Források és ellenőrzési
+hiányok</h3>
+<p>Forráskiindulópontok (nem olvasott, nem ellenőrzött bizonyítékok
+ebben a kérésben):</p>
+<ul>
+<li><a href="https://www.postgresql.org/docs/">PostgreSQL
+documentation</a></li>
+<li><a href="https://redis.io/docs/latest/">Redis documentation</a></li>
+<li><a href="https://www.rabbitmq.com/docs">RabbitMQ
+documentation</a></li>
+<li><a href="https://sre.google/books/">Google SRE Books</a></li>
+</ul>
+<p>Állításonkénti hivatalos források (hivatkozott verziók: PostgreSQL
+16, Redis 7.x az Ubuntu 24.04 csomagból, RabbitMQ 3.13, restic
+0.16+):</p>
+<ul>
+<li><code>max_connections</code> (postmaster-kontextus),
+<code>superuser_reserved_connections</code>: <a
+href="https://www.postgresql.org/docs/16/runtime-config-connection.html"
+class="uri">https://www.postgresql.org/docs/16/runtime-config-connection.html</a>;
+<code>ALTER SYSTEM</code>: <a
+href="https://www.postgresql.org/docs/16/sql-altersystem.html"
+class="uri">https://www.postgresql.org/docs/16/sql-altersystem.html</a>;
+<code>pg_settings.pending_restart</code>: <a
+href="https://www.postgresql.org/docs/16/view-pg-settings.html"
+class="uri">https://www.postgresql.org/docs/16/view-pg-settings.html</a></li>
+<li><code>pg_stat_activity</code> (<code>state</code>,
+<code>backend_type</code>): <a
+href="https://www.postgresql.org/docs/16/monitoring-stats.html"
+class="uri">https://www.postgresql.org/docs/16/monitoring-stats.html</a>;
+<code>pg_terminate_backend</code>: <a
+href="https://www.postgresql.org/docs/16/functions-admin.html"
+class="uri">https://www.postgresql.org/docs/16/functions-admin.html</a></li>
+<li>PITR, <code>recovery_target_time</code>: <a
+href="https://www.postgresql.org/docs/16/continuous-archiving.html"
+class="uri">https://www.postgresql.org/docs/16/continuous-archiving.html</a></li>
+<li>Redis <code>BGSAVE</code>, <code>stop-writes-on-bgsave-error</code>,
+<code>INFO persistence</code>: <a
+href="https://redis.io/docs/latest/commands/bgsave/"
+class="uri">https://redis.io/docs/latest/commands/bgsave/</a>, <a
+href="https://redis.io/docs/latest/commands/info/"
+class="uri">https://redis.io/docs/latest/commands/info/</a></li>
+<li>RabbitMQ management HTTP API
+(<code>/api/queues/{vhost}/{name}</code>): <a
+href="https://www.rabbitmq.com/docs/management"
+class="uri">https://www.rabbitmq.com/docs/management</a>; consumer ack
+és redelivery: <a href="https://www.rabbitmq.com/docs/confirms"
+class="uri">https://www.rabbitmq.com/docs/confirms</a></li>
+<li>restic <code>check --read-data-subset</code>,
+<code>restore --target/--include</code>: <a
+href="https://restic.readthedocs.io/en/stable/045_working_with_repos.html"
+class="uri">https://restic.readthedocs.io/en/stable/045_working_with_repos.html</a>,
+<a href="https://restic.readthedocs.io/en/stable/050_restore.html"
+class="uri">https://restic.readthedocs.io/en/stable/050_restore.html</a></li>
+<li>Error budget és burn rate: Google SRE Workbook, „Alerting on SLOs” —
+<a href="https://sre.google/workbook/alerting-on-slos/"
+class="uri">https://sre.google/workbook/alerting-on-slos/</a></li>
+</ul>
+<p>Reprodukciós státusz: a példák laborban ellenőrizendők; dátumozott
+futtatási napló még nem készült, a kimenetek illusztratívak.</p>
+<p>Ellenőrzési hiányok: a PostgreSQL <code>max_connections</code> és a
+<code>pg_stat_activity</code> viselkedése a tényleges lab-verziótól
+függ; a Redis <code>BGSAVE</code> hibakód pontos szövege a Redis
+verziófüggő; a RabbitMQ management API mezőnevei és a
+<code>messages_ready</code> pontos értéke a lab-queue aktuális
+állapotától függ. A restic <code>check</code> kimenet pontos szövegét a
+restic verzió határozza meg; a PITR restore parancs a lab wrapper script
+verziójától és a PostgreSQL <code>archive_command</code>
+konfigurációjától függ. A backup manifest <code>expected_orders</code>
+értéke a labor manifestben rögzítendő.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d264.html">← 53.4 Queue, stream, acknowledgement és delivery</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d266.html">54.1 Redundancia, failure domain és graceful degradation →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

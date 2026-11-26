@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ki öl és miért: global OOM, memcg OOM, systemd-oomd</title>
+<style>
+:root{--fg:#111;--bg:#fff;--muted:#666;--hl:#1f4e79;--hl2:#c55a11;--cell:#fff;--cellhl:#d9d9d9;--line:#000;--code:#f3f3f3}
+@media (prefers-color-scheme:dark){:root{--fg:#eee;--bg:#1b1b1b;--muted:#aaa;--hl:#8fb8e8;--hl2:#f0a060;--cell:#262626;--cellhl:#4a4a4a;--line:#ddd;--code:#2a2a2a}}
+*{box-sizing:border-box}
+body{margin:0;padding:10px;font:14px/1.45 system-ui,sans-serif;color:var(--fg);background:var(--bg)}
+.ctl{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:6px}
+button{font:inherit;padding:3px 10px;cursor:pointer}
+input[type=range]{flex:1;min-width:120px}
+#status{margin:4px 0 6px;min-height:2.9em}
+/* A pszeudokód a rajz ALATT, teljes szélességben (hosszú sorok ne görgessenek oldalra) */
+.wrap{display:flex;flex-direction:column;gap:10px;align-items:stretch}
+svg{width:100%;height:auto;display:block}
+pre#code{width:100%;margin:0;padding:6px 8px;background:var(--code);font:12.5px/1.5 ui-monospace,monospace;white-space:pre;overflow-x:auto}
+pre#code span{display:block;padding:0 4px}
+pre#code span.on{outline:2px solid var(--hl);font-weight:bold}
+svg text:not([fill]){fill:var(--fg);}
+svg text{font-family:system-ui,sans-serif}
+.small{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="ctl" role="group" aria-label="Lejátszás vezérlői">
+  <button id="first" title="Első lépés">⏮</button>
+  <button id="prev" title="Előző lépés">◀ Lépés</button>
+  <button id="play" title="Lejátszás / szünet">▶ Lejátszás</button>
+  <button id="next" title="Következő lépés">Lépés ▶</button>
+  <input id="pos" type="range" min="0" max="0" value="0" aria-label="Lépés kiválasztása">
+  <span id="cnt" class="small"></span>
+</div>
+<div class="ctl"><label>cgroup memory.current (MiB): <input id="cur" type="range" min="0" max="80" step="1" value="30" oninput="live()" style="width:150px" aria-label="cgroup memory.current (MiB):"> <span id="curv">30</span></label> <label>host szabad (MiB): <input id="free" type="range" min="0" max="4096" step="8" value="2600" oninput="live()" style="width:150px" aria-label="host szabad (MiB):"> <span id="freev">2600</span></label> <label>memory.pressure (%): <input id="psi" type="range" min="0" max="100" step="1" value="2" oninput="live()" style="width:150px" aria-label="memory.pressure (%):"> <span id="psiv">2</span></label> </div>
+<div id="status" aria-live="polite"></div>
+<div class="wrap">
+  <svg id="v" viewBox="0 0 560 300" role="img" aria-label="Három sáv (cgroup memory.current a 48 és 64 MiB küszöbbel, host szabad memória a watermarkokkal, memory.pressure a 60%-os limittel) és három oszlop: host globális OOM, memcg local OOM, systemd-oomd, mindegyiknél a trigger, a döntéshozó és a nyom."></svg>
+  <pre id="code" aria-label="Pszeudokód"></pre>
+</div>
+<p class="small">Modell, nem mérés. MemoryMax=64M a 9.3 kidolgozott példájából; a memory.high 48 MiB, a 4 GiB-os host, a min/low watermark (64/80 MiB) és az oomd 60%-os pressure-limitje illusztratív. Az oomd a limitet tartósan (időablakon át) túllépő pressure-re lép; itt a pillanatérték jelzi. A /proc/vmstat oom_kill mindkét kernel-OOM-nál nő, az elkülönítő jel a kernelnapló constraint mezője.</p>
+<script>
+// ---- Adat: lépések (a Python-szkript számolja ki és illeszti be, a könyv példájával egyezően) ----
+// Minden lépés: {msg: "állapotsor szövege", line: kiemelt pszeudokódsor indexe vagy -1, ...saját mezők}
+let STEPS = [{"msg": "1. Normál: memory.current 30 MiB < memory.high, a host szabad memóriája bőven a watermark fölött, alacsony pressure – egyik ág sem aktív.", "cur": 30, "free": 2600, "psi": 2}, {"msg": "2. memory.high fölött (56 MiB): a kernel a csoportot reclaimre kényszeríti és lassítja (throttle); kill nincs, a memory.events high számlálója nő.", "cur": 56, "free": 2600, "psi": 25}, {"msg": "3. memory.current = memory.max (64 MiB), a csoport-reclaim sikertelen → memcg local OOM; a host szabad memóriája változatlan.", "cur": 64, "free": 2600, "psi": 35}, {"msg": "4. Host-nyomás: a host szabad memóriája a min watermark alá esik, a globális reclaim sikertelen → host globális OOM (CONSTRAINT_NONE).", "cur": 30, "free": 40, "psi": 35}];
+const CODE = [];          // pszeudokód sorai (üres lista: a panel elrejtve)
+
+// ---- Rajzolás: ezt a függvényt kell az ábrához igazítani ----
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, text){const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);if(text!==undefined)e.textContent=text;svg.appendChild(e);return e;}
+const svg = document.getElementById("v");
+function css(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim();}
+function render(s){
+  // Példa: tömb cellákként, s.a = értékek, s.hl = kiemelt indexek
+  svg.innerHTML = "";
+  const a = s.a || [], w = 48, x0 = (560 - a.length * w) / 2, y0 = 110;
+  a.forEach((v, i) => {
+    const on = (s.hl || []).includes(i);
+    el("rect", {x: x0 + i * w, y: y0, width: w, height: w, fill: on ? css("--cellhl") : css("--cell"), stroke: css("--line"), "stroke-width": on ? 3 : 1.2});
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w / 2 + 6, "text-anchor": "middle", "font-size": 18}, String(v));
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w + 18, "text-anchor": "middle", "font-size": 12, fill: css("--muted")}, String(i));
+  });
+}
+
+const SC_COL = {fg: "--fg", muted: "--muted", bg: "--bg", g1: "--sc-g1", g2: "--sc-g2", g3: "--sc-g3",
+  hl: "--hl", hl2: "--hl2", hlf: "--sc-hlf", hl2f: "--sc-hl2f"};
+const SC_DASH = {solid: "", dash: "6 3.5", dot: "1.2 2.2", dashdot: "7 3 1.5 3", longdash: "10 4"};
+function scCol(c, d){ c = c || d; if (c === "none") return "none"; const v = SC_COL[c]; return v ? css(v) : c; }
+function scDefs(){
+  const d = document.createElementNS(NS, "defs"), f = css("--fg");
+  const pat = (id, body) => `<pattern id="${id}" width="7" height="7" patternUnits="userSpaceOnUse">${body}</pattern>`;
+  d.innerHTML =
+    ["fg", "muted", "hl", "hl2", "g3"].map(c => `<marker id="scah-${c}" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="${scCol(c)}"/></marker>`).join("") +
+    pat("h-sl", `<path d="M0,7L7,0M-1,1L1,-1M6,8L8,6" stroke="${f}" stroke-width="0.9"/>`) +
+    pat("h-bs", `<path d="M0,0L7,7M6,-1L8,1M-1,6L1,8" stroke="${f}" stroke-width="0.9"/>`) +
+    pat("h-dt", `<circle cx="3.5" cy="3.5" r="1" fill="${f}"/>`) +
+    pat("h-xx", `<path d="M0,7L7,0M0,0L7,7" stroke="${f}" stroke-width="0.8"/>`) +
+    pat("h-hz", `<path d="M0,3.5L7,3.5" stroke="${f}" stroke-width="0.9"/>`);
+  svg.appendChild(d);
+}
+const SC_HATCH = {"//": "h-sl", "///": "h-sl", "////": "h-sl", "\\\\": "h-bs", "\\\\\\\\": "h-bs", "..": "h-dt", "...": "h-dt", "xx": "h-xx", "--": "h-hz"};
+function scDraw(prims, ox, oy){
+  ox = ox || 0; oy = oy || 0;
+  for (const p of prims) {
+    const st = p[p.length - 1] || {};
+    if (p[0] === "rect") {
+      const [_, x, y, w, h] = p, ec = scCol(st.stroke, "fg"), lw = st.lw === undefined ? 1.2 : st.lw;
+      const a = {x: x + ox, y: y + oy, width: w, height: h, fill: scCol(st.fill, "bg"), stroke: ec, "stroke-width": lw};
+      if (st.rx) a.rx = st.rx;
+      if (st.ls && st.ls !== "solid") a["stroke-dasharray"] = SC_DASH[st.ls];
+      el("rect", a);
+      if (st.hatch && SC_HATCH[st.hatch]) el("rect", {x: x + ox, y: y + oy, width: w, height: h, fill: `url(#${SC_HATCH[st.hatch]})`, stroke: "none", rx: st.rx || 0});
+      if (st.cross) { el("line", {x1: x + ox, y1: y + oy, x2: x + ox + w, y2: y + oy + h, stroke: ec, "stroke-width": lw * 1.1});
+                      el("line", {x1: x + ox, y1: y + oy + h, x2: x + ox + w, y2: y + oy, stroke: ec, "stroke-width": lw * 1.1}); }
+    } else if (p[0] === "line" || p[0] === "poly") {
+      const pts = p[0] === "line" ? [[p[1], p[2]], [p[3], p[4]]] : p[1];
+      const c = scCol(st.color, "fg"), lw = st.lw === undefined ? 1.2 : st.lw;
+      const d = pts.map((q, i) => (i ? "L" : "M") + (q[0] + ox).toFixed(1) + "," + (q[1] + oy).toFixed(1)).join(" ") + (st.closed ? " Z" : "");
+      if (st.fill && st.fill !== "none") {
+        el("path", {d: d + " Z", fill: scCol(st.fill), stroke: "none"});
+        if (st.hatch && SC_HATCH[st.hatch]) el("path", {d: d + " Z", fill: `url(#${SC_HATCH[st.hatch]})`, stroke: "none"});
+      }
+      if (lw > 0) {
+        const a = {d: d, fill: "none", stroke: c, "stroke-width": lw};
+        if (st.ls && st.ls !== "solid") a["stroke-dasharray"] = SC_DASH[st.ls];
+        const mk = `url(#scah-${["muted", "hl", "hl2", "g3"].includes(st.color) ? st.color : "fg"})`;
+        if (st.arrow) a["marker-end"] = mk;
+        if (st.arrow0) a["marker-start"] = mk;
+        el("path", a);
+      }
+      if (st.marker) for (const q of pts) {
+        const m = st.marker, x = q[0] + ox, y = q[1] + oy, r = (st.ms || 6) / 2;
+        if (m === "x") { el("path", {d: `M${x-r},${y-r}L${x+r},${y+r}M${x-r},${y+r}L${x+r},${y-r}`, stroke: c, "stroke-width": 1.8}); }
+        else if (m === "^") el("path", {d: `M${x},${y-r}L${x+r},${y+r}L${x-r},${y+r}Z`, fill: c});
+        else if (m === "s") el("rect", {x: x - r, y: y - r, width: 2 * r, height: 2 * r, fill: c});
+        else el("circle", {cx: x, cy: y, r: r, fill: c});
+      }
+    } else if (p[0] === "text") {
+      const [_, x, y, s] = p, a = {x: x + ox, y: y + oy, "font-size": st.size || 13, "text-anchor": st.anchor || "start"};
+      if (st.color && st.color !== "fg") a.fill = scCol(st.color);
+      if (st.weight && st.weight !== "normal") a["font-weight"] = st.weight;
+      if (st.italic) a["font-style"] = "italic";
+      el("text", a, s);
+    }
+  }
+}
+(function(){
+  const s = document.createElement("style");
+  s.textContent = ":root{--sc-g1:#ececec;--sc-g2:#c8c8c8;--sc-g3:#8a8a8a;--sc-hlf:#d6e4f2;--sc-hl2f:#f8dcc8}" +
+    "@media (prefers-color-scheme:dark){:root{--sc-g1:#2e2e2e;--sc-g2:#4a4a4a;--sc-g3:#7a7a7a;--sc-hlf:#1f3550;--sc-hl2f:#4a2e1a}}";
+  document.head.appendChild(s);
+})();
+
+const G = {"Y0": 470, "Y1": 70, "BARS": {"cg": [34, 84], "host": [150, 200], "psi": [250, 290]}, "MAX": 64, "HIGH": 48, "HOST": 4096, "WMIN": 64, "WLOW": 80, "PSI": 60, "COLX": [318, 562, 806], "COLW": 236}, BASE = [["text", 59.0, 30.0, "cgroup", {"size": 13.5, "anchor": "middle", "weight": "bold"}], ["text", 59.0, 46.0, "memory.current", {"size": 12.5, "anchor": "middle"}], ["text", 59.0, 60.0, "(MiB)", {"size": 12.5, "anchor": "middle", "color": "muted"}], ["rect", 34, 70, 50, 400, {"fill": "none", "lw": 1.2}], ["text", 30, 475.0, "0", {"size": 12.5, "anchor": "end", "color": "muted"}], ["text", 30, 375.0, "20", {"size": 12.5, "anchor": "end", "color": "muted"}], ["text", 30, 275.0, "40", {"size": 12.5, "anchor": "end", "color": "muted"}], ["text", 30, 75.0, "80", {"size": 12.5, "anchor": "end", "color": "muted"}], ["line", 28, 230.0, 92, 230.0, {"ls": "dash", "lw": 1.8}], ["line", 28, 150.0, 92, 150.0, {"lw": 3.2}], ["text", 30, 235.0, "48", {"size": 12.5, "anchor": "end"}], ["text", 30, 155.0, "64", {"size": 12.5, "anchor": "end", "weight": "bold"}], ["text", 175.0, 30.0, "host", {"size": 13.5, "anchor": "middle", "weight": "bold"}], ["text", 175.0, 46.0, "szabad mem.", {"size": 12.5, "anchor": "middle"}], ["text", 175.0, 60.0, "(MiB, tört skála)", {"size": 12.5, "anchor": "middle", "color": "muted"}], ["rect", 150, 70, 50, 400, {"fill": "none", "lw": 1.2}], ["text", 146, 475.0, "0", {"size": 12.5, "anchor": "end", "color": "muted"}], ["text", 146, 275.0, "256", {"size": 12.5, "anchor": "end", "color": "muted"}], ["text", 146, 235.0, "1024", {"size": 12.5, "anchor": "end", "color": "muted"}], ["text", 146, 75.0, "4096", {"size": 12.5, "anchor": "end", "color": "muted"}], ["line", 146, 270.0, 204, 270.0, {"lw": 0.8, "ls": "dot", "color": "muted"}], ["line", 144, 420.0, 208, 420.0, {"lw": 3.2}], ["line", 144, 407.5, 208, 407.5, {"lw": 1.2, "ls": "dot"}], ["text", 146, 429.0, "min 64", {"size": 12.5, "anchor": "end", "weight": "bold"}], ["text", 146, 405.5, "low 80", {"size": 12.5, "anchor": "end"}], ["text", 270.0, 30.0, "pressure", {"size": 13.5, "anchor": "middle", "weight": "bold"}], ["text", 270.0, 46.0, "some avg", {"size": 12.5, "anchor": "middle"}], ["text", 270.0, 60.0, "(%)", {"size": 12.5, "anchor": "middle", "color": "muted"}], ["rect", 250, 70, 40, 400, {"fill": "none", "lw": 1.2}], ["text", 294, 475.0, "0", {"size": 12.5, "color": "muted"}], ["text", 294, 75.0, "100", {"size": 12.5, "color": "muted"}], ["line", 246, 230.0, 296, 230.0, {"lw": 2.2, "ls": "dashdot"}], ["text", 294, 235.0, "60", {"size": 12.5, "weight": "bold"}], ["poly", [[92.0, 150.0], [118.0, 150.0], [118.0, 494.0], [680.0, 494.0], [680.0, 478.0]], {"arrow": true, "lw": 1.6, "ls": "solid"}], ["poly", [[208.0, 420.0], [226.0, 420.0], [226.0, 506.0], [436.0, 506.0], [436.0, 478.0]], {"arrow": true, "lw": 1.6, "ls": "longdash"}], ["poly", [[312.0, 230.0], [306.0, 230.0], [306.0, 518.0], [924.0, 518.0], [924.0, 478.0]], {"arrow": true, "lw": 1.6, "ls": "dot"}], ["text", 8, 540.0, "Küszöbök: memory.max (vastag), memory.high (szaggatott: throttle, nincs kill), host min watermark (vastag) / low (pontozott: kswapd), oomd pressure-limit (pontvonal).", {"size": 12.5, "color": "muted"}], ["text", 8, 558.0, "MemoryMax=64M a 9.3 példájából; a memory.high 48 MiB, a 4 GiB host, a watermarkok és a 60%-os oomd-limit illusztratív (a valós érték: /proc/zoneinfo, oomd.conf).", {"size": 12.5, "color": "muted"}]], CA = [[["rect", 318, 6, 236, 470, {"fill": "hlf", "stroke": "hl2", "lw": 3.2, "rx": 6}], ["rect", 318, 6, 236, 54, {"fill": "g1", "hatch": "xx", "lw": 1.0, "rx": 6, "stroke": "hl2"}], ["rect", 326, 12, 220, 42, {"fill": "bg", "lw": 0, "rx": 4}], ["text", 436.0, 30.0, "1. host globális OOM", {"size": 14.5, "anchor": "middle", "weight": "bold"}], ["text", 436.0, 48.0, "kernel, out_of_memory()", {"size": 13, "anchor": "middle", "color": "muted"}], ["text", 326, 88.0, "Trigger", {"size": 13.5, "weight": "bold", "color": "hl2"}], ["text", 326, 106.0, "host szabad memória a min", {"size": 13}], ["text", 326, 121.6, "watermark alatt, és a", {"size": 13}], ["text", 326, 137.2, "globális reclaim/compaction", {"size": 13}], ["text", 326, 152.8, "sikertelen", {"size": 13}], ["text", 326, 208.0, "Ki dönt, kit öl?", {"size": 13.5, "weight": "bold", "color": "hl2"}], ["text", 326, 226.0, "legnagyobb oom_score", {"size": 13}], ["text", 326, 241.6, "(badness) a TELJES hoston;", {"size": 13}], ["text", 326, 257.2, "oom_score_adj számít", {"size": 13}], ["text", 326, 300.0, "Nyom / bizonyíték", {"size": 13.5, "weight": "bold", "color": "hl2"}], ["text", 326, 318.0, "kernelnapló: „Out of memory:", {"size": 13}], ["text", 326, 333.6, "Killed process …”", {"size": 13}], ["text", 326, 349.2, "constraint=CONSTRAINT_NONE", {"size": 13}], ["text", 326, 364.8, "/proc/vmstat oom_kill +1", {"size": 13}], ["text", 546, 470.0, "AKTÍV", {"size": 14, "anchor": "end", "weight": "bold", "color": "hl2"}]], [["rect", 562, 6, 236, 470, {"fill": "hlf", "stroke": "hl2", "lw": 3.2, "rx": 6}], ["rect", 562, 6, 236, 54, {"fill": "g1", "hatch": "..", "lw": 1.0, "rx": 6, "stroke": "hl2"}], ["rect", 570, 12, 220, 42, {"fill": "bg", "lw": 0, "rx": 4}], ["text", 680.0, 30.0, "2. memcg local OOM", {"size": 14.5, "anchor": "middle", "weight": "bold"}], ["text", 680.0, 48.0, "kernel, a cgroupon belül", {"size": 13, "anchor": "middle", "color": "muted"}], ["text", 570, 88.0, "Trigger", {"size": 13.5, "weight": "bold", "color": "hl2"}], ["text", 570, 106.0, "memory.current = memory.max", {"size": 13}], ["text", 570, 121.6, "(MemoryMax=64M), és a", {"size": 13}], ["text", 570, 137.2, "csoport saját reclaimje", {"size": 13}], ["text", 570, 152.8, "sikertelen", {"size": 13}], ["text", 570, 208.0, "Ki dönt, kit öl?", {"size": 13.5, "weight": "bold", "color": "hl2"}], ["text", 570, 226.0, "legnagyobb oom_score a", {"size": 13}], ["text", 570, 241.6, "limitált cgroupon belül;", {"size": 13}], ["text", 570, 257.2, "a host lehet bőven szabad", {"size": 13}], ["text", 570, 300.0, "Nyom / bizonyíték", {"size": 13.5, "weight": "bold", "color": "hl2"}], ["text", 570, 318.0, "memory.events: oom_kill 1", {"size": 13}], ["text", 570, 333.6, "kernelnapló: „Memory cgroup", {"size": 13}], ["text", 570, 349.2, "out of memory: Killed …”", {"size": 13}], ["text", 570, 364.8, "constraint=CONSTRAINT_MEMCG", {"size": 13}], ["text", 570, 380.4, "/proc/vmstat oom_kill +1 is!", {"size": 13}], ["text", 790, 470.0, "AKTÍV", {"size": 14, "anchor": "end", "weight": "bold", "color": "hl2"}]], [["rect", 806, 6, 236, 470, {"fill": "hlf", "stroke": "hl2", "lw": 3.2, "rx": 6}], ["rect", 806, 6, 236, 54, {"fill": "g1", "hatch": "//", "lw": 1.0, "rx": 6, "stroke": "hl2"}], ["rect", 814, 12, 220, 42, {"fill": "bg", "lw": 0, "rx": 4}], ["text", 924.0, 30.0, "3. systemd-oomd", {"size": 14.5, "anchor": "middle", "weight": "bold"}], ["text", 924.0, 48.0, "userspace daemon, policy", {"size": 13, "anchor": "middle", "color": "muted"}], ["text", 814, 88.0, "Trigger", {"size": 13.5, "weight": "bold", "color": "hl2"}], ["text", 814, 106.0, "a cgroup memory.pressure", {"size": 13}], ["text", 814, 121.6, "tartósan a limit fölött", {"size": 13}], ["text", 814, 137.2, "(ManagedOOMMemoryPressure=)", {"size": 13}], ["text", 814, 152.8, "vagy swap-telítettség", {"size": 13}], ["text", 814, 168.4, "(ManagedOOMSwap=)", {"size": 13}], ["text", 814, 208.0, "Ki dönt, kit öl?", {"size": 13.5, "weight": "bold", "color": "hl2"}], ["text", 814, 226.0, "a figyelt cgroupok közül", {"size": 13}], ["text", 814, 241.6, "választ, és a teljes", {"size": 13}], ["text", 814, 257.2, "cgroupot öli (SIGKILL)", {"size": 13}], ["text", 814, 300.0, "Nyom / bizonyíték", {"size": 13.5, "weight": "bold", "color": "hl2"}], ["text", 814, 318.0, "journalctl -u systemd-oomd:", {"size": 13}], ["text", 814, 333.6, "„Killed … due to memory", {"size": 13}], ["text", 814, 349.2, "pressure …”; kernel-OOM-sor", {"size": 13}], ["text", 814, 364.8, "nincs, memory.events", {"size": 13}], ["text", 814, 380.4, "oom_kill nem nő", {"size": 13}], ["text", 1034, 470.0, "AKTÍV", {"size": 14, "anchor": "end", "weight": "bold", "color": "hl2"}]]], CI = [[["rect", 318, 6, 236, 470, {"fill": "bg", "stroke": "fg", "lw": 1.0, "rx": 6}], ["rect", 318, 6, 236, 54, {"fill": "g1", "hatch": "xx", "lw": 1.0, "rx": 6, "stroke": "fg"}], ["rect", 326, 12, 220, 42, {"fill": "bg", "lw": 0, "rx": 4}], ["text", 436.0, 30.0, "1. host globális OOM", {"size": 14.5, "anchor": "middle", "weight": "bold"}], ["text", 436.0, 48.0, "kernel, out_of_memory()", {"size": 13, "anchor": "middle", "color": "muted"}], ["text", 326, 88.0, "Trigger", {"size": 13.5, "weight": "bold", "color": "hl"}], ["text", 326, 106.0, "host szabad memória a min", {"size": 13}], ["text", 326, 121.6, "watermark alatt, és a", {"size": 13}], ["text", 326, 137.2, "globális reclaim/compaction", {"size": 13}], ["text", 326, 152.8, "sikertelen", {"size": 13}], ["text", 326, 208.0, "Ki dönt, kit öl?", {"size": 13.5, "weight": "bold", "color": "hl"}], ["text", 326, 226.0, "legnagyobb oom_score", {"size": 13}], ["text", 326, 241.6, "(badness) a TELJES hoston;", {"size": 13}], ["text", 326, 257.2, "oom_score_adj számít", {"size": 13}], ["text", 326, 300.0, "Nyom / bizonyíték", {"size": 13.5, "weight": "bold", "color": "hl"}], ["text", 326, 318.0, "kernelnapló: „Out of memory:", {"size": 13}], ["text", 326, 333.6, "Killed process …”", {"size": 13}], ["text", 326, 349.2, "constraint=CONSTRAINT_NONE", {"size": 13}], ["text", 326, 364.8, "/proc/vmstat oom_kill +1", {"size": 13}]], [["rect", 562, 6, 236, 470, {"fill": "bg", "stroke": "fg", "lw": 1.0, "rx": 6}], ["rect", 562, 6, 236, 54, {"fill": "g1", "hatch": "..", "lw": 1.0, "rx": 6, "stroke": "fg"}], ["rect", 570, 12, 220, 42, {"fill": "bg", "lw": 0, "rx": 4}], ["text", 680.0, 30.0, "2. memcg local OOM", {"size": 14.5, "anchor": "middle", "weight": "bold"}], ["text", 680.0, 48.0, "kernel, a cgroupon belül", {"size": 13, "anchor": "middle", "color": "muted"}], ["text", 570, 88.0, "Trigger", {"size": 13.5, "weight": "bold", "color": "hl"}], ["text", 570, 106.0, "memory.current = memory.max", {"size": 13}], ["text", 570, 121.6, "(MemoryMax=64M), és a", {"size": 13}], ["text", 570, 137.2, "csoport saját reclaimje", {"size": 13}], ["text", 570, 152.8, "sikertelen", {"size": 13}], ["text", 570, 208.0, "Ki dönt, kit öl?", {"size": 13.5, "weight": "bold", "color": "hl"}], ["text", 570, 226.0, "legnagyobb oom_score a", {"size": 13}], ["text", 570, 241.6, "limitált cgroupon belül;", {"size": 13}], ["text", 570, 257.2, "a host lehet bőven szabad", {"size": 13}], ["text", 570, 300.0, "Nyom / bizonyíték", {"size": 13.5, "weight": "bold", "color": "hl"}], ["text", 570, 318.0, "memory.events: oom_kill 1", {"size": 13}], ["text", 570, 333.6, "kernelnapló: „Memory cgroup", {"size": 13}], ["text", 570, 349.2, "out of memory: Killed …”", {"size": 13}], ["text", 570, 364.8, "constraint=CONSTRAINT_MEMCG", {"size": 13}], ["text", 570, 380.4, "/proc/vmstat oom_kill +1 is!", {"size": 13}]], [["rect", 806, 6, 236, 470, {"fill": "bg", "stroke": "fg", "lw": 1.0, "rx": 6}], ["rect", 806, 6, 236, 54, {"fill": "g1", "hatch": "//", "lw": 1.0, "rx": 6, "stroke": "fg"}], ["rect", 814, 12, 220, 42, {"fill": "bg", "lw": 0, "rx": 4}], ["text", 924.0, 30.0, "3. systemd-oomd", {"size": 14.5, "anchor": "middle", "weight": "bold"}], ["text", 924.0, 48.0, "userspace daemon, policy", {"size": 13, "anchor": "middle", "color": "muted"}], ["text", 814, 88.0, "Trigger", {"size": 13.5, "weight": "bold", "color": "hl"}], ["text", 814, 106.0, "a cgroup memory.pressure", {"size": 13}], ["text", 814, 121.6, "tartósan a limit fölött", {"size": 13}], ["text", 814, 137.2, "(ManagedOOMMemoryPressure=)", {"size": 13}], ["text", 814, 152.8, "vagy swap-telítettség", {"size": 13}], ["text", 814, 168.4, "(ManagedOOMSwap=)", {"size": 13}], ["text", 814, 208.0, "Ki dönt, kit öl?", {"size": 13.5, "weight": "bold", "color": "hl"}], ["text", 814, 226.0, "a figyelt cgroupok közül", {"size": 13}], ["text", 814, 241.6, "választ, és a teljes", {"size": 13}], ["text", 814, 257.2, "cgroupot öli (SIGKILL)", {"size": 13}], ["text", 814, 300.0, "Nyom / bizonyíték", {"size": 13.5, "weight": "bold", "color": "hl"}], ["text", 814, 318.0, "journalctl -u systemd-oomd:", {"size": 13}], ["text", 814, 333.6, "„Killed … due to memory", {"size": 13}], ["text", 814, 349.2, "pressure …”; kernel-OOM-sor", {"size": 13}], ["text", 814, 364.8, "nincs, memory.events", {"size": 13}], ["text", 814, 380.4, "oom_kill nem nő", {"size": 13}]]];
+function yCg(v){ return G.Y0 - v * (G.Y0 - G.Y1) / 80; }
+function yHost(v){ return v <= 256 ? G.Y0 - v / 256 * 200 : G.Y0 - 200 - (v - 256) / (G.HOST - 256) * 200; }
+function yPsi(p){ return G.Y0 - p * (G.Y0 - G.Y1) / 100; }
+function classify(cur, free, psi){
+  const ce = Math.min(cur, G.MAX);
+  return {cur_eff: ce, clamped: cur > G.MAX, throttle: G.HIGH <= ce && ce < G.MAX, memcg: ce >= G.MAX,
+          glob: free <= G.WMIN, kswapd: G.WMIN < free && free <= G.WLOW, oomd: psi >= G.PSI};
+}
+function trace(c){
+  const r = [["memory.events", `high ${c.throttle || c.memcg ? "nő" : "0"}  max ${c.memcg ? "nő" : "0"}  oom ${c.memcg ? 1 : 0}  oom_kill ${c.memcg ? 1 : 0}`]];
+  if (c.memcg) { r.push(["kernelnapló", "Memory cgroup out of memory: Killed process … (memhog)"]);
+                 r.push(["kernelnapló", "oom-kill: constraint=CONSTRAINT_MEMCG, oom_memcg=/system.slice/oomdemo.scope"]); }
+  if (c.glob) { r.push(["kernelnapló", "Out of memory: Killed process … (legnagyobb oom_score a hoston)"]);
+                r.push(["kernelnapló", "oom-kill: constraint=CONSTRAINT_NONE"]); }
+  if (c.memcg || c.glob) r.push(["/proc/vmstat", `oom_kill +${(c.memcg ? 1 : 0) + (c.glob ? 1 : 0)} (mindkét kernel-OOM növeli)`]);
+  if (c.oomd) r.push(["journalctl -u systemd-oomd", "Killed /system.slice/… due to memory pressure … (a teljes cgroup)"]);
+  if (c.throttle) r.push(["állapot", "memory.high fölött: erőltetett reclaim, lassulás (throttle), nincs kill"]);
+  if (c.kswapd) r.push(["állapot", "host: a low watermark alatt a kswapd háttér-reclaimet végez, még nincs OOM"]);
+  if (r.length === 1 && !(c.throttle || c.memcg || c.glob || c.oomd)) r.push(["állapot", "normál működés: nincs reclaim-kényszer, nincs kill"]);
+  return r;
+}
+let CUR = null;
+function val(id){ return +document.getElementById(id).value; }
+function setCtl(p){ document.getElementById("cur").value = p.cur; document.getElementById("free").value = p.free; document.getElementById("psi").value = p.psi; }
+function live(){ stop(); draw({cur: val("cur"), free: val("free"), psi: val("psi")}, true); }
+function render(s){ setCtl(s); draw(s, false); }
+function draw(p, own){
+  svg.setAttribute("viewBox", "0 0 1050 700"); svg.innerHTML = ""; scDefs();
+  const c = classify(p.cur, p.free, p.psi);
+  ["cur", "free", "psi"].forEach(id => document.getElementById(id + "v").textContent = p[id]);
+  const on = [c.glob, c.memcg, c.oomd];
+  for (let i = 0; i < 3; i++) scDraw(on[i] ? CA[i] : CI[i]);
+  // sávok kitöltése (szürke) a küszöbvonalak alá
+  const B = G.BARS;
+  el("rect", {x: B.cg[0], y: yCg(c.cur_eff), width: B.cg[1] - B.cg[0], height: G.Y0 - yCg(c.cur_eff), fill: c.memcg ? css("--sc-hl2f") : css("--sc-g2")});
+  el("rect", {x: B.host[0], y: yHost(p.free), width: B.host[1] - B.host[0], height: G.Y0 - yHost(p.free), fill: c.glob ? css("--sc-hl2f") : css("--sc-g2")});
+  el("rect", {x: B.psi[0], y: yPsi(p.psi), width: B.psi[1] - B.psi[0], height: G.Y0 - yPsi(p.psi), fill: c.oomd ? css("--sc-hl2f") : css("--sc-g2")});
+  scDraw(BASE);
+  if (c.clamped) el("text", {x: B.cg[0], y: yCg(G.MAX) - 24, "font-size": 12.5, fill: css("--hl2")}, "a memory.current");
+  if (c.clamped) el("text", {x: B.cg[0], y: yCg(G.MAX) - 10, "font-size": 12.5, fill: css("--hl2")}, "nem lehet > max");
+  if (c.throttle) el("text", {x: B.cg[1] + 4, y: yCg(G.HIGH) - 6, "font-size": 12.5, fill: css("--hl2")}, "throttle");
+  // nyomtábla
+  const rows = trace(c);
+  el("text", {x: 8, y: 592, "font-size": 14, "font-weight": "bold"}, "Nyomtábla (a modell szerint várható sorok):");
+  rows.forEach((r, i) => { el("text", {x: 8, y: 614 + i * 18, "font-size": 13, fill: css("--muted")}, r[0]);
+                           el("text", {x: 220, y: 614 + i * 18, "font-size": 13, "font-family": "ui-monospace,monospace"}, r[1]); });
+  if (own) status.textContent = `Saját beállítás: memory.current ${p.cur} MiB, host szabad ${p.free} MiB, pressure ${p.psi}% → ` +
+     ([c.glob ? "host globális OOM" : "", c.memcg ? "memcg local OOM" : "", c.oomd ? "systemd-oomd beavatkozás" : "", c.throttle ? "throttle (memory.high)" : ""].filter(Boolean).join(", ") || "nincs beavatkozás");
+}
+
+
+// ---- Vezérlés (általában nem kell módosítani) ----
+let k = 0, timer = null;
+const pos = document.getElementById("pos"), status = document.getElementById("status");
+const codeEl = document.getElementById("code");
+if (!CODE.length) codeEl.style.display = "none";
+else codeEl.innerHTML = CODE.map((l, i) => `<span id="L${i}">${l.replace(/&/g,"&amp;").replace(/</g,"&lt;")}</span>`).join("");
+pos.max = STEPS.length - 1;
+// Új lépéssor betöltése (pl. saját bemenetből számolva): setSteps(lista)
+function setSteps(list){ stop(); STEPS = list; pos.max = STEPS.length - 1; show(0); }
+function show(i){
+  k = Math.max(0, Math.min(STEPS.length - 1, i));
+  const s = STEPS[k];
+  pos.value = k;
+  document.getElementById("cnt").textContent = `${k + 1}/${STEPS.length}`;
+  status.textContent = s.msg || "";
+  codeEl.querySelectorAll("span").forEach(x => x.classList.remove("on"));
+  if (s.line !== undefined && s.line >= 0) { const L = document.getElementById("L" + s.line); if (L) L.classList.add("on"); }
+  render(s);
+}
+function stop(){ if (timer) { clearInterval(timer); timer = null; } document.getElementById("play").textContent = "▶ Lejátszás"; }
+document.getElementById("first").onclick = () => { stop(); show(0); };
+document.getElementById("prev").onclick = () => { stop(); show(k - 1); };
+document.getElementById("next").onclick = () => { stop(); show(k + 1); };
+document.getElementById("play").onclick = () => {
+  if (timer) { stop(); return; }
+  if (k >= STEPS.length - 1) show(0);
+  document.getElementById("play").textContent = "⏸ Szünet";
+  timer = setInterval(() => { if (k >= STEPS.length - 1) stop(); else show(k + 1); }, 2200);
+};
+pos.oninput = () => { stop(); show(+pos.value); };
+document.addEventListener("keydown", e => { if (e.key === "ArrowRight") { stop(); show(k + 1); } if (e.key === "ArrowLeft") { stop(); show(k - 1); } });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => show(k));
+show(0);
+</script>
+<script>(function(){function s(){var b=document.body;parent.postMessage({figResize:Math.ceil(b.getBoundingClientRect().height)},"*")}addEventListener("load",s);addEventListener("resize",s);if(window.ResizeObserver)new ResizeObserver(s).observe(document.body);s()})()</script></body>
+</html>

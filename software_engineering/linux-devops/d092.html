@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>19.2 Kapacitás, inode, quota és filesystem feature – Linux és
+DevOps rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch19">19 Mount, quota és fájlszolgáltatások adminisztrációja</a></p>
+<div class="links"><a class="prev" rel="prev" href="d091.html">← 19.1 Mount, fstab és namespace</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d093.html">19.3 Snapshot, clone és filesystem replication →</a></div>
+</nav>
+<h2 data-number="19.2" id="d092"><span
+class="header-section-number">19.2</span> Kapacitás, inode, quota és
+filesystem feature</h2>
+<h3 data-number="19.2.1" id="miért-több-korlát-a-tárhely"><span
+class="header-section-number">19.2.1</span> Miért több korlát a
+tárhely?</h3>
+<p>A fájlrendszer szabad kapacitása több, egymástól független
+erőforráskorlát együttes hatásából adódik. Ugyanazon a könyvtárban
+gyakran egyszerre él a blokkcélú kapacitás, az inode- és
+metadata-kapa­citás, a fájlrendszer-reserved blocks, valamint a kvóta és
+a thin provisioning. Az üzemeltető akkor tudja megbízhatóan üzemeltetni
+a szolgáltatást, ha ezeket nem egyetlen „szabad hely” mutatóként, hanem
+külön erőforrásköltségvetésként kezeli.</p>
+<p>A C++ fejlesztő számára ez hasonló a natív alkalmazás
+erőforrásélettartamához: a HEAP és a stack mellett a file descriptor, a
+memóriás mmap, a thread stack és a cache memory is külön kifuthat. A
+<code>std::bad_alloc</code> hátterében sem mindig a tényleges RAM
+hiánya, hanem címzettartomány-/commit korlát áll. Ugyanígy a
+Linuxfájlrendszer „tele” állapot mögött is eltérő gyökérokok
+lehetnek.</p>
+<p>A d091 mount lifecycle és a d082 naplóretenció után most a
+fájlrendszer saját kapacitás- és jogosultsági korlátait vesszük sorra. A
+cél, hogy a disk full, inode full vagy kvóta-túllépés esetén ne csak
+„kevesebb fájl legyen”, hanem a megfelelő korlátot azonosítsuk, és a
+growth/retention tervet a tényleges workloadhoz igazítsuk.</p>
+<h3 data-number="19.2.2" id="definíciók-és-működési-modell"><span
+class="header-section-number">19.2.2</span> Definíciók és működési
+modell</h3>
+<p>A Linux fájlrendszerben az adat és a metaadat külön kezelve foglal
+helyet. A <strong>block capacity</strong> a fájlok adatblokkjainak
+maximális mérete. A <strong>filesystem free space</strong> a nem
+lefoglalt blokkok összessége, de ez nem feltétlenül azonos a felhasználó
+által írható bájtokkal. Az <strong>inode capacity</strong> a fájlok és
+könyvtárak rekordjainak (inode-jainak) maximális száma. A
+<strong>quota</strong> felhasználóhoz vagy csoporthoz kötött felső
+korlát, amely lehet blokk- és inode-alapú is. A <strong>reserved
+blocks</strong> a fájlrendszer azon blokkjai, amelyeket a kernel a root
+vagy az explicit reserved jogosultságú processzek számára tart fenn
+akkor is, ha a felhasználói terület tele van.</p>
+<ul>
+<li><strong>block limit</strong>: a felhasználó blokk-felhasználásának
+felső korlátja [KiB] (soft/hard);</li>
+<li><strong>inode limit</strong>: a felhasználó fájljainak és
+könyvtárainak számára vonatkozó felső korlát [db] (soft/hard).</li>
+</ul>
+<p>A <code>df</code> a mountolt fájlrendszer szempontjából mutatja a
+total/used/available blokkokat és inode-okat. A <code>du</code> egy
+könyvtár alatti fájlok ténylegesen elfoglalt blokkterületét összegzi. A
+kettő nem azonos, mert:</p>
+<ul>
+<li><code>df</code> a fájlrendszer szinten foglalt blokkokat látja,
+beleértve a metaadatot és a reserved blokkokat.</li>
+<li><code>du</code> a fájltartalmat és a hozzá tartozó indirekt
+blokkokat méri a megadott útvonalon.</li>
+<li><strong>open-deleted file</strong> esetén a fájl a neve törlődött,
+de egy processz továbbra is nyitva tartja, ezért a blokkok nem
+szabadulnak fel. A <code>df</code> tele marad, a <code>du</code> a
+könyvtárban már nem látja a fájlt.</li>
+</ul>
+<h3 data-number="19.2.3" id="df-du-és-open-deleted-file"><span
+class="header-section-number">19.2.3</span> <code>df</code>,
+<code>du</code> és open-deleted file</h3>
+<p>A következő parancs három képet mutat ugyanarról a labhoston. A példa
+a <code>labhost1</code> VM-en fut, a <code>/srv/lab-data</code> egy ext4
+diszket mountol, a <code>labuser</code> UID 1000.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, account: labuser, privileges: nincs</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-h</span> /srv/lab-data</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-i</span> /srv/lab-data</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">du</span> <span class="at">-sh</span> /srv/lab-data</span></code></pre></div>
+<p>A tipikus, de nem garantált kimenet:</p>
+<pre><code>Filesystem      Size  Used Avail Use% Mounted on
+/dev/vdb1        20G   4.2G   15G  22% /srv/lab-data
+
+Filesystem      Inodes IUsed IFree IUse% Mounted on
+/dev/vdb1        1.3M    104   1.3M    1% /srv/lab-data
+
+4.2G    /srv/lab-data</code></pre>
+<p>Ebből még nem derül ki az open-deleted probléma. A diagnózishoz a
+nyitott, de törölt fájlt leíró <code>lsof</code> szükséges:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, account: root, privileges: sudo</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> lsof +L1 /srv/lab-data</span></code></pre></div>
+<p>A <code>L1</code> megmutatja azokat a fájlokat, amelyek link count 0,
+azaz a nevet törölték. Ha például egy korábbi <code>myapp.log</code>
+rotálása során a <code>logrotate</code> copytruncate nélkül újraindítás
+helyett csak törölte a fájlt, az író processz még foghatja a régi FD-t.
+A <code>df</code> Used nő, a <code>du</code> viszont nem mutatja. A
+reclaim csak akkor történik meg, ha az író processzt helyesen
+újraindítjuk, vagy <code>kill</code>-öt küldünk. A <code>kill</code> itt
+nem a „globális megoldás”, hanem a szolgáltatás-életciklus szerves
+része.</p>
+<h3 data-number="19.2.4" id="usergroupproject-quota"><span
+class="header-section-number">19.2.4</span> User/group/project
+quota</h3>
+<p>A kvóta a fájlrendszer szintű erőforrás-elszámolást felhasználóra
+(UID) vagy csoportra (GID) metszi le. A <code>quota</code> csomag
+eszközei:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, account: root, privileges: sudo</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> apt install quota</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> quotacheck <span class="at">-cugm</span> /srv/lab-data</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> quotaon /srv/lab-data</span></code></pre></div>
+<p>Az ext4 esetében a kvóta aktiválása a mount option
+<code>usrquota,grpquota</code> vagy az internal journaled quota. Az
+Ubuntu Server 24.04 baseline-on a
+<code>mount -o usrquota,grpquota</code> beállítás után a
+<code>quotaon</code> engedélyezi a számlálást.</p>
+<p>A konkrét korlátokat az <code>edquota</code> interaktívan vagy a
+<code>setquota</code> nem interaktívan állítja be:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, account: root, privileges: sudo</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Felhasználói blokk soft/hard limit [KiB], inode soft/hard limit [db]</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> setquota <span class="at">-u</span> labuser 524288 1048576 4096 8192 /srv/lab-data</span></code></pre></div>
+<p>Ez 512 MiB soft és 1 GiB hard blokklimitet, valamint 4096 soft és
+8192 hard inode-ot ad a <code>labuser</code> számára. A
+<code>soft</code> limit átlépése grace periódust indít, amely alatt a
+felhasználó még írhat, de a <code>hard</code> limitet nem haladhatja
+meg. A kvóta nem a teljes fájlrendszert szabályozza, hanem az adott
+UID-hez tartozó fájlokat. A project quota hasonló, de a fájlrendszeren
+belüli projektszintű kategorizálást használ, ahol az azonos project
+ID-val jelölt fájlokra vonatkozik a korlát. Ez jól használható C++ build
+artifact / tenant szétválasztáshoz.</p>
+<h3 data-number="19.2.5" id="inode-és-metadata-exhaustion"><span
+class="header-section-number">19.2.5</span> Inode és metadata
+exhaustion</h3>
+<p>Az inode-túlcsordulás akkor következik be, ha a fájlrendszerben nincs
+több szabad inode, pedig blokkból még teleírható lenne a terület. Ez
+jellemzően sok kisméretű fájl, például cache, napló, build intermediate,
+frontend statikus asset esetén alakul ki. A tünet:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, account: labuser, privileges: nincs</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;x&quot;</span> <span class="op">&gt;</span> /srv/lab-data/newfile</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="co"># várt hiba: No space left on device (ENOSPC)</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-h</span> /srv/lab-data   <span class="co"># van szabad blokk</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-i</span> /srv/lab-data   <span class="co"># 100% IUse</span></span></code></pre></div>
+<p>A <code>df -i</code> azonnal megkülönbözteti a blokk és inode
+kimerülést. A meta­adatok másik korlátja a <strong>fs metadata</strong>
+log vagy a <strong>directory entry</strong> méretkorlátja. A
+<code>mkdir</code> és <code>rm</code> során a dentry/tree műveletek is
+fogyasztanak inode-ot; ezért a törlés is igényel néhány szabad inode-ot
+és blokkot. A kontrollált reclaim ilyenkor a legrégebbi, a retention
+szerint fölöslegessé vált <strong>fájlok</strong> törlésével vagy a
+könyvtárstruktúra rendezésével történik.</p>
+<h3 data-number="19.2.6" id="reserved-blocks-és-filesystem-limit"><span
+class="header-section-number">19.2.6</span> Reserved blocks és
+filesystem limit</h3>
+<p>A fájlrendszer <strong>reserved blocks</strong> egy külön, a
+<code>df</code> <code>Avail</code> oszlopában is rejtett korlát. Ext4
+alapértelmezés szerint a teljes kapacitás 5%-át a root számára tartja
+fenn. Ez az oka annak, hogy a felhasználó akkor is ENOSPC-t kap, amikor
+a <code>df</code> még néhány százalék szabad helyet mutat. A reserved
+blocks célja, hogy a root akkor is tudjon csomagot, naplót, hibaelhárító
+parancsot telepíteni, ha a felhasználói tér teljesen megtelt.
+Vizsgálata:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, account: root, privileges: sudo</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> tune2fs <span class="at">-l</span> /dev/vdb1 <span class="dt">\</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>  <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&quot;Reserved block count|Block size|Block count&quot;</span></span></code></pre></div>
+<p>A fájlrendszer limitje tehát nem <code>Size</code>, hanem
+<code>Size × (1 - reserved_ratio)</code> a nem root felhasználók
+számára. A <code>tune2fs -m</code> csökkentheti vagy növelheti ezt a
+tartalékot, de a művelet befolyásolja a rendszer stabilitását, ezért a
+d092 laborban csak akkor változtassuk, ha explicit kapacitásterv
+indokolja, és a visszavonásához feljegyeztük a korábbi értéket.</p>
+<h3 data-number="19.2.7"
+id="compression-sparse-és-thin-accounting"><span
+class="header-section-number">19.2.7</span> Compression, sparse és thin
+accounting</h3>
+<p>A modern fájlrendszerekben a <strong>sparse file</strong> olyan fájl,
+amely logikailag nagy, de a nullákkal kitöltött részeket nem foglalják
+le fizikai blokkok. A <code>du</code> az elfoglalt blokkokat, a
+<code>ls -l</code> a látszólagos méretet mutatja. A különbség egy sparse
+és egy előfoglalt fájl összevetésével:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, account: labuser, privileges: nincs</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> /srv/lab-data</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="fu">truncate</span> <span class="at">-s</span> 1G sparse-file.bin      <span class="co"># csak a látszólagos méret</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="ex">fallocate</span> <span class="at">-l</span> 1G prealloc.bin        <span class="co"># blokkokat foglal elő</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-lh</span> sparse-file.bin prealloc.bin</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="fu">du</span> <span class="at">-h</span> sparse-file.bin prealloc.bin</span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="ex">filefrag</span> <span class="at">-e</span> sparse-file.bin prealloc.bin</span></code></pre></div>
+<p>Az <code>ls</code> mindkettőre 1 GiB-ot mutat. A
+<code>sparse-file.bin</code>-re a <code>du</code> 0-hoz közeli értéket
+ad, a <code>filefrag</code> nem listáz extentet, mert a fájl nem foglal
+blokkot. A <code>prealloc.bin</code>-re a <code>du</code> ~1,0G-t ad, a
+<code>filefrag</code> extenteket (unwritten) mutat: a
+<code>fallocate</code> blokkot foglal, ezért kvótába és
+<code>df</code>-be is beszámít, a <code>truncate</code> csak a
+látszólagos méretet állítja. A <code>filefrag</code> root nélkül egyes
+fájlrendszereken „FIBMAP requires root privileges” hibát ad; ilyenkor
+<code>filefrag -e</code> (FIEMAP) vagy <code>sudo</code> kell. Hasonló
+eltérést okoz a <strong>compression</strong> (Btrfs, ZFS) és a
+<strong>thin provisioning</strong> (LVM thin pool, virtIO storage). A
+számvitel során ezért a <strong>provisioned</strong> (látszólagos) és a
+<strong>allocated</strong> (ténylegesen blokkolt) kapacitás külön
+kezelendő. A vékonykapacitású háttérben a valódi blokkhiány akkor derül
+ki, amikor a thin pool betelik, és a vendég <code>write</code> syscallja
+ENOSPC-t ad, miközben a vendég <code>df</code> még szabadot mutat. A C++
+fejlesztői mérőeszközökben ezért mindig rögzíteni kell a mérés
+<strong>rétegét</strong>: alkalmazás-bytes, fájlrendszer allocated,
+storage pool physical.</p>
+<h3 data-number="19.2.8"
+id="capacity-alert-és-kontrollált-reclaim"><span
+class="header-section-number">19.2.8</span> Capacity alert és
+kontrollált reclaim</h3>
+<p>A kapacitástervezés nem a 100%-os telítettségnél kezdődik, hanem az
+előre definiált küszöbnél. A d092 keretében a következő független jelek
+mindegyikét figyelni kell:</p>
+<ul>
+<li>filesystem blokkhasználat (node_exporter:
+<code>node_filesystem_avail_bytes</code>)</li>
+<li>inode-használat:
+<code>1 - node_filesystem_files_free{mountpoint="/srv/lab-data"} / node_filesystem_files{mountpoint="/srv/lab-data"}</code>
+(a <code>node_filesystem_files</code> önmagában az összes inode
+száma)</li>
+<li>kvóta soft/hard limit átlépése: a
+<code>repquota</code>/<code>quota</code> kimenetéből saját exporterrel
+vagy textfile collectorral (ez nem node_exporter-metrika; a metrikanév a
+labor saját döntése)</li>
+<li>open-deleted FD-ek (<code>lsof +L1</code> vagy eBPF alapú jel)</li>
+</ul>
+<p>A <strong>growth/retention terv</strong> a workload növekedési
+rátájából és a retentionből határozza meg a szükséges kapacitást. A
+0/100%-os küszöbön túl kell tartalékot, reserved blokkot és grace
+periódust is tervezni. A <strong>kontrollált reclaim</strong> során a
+válogatás nélküli <code>rm -rf</code> tiltott; a helyes eljárás a
+napló-, cache- és tempfájlok szabályozott törlése, valamint a retention
+szerinti generációk eltávolítása. A d082 logrotation
+<code>rotate</code>, <code>maxage</code>, <code>maxsize</code> értékeit
+a tényleges <code>df</code>- és inode-görbéből számoljuk.</p>
+<h3 data-number="19.2.9"
+id="kidolgozott-példa-kvóta-inode-és-open-deleted-reclaim-a-labben"><span
+class="header-section-number">19.2.9</span> Kidolgozott példa: kvóta,
+inode és open-deleted reclaim a labben</h3>
+<p>A laborban a <code>/srv/lab-data</code> ext4 diszket használjuk. A
+cél: a <code>labuser</code> (UID 1000) fájlterületének behatárolása,
+majd egy szándékos open-deleted fájllal a
+<code>df</code>/<code>du</code> eltérés reprodukálása és a reclaim
+bemutatása.</p>
+<ol type="1">
+<li>Ellenőrizzük a hozzáférést és a fájlrendszer állapotát.</li>
+</ol>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, account: labuser, privileges: nincs</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="fu">id</span> labuser</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-h</span> /srv/lab-data</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-i</span> /srv/lab-data</span></code></pre></div>
+<p>Várt kimenet: <code>uid=1000(labuser) gid=1000(labuser)</code>.</p>
+<ol start="2" type="1">
+<li>Kvóta beállítása:</li>
+</ol>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, account: root, privileges: sudo</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mount <span class="at">-o</span> remount,usrquota,grpquota /srv/lab-data</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> quotacheck <span class="at">-cugm</span> /srv/lab-data</span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> quotaon /srv/lab-data</span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> setquota <span class="at">-u</span> labuser 1048576 2097152 512 1024 /srv/lab-data</span></code></pre></div>
+<p>A <code>labuser</code> 1 GiB soft és 2 GiB hard blokklimitet, 512
+soft és 1024 hard inode-ot kap.</p>
+<ol start="3" type="1">
+<li>A <code>labuser</code> készít egy 1.5 GiB-os fájlt
+<code>fallocate</code>-tal, hogy a soft limit átlépését
+ellenőrizzük:</li>
+</ol>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, account: labuser, privileges: nincs</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> /srv/lab-data</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="ex">fallocate</span> <span class="at">-l</span> 1536M demo.bin</span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="fu">du</span> <span class="at">-h</span> demo.bin</span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-h</span> /srv/lab-data</span></code></pre></div>
+<p>Várt kimenet: a fájl létrejön, a soft limitet átlépi, a grace
+periódus elindul. A <code>df</code> Used nő.</p>
+<ol start="4" type="1">
+<li>Túlírjuk a hard limitet:</li>
+</ol>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">fallocate</span> <span class="at">-l</span> 3G demo2.bin</span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="co"># várt hiba: fallocate: demo2.bin: Disk quota exceeded</span></span></code></pre></div>
+<p>Ez a kvóta exhaustion, nem a disk full. A <code>df -h</code> még
+szabadot mutat, a <code>quota</code> megmutatja a felhasználó
+értékeit.</p>
+<ol start="5" type="1">
+<li>Megszüntetjük a kvóta-túllépést a jogosult nagy fájl
+törlésével:</li>
+</ol>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> demo2.bin</span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> demo.bin</span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-h</span> /srv/lab-data</span></code></pre></div>
+<ol start="6" type="1">
+<li>Open-deleted fájl szimulálása. Egy rövid Python-példa (ugyanazokat a
+syscallokat hívja, mint egy C++ program): <code>open</code>-nel létrehoz
+egy fájlt, <code>unlink</code>-eli a nevet, ír az FD-re, majd nyitva
+tartja, ezért a háttérben fut tovább. A kiírt PID a reclaim célja.</li>
+</ol>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, account: labuser, privileges: nincs</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> <span class="at">-</span> <span class="op">&lt;&lt;&#39;PY&#39;</span> <span class="kw">&amp;</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="st">import os, time</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="st">path = &#39;/srv/lab-data/deleted-example&#39;</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="st">fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a><span class="st">os.unlink(path)</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a><span class="st">os.write(fd, b&#39;x&#39; * 10485760)</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a><span class="st">print(os.getpid(), flush=True)</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a><span class="st">time.sleep(3600)   # az FD nyitva marad</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a><span class="op">PY</span></span></code></pre></div>
+<p>A fájl a <code>df</code>-ben foglalja a blokkokat, a <code>du</code>
+nem mutatja, az <code>lsof +L1</code> azonosítja (illusztratív,
+rövidített kimenet):</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, account: root, privileges: sudo</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> lsof +L1 /srv/lab-data</span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="co"># COMMAND PID  USER    FD TYPE SIZE/OFF NLINK NAME</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="co"># python3 1234 labuser 3w REG  10485760     0 /srv/lab-data/deleted-example</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a><span class="co">#                                             (deleted)</span></span></code></pre></div>
+<p>Reclaim: a processz leállítása, azaz
+<code>sudo kill -TERM 1234</code> (vagy
+<code>sudo kill -s TERM 1234</code>), majd ellenőrzés: a
+<code>sudo lsof +L1 /srv/lab-data</code> üres, a
+<code>df -h /srv/lab-data</code> Used értéke csökkent.</p>
+<ol start="7" type="1">
+<li>A példa zárt postconditionje: a <code>df</code> szabad tartaléka
+visszaállt, a <code>lsof +L1</code> üres, a kvóta nem jelzi a
+<code>labuser</code> túllépését.</li>
+</ol>
+<h3 data-number="19.2.10" id="hibák-és-ellenpróbák"><span
+class="header-section-number">19.2.10</span> Hibák és ellenpróbák</h3>
+<p>A <code>ENOSPC</code> tünet önmagában nem elegendő a gyökérok
+meghatározásához. Az alábbi táblázat segít a hipotézis
+kiválasztásban.</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Tünet</th>
+<th>Hipotézis</th>
+<th>Diagnosztikai parancs</th>
+<th>Megerősítő jel</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>df -h</code> 100%</td>
+<td>valódi blokk full</td>
+<td><code>du -sh</code></td>
+<td><code>du</code> is nagyot mutat</td>
+</tr>
+<tr>
+<td><code>df -h</code> tele, <code>du</code> alacsony</td>
+<td>open-deleted file</td>
+<td><code>lsof +L1</code></td>
+<td><code>NLINK=0</code>, <code>SIZE_OFF</code> nő</td>
+</tr>
+<tr>
+<td><code>df -h</code> van szabad, <code>df -i</code> 100%</td>
+<td>inode full</td>
+<td><code>df -i</code></td>
+<td><code>IFree=0</code></td>
+</tr>
+<tr>
+<td><code>df -h</code> van szabad, de <code>write</code> ENOSPC</td>
+<td>kvóta hard limit</td>
+<td><code>quota -u user</code></td>
+<td><code>blocks</code> eléri a hard értéket</td>
+</tr>
+<tr>
+<td><code>df -h</code> van szabad, <code>write</code> ENOSPC</td>
+<td>reserved blocks</td>
+<td><code>tune2fs -l</code></td>
+<td><code>Reserved block count</code> magas, user nem root</td>
+</tr>
+<tr>
+<td><code>df</code> szabad, de a hypervisor fizikai pool tele</td>
+<td>thin provisioning</td>
+<td><code>du</code> / LVM thin pool <code>lvs --all</code></td>
+<td>a pool <code>Data%</code> 100%</td>
+</tr>
+</tbody>
+</table>
+<p>A leggyakoribb hibás reakció: a <code>rm -rf</code> az egész
+könyvtárra, vagy a <code>chmod 777</code> a jogosultsági probléma
+megkerülésére. A kvóta- vagy inode-túllépésnél a jogosultság
+megváltoztatása nem oldja meg a korlátot. A <code>df</code> és
+<code>du</code> eltérésekor a helyes eljárás: először az open-deleted
+FD-eket keressük, majd a felesleges fájlokat retention szerint
+távolítsuk el. A reserved blocks csökkentése nem az első lépés.</p>
+<p>Egy konkrét ellenpróba: ha a <code>df -h</code> 98%, akkor a
+<code>du -sh /srv/lab-data</code> 4.2G, a <code>lsof +L1</code> mutat
+egy 10 GB-os törölt fájlt. A törlésével nem szabadul fel a terület. A
+<code>kill</code> után a <code>df</code> csökken. Ha a <code>kill</code>
+után is teljes marad, a hiba a nem rotált napló vagy a reserved blocks /
+kvóta.</p>
+<h3 data-number="19.2.11" id="feladatok"><span
+class="header-section-number">19.2.11</span> Feladatok</h3>
+<h4 data-number="19.2.11.1"
+id="magyarázó-feladat-a-korlátok-elkülönítése"><span
+class="header-section-number">19.2.11.1</span> 1. Magyarázó feladat: a
+korlátok elkülönítése</h4>
+<p>A <code>labhost1</code>-en a <code>/srv/lab-data</code> mountolt ext4
+diszken az alábbiakat látja: <code>df -h</code> 68% Used,
+<code>df -i</code> 100% IUse (<code>IFree</code> 0),
+<code>du -sh /srv/lab-data</code> 11G, de egy <code>echo</code> egy új
+fájlba ENOSPC-t ad. Melyik korlát okozza a hibát, és miért? Fogalmazza
+meg a logikai lépéseket, és adja meg a további parancsokat, amelyekkel a
+diagnózis megerősíthető.</p>
+<h4 data-number="19.2.11.2"
+id="adminisztrációskonfigurációs-feladat-kvóta-beállítása"><span
+class="header-section-number">19.2.11.2</span> 2.
+Adminisztrációs/konfigurációs feladat: kvóta beállítása</h4>
+<p>A <code>labuser</code> (UID 1000) számára az
+<code>/srv/lab-data</code> fájlrendszeren a következő kvótákat kell
+érvényesíteni: 2 GiB hard blokklimit, 1 GiB soft blokklimit, 1000 hard
+inode limit, 500 soft inode limit. A fájlrendszer nincs mountolva
+<code>usrquota,grpquota</code> opciókkal. Hajtsa végre a szükséges
+lépéseket, írja le a parancsokat, ellenőrizze a korlátokat, és adja meg
+a rollbacket.</p>
+<h4 data-number="19.2.11.3"
+id="diagnosztikaifailurerecovery-feladat-open-deleted-és-inode-incident"><span
+class="header-section-number">19.2.11.3</span> 3.
+Diagnosztikai/failure/recovery feladat: open-deleted és inode
+incident</h4>
+<p>A szolgáltatás <code>df -h</code> Used folyamatosan nő, de a
+<code>du</code> a log könyvtárban nem emelkedik. A <code>df -i</code>
+100%, a <code>lsof +L1</code> egy törölt <code>access.log</code>-ot
+mutat. A napló író processz PID 3456. Szabadítsa fel (reclaim) a törölt
+fájl által foglalt helyet, és állítsa vissza a kapacitást úgy, hogy a
+szolgáltatás ne veszítsen inode-ot. Továbbá: a <code>lsof</code> után
+<code>rm -rf /srv/lab-data/logs/*</code> nem volt elég. Miért? A
+megoldás részeként ellenőrizze a helyreállítás utáni <code>df -h</code>
+és <code>df -i</code> értéket.</p>
+<h3 data-number="19.2.12" id="megoldások"><span
+class="header-section-number">19.2.12</span> Megoldások</h3>
+<h4 data-number="19.2.12.1"
+id="megoldás-indoklás-és-postcondition"><span
+class="header-section-number">19.2.12.1</span> 1. Megoldás, indoklás és
+postcondition</h4>
+<p>A <code>df -i</code> 100% IUse és <code>IFree</code> 0 azt jelenti,
+hogy az inode-ok elfogytak, ez okozza az ENOSPC-t. Bár blokkból van
+szabad, a fájlrendszer nem tud új inode-ot lefoglalni az új fájlnak. (A
+99% még nem kimerülés: a <code>df</code> felfelé kerekít, ilyenkor még
+legalább ~1% inode szabad.) A diagnózis megerősítésére:</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, account: labuser, privileges: nincs</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-i</span> /srv/lab-data</span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="fu">stat</span> <span class="at">-f</span> /srv/lab-data          <span class="co"># &quot;Inodes: Total ... Free: 0&quot;</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a><span class="co"># a fő fogyasztó könyvtár:</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> find /srv/lab-data <span class="at">-xdev</span> <span class="at">-type</span> f <span class="kw">|</span> <span class="fu">cut</span> <span class="at">-d</span>/ <span class="at">-f1-5</span> <span class="dt">\</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a>  <span class="kw">|</span> <span class="fu">sort</span> <span class="kw">|</span> <span class="fu">uniq</span> <span class="at">-c</span> <span class="kw">|</span> <span class="fu">sort</span> <span class="at">-n</span> <span class="kw">|</span> <span class="fu">tail</span></span></code></pre></div>
+<p>A <code>stat -f</code> a fájlrendszer szabad inode-jait mutatja (a
+<code>stat</code> kapcsoló nélkül csak a könyvtár saját inode-ját).
+Postcondition: az <code>IFree=0</code> igazolja a kimerülést, a
+<code>find … | uniq -c</code> megnevezi a sok apró fájlt termelő
+könyvtárat; az új fájl létrehozása a szükséges inode felszabadításáig
+ENOSPC-t ad.</p>
+<h4 data-number="19.2.12.2"
+id="megoldás-indoklás-és-postcondition-1"><span
+class="header-section-number">19.2.12.2</span> 2. Megoldás, indoklás és
+postcondition</h4>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, account: root, privileges: sudo</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. Készítsen fstab entryt (vagy remount):</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mount <span class="at">-o</span> remount,usrquota,grpquota /srv/lab-data</span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. Inicializálja a quota fájlokat:</span></span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> quotacheck <span class="at">-cugm</span> /srv/lab-data</span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. Aktiválja:</span></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> quotaon /srv/lab-data</span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 4. Állítsa be a korlátokat:</span></span>
+<span id="cb17-12"><a href="#cb17-12" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> setquota <span class="at">-u</span> labuser 1048576 2097152 500 1000 /srv/lab-data</span>
+<span id="cb17-13"><a href="#cb17-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-14"><a href="#cb17-14" aria-hidden="true" tabindex="-1"></a><span class="co"># 5. Ellenőrzés:</span></span>
+<span id="cb17-15"><a href="#cb17-15" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> quota <span class="at">-u</span> labuser</span>
+<span id="cb17-16"><a href="#cb17-16" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-h</span> /srv/lab-data</span></code></pre></div>
+<p>A <code>setquota</code> értékei [KiB]-ban és darabban értendők. Az
+ellenőrzés után a <code>labuser</code> a soft limitet átlépve grace
+periódust kap. A rollback: a kvóta törlése
+<code>sudo quotaoff /srv/lab-data</code> és a mount opciók eltávolítása,
+valamint a quota fájlok törlése
+<code>sudo rm /srv/lab-data/aquota.user /srv/lab-data/aquota.group</code>.
+Postcondition: a <code>labuser</code> korlátai a megadottak, a kvóta
+aktív.</p>
+<h4 data-number="19.2.12.3"
+id="megoldás-indoklás-és-postcondition-2"><span
+class="header-section-number">19.2.12.3</span> 3. Megoldás, indoklás és
+postcondition</h4>
+<p>A feladatban két külön hiba van, ezért két ágon dolgozunk. Az
+<code>rm -rf /srv/lab-data/logs/*</code> azért nem volt elég, mert a
+törölt <code>access.log</code> neve már nincs a könyvtárban, a processz
+<code>3456</code> viszont még fogja az FD-t, így a blokkjai nem
+szabadulnak fel; az inode-kimerülést pedig nem a logkönyvtár, hanem más,
+sok apró fájlt tartalmazó könyvtár okozhatja.</p>
+<ol type="A">
+<li>Blokk: az open-deleted fájl felszabadítása a tulajdonos szolgáltatás
+újraindításával (a unit nevét a PID-ből állapítjuk meg):</li>
+</ol>
+<div class="sourceCode" id="cb18"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, account: root, privileges: sudo</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> lsof +L1 /srv/lab-data</span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="va">UNIT</span><span class="op">=</span><span class="va">$(</span><span class="fu">ps</span> <span class="at">-o</span> unit= <span class="at">-p</span> 3456<span class="va">)</span>    <span class="co"># vagy: systemctl status 3456</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;</span><span class="va">$UNIT</span><span class="st">&quot;</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart <span class="st">&quot;</span><span class="va">$UNIT</span><span class="st">&quot;</span> <span class="co"># reopen: új access.log</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-h</span> /srv/lab-data</span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> lsof +L1 /srv/lab-data</span></code></pre></div>
+<p>A restart után a régi processz kilép, az FD lezáródik, a blokkok
+felszabadulnak: a <code>df -h</code> Used csökken, a
+<code>lsof +L1</code> üres. Ez legfeljebb egyetlen inode-ot ad
+vissza.</p>
+<ol start="2" type="A">
+<li>Inode: a <code>df -i</code> továbbra is 100%, ezért megkeressük a
+fogyasztót, és retention-szabály szerint törlünk:</li>
+</ol>
+<div class="sourceCode" id="cb19"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, account: root, privileges: sudo</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-i</span> /srv/lab-data</span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> find /srv/lab-data <span class="at">-xdev</span> <span class="at">-type</span> f <span class="kw">|</span> <span class="fu">cut</span> <span class="at">-d</span>/ <span class="at">-f1-5</span> <span class="dt">\</span></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a>  <span class="kw">|</span> <span class="fu">sort</span> <span class="kw">|</span> <span class="fu">uniq</span> <span class="at">-c</span> <span class="kw">|</span> <span class="fu">sort</span> <span class="at">-n</span> <span class="kw">|</span> <span class="fu">tail</span></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a><span class="co"># példa: a cache könyvtár a fogyasztó; a 7 napnál régebbi</span></span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a><span class="co"># fájlokat a dokumentált retention-szabály szerint töröljük</span></span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> find /srv/lab-data/cache <span class="at">-xdev</span> <span class="at">-type</span> f <span class="at">-mtime</span> +7 <span class="at">-delete</span></span>
+<span id="cb19-8"><a href="#cb19-8" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-i</span> /srv/lab-data</span></code></pre></div>
+<p>A törlési szabályt (könyvtár, kor, felelős) a runbookban rögzítjük; a
+szolgáltatás saját, élő fájljai nem érintettek, így a szolgáltatás „nem
+veszít inode-ot”. Postcondition: a <code>df -h</code> Used csökkent, a
+<code>df -i</code> &lt;100%, a <code>lsof +L1</code> üres.</p>
+<h3 data-number="19.2.13" id="rövid-összefoglaló"><span
+class="header-section-number">19.2.13</span> Rövid összefoglaló</h3>
+<p>A Linux fájlrendszer kapacitását egymástól független korlátok
+alakítják: block-, inode-, kvóta- és reserved block limit. A
+<code>df</code> a fájlrendszer szintű, a <code>du</code> a tartalom
+szintű blokk­használatot mutatja; az eltérés gyakran open-deleted fájlból
+ered, amit <code>lsof +L1</code> azonosít. A kvóta a fájlok blokk- és
+inode-felhasználását UID/GID szerint határolja. A kapacitási
+riasztásoknak ezeket a korlátokat külön kell figyel­niük, és a reclaimet
+retention szerint, nem globális <code>rm -rf</code>-ként kell
+végrehajtani.</p>
+<p>Továbbhasznált definíciók:</p>
+<ul>
+<li><strong>Block capacity:</strong> a fájlrendszer által lefoglalható
+adatblokkok maximális mennyisége.</li>
+<li><strong>Inode capacity:</strong> a fájlok és könyvtárak rekordjainak
+maximális száma.</li>
+<li><strong>Quota:</strong> felhasználóhoz vagy csoporthoz kötött,
+blokkra és inode-okra vonatkozó korlát soft/hard limitekkel.</li>
+</ul>
+<h3 data-number="19.2.14" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">19.2.14</span> Források és ellenőrzési
+hiányok</h3>
+<p>Állításonkénti forrásindex (hivatkozott verzió: Ubuntu Server 24.04
+LTS – kernel 6.8, <code>quota</code>, <code>e2fsprogs</code>,
+<code>util-linux</code>, <code>lsof</code> csomag; a pontos verziókat a
+labhoston <code>quota -V</code>, <code>tune2fs</code> kimenetének
+fejléce, <code>fallocate --version</code>, <code>lsof -v</code>
+rögzíti):</p>
+<ul>
+<li><a href="https://man7.org/linux/man-pages/man1/df.1.html">df(1)</a>,
+<a href="https://man7.org/linux/man-pages/man1/du.1.html">du(1)</a>, <a
+href="https://man7.org/linux/man-pages/man1/stat.1.html">stat(1)</a> –
+blokk- és inode-nézet, <code>-i</code>, <code>stat -f</code>.</li>
+<li><a
+href="https://man7.org/linux/man-pages/man8/lsof.8.html">lsof(8)</a> –
+<code>+L1</code>; <a
+href="https://man7.org/linux/man-pages/man2/unlink.2.html">unlink(2)</a>
+– a nyitott, törölt fájl felszabadítása.</li>
+<li><a
+href="https://man7.org/linux/man-pages/man8/quotacheck.8.html">quotacheck(8)</a>,
+<a
+href="https://man7.org/linux/man-pages/man8/quotaon.8.html">quotaon(8)</a>,
+<a
+href="https://man7.org/linux/man-pages/man8/setquota.8.html">setquota(8)</a>,
+<a
+href="https://man7.org/linux/man-pages/man1/quota.1.html">quota(1)</a> –
+kvóta-életciklus, soft/hard, grace.</li>
+<li><a
+href="https://man7.org/linux/man-pages/man8/tune2fs.8.html">tune2fs(8)</a>
+és <a
+href="https://man7.org/linux/man-pages/man5/ext4.5.html">ext4(5)</a> –
+reserved blocks, <code>quota</code> feature.</li>
+<li><a
+href="https://man7.org/linux/man-pages/man1/fallocate.1.html">fallocate(1)</a>,
+<a
+href="https://man7.org/linux/man-pages/man1/truncate.1.html">truncate(1)</a>,
+<a
+href="https://man7.org/linux/man-pages/man8/filefrag.8.html">filefrag(8)</a>
+– előfoglalás vs. sparse fájl, extentek.</li>
+<li><a
+href="https://github.com/prometheus/node_exporter">node_exporter</a> –
+<code>node_filesystem_*</code> metrikák, textfile collector.</li>
+<li><a href="https://openzfs.github.io/openzfs-docs/">OpenZFS
+dokumentáció</a> és <a href="https://btrfs.readthedocs.io/">Btrfs
+dokumentáció</a> – compression és allocated/provisioned elszámolás.</li>
+</ul>
+<p>Ellenőrzési hiány: a példák laborban ellenőrizendők; dátumozott
+reprodukciós napló (tool <code>--version</code>, sikeres és hibás ág
+kimenete) még nem készült. Az ext4 internal quota viselkedése és a thin
+provisioning pontos hibajelei a labhoston ellenőrzendők.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d091.html">← 19.1 Mount, fstab és namespace</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d093.html">19.3 Snapshot, clone és filesystem replication →</a></div>
+</nav>
+</body>
+</html>

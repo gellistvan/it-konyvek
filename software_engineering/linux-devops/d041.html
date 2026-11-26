@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>9.1 Lapozás, page fault, mmap és copy-on-write – Linux és
+DevOps rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch09">9 Linux virtuális memória és erőforrásnyomás</a></p>
+<div class="links"><a class="prev" rel="prev" href="d040.html">← 8.5 Process-, szál- és erőforrásdiagnosztikai labor</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d042.html">9.2 Page cache, reclaim, swap és overcommit →</a></div>
+</nav>
+<h2 data-number="9.1" id="d041"><span
+class="header-section-number">9.1</span> Lapozás, page fault, mmap és
+copy-on-write</h2>
+<h3 data-number="9.1.1" id="motiváció"><span
+class="header-section-number">9.1.1</span> Motiváció</h3>
+<p>Egy C++ programban a <code>new</code> vagy a <code>malloc</code> után
+kapott mutató mögött sokáig nincs tényleges fizikai memória. A Linux
+kernel csak a virtuális címtartományt jegyzi be, a fizikai lapokat pedig
+az első hozzáféréskor, laphiba (page fault) útján rendeli hozzá. Ha
+üzemeltetés közben a VSZ-t nézzük, könnyű tévesen azt hinni, hogy a
+processz elfogyasztotta a memóriát; ha viszont csak az RSS-t nézzük, a
+megosztott lapok kétszeres elszámolása miatt becsülhetjük félre a valódi
+költséget. Ebben az alfejezetben a virtuális cím, a committed tároló és
+a resident lapok közötti különbséget, a minor/major page fault pontos
+adatútját, valamint a fork és mmap által használt copy-on-write
+mechanizmust tanítjuk meg.</p>
+<h3 data-number="9.1.2" id="definíció-és-működés"><span
+class="header-section-number">9.1.2</span> Definíció és működés</h3>
+<h4 data-number="9.1.2.1" id="lapok-page-table-és-tlb"><span
+class="header-section-number">9.1.2.1</span> Lapok, page table és
+TLB</h4>
+<p>A processz által használt címek virtuális címek. A hardver ezeket a
+processz page table-én keresztül fordítja fizikai címekre. A legkisebb
+tipikus x86-64 lapméret 4 KiB, de nagyobb, 2 MiB vagy 1 GiB lapok is
+használhatók. A page table bejegyzés (PTE) tartalmazza a fizikai
+lapkeret számát és a jogosultságokat. Ha a PTE „not present” vagy
+jogosultsági hiba áll fenn, a CPU page fault exceptiont vált ki.</p>
+<p>A TLB a korábban elvégzett címfordítások gyorsítótára. A TLB miss
+önmagában nem page fault: ha a PTE érvényes és present, csak újra kell
+tölteni a TLB-t, ami legfeljebb néhány száz nanoszekundum. A page fault
+akkor következik be, amikor a PTE nem érvényes, vagy a hozzáférés
+jogosultsági hibát okoz. A kernel a processz VMA-készletéből
+(<code>vm_area_struct</code>; a 6.1-es kernel óta maple tree
+adatszerkezetben tárolva, korábban láncolt lista és red-black fa) dönti
+el, hogy a hiba érvényes memóriaterületre hivatkozik-e; ha nem, a
+processz <code>SIGSEGV</code> jelzést kap.</p>
+<h4 data-number="9.1.2.2"
+id="anonymous-versus-file-backed-mapping"><span
+class="header-section-number">9.1.2.2</span> Anonymous versus
+file-backed mapping</h4>
+<p>A Linux memóriamapők két fő csoportra oszthatók:</p>
+<ul>
+<li><strong>Anonymous mapping</strong>: nincs fájl a háttérben; a lapok
+tartalma a processz által írt adat, például heap, stack,
+<code>malloc</code> nagy allokációk. A lefoglalás kezdetben írásvédett
+nulla lapra (zero page) mutathat, vagy fizikai lap hozzárendelését
+igényelhet.</li>
+<li><strong>File-backed mapping</strong>: a virtuális cím közvetlenül
+egy fájl lapjaira mutat. A fájl tartalma a page cache-ben van, így a
+processz virtuális memóriája és a fájlrendszer ugyanazt a fizikai lapot
+látja. <code>mmap</code>-pal hozható létre, például
+<code>MAP_SHARED</code> vagy <code>MAP_PRIVATE</code> flaggel.</li>
+</ul>
+<h4 data-number="9.1.2.3" id="demand-paging-és-minormajor-fault"><span
+class="header-section-number">9.1.2.3</span> Demand paging és
+minor/major fault</h4>
+<p>A Linux demand paginget használ: a <code>mmap</code> vagy
+<code>malloc</code> hívás nem foglalja le azonnal a fizikai memóriát,
+csak a virtuális címtartományt és a VMA-t hozza létre. A fizikai lap
+akkor jön létre, amikor a processz először hozzáfér az adott címhez. Ezt
+a hozzáférést a page fault kezeli.</p>
+<p>A faultoknak két fontos típusa van:</p>
+<ul>
+<li><strong>Minor page fault</strong>: A lap nem volt a processz page
+table-ében, de a tartalma már elérhető a memóriában: például nulla lap,
+copy-on-write másolás, vagy egy másik processz által már betöltött
+file-backed lap. Minor fault nem igényel lassú háttértároló I/O-t.</li>
+<li><strong>Major page fault</strong>: A lap ténylegesen csak lassú
+háttértárolóról tölthető be: fájl a diszkről, swap területről
+visszaolvasandó lap. A major fault késleltetése milliszekundumos
+nagyságrendű, és a <code>/proc/&lt;pid&gt;/stat</code>
+<code>majflt</code> mezője mutatja.</li>
+</ul>
+<p>A <code>pgfault</code> számláló a minor+major faultok összegét, a
+<code>pgmajfault</code> csak a major faultokat jelenti.</p>
+<h4 data-number="9.1.2.4" id="mmap-fork-és-copy-on-write"><span
+class="header-section-number">9.1.2.4</span> mmap, fork és
+copy-on-write</h4>
+<p>Az <code>mmap</code> hívásnál két független döntést hozunk. Az első a
+háttér:</p>
+<ul>
+<li>anonim leképezés (<code>MAP_ANONYMOUS</code>, <code>fd = -1</code>):
+fájl nélküli lefoglalás, tartalma kezdetben nulla;</li>
+<li>fájlleképezés: nincs <code>MAP_ANONYMOUS</code>, egy megnyitott
+fájldeszkriptor adott offsetjétől mapelődik a fájl tartalma. (A
+<code>MAP_FILE</code> flag csak kompatibilitási célú, a kernel figyelmen
+kívül hagyja; nem ez adja a fájlleképezést.)</li>
+</ul>
+<p>A második, mindig kötelező választás a láthatóság:</p>
+<ul>
+<li><code>MAP_SHARED</code>: az írás a közös lapba (fájlnál a page
+cache-be) kerül, más processz és – visszaírás után – a fájl is
+látja;</li>
+<li><code>MAP_PRIVATE</code>: az első írás copy-on-write másolatot
+készít, a fájl és a többi processz nem látja a módosítást.</li>
+</ul>
+<p>A <code>fork</code> rendszerhívás a szülő processz virtuális
+memóriájának másolatát hozza létre a gyermekben. A tényleges fizikai
+másolás elkerülésére a kernel <strong>copy-on-write (CoW)</strong>
+technikát használ: a gyermek page table-e ugyanazokra a fizikai lapokra
+mutat, mint a szülő, de mindkét oldal PTE-je írásvédett lesz. Ha
+valamelyik processz írni próbál egy ilyen lapra, minor page fault
+keletkezik; ekkor a kernel egy új fizikai lapot foglal, átmásolja a
+tartalmat, és az író processz PTE-jét az új, írható lapra állítja; a
+másik processz az eredeti lapot tartja meg (ha már csak ő hivatkozik rá,
+a kernel másolás nélkül újra írhatóvá teszi). Ezért a fork gyors, de a
+későbbi írások miatt a memóriafogyasztás csak lazy módon nő.</p>
+<figure id="fig-d041-pagefault-cow">
+<div class="fig-interactive"><iframe src="figures/html/d041-pagefault-cow.html" title="Bal oldalt döntési út: TLB-találat, PTE jelenléte, jogosultság, VMA, a lap forrása; kimenetek minor, major, CoW és SIGSEGV. Jobb oldalt négy állapot: fork előtt a szülő négy lapja privát; fork után a szülő és a gyermek PTE-je írásvédetten ugyanarra a keretre mutat; a gyermek két érintett lapra ír, ezek CoW-másolatot kapnak; alternatívaként két nem érintett lapra ír, ez demand-zero, a megosztott lapok száma nem csökken. Alul smaps-táblázat kB-ban." loading="lazy" style="width:100%;border:0;height:620px"></iframe><noscript><img src="figures/img/d041-pagefault-cow.png" style="width:100.0%"
+alt="Bal oldalt döntési út: TLB-találat, PTE jelenléte, jogosultság, VMA, a lap forrása; kimenetek minor, major, CoW és SIGSEGV. Jobb oldalt négy állapot: fork előtt a szülő négy lapja privát; fork után a szülő és a gyermek PTE-je írásvédetten ugyanarra a keretre mutat; a gyermek két érintett lapra ír, ezek CoW-másolatot kapnak; alternatívaként két nem érintett lapra ír, ez demand-zero, a megosztott lapok száma nem csökken. Alul smaps-táblázat kB-ban." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d041-pagefault-cow.png" style="width:100.0%"
+alt="Bal oldalt döntési út: TLB-találat, PTE jelenléte, jogosultság, VMA, a lap forrása; kimenetek minor, major, CoW és SIGSEGV. Jobb oldalt négy állapot: fork előtt a szülő négy lapja privát; fork után a szülő és a gyermek PTE-je írásvédetten ugyanarra a keretre mutat; a gyermek két érintett lapra ír, ezek CoW-másolatot kapnak; alternatívaként két nem érintett lapra ír, ez demand-zero, a megosztott lapok száma nem csökken. Alul smaps-táblázat kB-ban." /></details></div>
+<figcaption>Page fault döntési út és copy-on-write: a hozzáférés útja a
+TLB-n, a PTE-n és a VMA-n át a minor, major, CoW és SIGSEGV kimenetekig,
+valamint a szülő és a gyermek laptáblája fork előtt, fork után, CoW-írás
+és demand-zero írás után (számított modell, nem mérés)</figcaption>
+</figure>
+<h4 data-number="9.1.2.5" id="rss-pss-shared-és-smaps"><span
+class="header-section-number">9.1.2.5</span> RSS, PSS, shared és
+smaps</h4>
+<p>A folyamat memóriaelszámolásához több mutatót használunk:</p>
+<ul>
+<li><strong>VSZ (Virtual Size)</strong>: a processz teljes virtuális
+címtartománya, a VMA-k összege. Nem jelenti a tényleges fizikai
+foglalást.</li>
+<li><strong>RSS (Resident Set Size)</strong>: a processzhez tartozó,
+fizikai keretben lévő lapok mérete. A megosztott lapokat minden processz
+RSS-ébe beleszámítja, ezért a rendszer összesített RSS értéke nagyobb
+lehet a fizikai memóriánál.</li>
+<li><strong>PSS (Proportional Set Size)</strong>: mint az RSS, de a
+megosztott lapok méretét elosztja a megosztó processzek számával. A PSS
+jobb közelítése az egyedi memóriaterhelésnek.</li>
+<li><strong>Shared/Private</strong>: a lap lehet csak egy processzé
+(private), vagy több processz osztozik rajta (shared). A privát lapok
+írása nem érint másokat, a shared lapok viszont közös adatot
+jelentenek.</li>
+</ul>
+<p>A <code>/proc/&lt;pid&gt;/smaps_rollup</code> és
+<code>/proc/&lt;pid&gt;/smaps</code> fájlok mutatják a részleteket:
+<code>Rss</code>, <code>Pss</code>, <code>Shared_Clean</code>,
+<code>Shared_Dirty</code>, <code>Private_Clean</code>,
+<code>Private_Dirty</code>, <code>Anonymous</code>, <code>File</code>
+stb. A <code>dirty</code> lapok olyanok, amelyek tartalma módosult, és
+még nem íródott vissza a háttértárolóra.</p>
+<h4 data-number="9.1.2.6" id="huge-page-és-thp"><span
+class="header-section-number">9.1.2.6</span> Huge page és THP</h4>
+<p>A nagy lapok csökkentik a TLB-nyomást és a page table walk költségét.
+A <strong>Transparent Huge Pages (THP)</strong> automatikusan próbál 2
+MiB-os lapokat használni anélkül, hogy az alkalmazásnak explicitet
+kellene tennie. A THP beállításait a
+<code>/sys/kernel/mm/transparent_hugepage/</code> alatt találjuk;
+tipikus policy az <code>always</code>, <code>madvise</code> vagy
+<code>never</code>. A THP nem mindig előnyös: nagy, ritkán használt
+anonim memóriánál fragmentálódást és nagyobb memória-overheadet okozhat.
+Az ellenőrzéshez meg kell nézni az adott kernel és workload specifikus
+viselkedését.</p>
+<h3 data-number="9.1.3" id="kidolgozott-példa"><span
+class="header-section-number">9.1.3</span> Kidolgozott példa</h3>
+<p>A példa egy Ubuntu Server 24.04 LTS labhost-on fut, felhasználó:
+<code>labuser</code>, UID 1000, host: <code>labvm1</code>. A cél egy C++
+program, amely 1 GiB anonim memóriát foglal, de csak 100 MiB-ot érint;
+emellett mmap-pal egy fájlt is betölt, majd fork után figyeli a
+memóriaelszámolást.</p>
+<p>Először létrehozunk egy fájlt a méréshez:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labvm1, labuser UID 1000</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">dd</span> if=/dev/zero of=/tmp/lab-d041.bin bs=1M count=16</span></code></pre></div>
+<p>A következő C++ program (<code>lab_d041.cpp</code>; illusztratív, a
+könyvben nem futtatott) a fenti műveleteket végzi. A fork előtt 20
+másodpercig vár, hogy a szülő állapota mérhető legyen; a gyermek a szülő
+által már érintett első 50 MiB-ba ír (ez valódi copy-on-write), majd 60
+másodperc után mindkét processz kilép:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// a g++ a _GNU_SOURCE makrót előre definiálja, ezért nem kell #define</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sys/mman.h&gt;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sys/wait.h&gt;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;unistd.h&gt;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstring&gt;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1 GiB anonim mapping, nem érintjük</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span><span class="op">*</span> anon <span class="op">=</span> mmap<span class="op">(</span><span class="kw">nullptr</span><span class="op">,</span> <span class="dv">1024</span><span class="bu">UL</span> <span class="op">&lt;&lt;</span> <span class="dv">20</span><span class="op">,</span> PROT_READ <span class="op">|</span> PROT_WRITE<span class="op">,</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>                      MAP_PRIVATE <span class="op">|</span> MAP_ANONYMOUS<span class="op">,</span> <span class="op">-</span><span class="dv">1</span><span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>anon <span class="op">==</span> MAP_FAILED<span class="op">)</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 100 MiB-ot érintünk: 4 KiB-os lépésekben írunk</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> touch <span class="op">=</span> <span class="dv">100</span><span class="bu">UL</span> <span class="op">&lt;&lt;</span> <span class="dv">20</span><span class="op">;</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">size_t</span> off <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> off <span class="op">&lt;</span> touch<span class="op">;</span> off <span class="op">+=</span> <span class="dv">4096</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>        <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">char</span><span class="op">*&gt;(</span>anon<span class="op">)[</span>off<span class="op">]</span> <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Fájl mmap 16 MiB, private</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>    <span class="dt">FILE</span><span class="op">*</span> f <span class="op">=</span> fopen<span class="op">(</span><span class="st">&quot;/tmp/lab-d041.bin&quot;</span><span class="op">,</span> <span class="st">&quot;r&quot;</span><span class="op">);</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>f<span class="op">)</span> <span class="cf">return</span> <span class="dv">3</span><span class="op">;</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> fd <span class="op">=</span> fileno<span class="op">(</span>f<span class="op">);</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span><span class="op">*</span> file_map <span class="op">=</span> mmap<span class="op">(</span><span class="kw">nullptr</span><span class="op">,</span> <span class="dv">16</span><span class="bu">UL</span> <span class="op">&lt;&lt;</span> <span class="dv">20</span><span class="op">,</span> PROT_READ <span class="op">|</span> PROT_WRITE<span class="op">,</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>                          MAP_PRIVATE<span class="op">,</span> fd<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>    fclose<span class="op">(</span>f<span class="op">);</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>file_map <span class="op">==</span> MAP_FAILED<span class="op">)</span> <span class="cf">return</span> <span class="dv">2</span><span class="op">;</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1 MiB-ot érintünk a fájlból</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">size_t</span> off <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> off <span class="op">&lt;</span> <span class="op">(</span><span class="dv">1</span><span class="bu">UL</span> <span class="op">&lt;&lt;</span> <span class="dv">20</span><span class="op">);</span> off <span class="op">+=</span> <span class="dv">4096</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>        <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">char</span><span class="op">*&gt;(</span>file_map<span class="op">)[</span>off<span class="op">]</span> <span class="op">=</span> <span class="dv">2</span><span class="op">;</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>    <span class="co">// mérési ablak a fork előtt</span></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;pre-fork pid=</span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> getpid<span class="op">());</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>    fflush<span class="op">(</span>stdout<span class="op">);</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a>    sleep<span class="op">(</span><span class="dv">20</span><span class="op">);</span></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a>    <span class="dt">pid_t</span> pid <span class="op">=</span> fork<span class="op">();</span></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>pid <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a>        <span class="co">// gyermek: a szülő által már érintett első 50 MiB-ba ír -&gt; CoW</span></span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">size_t</span> off <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> off <span class="op">&lt;</span> <span class="op">(</span><span class="dv">50</span><span class="bu">UL</span> <span class="op">&lt;&lt;</span> <span class="dv">20</span><span class="op">);</span> off <span class="op">+=</span> <span class="dv">4096</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true" tabindex="-1"></a>            <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">char</span><span class="op">*&gt;(</span>anon<span class="op">)[</span>off<span class="op">]</span> <span class="op">=</span> <span class="dv">3</span><span class="op">;</span></span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-45"><a href="#cb2-45" aria-hidden="true" tabindex="-1"></a>        sleep<span class="op">(</span><span class="dv">60</span><span class="op">);</span></span>
+<span id="cb2-46"><a href="#cb2-46" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-47"><a href="#cb2-47" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-48"><a href="#cb2-48" aria-hidden="true" tabindex="-1"></a>    waitpid<span class="op">(</span>pid<span class="op">,</span> <span class="kw">nullptr</span><span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb2-49"><a href="#cb2-49" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-50"><a href="#cb2-50" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Fordítás és indítás a háttérben:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labvm1, labuser UID 1000</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">g++</span> <span class="at">-O0</span> <span class="at">-Wall</span> <span class="at">-o</span> lab_d041 lab_d041.cpp</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="ex">./lab_d041</span> <span class="kw">&amp;</span></span></code></pre></div>
+<p>A mérést a fork előtti 20 másodperces ablakban és a fork után is
+elvégezzük. A <code>pgrep -o</code> a legrégebbi (szülő), a
+<code>pgrep -n</code> a legújabb (fork után a gyermek) egyező processzt
+adja:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labvm1, labuser UID 1000</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ps</span> <span class="at">-o</span> pid,ppid,vsz,rss,min_flt,maj_flt,cmd <span class="at">-C</span> lab_d041</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/<span class="va">$(</span><span class="ex">pgrep</span> <span class="at">-o</span> lab_d041<span class="va">)</span>/smaps_rollup   <span class="co"># szülő</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/<span class="va">$(</span><span class="ex">pgrep</span> <span class="at">-n</span> lab_d041<span class="va">)</span>/smaps_rollup   <span class="co"># fork után: gyermek</span></span></code></pre></div>
+<p>Takarítás (a program 20 + 60 másodperc után magától is kilép):</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labvm1, labuser UID 1000</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">pkill</span> <span class="at">-x</span> lab_d041</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">-f</span> /tmp/lab-d041.bin</span></code></pre></div>
+<p><strong>Várt, illusztratív számítás</strong> – a tényleges futásban a
+kernel verziója és a THP beállítás módosíthatja a lapméretet, ezért ezek
+mint számított példa értendők:</p>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr>
+<th>Terület</th>
+<th>VSZ</th>
+<th>RSS</th>
+<th>PSS</th>
+<th>Megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Anonim mapping</td>
+<td>1024 MiB</td>
+<td>100 MiB</td>
+<td>100 MiB</td>
+<td>csak 100 MiB érintve</td>
+</tr>
+<tr>
+<td>Fájl mapping</td>
+<td>16 MiB</td>
+<td>1 MiB</td>
+<td>1 MiB</td>
+<td>private mapping</td>
+</tr>
+<tr>
+<td>Fork után (szülő és gyermek külön-külön)</td>
+<td>kb. 1040 MiB</td>
+<td>kb. 101 MiB</td>
+<td>kb. 50,5 MiB</td>
+<td>a 101 MiB megosztott (Shared_Dirty), mindkét processz a felét
+viseli</td>
+</tr>
+<tr>
+<td>Gyermek 50 MiB-os CoW-írása után</td>
+<td>kb. 1040 MiB</td>
+<td>változatlan, kb. 101 MiB</td>
+<td>kb. 50 + 25,5 MiB</td>
+<td>50 MiB CoW-másolat: a szülő és a gyermek is 50 MiB privátot kap, kb.
+51 MiB megosztott marad</td>
+</tr>
+</tbody>
+</table>
+<p>A CoW-írás nem növeli egyik processz RSS-ét sem, csak a lapok gazdája
+változik: a szülő <code>Shared_Dirty</code> értéke kb. 50 MiB-tal
+csökken, <code>Private_Dirty</code> értéke ugyanennyivel nő. Ha a
+gyermek a szülő által sosem érintett tartományba írna, az nem CoW lenne,
+hanem új, nullára inicializált anonim lap (demand-zero fault), és a
+gyermek RSS-e nőne.</p>
+<p>A pontos értékek a <code>smaps_rollup</code> sorokból olvashatók ki.
+A <code>Rss</code> és <code>Pss</code> mezők különbsége a megosztott
+lapok elszámolását mutatja.</p>
+<h3 data-number="9.1.4" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">9.1.4</span> Tipikus hibák és
+ellenpróbák</h3>
+<ol type="1">
+<li><p><strong>A VSZ-t tartják a tényleges
+memóriafogyasztásnak.</strong><br />
+Tünet: egy processz VSZ értéke 10 GiB, de a rendszer mégsem fut ki a
+memóriából. A VSZ csak a virtuális címtartomány mérete; a tényleges
+nyomást az RSS, PSS és a page faultok jelzik. Ellenpróba:
+<code>ps -o vsz,rss</code> és
+<code>cat /proc/&lt;pid&gt;/smaps_rollup</code> – ha az RSS alacsony, a
+memóriafoglalás lazy.</p></li>
+<li><p><strong>A minor/major faultot tévesen a TLB hibával
+azonosítják.</strong><br />
+Tünet: egy alkalmazásnál sok TLB miss-t feltételeznek, de a
+<code>perf</code> szerint sok page fault van. A TLB miss hardveres
+címfordítási esemény, a page fault a hiányzó lapé. A faultot
+processzenként a <code>ps -o min_flt,maj_flt -p &lt;pid&gt;</code> (a
+<code>/proc/&lt;pid&gt;/stat</code> 10. és 12. mezője), a TLB
+viselkedést a <code>perf stat</code> méri.</p></li>
+<li><p><strong>A huge page-eket minden workloadra
+bekapcsolják.</strong><br />
+Tünet: THP <code>always</code> mellett egy nagy, de ritkán érintett
+terület miatt a memória fragmentálódik, vagy a faultoknál nagyobb
+késleltetés lép fel. A policy-t a workload alapján kell választani, és a
+<code>/sys/kernel/mm/transparent_hugepage/</code> beállítást
+ellenőrizni.</p></li>
+<li><p><strong>A fork utáni CoW költsége rejtve marad.</strong><br />
+Tünet: egy service sok gyermekprocesszt hoz létre fork-kal, a kezdeti
+RSS szerény, de később a memóriahasználat hirtelen megnő. A gyermekek
+írásai miatt a CoW egyenként másolja a privát lapokat. A méréshez nézni
+kell a <code>pgfault</code> és <code>Rss</code> növekedését a fork
+után.</p></li>
+</ol>
+<h3 data-number="9.1.5" id="feladatok"><span
+class="header-section-number">9.1.5</span> Feladatok</h3>
+<h4 data-number="9.1.5.1" id="feladat-magyarázó"><span
+class="header-section-number">9.1.5.1</span> 1. Feladat (magyarázó)</h4>
+<p>Adott a következő <code>smaps_rollup</code> kivonat egy
+processzről:</p>
+<pre class="text"><code>Rss:               51200 kB
+Pss:               40960 kB
+Shared_Clean:      10240 kB
+Shared_Dirty:      10240 kB
+Private_Clean:     10240 kB
+Private_Dirty:     20480 kB
+Anonymous:         40960 kB
+File:              10240 kB</code></pre>
+<p>Magyarázd el, miért kisebb a PSS az RSS-nél, és mi lehet a megosztott
+lapok szerepe. Tegyük fel, hogy a processz pontosan egy másik processzel
+osztozik a shared lapokon. Mennyivel járulnak a shared lapok a két
+processz együttes PSS-éhez, illetve együttes RSS-éhez?</p>
+<h4 data-number="9.1.5.2"
+id="feladat-adminisztrációskonfigurációs"><span
+class="header-section-number">9.1.5.2</span> 2. Feladat
+(adminisztrációs/konfigurációs)</h4>
+<p>A labVM-en futtasd a fenti C++ példát, majd gyűjtsd be a
+<code>ps</code>, <code>/proc/&lt;pid&gt;/status</code> és
+<code>/proc/&lt;pid&gt;/smaps_rollup</code> kimenetét a fork előtt és
+után. Dokumentáld a VSZ, RSS, PSS és a
+<code>minflt</code>/<code>majflt</code> értékeket. Ellenőrizd, hogy a
+gyermek írása után hogyan változik a privát lapok száma. A feladathoz ne
+futtass rootként olyan parancsot, ami más processzt érint.</p>
+<h4 data-number="9.1.5.3"
+id="feladat-diagnosztikaifailurerecovery"><span
+class="header-section-number">9.1.5.3</span> 3. Feladat
+(diagnosztikai/failure/recovery)</h4>
+<p>Egy webes service nagy latenciát mutat, és a
+<code>/proc/vmstat</code> <code>pgmajfault</code> számlálója gyorsan nő.
+A processz RSS-e alacsony, a VSZ-e nagy. Állíts fel hipotézist a swap
+vagy a file-backed memory viselkedéséről. Gyűjts adatokat
+(<code>/proc/&lt;pid&gt;/smaps</code>,
+<code>ps -o pid,min_flt,maj_flt -p &lt;pid&gt;</code>,
+<code>grep -E '^pg(maj)?fault' /proc/vmstat</code> két mintavétellel, a
+<code>vmstat 1</code> <code>si</code>/<code>so</code>/<code>bi</code>
+oszlopai), majd javasolj egy konfigurációs vagy kódolási változtatást,
+és határozd meg a visszaellenőrzés módját.</p>
+<h3 data-number="9.1.6" id="megoldások"><span
+class="header-section-number">9.1.6</span> Megoldások</h3>
+<h4 data-number="9.1.6.1" id="megoldás"><span
+class="header-section-number">9.1.6.1</span> 1. Megoldás</h4>
+<p>Az RSS az összes resident lap mérete, beleértve a más processzekkel
+megosztott lapokat is. A PSS a megosztott lapok méretét a megosztók
+számával arányosan osztja. Itt shared = 10240 + 10240 = 20480 kB,
+private = 10240 + 20480 = 30720 kB, RSS = 51200 kB. Két megosztónál a
+processz PSS-e = 30720 + 20480/2 = 40960 kB, ami egyezik a kivonattal;
+az RSS és a PSS különbsége (10240 kB) a shared lapok másik processzre
+eső fele.</p>
+<p>A 20480 kB megosztott terület a két processz együttes PSS-ében
+pontosan egyszer szerepel (2 × 10240 = 20480 kB), az együttes RSS-ben
+viszont kétszer (2 × 20480 = 40960 kB). Ezért összegezhető a PSS, és
+ezért túloz az RSS-összeg. A két processz teljes PSS-összege 40960 kB +
+a másik processz saját PSS-e; ez utóbbi a kivonatból nem határozható
+meg, mert a másik processz privát lapjait nem ismerjük.</p>
+<h4 data-number="9.1.6.2" id="megoldás-1"><span
+class="header-section-number">9.1.6.2</span> 2. Megoldás</h4>
+<p>A fork előtti 20 másodperces ablakban a
+<code>ps -o pid,ppid,vsz,rss,min_flt,maj_flt -C lab_d041</code> egy sort
+ad. A szülő <code>smaps_rollup</code> <code>Rss</code> értéke várhatóan
+körülbelül 101 MiB (100 MiB anonim + 1 MiB fájl), szinte teljesen
+<code>Private_Dirty</code>, a VSZ pedig kb. 1040 MiB (plusz a programkód
+és a könyvtárak). A fork után két sor látszik; a gyermek
+<code>Rss</code> értéke kezdetben ugyanannyi, mint a szülőé, a lapok
+<code>Shared_Dirty</code>-be kerülnek, és mindkét PSS kb. a felére
+csökken. A gyermek 50 MiB-os CoW-írása után a szülő
+<code>Shared_Dirty</code> értéke kb. 50 MiB-tal csökken,
+<code>Private_Dirty</code> értéke ugyanennyivel nő; a gyermek RSS-e nem
+nő, a <code>min_flt</code> értéke viszont kb. 12 800-zal (50 MiB / 4
+KiB) emelkedik. A <code>/proc/&lt;pid&gt;/status</code>
+<code>VmSize</code>, <code>VmRSS</code>, <code>RssAnon</code> és
+<code>RssFile</code> sorai is megerősítik. A feladat postconditionje: a
+hallgató tudja, hogy a fork nem másolja azonnal a memóriát, és a már
+megosztott lapokra írás CoW-faultokkal jár. (A számok várt értékek; THP
+és kernelverzió módosíthatja őket.)</p>
+<h4 data-number="9.1.6.3" id="megoldás-2"><span
+class="header-section-number">9.1.6.3</span> 3. Megoldás</h4>
+<p>A magas <code>majfault</code> arra utal, hogy a processz lapjait
+gyakran kell háttértárolóról visszaolvasni. Lehetséges ok: a processz
+nagy file-backed mappinget használ, és a file cache-t a memórianyomás
+kiüríti, vagy a swap terület aktív. Diagnosztika:
+<code>ps -o pid,min_flt,maj_flt -p &lt;pid&gt;</code> (a
+<code>/proc/&lt;pid&gt;/stat</code> mezőnevek nélküli sor, ezért abban a
+<code>grep majflt</code> semmit nem talál),
+<code>grep -E '^pg(maj)?fault' /proc/vmstat</code> két mintavétellel, a
+<code>vmstat 1</code> <code>si</code>/<code>so</code>/<code>bi</code>
+oszlopai, <code>cat /proc/&lt;pid&gt;/smaps</code>. Ha a major faultok a
+file-backed régiókban jelentkeznek, a megoldás lehet a fájl explicit
+<code>mlock</code>-olása (ha indokolt), vagy a memória növelése, hogy a
+page cache ne legyen reclaimálva. Ha a swap okolható, a
+<code>vm.swappiness</code> mérséklése vagy a processz fizikai memória
+limitjének emelése segíthet. A változtatás után a <code>majfault</code>
+ráta csökkenését és a latency javulását kell mérni.</p>
+<h3 data-number="9.1.7" id="rövid-összefoglaló"><span
+class="header-section-number">9.1.7</span> Rövid összefoglaló</h3>
+<p>A Linux virtuális memória a demand pagingre épül: a
+<code>malloc</code>/<code>mmap</code> csak virtuális címtartományt hoz
+létre, a fizikai lapokat az első hozzáférés hozza be. A minor page fault
+memóriabeli lapot ad, a major fault háttértárolóról olvas. A fork
+copy-on-write módon osztja meg a lapokat, és csak írásra másol. Az RSS a
+resident lapok összessége, a PSS a megosztott részek arányos
+elszámolása, a VSZ pedig a teljes virtuális méret. A THP csökkentheti a
+TLB-nyomást, de policy-t kell választani.</p>
+<ul>
+<li><strong>minor page fault</strong>: a hiányzó lap tartalma elérhető
+memóriában, nem igényel lassú I/O-t.</li>
+<li><strong>major page fault</strong>: a lapot háttértárolóról
+(fájl/swap) kell betölteni.</li>
+<li><strong>PSS</strong>: a resident lapok mérete arányosítva a megosztó
+processzek számával.</li>
+</ul>
+<h3 data-number="9.1.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">9.1.8</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li><a href="https://docs.kernel.org/">Linux kernel documentation</a> –
+kiindulópont a page table, memory management és THP részleteihez.</li>
+<li><a href="https://man7.org/linux/man-pages/">man7.org Linux
+man-pages</a> – mmap, fork, proc dokumentációhoz.</li>
+<li><a href="https://systemd.io/">systemd.io</a> – a memory accounting
+és cgroup összefüggésekhez.</li>
+</ul>
+<p>Állításonkénti forrásindex (a labor viszonyítási pontja az Ubuntu
+Server 24.04 LTS 6.8-as GA kernele; a man-pages online változata a
+legfrissebb kiadást mutatja, a 24.04 csomagváltozata eltérhet):</p>
+<ul>
+<li><code>mmap</code> flagek (<code>MAP_SHARED</code>,
+<code>MAP_PRIVATE</code>, <code>MAP_ANONYMOUS</code>,
+<code>MAP_FILE</code> mint figyelmen kívül hagyott kompatibilitási
+flag): https://man7.org/linux/man-pages/man2/mmap.2.html – DESCRIPTION
+szakasz.</li>
+<li><code>fork</code> és a copy-on-write:
+https://man7.org/linux/man-pages/man2/fork.2.html – NOTES szakasz.</li>
+<li><code>/proc/&lt;pid&gt;/stat</code> mezők (<code>minflt</code> =
+10., <code>majflt</code> = 12.), <code>smaps</code>,
+<code>smaps_rollup</code>, <code>status</code>:
+https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html,
+https://man7.org/linux/man-pages/man5/proc_pid_smaps.5.html,
+https://man7.org/linux/man-pages/man5/proc_pid_status.5.html.</li>
+<li>RSS/PSS/smaps mezők jelentése:
+https://docs.kernel.org/filesystems/proc.html –
+„/proc/&lt;pid&gt;/smaps” rész.</li>
+<li>THP policy
+(<code>always</code>/<code>madvise</code>/<code>never</code>):
+https://docs.kernel.org/admin-guide/mm/transhuge.html.</li>
+<li>VMA-tárolás maple tree-ben (6.1+):
+https://docs.kernel.org/core-api/maple_tree.html.</li>
+</ul>
+<p>A fenti források ebben a kérésben nem voltak ellenőrzött, olvasott
+dokumentumok. A példák laborban ellenőrizendők; dátumozott futtatási
+napló (tool <code>--version</code>, parancskimenet, sikeres és hibás ág)
+még nem készült. A kernel verziófüggő viselkedése (például THP
+alapértelmezett policy, lapfault költségek) és a pontos
+<code>/proc</code> mezők ellenőrzése a használt Ubuntu Server 24.04 LTS
+kernel verzióján szükséges.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d040.html">← 8.5 Process-, szál- és erőforrásdiagnosztikai labor</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d042.html">9.2 Page cache, reclaim, swap és overcommit →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

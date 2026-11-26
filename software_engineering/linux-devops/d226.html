@@ -1,0 +1,655 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>46.1 Declarative infrastructure, provider és state – Linux és
+DevOps rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch46">46 Infrastructure as Code: OpenTofu/Terraform és állapot</a></p>
+<div class="links"><a class="prev" rel="prev" href="d225.html">← 45.5 Cloud packet/storage/recovery labor</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d227.html">46.2 Remote state, locking és recovery →</a></div>
+</nav>
+<h2 data-number="46.1" id="d226"><span
+class="header-section-number">46.1</span> Declarative infrastructure,
+provider és state</h2>
+<h3 data-number="46.1.1" id="motiváció"><span
+class="header-section-number">46.1.1</span> Motiváció</h3>
+<p>Egy szenior C++ fejlesztő a buildrendszerében megszokta, hogy a make
+vagy CMake függőségi gráf alapján, helyesen topologikus sorrendben hívja
+a fordítót, és csak akkor épít újra, ha a forrás vagy a függőség
+ténylegesen megváltozott. Amikor viszont felhő-erőforrásokat (VM,
+hálózat, tár) kell létrehozni, a manuális CLI-hívások nem adnak ilyen
+garanciát: a sorrend könnyen elromlik, az állapot a fejünkben vagy egy
+scriptben él, és a környezet idővel „elsodródik” a dokumentációtól. Az
+Infrastructure as Code (IaC) a buildrendszerhez hasonló fegyelmet vezet
+be: deklaratív konfigurációból gráfot épít, és a gráf szerint hajtja
+végre a távoli provider API-hívásokat, miközben egy külön állapotfájlban
+rögzíti a hozzárendelést a konfiguráció és a tényleges erőforrás
+között.</p>
+<p>Ebben az alfejezetben az IaC alapfogalmait vezetjük be. A cél, hogy a
+korábbi <a href="d111.html">d111</a> inventory/SoT fejezetből ismert
+desired state, observed state és drift fogalmakat továbbvigyük az
+infrastruktúraprogramozásba, és programozói szemmel is értékeljük a
+provider API műveletek függőségi és idempotencia-tulajdonságait.</p>
+<h3 data-number="46.1.2" id="config-state-és-tényleges-erőforrás"><span
+class="header-section-number">46.1.2</span> Config, state és tényleges
+erőforrás</h3>
+<p>Az IaC három, egymástól élesen elválasztott állapotot használ:</p>
+<ul>
+<li><strong>Config (desired state):</strong> a verziózott HCL-ben
+(Hashicorp Configuration Language) vagy más deklaratív nyelven leírt
+kívánt állapot. Ez adja meg, <em>mi</em> létezzen, nem azt, hogy
+<em>hogyan</em> jöjjön létre. A config a source of truth; a Git
+repositoryban él, review-n megy keresztül.</li>
+<li><strong>State (stored state):</strong> a Terraform/OpenTofu által
+karbantartott állapotfájl, amely a configban szereplő erőforrásokat a
+provider által visszaadott tényleges azonosítóhoz (<code>id</code>,
+<code>arn</code>, DNS-név stb.) rendeli. Ez nem egyszerű cache: a
+működéshez szükséges a függőségi gráf kiszámításához, a törlés és
+frissítés megtervezéséhez, valamint az importáláshoz.</li>
+<li><strong>Actual resource (observed state):</strong> a provider API-ja
+által éppen látott valós erőforrás. Ez a valóság, amit a
+<code>refresh</code> művelet kérdez le, és ez alapján derül ki a
+drift.</li>
+</ul>
+<p>A három állapot kapcsolata:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Fogalom</th>
+<th>Példa</th>
+<th>Honnan származik</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Config / desired</td>
+<td><code>aws_s3_bucket.lab_artifact</code> deklaráció</td>
+<td>Git repository</td>
+</tr>
+<tr>
+<td>State / stored</td>
+<td><code>"aws_s3_bucket.lab_artifact"</code> →
+<code>"id": "lab-artifact-xyz"</code></td>
+<td>A legutóbbi apply eredménye</td>
+</tr>
+<tr>
+<td>Actual / observed</td>
+<td>a bucket ténylegesen létezik-e az AWS konzolban</td>
+<td>Provider API hívás</td>
+</tr>
+</tbody>
+</table>
+<p>Az erőforrások HCL-ben <code>resource</code>, a csak olvasható adatok
+<code>data</code> blokkban jelennek meg. A <code>provider</code> blokk
+választja ki és konfigurálja a felhőszolgáltatót vagy más API-t; a
+<code>module</code> pedig újrafelhasználható, paraméterezett
+alrendszer-config csomag. Az alábbi példa egy üres <code>resource</code>
+blokk és egy provider konfiguráció vázlata:</p>
+<pre class="hcl"><code># provider konfiguráció: region, credential forrás
+provider &quot;aws&quot; {
+  region = &quot;eu-west-1&quot;
+}
+
+# resource: az erőforrás típusa &quot;aws_s3_bucket&quot;, a helyi neve &quot;lab_artifact&quot;
+resource &quot;aws_s3_bucket&quot; &quot;lab_artifact&quot; {
+  bucket = &quot;lab-artifact-demo&quot;
+}</code></pre>
+<p>A <code>data</code> blokk már létező erőforrást olvas be anélkül,
+hogy az életciklusát kezelné. A <code>module</code> segítségével ugyanez
+a konfiguráció paraméterezhető, például a bucket neve változóként adható
+át.</p>
+<h3 data-number="46.1.3" id="desired-state-és-resource-graph"><span
+class="header-section-number">46.1.3</span> Desired state és resource
+graph</h3>
+<p>A Terraform/OpenTofu nem szekvenciálisan futtat parancsokat, hanem a
+configból egy <strong>függőségi gráfot</strong> (resource graph) épít. A
+gráf csúcsai az erőforrások és a data-source-ok, az élei a HCL-ben
+megjelenő referencia-kapcsolatok. Például:</p>
+<pre class="hcl"><code>resource &quot;random_pet&quot; &quot;bucket_suffix&quot; {
+  length = 2
+}
+
+resource &quot;aws_s3_bucket&quot; &quot;lab_artifact&quot; {
+  bucket = &quot;lab-artifact-${random_pet.bucket_suffix.id}&quot;
+}</code></pre>
+<p>Itt az <code>aws_s3_bucket.lab_artifact</code> függ a
+<code>random_pet.bucket_suffix</code> tulajdonságtól. A gráf él:
+<code>random_pet.bucket_suffix</code> →
+<code>aws_s3_bucket.lab_artifact</code>. A gráf aciklikus, ezért
+topologikus sorrendben párhuzamosítható: a fundamentális sorrendben a
+<code>random_pet</code> létrehozása megelőzi a bucket létrehozását, mert
+a bucket neve a <code>random_pet.id</code>-től függ.</p>
+<p>A gráfot a <code>terraform graph</code> parancs is ki tudja rajzolni,
+de a plan outputban is megjelenik a sorrend. A make build graphtól való
+hasonlóság nem véletlen: a cél, hogy csak a ténylegesen változó
+erőforrásokat módosítsuk, és a függőségi irányokat mindig
+előrevetítsük.</p>
+<h3 data-number="46.1.4" id="plan-apply-és-external-side-effect"><span
+class="header-section-number">46.1.4</span> Plan, apply és external side
+effect</h3>
+<p>A <strong>plan</strong> fázis három lépést végez:</p>
+<ol type="1">
+<li><strong>Refresh</strong>: a provider API-kból frissíti a state-hez
+tartozó erőforrások aktuális tulajdonságait, hogy a state a tényleges
+állapotot tükrözze.</li>
+<li><strong>Diff</strong>: összehasonlítja a configban leírt desired
+state-et a refreshed state-ből számolt aktuális állapottal. Ha az
+erőforrás nincs a state-ben, akkor létrehozást (create) tervez; ha
+létezik, de a paraméterek eltérnek, frissítést (update); ha a configból
+törölve lett, de a state-ben szerepel, törlést (delete).</li>
+<li><strong>Order</strong>: a gráf alapján meghatározza a műveletek
+biztonságos sorrendjét. A törlés általában fordított függőségi
+sorrendben történik.</li>
+</ol>
+<p>Az <strong>apply</strong> a planben kiszámított gráf szerint valóban
+meghívja a provider API-ját. Minden ilyen hívás <strong>külső
+mellékhatással</strong> (external side effect) jár: VM-et indít,
+hálózati interfészt készít, DNS-rekordot hoz létre. Ez nem csak egy
+fordítás: a hibás sorrend vagy egy megszakadt futtatás valódi, talán nem
+triviálisan visszaállítható változást okoz a felhőben. Ezért a plan
+kimenetét mindig review-zni kell, és az apply előtt explicit jóváhagyást
+kérni, például a <code>-auto-approve</code> elhagyásával.</p>
+<p>A HCL config létrehozása és a futtatás minimális lépései:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. Inicializálás: provider pluginok, modulok, backend letöltése</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">terraform</span> init</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. Plan: az aktuális állapot frissítése és a függőségi gráf</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="co">#    szerinti változások előrejelzése</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="ex">terraform</span> plan</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. Apply: a terv végrehajtása a provider API-n keresztül</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="ex">terraform</span> apply</span></code></pre></div>
+<h3 data-number="46.1.5"
+id="statefile-nem-csak-cache-hanem-szükséges-mapping"><span
+class="header-section-number">46.1.5</span> Statefile: nem csak cache,
+hanem szükséges mapping</h3>
+<p>A statefile gyakran JSON formátumú, és a <code>.tfstate</code>
+kiterjesztésű helyi fájlban vagy távoli backendben él. Egy
+leegyszerűsített részlet:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;version&quot;</span><span class="fu">:</span> <span class="dv">4</span><span class="fu">,</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;terraform_version&quot;</span><span class="fu">:</span> <span class="st">&quot;1.8.0&quot;</span><span class="fu">,</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;resources&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;mode&quot;</span><span class="fu">:</span> <span class="st">&quot;managed&quot;</span><span class="fu">,</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;random_pet&quot;</span><span class="fu">,</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;name&quot;</span><span class="fu">:</span> <span class="st">&quot;bucket_suffix&quot;</span><span class="fu">,</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;provider&quot;</span><span class="fu">:</span> <span class="st">&quot;provider[</span><span class="ch">\&quot;</span><span class="st">registry.terraform.io/hashicorp/random</span><span class="ch">\&quot;</span><span class="st">]&quot;</span><span class="fu">,</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;instances&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>        <span class="fu">{</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>          <span class="dt">&quot;schema_version&quot;</span><span class="fu">:</span> <span class="dv">0</span><span class="fu">,</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>          <span class="dt">&quot;attributes&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>            <span class="dt">&quot;id&quot;</span><span class="fu">:</span> <span class="st">&quot;brief-marmot&quot;</span><span class="fu">,</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>            <span class="dt">&quot;length&quot;</span><span class="fu">:</span> <span class="dv">2</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>          <span class="fu">}</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>        <span class="fu">}</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>      <span class="ot">]</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>  <span class="ot">]</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>A statefile szerepe többrétű:</p>
+<ul>
+<li><strong>Azonosító leképezés:</strong> a configbeli név
+(<code>random_pet.bucket_suffix</code>) és a provider által visszaadott
+tényleges azonosító (<code>id = "brief-marmot"</code>) közötti
+kapcsolat. A provider csak az <code>id</code>-t ismeri, a HCL referencia
+viszont a configbeli nevet használja.</li>
+<li><strong>Leképezés hiánya state nélkül:</strong> a függőségi gráf a
+configból épül, nem a state-ből. Ha elveszne a state, egy későbbi
+<code>terraform plan</code> a configbeli címekhez
+(<code>random_pet.bucket_suffix</code>,
+<code>aws_s3_bucket.lab_artifact</code>) nem találna valós erőforrást,
+ezért mindent create-ként tervezne: fix nevű erőforrásnál névütközés,
+random névnél (itt új pet-név) duplikáció lenne az eredmény.</li>
+<li><strong>Életciklus-metaadatok:</strong> a state tárolja a provider
+által visszaadott teljes attribútumhalmazt – a <code>sensitive</code>
+értékeket is, <strong>nyílt szövegben</strong> (a <code>sensitive</code>
+jelölés csak a CLI-kimenetben maszkol), ezért a state titkot tartalmazó
+artifact, amelyet hozzáférés-védelemmel kell kezelni (lásd <a
+href="d227.html">d227</a>). Emellett a resource-függőségek listáját is
+tárolja, amely a configból már törölt erőforrások helyes
+destroy-sorrendjéhez kell.</li>
+<li><strong>Importálás alapja:</strong> a <code>terraform import</code>
+a meglévő actual resource-t regisztrálja a state-be anélkül, hogy újra
+létrehozná.</li>
+</ul>
+<p>A statefile tehát nem egy gyorsítótár, amit törölhetünk; ez a híd a
+minket érdeklő desired state és a provider által látott actual resource
+között. Ennek a mappingnek az elvesztése gyakran manuális feladatot,
+importálást vagy akár teljes újraépítést igényel. A termelési
+használatban a state remote backendben van, lockolva, verziózva (lásd <a
+href="d227.html">d227</a>).</p>
+<h3 data-number="46.1.6" id="drift-és-out-of-band-change"><span
+class="header-section-number">46.1.6</span> Drift és out-of-band
+change</h3>
+<p>Az out-of-band change (sávon kívüli változás) olyan módosítás, amely
+nem a Terraform/OpenTofu alkalmazáson keresztül történt: például valaki
+a webkonzolban kézzel töröl egy bucketet, vagy a CLI-vel módosít egy
+security group szabályt. A következő <code>terraform plan</code> során a
+refresh észleli, hogy a state-ben tárolt attribútumok nem egyeznek a
+provider API által visszaadottakkal. Ez a <strong>drift</strong>: az
+observed state eltér a config (desired) által rögzített állapottól.</p>
+<p>Az alábbi ábra három tipikus forgatókönyvön mutatja, melyik állapot
+melyik irányba frissül a plan lépései során, és milyen plan-összesítő
+keletkezik.</p>
+<figure id="fig-d226-drift-plan">
+<div class="fig-interactive"><iframe src="figures/html/d226-drift-plan.html" title="Három oszlop, mindegyikben Config, State és Actual doboz; a refresh nyíl az Actual-ból a State felé, a diff a Config és a State között, az apply a Config szerint az Actual felé mutat. A: a bucket nem létezik, a refresh után a State-ből kikerül, a diff create, Plan: 1 to add, 0 to change, 0 to destroy. B: a tag kézzel módosult, a State átveszi, a diff update in-place, Plan: 0 to add, 1 to change, 0 to destroy. C: a configból törölt resource a State-ben még szerepel, a diff destroy, Plan: 0 to add, 0 to change, 1 to destroy." loading="lazy" style="width:100%;border:0;height:520px"></iframe><noscript><img src="figures/img/d226-drift-plan.png" style="width:100.0%"
+alt="Három oszlop, mindegyikben Config, State és Actual doboz; a refresh nyíl az Actual-ból a State felé, a diff a Config és a State között, az apply a Config szerint az Actual felé mutat. A: a bucket nem létezik, a refresh után a State-ből kikerül, a diff create, Plan: 1 to add, 0 to change, 0 to destroy. B: a tag kézzel módosult, a State átveszi, a diff update in-place, Plan: 0 to add, 1 to change, 0 to destroy. C: a configból törölt resource a State-ben még szerepel, a diff destroy, Plan: 0 to add, 0 to change, 1 to destroy." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d226-drift-plan.png" style="width:100.0%"
+alt="Három oszlop, mindegyikben Config, State és Actual doboz; a refresh nyíl az Actual-ból a State felé, a diff a Config és a State között, az apply a Config szerint az Actual felé mutat. A: a bucket nem létezik, a refresh után a State-ből kikerül, a diff create, Plan: 1 to add, 0 to change, 0 to destroy. B: a tag kézzel módosult, a State átveszi, a diff update in-place, Plan: 0 to add, 1 to change, 0 to destroy. C: a configból törölt resource a State-ben még szerepel, a diff destroy, Plan: 0 to add, 0 to change, 1 to destroy." /></details></div>
+<figcaption>Drift-forgatókönyvek a plan lépéseiben: a refresh az Actual
+felől frissíti a State-et, a diff a Config és a frissített State
+különbségéből tervez; (A) kézzel törölt bucket: 1 to add, 0 to destroy;
+(B) kézzel módosított tag: 1 to change; (C) a configból törölt resource:
+1 to destroy (illusztratív plan-összesítők, nem futtatott
+kimenet)</figcaption>
+</figure>
+<p>A terv ilyenkor általában a config által előírt állapotot
+visszaállító műveletet jelez. Ha a bucket eltűnt, a plan újra
+létrehozza. Ha csak egy attribútum változott meg, a plan in-place
+frissítést mutat. Ha a bucket a configban már nem szerepel, de a
+state-ben még igen, a plan törlésre fog javaslatot tenni, függetlenül
+attól, hogy az actual resource még létezik-e.</p>
+<p>A drift kezelése a d111-ből ismert elv szerint történik: vagy a
+source of truth-ot frissítjük, vagy a megfigyelt állapotot állítjuk
+vissza. Az IaC esetében ez a config módosítása vagy az apply
+végrehajtása, illetve az out-of-band módosítás importálása a
+configba.</p>
+<h3 data-number="46.1.7" id="opentofuterraform-támogatott-profil"><span
+class="header-section-number">46.1.7</span> OpenTofu/Terraform
+támogatott profil</h3>
+<p>A könyv a Terraform és az OpenTofu fogalmát párhuzamosan használja,
+mert az OpenTofu a Terraform BUSL licence után indult nyílt forráskódú
+fork, és a HCL nyelv, a resource graph, a statefile koncepciója
+kompatibilis maradt. A generálás időpontjában a támogatott stabil
+kiadások, a provider support matrix és a hashicorp/aws vagy
+hashicorp/random provider verziók a hivatalos dokumentációból
+ellenőrizendők. Az alábbi általános irányelvek viszont stabilak:</p>
+<ul>
+<li>A HCL és a statefile formátum alapvetően kompatibilis a két projekt
+között a fork idején, de a későbbi feature-ök és a backend-támogatás
+eltérhet. Különböző verziójú CLI-k ne írják ugyanazt a statefile-t.</li>
+<li>Az Ubuntu 24.04 LTS disztribúció által szállított csomagok nem
+feltétlenül a legfrissebb stabil verziók; a laborban a projekt hivatalos
+release-jét vagy egy verziózott letöltést érdemes használni, a hash
+ellenőrzésével.</li>
+<li>A <code>required_version</code> és <code>required_providers</code>
+korlátozások a configban egyfajta ABI-kontrollként szolgálnak:
+biztosítják, hogy a gráfot ugyanaz a függvénykönyvtár-verzió számolja,
+amelyre a config íródott. Ez hasonló ahhoz, ahogy a C++ projekt rögzíti
+a szabványt (<code>-std=c++20</code>).</li>
+</ul>
+<p>A pontos verziókat és support mátrixot a kutatás hiánya miatt nem
+adom meg; az ellenőrzési hiányok között jelölöm.</p>
+<h3 data-number="46.1.8"
+id="kidolgozott-példa-véletlen-névből-függő-s3-bucket"><span
+class="header-section-number">46.1.8</span> Kidolgozott példa: véletlen
+névből függő S3 bucket</h3>
+<p>A következő példa egy izolált sandboxban futtatható, hipotetikus
+AWS-fiókot használ; a tényleges futtatáshoz éles account és credential
+kell, amit a szabályok szerint a laborhoz külön kell biztosítani. A
+config:</p>
+<pre class="hcl"><code>terraform {
+  required_version = &quot;&gt;= 1.8&quot;
+  required_providers {
+    random = {
+      source  = &quot;hashicorp/random&quot;
+      version = &quot;&gt;= 3.6, &lt; 4.0&quot;
+    }
+    aws = {
+      source  = &quot;hashicorp/aws&quot;
+      version = &quot;&gt;= 5.0, &lt; 6.0&quot;
+    }
+  }
+}
+
+provider &quot;aws&quot; {
+  region = &quot;eu-west-1&quot;
+}
+
+resource &quot;random_pet&quot; &quot;bucket_suffix&quot; {
+  length = 2
+}
+
+resource &quot;aws_s3_bucket&quot; &quot;lab_artifact&quot; {
+  bucket = &quot;lab-artifact-${random_pet.bucket_suffix.id}&quot;
+}</code></pre>
+<p>A várt <code>terraform plan</code> kimenet (illusztratív, nem
+tényleges futtatás):</p>
+<pre class="text"><code>Terraform will perform the following actions:
+
+  # random_pet.bucket_suffix will be created
+  + resource &quot;random_pet&quot; &quot;bucket_suffix&quot; {
+      + id     = (known after apply)
+      + length = 2
+    }
+
+  # aws_s3_bucket.lab_artifact will be created
+  + resource &quot;aws_s3_bucket&quot; &quot;lab_artifact&quot; {
+      + bucket = (known after apply)
+    }
+
+Plan: 2 to add, 0 to change, 0 to destroy.</code></pre>
+<p>A kimenet mutatja, hogy a <code>bucket</code> érték „known after
+apply”, mert függ a <code>random_pet.id</code>-től, ami csak a create
+után derül ki. A gráf topologikusan sorrendezi: előbb a
+<code>random_pet</code>, utána a bucket.</p>
+<p>Az apply után a statefile (részlet) így néz ki:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;version&quot;</span><span class="fu">:</span> <span class="dv">4</span><span class="fu">,</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;resources&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;mode&quot;</span><span class="fu">:</span> <span class="st">&quot;managed&quot;</span><span class="fu">,</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;random_pet&quot;</span><span class="fu">,</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;name&quot;</span><span class="fu">:</span> <span class="st">&quot;bucket_suffix&quot;</span><span class="fu">,</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;instances&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>        <span class="fu">{</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>          <span class="dt">&quot;attributes&quot;</span><span class="fu">:</span> <span class="fu">{</span> <span class="dt">&quot;id&quot;</span><span class="fu">:</span> <span class="st">&quot;brief-marmot&quot;</span><span class="fu">,</span> <span class="dt">&quot;length&quot;</span><span class="fu">:</span> <span class="dv">2</span> <span class="fu">}</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>        <span class="fu">}</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>      <span class="ot">]</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;mode&quot;</span><span class="fu">:</span> <span class="st">&quot;managed&quot;</span><span class="fu">,</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;aws_s3_bucket&quot;</span><span class="fu">,</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;name&quot;</span><span class="fu">:</span> <span class="st">&quot;lab_artifact&quot;</span><span class="fu">,</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;instances&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>        <span class="fu">{</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>          <span class="dt">&quot;attributes&quot;</span><span class="fu">:</span> <span class="fu">{</span> <span class="dt">&quot;bucket&quot;</span><span class="fu">:</span> <span class="st">&quot;lab-artifact-brief-marmot&quot;</span> <span class="fu">}</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a>        <span class="fu">}</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>      <span class="ot">]</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a>  <span class="ot">]</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>Ha most valaki kézzel törli a bucketet a konzolon, a következő
+<code>terraform plan</code> először refresh-el, és a state-ben lévő
+bucket ténylegesen nem létezik; a refresh kivezeti a state-ből. A plan
+ezt mutatja (illusztratív):</p>
+<pre class="text"><code>Note: Objects have changed outside of Terraform
+
+  # aws_s3_bucket.lab_artifact has been deleted
+  ...
+
+  # aws_s3_bucket.lab_artifact will be created
+  + resource &quot;aws_s3_bucket&quot; &quot;lab_artifact&quot; {
+      + bucket = &quot;lab-artifact-brief-marmot&quot;
+    }
+
+Plan: 1 to add, 0 to change, 0 to destroy.</code></pre>
+<p>Destroy-művelet nincs, hiszen nincs mit törölni; egy cserét (replace)
+tartalmazó plan ezzel szemben
+<code>1 to add, 0 to change, 1 to destroy</code> összesítőt adna.</p>
+<p>A terv nem tudja, hogy a bucket valaha létezett; a provider
+visszajelzése alapján hiányzik, ezért újra létrehozza. Ez a drift
+javítás egyik módja: az apply visszaállítja a desired state-et. A másik
+út, ha a bucket törlése szándékos, akkor a configból el kell távolítani
+az erőforrást, és apply-val törölni a state-ből is.</p>
+<h3 data-number="46.1.9" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">46.1.9</span> Tipikus hibák és
+ellenpróbák</h3>
+<ol type="1">
+<li><p><strong>Cycle észlelése:</strong> Ha két erőforrás kölcsönösen
+egymásra hivatkozik, a gráf ciklust tartalmaz, és a
+<code>terraform plan</code> hibát ad:
+<code>Cycle: aws_security_group.a, aws_security_group.b</code>. Ez
+általában tervezési hibát jelez, nem valós függőséget. Megoldás: a kört
+a config átstrukturálásával kell megszakítani – például a két security
+group egymásra mutató szabályait külön
+<code>aws_vpc_security_group_ingress_rule</code> (régebbi providerben
+<code>aws_security_group_rule</code>) resource-okba emeljük, amelyek
+mindkét SG-től függnek; így előbb a két SG jön létre, utánuk a
+szabályok. A <code>depends_on</code> nem old fel ciklust, mert csak új
+élt ad a gráfhoz, meglévőt nem vesz el.</p></li>
+<li><p><strong>Statefile elvesztése:</strong> Ha a <code>.tfstate</code>
+törlődik, de a tényleges erőforrások léteznek, a
+<code>terraform plan</code> mindent újként mutat, és az apply
+duplikálhat. A helyes lépés:
+<code>terraform import &lt;resource&gt; &lt;id&gt;</code> minden meglévő
+erőforrásra, majd plan. A statefile tehát nem egy frissíthető cache,
+hanem a source of truth része.</p></li>
+<li><p><strong>Out-of-band módosítás félreértelmezése:</strong> A plan
+által mutatott destroy nem feltétlenül jelenti a bucket törlését; ha a
+bucket a configban van, de a state-ben nem, a plan létrehozást jelez. Ha
+viszont a bucket a state-ben van, de a configból töröltük, akkor a plan
+törlést javasol, még akkor is, ha a bucket ténylegesen létezik. Ez a
+config mint desired state következménye.</p></li>
+<li><p><strong>Provider verzió inkompatibilitás:</strong> Ha a
+statefile-t egy újabb Terraform/OpenTofu verzió nyitja meg, a version
+lock és a state schema frissülhet. A visszafelé kompatibilitás nem
+garantált, ezért a generáláskori stabil verziót rögzíteni kell, és a
+frissítést tesztelt módon, külön backenddel végezni.</p></li>
+<li><p><strong>Partial apply:</strong> Ha az apply hálózati hiba miatt
+megszakad, a statefile inkonzisztens lehet: néhány erőforrás létrejött,
+más nem. A következő <code>terraform plan</code> képes felismerni a
+tényleges állapotot a refresh segítségével, de a megszakadt művelet
+során létrejött erőforrások állapota a provider függvénye. A jövőbeli
+fejezet <a href="d227.html">d227</a> tárgyalja a lockolást és a
+recovery-t.</p></li>
+</ol>
+<h3 data-number="46.1.10" id="feladatok"><span
+class="header-section-number">46.1.10</span> Feladatok</h3>
+<h4 data-number="46.1.10.1"
+id="feladat-magyarázó-resource-graph-és-provider-hívási-sorrend"><span
+class="header-section-number">46.1.10.1</span> 1. feladat (magyarázó):
+resource graph és provider hívási sorrend</h4>
+<p>Tekintsd a következő HCL konfigurációt:</p>
+<pre class="hcl"><code>resource &quot;aws_vpc&quot; &quot;lab_vpc&quot; {
+  cidr_block = &quot;10.0.0.0/16&quot;
+}
+
+resource &quot;aws_subnet&quot; &quot;lab_subnet&quot; {
+  vpc_id     = aws_vpc.lab_vpc.id
+  cidr_block = &quot;10.0.1.0/24&quot;
+}
+
+resource &quot;aws_instance&quot; &quot;lab_vm&quot; {
+  ami           = &quot;ami-12345678&quot;
+  instance_type = &quot;t3.micro&quot;
+  subnet_id     = aws_subnet.lab_subnet.id
+  depends_on    = [aws_vpc.lab_vpc]
+}</code></pre>
+<p>Rajzold fel a függőségi gráfot, és add meg a provider hívási
+sorrendet a create fázisban. Indokold, hogy a
+<code>depends_on = [aws_vpc.lab_vpc]</code> miért szigorúan véve
+redundáns ebben a konfigurációban.</p>
+<h4 data-number="46.1.10.2"
+id="feladat-adminisztrációskonfigurációs-helyi-drift-gyakorlat"><span
+class="header-section-number">46.1.10.2</span> 2. feladat
+(adminisztrációs/konfigurációs): helyi drift gyakorlat</h4>
+<p>Készíts egy új munkakönyvtárat <code>lab-iac-state</code> néven. Hozz
+létre benne egy <code>main.tf</code> fájlt az alábbi tartalommal:</p>
+<pre class="hcl"><code>terraform {
+  required_version = &quot;&gt;= 1.8&quot;
+  required_providers {
+    random = {
+      source  = &quot;hashicorp/random&quot;
+      version = &quot;&gt;= 3.6, &lt; 4.0&quot;
+    }
+    local = {
+      source  = &quot;hashicorp/local&quot;
+      version = &quot;&gt;= 2.5, &lt; 3.0&quot;
+    }
+  }
+}
+
+resource &quot;random_pet&quot; &quot;demo&quot; {
+  length = 2
+}
+
+resource &quot;local_file&quot; &quot;demo_output&quot; {
+  content  = random_pet.demo.id
+  filename = &quot;${path.module}/demo.txt&quot;
+}</code></pre>
+<p>Futtasd a <code>terraform init</code>, <code>terraform plan</code>,
+<code>terraform apply</code> parancsokat. Ellenőrizd a
+<code>terraform state list</code> és a
+<code>terraform state show random_pet.demo</code> kimenetét. Ezután
+kézzel töröld a <code>demo.txt</code> fájlt, és futtass újra
+<code>terraform plan</code>-t. Írd le, mit mutat a terv, és miért. Végül
+futtass <code>terraform apply</code>-t, és bizonyítsd a
+<code>demo.txt</code> visszaállítását.</p>
+<h4 data-number="46.1.10.3"
+id="feladat-diagnosztikaifailure-recovery-out-of-band-törlés"><span
+class="header-section-number">46.1.10.3</span> 3. feladat
+(diagnosztikai/failure/ recovery): out-of-band törlés</h4>
+<p>Szituáció: az előző gyakorlat után valaki a <code>demo.txt</code>
+tartalmát kézzel átírja (<code>echo hacked &gt; demo.txt</code>). A
+<code>random_pet.demo</code> logikai resource, csak a state-ben létezik,
+ezért azon drift nem keletkezhet; a valós, külső objektum a
+<code>demo.txt</code>. Futtasd a <code>terraform plan</code>-t, és írd
+le, mit mutat a <code>local_file.demo_output</code>-ra. Indokold, miért
+a <code>terraform apply</code> a drift helyes megszüntetése, és miért
+nem megoldás a <code>demo.txt</code>-t kézzel visszaírni. Milyen
+adatgyűjtési lépéssel igazolnád, hogy a state, a config és a fájl
+konzisztens az apply után?</p>
+<h3 data-number="46.1.11" id="megoldások"><span
+class="header-section-number">46.1.11</span> Megoldások</h3>
+<h4 data-number="46.1.11.1" id="feladat-megoldása"><span
+class="header-section-number">46.1.11.1</span> 1. feladat megoldása</h4>
+<p>A gráf élei:</p>
+<ul>
+<li><code>aws_vpc.lab_vpc</code> → <code>aws_subnet.lab_subnet</code>,
+mert a subnet hivatkozik a VPC <code>id</code>-jére.</li>
+<li><code>aws_subnet.lab_subnet</code> →
+<code>aws_instance.lab_vm</code>, mert az instance
+<code>subnet_id</code>-je a subnet <code>id</code>-jét használja.</li>
+<li>Emellett a <code>depends_on = [aws_vpc.lab_vpc]</code> közvetlen élt
+ad a VPC és az instance közé.</li>
+</ul>
+<p>A create sorrend: először a VPC, majd a subnet, végül az instance. A
+redundáns <code>depends_on</code> azért szükségtelen, mert az instance a
+subnet-re hivatkozik, a subnet pedig a VPC-re, így a tranzitív függőség
+már biztosítja a helyes sorrendet. A <code>depends_on</code> ott
+hasznos, ha nincs közvetlen attribútum-referencia, de a létrehozási
+sorrend mégis fontos (pl. egy olyan erőforrásnál, ami policy-t állít be
+egy másik service-ben).</p>
+<p><strong>Postcondition:</strong> A gráf aciklikus, topologikus sorrend
+a VPC → subnet → instance. A <code>terraform plan</code> nem jelez
+ciklust.</p>
+<h4 data-number="46.1.11.2" id="feladat-megoldása-1"><span
+class="header-section-number">46.1.11.2</span> 2. feladat megoldása</h4>
+<p>A parancsok sorrendje:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">terraform</span> init</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">terraform</span> plan</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="ex">terraform</span> apply</span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="ex">terraform</span> state list</span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="co"># kimnet: random_pet.demo, local_file.demo_output</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="ex">terraform</span> state show random_pet.demo</span></code></pre></div>
+<p>A <code>demo.txt</code> törlése után a <code>terraform plan</code>
+ezt mutatja (várható, illusztratív):</p>
+<pre class="text"><code>Terraform will perform the following actions:
+
+  # local_file.demo_output will be created
+  + resource &quot;local_file&quot; &quot;demo_output&quot; {
+      + content  = &quot;brief-marmot&quot;
+      + filename = &quot;./demo.txt&quot;
+    }
+
+Plan: 1 to add, 0 to change, 0 to destroy.</code></pre>
+<p>Azért, mert a refresh során a provider a helyi fájlrendszerben nem
+találja a fájlt, tehát az observed state hiányt jelez. A
+<code>local_file</code> erőforrás létezik a state-ben, de az actual
+hiányzik, ezért a plan újra létrehozza. Az <code>apply</code>
+visszaállítja a fájlt a state-ben tárolt <code>content</code>
+alapján.</p>
+<p><strong>Postcondition:</strong> A <code>demo.txt</code> ismét létezik
+a <code>random_pet.demo.id</code> értékével. A
+<code>terraform state list</code> továbbra is ugyanazt a két erőforrást
+mutatja, a state-ben nem jött létre duplikátum.</p>
+<h4 data-number="46.1.11.3" id="feladat-megoldása-2"><span
+class="header-section-number">46.1.11.3</span> 3. feladat megoldása</h4>
+<p>A refresh során a <code>local</code> provider észleli, hogy a
+<code>demo.txt</code> tartalma (ellenőrzőösszege) eltér a state-ben
+rögzítettől, ezért a <code>local_file.demo_output</code>-ot
+helyreállítandónak jelzi: a provider-verziótól függően
+<code>will be created</code> (a resource kikerül a state-ből) vagy
+<code>must be replaced</code> formában – a pontos kimenetet a labor
+futtatásakor kell rögzíteni. A <code>random_pet.demo</code> változatlan:
+logikai resource, nincs külső objektuma, amely elveszhetne vagy
+eltérhetne.</p>
+<p>A <code>terraform apply</code> azért a helyes megoldás, mert a source
+of truth a config és a state: az apply a state-ben tárolt
+<code>random_pet.demo</code> id-vel írja újra a fájlt, és a state-et is
+konzisztensen frissíti. A fájl kézi visszaírása újabb out-of-band
+változás lenne: csak bájtra pontos egyezés esetén szüntetné meg a
+driftet (egy eltérő sorvége már nem), és nem hagy auditálható nyomot a
+változáskezelésben.</p>
+<p>Az apply utáni verifikáció:
+<code>terraform plan -detailed-exitcode</code> 0-s kilépési kóddal tér
+vissza (nincs változás), és a <code>cat demo.txt</code> kimenete
+megegyezik a <code>terraform state show random_pet.demo</code>
+<code>id</code> értékével (az apply előtti id-vel, hiszen a
+<code>random_pet</code> nem változott).</p>
+<p><strong>Postcondition:</strong> A <code>demo.txt</code> a változatlan
+<code>random_pet.demo</code> id-t tartalmazza, a state és a config
+konzisztens, és a <code>terraform plan</code> üres (0 to add, 0 to
+change, 0 to destroy).</p>
+<h3 data-number="46.1.12" id="rövid-összefoglaló"><span
+class="header-section-number">46.1.12</span> Rövid összefoglaló</h3>
+<p>A declarative infrastructure három állapotot különböztet meg: a
+config a desired state, a statefile a stored mapping, az actual resource
+a provider által látott observed state. A HCL resource gráfot definiál,
+amelyből a Terraform/OpenTofu topologikus sorrendben képezi le a
+provider API-hívásokat. A plan refresh, diff és sorrend szerint előre
+jelzi a módosításokat; az apply tényleges külső mellékhatásokkal jár. A
+statefile nem cache, hanem az azonosító-leképezés forrása (a függőségi
+gráf a configból épül), és az érzékeny értékeket nyíltan tárolja;
+elvesztése importálást igényel. A drift a config és az actual resource
+eltérése, amit a plan jelzi és az apply vagy a config módosítása old
+fel. Továbbhasznált definíciók: <strong>resource graph</strong>,
+<strong>state mapping</strong>, <strong>drift</strong>.</p>
+<h3 data-number="46.1.13" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">46.1.13</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li><a href="https://opentofu.org/docs/">OpenTofu Documentation</a> –
+„Language: Resources” (függőségek, <code>depends_on</code>), „State” (a
+state szerepe, „Sensitive data in state”), „CLI commands: plan”
+(refresh, <code>-detailed-exitcode</code>), „import”, „state rm”;
+hivatkozott verzió: OpenTofu 1.8.x (a példák
+<code>required_version = "&gt;= 1.8"</code> korlátja).</li>
+<li><a href="https://developer.hashicorp.com/terraform/docs">Terraform
+Documentation</a> – ugyanezek a fejezetek a Terraform 1.8-hoz; a két
+projekt eltérései a release notesban.</li>
+<li>Provider-viselkedés (<code>random_pet</code> logikai resource,
+<code>local_file</code> drift-kezelése, <code>aws_s3_bucket</code>,
+<code>aws_vpc_security_group_ingress_rule</code>): a <a
+href="https://registry.terraform.io/">Terraform Registry</a>
+<code>hashicorp/random</code> 3.6.x, <code>hashicorp/local</code> 2.5.x
+és <code>hashicorp/aws</code> 5.x dokumentációja.</li>
+<li><a href="https://docs.aws.amazon.com/">AWS Documentation</a> – az S3
+bucket és a security group fogalmai.</li>
+</ul>
+<p><strong>Ellenőrzési státusz:</strong> a 2. és 3. feladat helyi
+(<code>random</code>/<code>local</code> provideres) laborja és az
+S3-példa sikeres és drift-ága laborban ellenőrizendő; dátumozott
+futtatási napló (eszközverziókkal és parancskimenettel) még nem
+készült.</p>
+<p>A fenti hivatkozások a fejezet seed-forrásai; ebben a kérésben nem
+volt webes keresőeszköz, ezért tartalmukat nem ellenőriztem. A konkrét
+OpenTofu/Terraform stabil kiadások, a provider support matrix, az Ubuntu
+24.04 LTS-re telepíthető verziók és a HCL/state schema verziófájlok a
+labor futtatásakor a hivatalos dokumentációból ellenőrizendők. A
+példákban szereplő AWS erőforrások hipotetikusak; a tényleges
+futtatáshoz izolált sandbox fiók, credential és cost-ellenőrzés
+szükséges. A <code>terraform plan</code> és <code>terraform apply</code>
+kimenetek várt, illusztratív formában szerepelnek, nem tényleges
+futtatási eredmények.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d225.html">← 45.5 Cloud packet/storage/recovery labor</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d227.html">46.2 Remote state, locking és recovery →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

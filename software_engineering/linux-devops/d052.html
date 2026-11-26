@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>11.2 Journaling, CoW, checksum és recovery – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch11">11 Fájlrendszer-elmélet és Linux filesystem típusok</a></p>
+<div class="links"><a class="prev" rel="prev" href="d051.html">← 11.1 Path, inode, link és filesystem namespace</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d053.html">11.3 ext4 és XFS működés és tradeoff →</a></div>
+</nav>
+<h2 data-number="11.2" id="d052"><span
+class="header-section-number">11.2</span> Journaling, CoW, checksum és
+recovery</h2>
+<h3 data-number="11.2.1" id="motiváció-és-definíció"><span
+class="header-section-number">11.2.1</span> Motiváció és definíció</h3>
+<p>A <a href="d047.html">d047 írási és crash consistency</a> fejezetben
+láttuk, hogy az alkalmazás szintjén <code>fsync</code>-kel és
+<code>rename</code>-nel kell tartósságot elérni. A fájlrendszer azonban
+ezen túl saját belső metaadat-állapotát is konzisztensen kell tartsa
+áramszünet vagy kernelpánik esetén. Egy inode, egy directory entry, egy
+extent-lefoglalási tábla és egy szabad blokk bitkép együttesen több
+blokkon él; ha ezek közül csak néhányat írunk ki, akkor a fájlrendszer
+olyan állapotba kerülhet, amelyben például egy blokk lefoglalt, de már
+nem hivatkozik rá semmilyen fájl, vagy egy fájl mérete olyan adatblokkra
+mutat, amelyet még nem írtunk ki. A <strong>journaling</strong>
+(naplózás), a <strong>CoW (Copy-on-Write)</strong> tranzakciók és a
+<strong>checksum</strong> három különböző mechanizmus, amelyek más-más
+hibamód ellen védenek, és más teljesítmény-árral járnak.</p>
+<p><strong>Definíciók</strong>: - <strong>Journaling</strong>: a
+fájlrendszer a metaadat-változásokat (és opcionálisan az
+adatváltozásokat is) egy append-only naplóba írja, mielőtt a tényleges
+blokkokat módosítaná. Crash után a napló visszajátszásával a
+fájlrendszer metaadat-állapota konzisztenssé tehető. - <strong>CoW
+(Copy-on-Write)</strong>: a módosított blokkokat soha nem írjuk felül,
+hanem új helyre kerülnek; a régi blokkok addig megmaradnak, amíg a régi
+tranzakciót nem szabadítjuk fel. A tranzakció commitja a gyökérpointer
+atomi cseréje. - <strong>Checksum</strong>: minden metaadat- és
+adatblokkhoz számított ellenőrzőösszeg, amely lehetővé teszi a csendes
+adatromlás (silent data error) észlelését. - <strong>Scrub</strong>:
+háttérfolyamat, amely a teljes fájlrendszert végigolvassa, ellenőrzi a
+checksumokat, és redundancia esetén javítja a hibás blokkokat. -
+<strong>Snapshot</strong>: a fájlrendszer egy időpontra rögzített, csak
+olvasható nézete, amely CoW alapon osztozik a blokkokon. -
+<strong>Clone</strong>: írható példány egy snapshotból vagy egy másik
+alvolume-ból, szintén CoW alapon.</p>
+<p>A fenti fogalmak közül a journaling és a CoW elsősorban a
+<strong>crash consistency</strong> (összeomlás utáni konzisztencia), míg
+a checksum a <strong>torn write</strong> és a <strong>silent data
+error</strong> észlelésére szolgál. A kettő nem helyettesíti
+egymást.</p>
+<h3 data-number="11.2.2" id="metadata-versus-data-journal"><span
+class="header-section-number">11.2.2</span> Metadata versus data
+journal</h3>
+<p>A klasszikus journaling fájlrendszer, például az <code>ext4</code>, a
+<strong>write-ahead log</strong> (WAL) elvet követi: a tranzakció minden
+metaadat-blokkját először a journal területre írja, megvár egy flush-t,
+majd egy commit rekorddal lezárja (szintén flush/FUA-val). Csak a commit
+tartóssá válása után írja a blokkokat a valódi helyükre (checkpoint), és
+ezután szabadítja fel a journal területét. Crash esetén indításkor a
+kernel <strong>journal replay</strong> során megnézi, mely
+tranzakciókhoz van commit rekord, és ezeket (a még nem checkpointolt
+blokkjaikkal) újra alkalmazza a valódi blokkokra; a commit nélkülieket
+eldobja. A sorrend tehát: journal-írás → flush → commit → checkpoint →
+felszabadítás (ugyanez a <a href="d047.html">write, fsync, flush és
+crash consistency</a> alfejezet leírásával). Ez garantálja, hogy a
+metaadatok a commit után nem maradhatnak félkész állapotban.</p>
+<p>Az <code>ext4</code> három mount módot kínál:</p>
+<ul>
+<li><code>data=ordered</code> (alapértelmezett): csak metaadat kerül a
+journalba, de a módosított adatblokkokat a kernel a kapcsolódó
+metaadatblokkok kiírása <strong>előtt</strong> írja ki a helyükre. Így a
+commit után sosem fordulhat elő, hogy egy metaadatbejegyzés olyan
+adatblokkra mutat, amely még nem tartós. Az adatblokkok tartalma azonban
+nem feltétlenül atomi; ha az írás közben szakad meg, az adatblokk lehet
+régi vagy félig írt, de a metaadatok konzisztensek maradnak.</li>
+<li><code>data=journal</code>: az adatblokkok is bekerülnek a journalba,
+majd onnan a helyükre. Ezzel erősebb konzisztencia érhető el (az adat és
+metaadat egy tranzakcióban commitolt), de <strong>write
+amplification</strong>: minden adatblokk kétszer íródik – egyszer a
+journalba, egyszer a valódi helyére.</li>
+<li><code>data=writeback</code>: a rendezést nem garantálja; a metaadat
+commit előbb történhet, mint az adat kiírása. Crash után a metaadatok
+konzisztensek, de egy frissen megnövelt fájl vége régi szeméttartalmat
+mutathat. Ez a leggyorsabb, de a legkevésbé biztonságos.</li>
+</ul>
+<p>A <code>data=journal</code> mód tipikus felhasználása olyan
+alkalmazásoknál indokolt, ahol az adatblokk és a metaadatblokk közötti
+rendezés üzleti követelmény, és a dupla írás költsége elfogadható. A
+gyakorlatban a <code>data=ordered</code> a jó kompromisszum a legtöbb
+workloadhoz.</p>
+<h3 data-number="11.2.3"
+id="cow-transaction-és-write-amplification"><span
+class="header-section-number">11.2.3</span> CoW transaction és write
+amplification</h3>
+<p>A CoW alapú fájlrendszerek – mint a <strong>Btrfs</strong> és az
+<strong>OpenZFS</strong> – nem naplót írnak, hanem a <strong>soha ne írj
+felül</strong> elvet követik. Ha egy blokk módosul, a fájlrendszer
+beolvassa a régit, kiszámítja az újat, és egy <strong>új fizikai
+helyre</strong> írja; a régi blokk továbbra is a lemezen marad. A
+fájlrendszer gyökérpointere (a superblockban vagy a tree root-ban) az
+utolsó commit előtt a régi blokkokra mutat, a commit pedig úgy történik,
+hogy a gyökeret <strong>atomikusan</strong> cseréljük az új pointerre.
+Ez a commit egyetlen írás, amely után a fájlrendszer új állapota válik
+elérhetővé, a régi pedig inkonzisztens nélkül eldobható. Nincs szükség
+journal replay-re, mert a félig kész tranzakció blokkjai nem
+befolyásolják a korábbi konzisztens állapotot.</p>
+<p>A CoW természetes következménye a <strong>write
+amplification</strong>. Ha egy 4 KiB-os blokkon belül egyetlen bájtot
+módosítunk, a teljes blokkot újra kell írni. Ráadásul a CoW
+fájlrendszerek gyakran metaadat-tree-ket is CoW módon frissítenek, így
+egy kis írás több metaadatblokk újraírását is okozhatja. Ez különösen
+random kis írásoknál jelentős többlet I/O-hoz vezet. Cserébe a
+snapshotok és a clone-ok gyakorlatilag nulla másolással jönnek létre, és
+a régi blokkok megőrzése lehetővé teszi a konzisztens
+pillanatképeket.</p>
+<p>A write amplification mérése workload-függő: például egy 4 KiB random
+write <code>data=journal</code> ext4-en kétszer írja a blokkot (journal
++ data), míg Btrfs-en a blokk CoW-ja miatt a data blokk újraírása
+mellett a metadata tree frissítése is többlet írást generál, bár a Btrfs
+késleltetheti és összevonhatja a tranzakciókat.</p>
+<h3 data-number="11.2.4" id="checksum-és-scrub"><span
+class="header-section-number">11.2.4</span> Checksum és scrub</h3>
+<p>A hagyományos journaling fájlrendszerek nem számítanak checksumot az
+<strong>adatblokkokhoz</strong>; a metaadatokat viszont az ext4
+(<code>metadata_csum</code>, a mai e2fsprogs – így az Ubuntu 24.04
+<code>mkfs.ext4</code> – alapértelmezése; ellenőrzés:
+<code>dumpe2fs -h &lt;eszköz&gt; | grep features</code>) és az XFS v5 is
+checksummal védi. A CoW fájlrendszerek viszont minden metaadat- és
+adatblokkhoz ellenőrzőösszeget tárolnak (Btrfs: CRC32C, xxhash, SHA256,
+blake2; ZFS: Fletcher4, SHA256 stb.). Amikor a blokkot olvassák, a
+rendszer újraszámolja a checksumot, és összehasonlítja a tárolttal. Ha
+eltér, akkor a blokk <strong>corrupt</strong>.</p>
+<p>A <strong>scrub</strong> egy adminisztrátor által indítható folyamat,
+amely a teljes fájlrendszert végigolvassa, minden blokk checksumját
+ellenőrzi, és hibát jelent. Redundáns konfigurációban – például Btrfs
+RAID1, RAID10, ZFS mirror vagy RAIDZ – a scrub képes a hibás blokkot a
+jó másolatból újraírni. <strong>Checksum nélkül</strong> a scrub nem
+tudná azonosítani, hogy a blokk tartalma megsérült-e, mert az eszköz nem
+feltétlenül jelez hibát (silent data error). A checksum tehát az
+<strong>észleléshez</strong>, a redundancia pedig a
+<strong>javításhoz</strong> kell.</p>
+<p>Fontos különbség: a checksum a <strong>torn write</strong>-ot is
+észleli, mert ha egy blokk csak félig íródott ki, a tartalom nem a régi
+és nem is az új, így a checksum nem fog stimmelni. A CoW fájlrendszerek
+azonban a régi blokkot sosem írják felül, így a torn write legfeljebb a
+még nem commitolt új blokkokat rontja el; a régi, commitolt állapot ép
+marad.</p>
+<h3 data-number="11.2.5"
+id="crash-replay-versus-application-recovery"><span
+class="header-section-number">11.2.5</span> Crash replay versus
+application recovery</h3>
+<p>A journaling fájlrendszer crash után <strong>automatikusan</strong>
+visszajátssza a naplót a mount során. Ez a <strong>fájlrendszer szintű
+recovery</strong>: a metaadatok konzisztensek lesznek, a commitolt
+tranzakciók megmaradnak, a nem commitoltak elvesznek. Ez azonban nem
+oldja meg az <strong>alkalmazás logikai konzisztenciáját</strong>. Ha
+például egy adatbázis két <code>write()</code>-et adott ki, majd
+<code>fsync</code>-et, a fájlrendszer garantálja, hogy a
+<code>fsync</code> után mindkét adat a lemezen van, de ha az alkalmazás
+a második <code>write</code> előtt crash-elt, akkor az első írás megvan,
+a második nincs – ez üzleti szinten inkonzisztens lehet. Ezért az
+alkalmazásoknak saját <strong>application recovery</strong> mechanizmust
+kell alkalmazniuk, például adatbázis WAL-t, tranzakciós logot, vagy a <a
+href="d047.html">d047</a>-ben tárgyalt rename + <code>fsync</code>
+protokollt.</p>
+<p>A kulcsmondat: a fájlrendszer a saját struktúrájának konzisztenciáját
+garantálja, nem az alkalmazás adatmodelljének konzisztenciáját.</p>
+<h3 data-number="11.2.6" id="snapshot-és-clone"><span
+class="header-section-number">11.2.6</span> Snapshot és clone</h3>
+<p>A CoW fájlrendszerek egyik nagy előnye a <strong>snapshot</strong>
+(pillanatkép) és a <strong>clone</strong> (írható klón) olcsó
+létrehozása. A snapshot egy időpontra rögzített, <strong>csak
+olvasható</strong> nézet a fájlrendszerről. Létrehozásakor nem másolódik
+adat; a snapshot egyszerűen regisztrálja a jelenlegi gyökérpointert, és
+ezentúl a régi blokkokat mindaddig megőrzi, amíg a snapshot hivatkozik
+rájuk. Ha az eredeti fájlrendszerben módosítunk egy blokkot, a CoW miatt
+az új adat új blokkra kerül, a régi blokk a snapshot számára elérhető
+marad. A clone egy snapshotból készített <strong>írható</strong>
+alvolume (Btrfs terminológiával subvolume), amely ugyanígy CoW alapon
+osztozik a blokkokon; a clone-hoz tartozó írások nem érintik a szülő
+snapshotot.</p>
+<p>Fontos üzemeltetési tévedés, hogy a snapshot <strong>nem
+backup</strong>. Ha a fizikai tároló megsérül, vagy a fájlrendszer
+teljes területe elveszik, a snapshot is elveszik, mert ugyanazon a
+device-on él. A snapshot a logikai hibák (véletlen törlés, rossz deploy)
+ellen véd, de a fizikai meghibásodás ellen <strong>replikációra</strong>
+vagy külön médiára mentett backupra van szükség.</p>
+<h3 data-number="11.2.7"
+id="corruption-torn-write-és-silent-data-error"><span
+class="header-section-number">11.2.7</span> Corruption, torn write és
+silent data error</h3>
+<p>A <strong>corruption</strong> tág fogalom: bármely blokk tartalmának
+nem várt megváltozása. Ennek okai lehetnek:</p>
+<ul>
+<li><strong>Torn write</strong>: egy több szektorból álló blokk írása
+közben power loss; a blokk egy része az új, más része a régi adatot
+tartalmazza.</li>
+<li><strong>Silent data error</strong>: a tárolóeszköz hibás adatot ad
+vissza anélkül, hogy I/O hibát jelezne; például bitrot a lemezen,
+firmware hiba, kábelhiba, memóriahiba.</li>
+<li>Logikai hiba: például egy rossz kernelmodul vagy egy bugos
+alkalmazás felülír egy blokkot.</li>
+</ul>
+<p>A journaling a <strong>metaadatok</strong> torn write-ja ellen véd: a
+metaadatokat csak a journal commit után írjuk a valódi helyükre, és
+crash esetén a napló visszaállítja a konzisztens állapotot. Az
+adatblokkok torn write-ja ellen viszont a hagyományos journaling
+fájlrendszerek <strong>nem védenek</strong>, mert a data blokk checksum
+nélkül nem észlelhető. A CoW + checksum viszont minden blokkra kiterjedő
+védelmet nyújt az észlelésben, de a javításhoz redundancia
+szükséges.</p>
+<p>A <strong>silent data error</strong> az egyik legveszélyesebb hibamód
+a nagy tárolókban, mert a rendszer nem tud róla, és a hibás adat
+csendben terjedhet a backupokba is, ha ott nincs ellenőrzés. A checksum
+és a rendszeres scrub ennek a felderítésére szolgál.</p>
+<h3 data-number="11.2.8"
+id="kidolgozott-példa-btrfs-snapshot-clone-és-scrub-loopback-eszközön"><span
+class="header-section-number">11.2.8</span> Kidolgozott példa: Btrfs
+snapshot, clone és scrub loopback eszközön</h3>
+<p>Az alábbi példa egy izolált labVM-en fut, <code>labvm1</code>
+hostnéven, <code>labuser</code> felhasználóval (UID 1000). Célunk egy
+Btrfs fájlrendszer létrehozása loopback fájlon, snapshot és clone
+készítése, majd egy <code>scrub</code> futtatása egészséges állapotban.
+A példa <strong>nem</strong> szimulál corruptiont; azt a 3. feladatban
+tesszük meg.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost: labvm1, user: labuser (UID 1000)</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Előfeltétel: btrfs-progs telepítve, /tmp/lab-btrfs.img nem létezik</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co"># Futtatás: lab-btrfs.sh-ként mentve, `bash -eux lab-btrfs.sh` (interaktív</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="co"># shellben a `set -e` hibánál a teljes terminált bezárná)</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 2 GiB-os lab fájl létrehozása</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="fu">truncate</span> <span class="at">-s</span> 2G /tmp/lab-btrfs.img</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Btrfs formázás, label: lab-btrfs</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkfs.btrfs <span class="at">-f</span> <span class="at">-L</span> lab-btrfs /tmp/lab-btrfs.img</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="co"># Mount pointek létrehozása és mount loop eszközön</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkdir <span class="at">-p</span> /mnt/lab-btrfs</span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mount <span class="at">-o</span> loop /tmp/lab-btrfs.img /mnt/lab-btrfs</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="co"># Tulajdonos beállítása a labuser részére</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> chown labuser:labuser /mnt/lab-btrfs</span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="co"># Munkakönyvtár</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> /mnt/lab-btrfs</span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="co"># Kiinduló fájl</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;lab data v1&quot;</span> <span class="op">&gt;</span> file1.txt</span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a><span class="fu">sync</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a><span class="co"># Read-only snapshot készítése</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> btrfs subvolume snapshot <span class="at">-r</span> /mnt/lab-btrfs /mnt/lab-btrfs/snap1</span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a><span class="co"># Ellenőrzés: a snapshot tartalma</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> snap1/file1.txt   <span class="co"># várt: lab data v1</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a><span class="co"># Módosítás az eredeti fájlban; a snapshot nem változik</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;lab data v2&quot;</span> <span class="op">&gt;</span> file1.txt</span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a><span class="fu">sync</span></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a><span class="co"># Ellenőrzés: az eredeti új, a snapshot régi tartalmat mutat</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;original:&quot;</span><span class="kw">;</span> <span class="fu">cat</span> file1.txt      <span class="co"># lab data v2</span></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;snapshot:&quot;</span><span class="kw">;</span> <span class="fu">cat</span> snap1/file1.txt <span class="co"># lab data v1</span></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a><span class="co"># Írható clone készítése a snapshotból</span></span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> btrfs subvolume snapshot /mnt/lab-btrfs/snap1 /mnt/lab-btrfs/clone1</span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a><span class="co"># A clone-ba írás nem érinti a snapshotot</span></span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;clone modified&quot;</span> <span class="op">&gt;</span> clone1/file2.txt</span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true" tabindex="-1"></a><span class="fu">sync</span></span>
+<span id="cb1-40"><a href="#cb1-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-41"><a href="#cb1-41" aria-hidden="true" tabindex="-1"></a><span class="co"># Ellenőrzés: clone-ban megvan az új fájl, snapshotban nem</span></span>
+<span id="cb1-42"><a href="#cb1-42" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> clone1/        <span class="co"># file1.txt file2.txt</span></span>
+<span id="cb1-43"><a href="#cb1-43" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> snap1/         <span class="co"># file1.txt</span></span>
+<span id="cb1-44"><a href="#cb1-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-45"><a href="#cb1-45" aria-hidden="true" tabindex="-1"></a><span class="co"># Scrub futtatása (egészséges esetben nem talál hibát)</span></span>
+<span id="cb1-46"><a href="#cb1-46" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> btrfs scrub start <span class="at">-B</span> /mnt/lab-btrfs</span>
+<span id="cb1-47"><a href="#cb1-47" aria-hidden="true" tabindex="-1"></a><span class="co"># Várt kimenet összegzés: Scrub started, finished, no errors found.</span></span>
+<span id="cb1-48"><a href="#cb1-48" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-49"><a href="#cb1-49" aria-hidden="true" tabindex="-1"></a><span class="co"># Subvolume-ok listája (a top-level, ID 5 nem listázódik)</span></span>
+<span id="cb1-50"><a href="#cb1-50" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> btrfs subvolume list /mnt/lab-btrfs</span></code></pre></div>
+<p><strong>Várt kimenet és ellenőrzési feltétel</strong>: A
+<code>btrfs subvolume list</code> két subvolume-ot mutat
+(<code>path snap1</code> és <code>path clone1</code>); a top-level
+subvolume (ID 5) nem jelenik meg a listában. A <code>cat</code>
+parancsok bizonyítják a CoW snapshot viselkedést. A
+<code>btrfs scrub status /mnt/lab-btrfs</code> kimenetében
+<code>no errors found</code> szerepel.</p>
+<p><strong>Rollback</strong> (a mountpontból előbb ki kell lépni,
+különben az <code>umount</code> „target is busy” hibát ad):</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> umount /mnt/lab-btrfs</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">-f</span> /tmp/lab-btrfs.img</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rmdir /mnt/lab-btrfs</span></code></pre></div>
+<p><strong>Hibajelenség</strong>: Ha a <code>mount -o loop</code> azt
+írja, hogy <code>wrong fs type</code>, akkor a kernelben nincs Btrfs
+támogatás (a mounthoz a kernelmodul kell; a <code>btrfs-progs</code>
+hiánya már a <code>mkfs.btrfs</code>-nél kiderült volna). Ellenőrzés:
+<code>sudo dmesg | tail</code>, <code>modinfo btrfs</code>,
+<code>sudo modprobe btrfs</code>.</p>
+<h3 data-number="11.2.9" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">11.2.9</span> Tipikus hibák és
+ellenpróbák</h3>
+<ol type="1">
+<li><strong>„A journaling megvédi az adataimat.”</strong> Tévhit. A
+<code>data=ordered</code> vagy <code>data=writeback</code> ext4 crash
+után konzisztens metaadatokat ad, de a fájl tartalma lehet régebbi vagy
+félig írt, hacsak nem alkalmazott az alkalmazás <code>fsync</code>-et. A
+<code>data=journal</code> sem véd a silent data error ellen, csak a torn
+write ellen erősebb.</li>
+<li><strong>„A snapshot az backup.”</strong> A snapshot ugyanazon a
+fizikai device-on él, így nem véd a lemez meghibásodása, a pool szintű
+corruption vagy a véletlen törlés ellen, ha az egész fájlrendszert
+törlik. A backup mindig külön médiára vagy legalább egy másik rendszerre
+készül.</li>
+<li><strong>„A checksum javítja a hibás blokkokat.”</strong> A checksum
+csak észlel. A javításhoz redundancia kell (RAID, replica, másolat). Ha
+nincs redundancia, a scrub csak jelzi a hibát, és a blokk
+elveszett.</li>
+<li><strong>„A CoW fájlrendszernek nincs write amplification.”</strong>
+Valójában a CoW a kis módosításokat is teljes blokk újraírásra
+kényszeríti, és a metadata tree frissítés is többlet. Ezért a random
+write workloadokon a CoW fájlrendszerek teljesítménye elmaradhat a
+journaling ext4-től.</li>
+<li><strong>„A journal replay után az alkalmazásomnak nem kell
+recovery.”</strong> A fájlrendszer csak a saját
+metaadat-konzisztenciáját állítja helyre; az alkalmazás logikai
+tranzakcióit nem.</li>
+</ol>
+<h3 data-number="11.2.10" id="feladatok"><span
+class="header-section-number">11.2.10</span> Feladatok</h3>
+<h4 data-number="11.2.10.1" id="feladat-magyarázó"><span
+class="header-section-number">11.2.10.1</span> 1. Feladat
+(magyarázó)</h4>
+<p>Magyarázza el, mi a különbség az <code>ext4</code>
+<code>data=ordered</code>, <code>data=writeback</code> és
+<code>data=journal</code> mount módjai között crash consistency
+szempontból. Melyik mód növeli a write amplificationt, és miért?</p>
+<h4 data-number="11.2.10.2" id="feladat-adminisztrációs"><span
+class="header-section-number">11.2.10.2</span> 2. Feladat
+(adminisztrációs)</h4>
+<p>Hozzon létre egy 1 GiB-os loopback fájlt, formázza
+<code>ext4</code>-re, és mountolja a <code>/mnt/lab-ext4</code> pontra.
+Mérje meg a kis fájlok írási teljesítményét <code>data=ordered</code> és
+<code>data=journal</code> módban. Használjon <code>fio</code>-t vagy
+<code>dd</code>-t. Értelmezze az eredményt, különös tekintettel a write
+amplificationra. A mérés után távolítsa el a fájlrendszert.</p>
+<h4 data-number="11.2.10.3" id="feladat-diagnosztikafailure"><span
+class="header-section-number">11.2.10.3</span> 3. Feladat
+(diagnosztika/failure)</h4>
+<p>Hozzon létre egy Btrfs fájlrendszert loopback fájlon, és készítsen
+egy snapshotot egy adatfájlról. Szimuláljon corruptiont egy adatblokkban
+a device-on (például <code>dd</code>-vel felülír egy adott offsetet).
+Futtasson <code>btrfs scrub</code>-ot, és figyelje meg a hibajelentést.
+Magyarázza el, miért nem tudja a checksum automatikusan javítani a hibát
+csupán a fájlrendszer alapértelmezett single profile-ja esetén. Mi lenne
+a teendő a hiba javításához?</p>
+<h3 data-number="11.2.11" id="megoldások"><span
+class="header-section-number">11.2.11</span> Megoldások</h3>
+<h4 data-number="11.2.11.1" id="feladat-megoldása"><span
+class="header-section-number">11.2.11.1</span> 1. Feladat megoldása</h4>
+<ul>
+<li><code>data=writeback</code>: csak metaadat naplózva; nincs rendezés
+az adat és metaadat között. Crash után a metaadatok konzisztensek, de a
+frissen kiosztott blokkokban régi szeméttartalom lehet. Leggyorsabb,
+legkevésbé biztonságos.</li>
+<li><code>data=ordered</code>: az adatblokkokat a kernel a metaadatok
+előtt írja ki. Ezzel biztosított, hogy a commit után ne mutasson
+metaadat olyan adatblokkra, amely még nem tartós. Az adatblokk tartalma
+lehet félig írt, ha az írás közben szakadt meg, de a fájlméret pontosan
+tükrözi, mely blokkok érvényesek. Jó kompromisszum.</li>
+<li><code>data=journal</code>: az adatblokkok is a journalba kerülnek,
+majd onnan a helyükre. Ez dupla írást jelent (write amplification):
+minden adatblokk először a journalba, majd a valódi helyére íródik.
+Erősebb konzisztencia, de jelentős teljesítménycsökkenés. Postcondition:
+A hallgató pontosan meg tudja határozni, melyik módot milyen workloadhoz
+érdemes választani, és miért növeli a <code>data=journal</code> a write
+amplificationt.</li>
+</ul>
+<h4 data-number="11.2.11.2" id="feladat-megoldása-1"><span
+class="header-section-number">11.2.11.2</span> 2. Feladat megoldása</h4>
+<p>Példa parancsok. Az 1 GiB-os ext4-en a <code>mkfs</code> után kb. 973
+MiB szabad (a root-tartalékkal együtt); a <code>--numjobs=4</code> négy
+külön fájlt hoz létre, ezért jobonként 128 MiB (összesen 512 MiB) fér el
+biztonsággal. Az <code>--fsync=1</code> nélkül a buffered írás 30 s
+alatt jórészt a page cache sebességét mérné; a kettős írást az
+eszközszintű számláló (<code>lifetime_write_kbytes</code>) mutatja.
+(<code>O_DIRECT</code> <code>data=journal</code> mellett nem támogatott,
+ezért buffered + fsync a mérés.)</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost: labvm1, user: labuser, UID 1000</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">truncate</span> <span class="at">-s</span> 1G /tmp/lab-ext4.img</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkfs.ext4 <span class="at">-F</span> /tmp/lab-ext4.img</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkdir <span class="at">-p</span> /mnt/lab-ext4</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="fu">run_fio()</span> <span class="kw">{</span>   <span class="co"># $1: data= mód</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>  <span class="fu">sudo</span> mount <span class="at">-o</span> loop,data=<span class="st">&quot;</span><span class="va">$1</span><span class="st">&quot;</span> /tmp/lab-ext4.img /mnt/lab-ext4</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>  <span class="va">loopdev</span><span class="op">=</span><span class="va">$(</span><span class="ex">findmnt</span> <span class="at">-no</span> SOURCE /mnt/lab-ext4<span class="va">)</span>          <span class="co"># pl. /dev/loop3</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>  <span class="va">lw</span><span class="op">=</span>/sys/fs/ext4/<span class="va">$(</span><span class="fu">basename</span> <span class="st">&quot;</span><span class="va">$loopdev</span><span class="st">&quot;</span><span class="va">)</span>/lifetime_write_kbytes</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>  <span class="va">before</span><span class="op">=</span><span class="va">$(</span><span class="fu">cat</span> <span class="st">&quot;</span><span class="va">$lw</span><span class="st">&quot;</span><span class="va">)</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>  <span class="fu">sudo</span> fio <span class="at">--name</span><span class="op">=</span>small-write <span class="at">--directory</span><span class="op">=</span>/mnt/lab-ext4 <span class="dt">\</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="at">--rw</span><span class="op">=</span>randwrite <span class="at">--bs</span><span class="op">=</span>4k <span class="at">--size</span><span class="op">=</span>128M <span class="at">--numjobs</span><span class="op">=</span>4 <span class="at">--fsync</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="at">--runtime</span><span class="op">=</span>30 <span class="at">--time_based</span> <span class="at">--group_reporting</span> <span class="dt">\</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    <span class="at">--output-format</span><span class="op">=</span>json <span class="at">--output</span><span class="op">=</span><span class="st">&quot;/tmp/lab-fio-</span><span class="va">$1</span><span class="st">.json&quot;</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>  <span class="bu">echo</span> <span class="st">&quot;</span><span class="va">$1</span><span class="st">: eszközre írt KiB: </span><span class="va">$((</span> <span class="va">$(</span><span class="fu">cat</span> <span class="st">&quot;</span><span class="va">$lw</span><span class="st">&quot;</span><span class="va">)</span> <span class="op">-</span> <span class="va">before</span> <span class="va">))</span><span class="st">&quot;</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>  <span class="fu">sudo</span> rm <span class="at">-f</span> /mnt/lab-ext4/small-write.<span class="pp">*</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>  <span class="fu">sudo</span> umount /mnt/lab-ext4</span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a><span class="kw">}</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a><span class="ex">run_fio</span> ordered</span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a><span class="ex">run_fio</span> journal</span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a><span class="ex">jq</span> <span class="st">&#39;.jobs[0].write | {iops, kib: .io_kbytes}&#39;</span> /tmp/lab-fio-<span class="pp">*</span>.json</span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a><span class="co"># rollback</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">-f</span> /tmp/lab-ext4.img /tmp/lab-fio-ordered.json /tmp/lab-fio-journal.json</span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rmdir /mnt/lab-ext4</span></code></pre></div>
+<p>A mérés várhatóan azt mutatja, hogy <code>data=journal</code> módban
+a write IOPS és átvitel alacsonyabb, mint <code>data=ordered</code>
+módban, és a <code>lifetime_write_kbytes</code> növekménye a fio által
+kiírt adat (<code>io_kbytes</code>) kb. kétszerese (journal + végleges
+hely), míg <code>data=ordered</code> módban közel egyszerese (plusz a
+metaadat-journal). A pontos számok a lab hardverétől függenek; a feladat
+célja a tendencia felismerése, nem egy abszolút benchmark.
+Postcondition: A hallgató képes reprodukálni a mount módok közötti
+teljesítmény- és write-amplification-különbséget, és mérési
+jegyzőkönyvet készíteni; az image és a mountpont törölve.</p>
+<h4 data-number="11.2.11.3" id="feladat-megoldása-2"><span
+class="header-section-number">11.2.11.3</span> 3. Feladat megoldása</h4>
+<p>A Btrfs létrehozás és snapshot ugyanúgy történik, mint a kidolgozott
+példában. A corruption szimulálásához meg kell találni egy adatblokk
+helyét a backing image-ben. Két buktató van: a <code>filefrag -v</code>
+<code>physical_offset</code> oszlopa fájlrendszer-blokkban (4096 B) van,
+nem bájtban; és Btrfs-en ez a szám a Btrfs <strong>logikai</strong>
+címtere (a chunk-leképezés előtt), nem az image bájtoffsete. A
+logikai→fizikai leképezést a <code>btrfs-map-logical</code> végzi. A
+<code>dd</code> csak a lecsatolt fájlrendszer alá írhat. Ha rossz helyre
+írnánk (superblock, metaadat-chunk), a fájlrendszer mountolhatatlanná
+válhat – ezért csak a dedikált lab-image-en dolgozunk.</p>
+<p>Példa lépések (a fájl a Btrfs subvolume-ban, nem a snapshotban; a
+fájl nem tömörített, a CoW nincs kikapcsolva):</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost: labvm1, user: labuser; csak a /tmp/lab-btrfs.img lab-image-en!</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">dd</span> if=/dev/urandom of=/mnt/lab-btrfs/datafile bs=1M count=100</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sync</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="va">loopdev</span><span class="op">=</span><span class="va">$(</span><span class="ex">losetup</span> <span class="at">-j</span> /tmp/lab-btrfs.img <span class="kw">|</span> <span class="fu">cut</span> <span class="at">-d:</span> <span class="at">-f1</span><span class="va">)</span>   <span class="co"># pl. /dev/loop4</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="co"># az első extent logikai kezdőblokkja (4 KiB-os blokkban)</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="va">L</span><span class="op">=</span><span class="va">$(</span><span class="fu">sudo</span> filefrag <span class="at">-v</span> /mnt/lab-btrfs/datafile <span class="dt">\</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">|</span> <span class="fu">awk</span> <span class="st">&#39;/^ *0:/{print $4}&#39;</span> <span class="kw">|</span> <span class="fu">tr</span> <span class="at">-d</span> .<span class="va">)</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="co"># logikai bájtcím -&gt; fizikai bájtoffset az eszközön (= az image-ben)</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="va">PHYS</span><span class="op">=</span><span class="va">$(</span><span class="fu">sudo</span> btrfs-map-logical <span class="at">-l</span> <span class="va">$((L</span> <span class="op">*</span> <span class="dv">4096</span><span class="va">))</span> <span class="st">&quot;</span><span class="va">$loopdev</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">|</span> <span class="fu">awk</span> <span class="st">&#39;/physical/{for (i = 1; i &lt;= NF; i++)</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="st">                        if ($i == &quot;physical&quot;) {print $(i + 1); exit}}&#39;</span><span class="va">)</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;logikai=</span><span class="va">$((L</span> <span class="op">*</span> <span class="dv">4096</span><span class="va">))</span><span class="st"> fizikai=</span><span class="va">$PHYS</span><span class="st">&quot;</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~</span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> umount /mnt/lab-btrfs</span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="co"># egy 4 KiB-os blokk felülírása zajjal a fizikai offseten</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="fu">dd</span> if=/dev/urandom of=/tmp/lab-btrfs.img bs=4096 count=1 <span class="dt">\</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>   seek=<span class="va">$((PHYS</span> <span class="op">/</span> <span class="dv">4096</span><span class="va">))</span> conv=notrunc</span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mount <span class="at">-o</span> loop /tmp/lab-btrfs.img /mnt/lab-btrfs</span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> btrfs scrub start <span class="at">-B</span> /mnt/lab-btrfs</span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> btrfs device stats /mnt/lab-btrfs</span></code></pre></div>
+<p>A scrub ekkor adat-checksum hibát jelez (<code>csum</code> hiba, a
+kernelnaplóban <code>csum failed</code>), nem metaadat- vagy
+superblock-hibát. A checksum észleli a corruptiont, de az adat
+<strong>single profile</strong> esetén egy példányban van, így a blokk
+nem javítható; a scrub javíthatatlan (uncorrectable) hibát mutat, és a
+fájl érintett részének olvasása EIO-t ad.</p>
+<p>A snapshot itt nem segít: a változatlan fájl blokkjait a snapshot
+ugyanazon a fizikai helyen osztja meg (CoW), ezért a snapshotban is
+ugyanaz a blokk sérült. A javítás útjai: redundáns profil
+(<code>-d raid1</code> két eszközzel, vagy egy eszközön
+<code>-d dup</code>) esetén a scrub a jó másolatból automatikusan javít;
+single profilnál a fájlt külső backupból kell visszaállítani (például
+<code>cp --reflink=never</code> a backupból, majd scrub-ellenőrzés). A
+<code>btrfs restore</code> csak mountolhatatlan fájlrendszerből való
+offline fájlkimentésre, a <code>btrfs replace</code> eszközcserére
+szolgál – egyik sem javítja a sérült blokkot.</p>
+<p>Cleanup:
+<code>cd ~; sudo umount /mnt/lab-btrfs; rm -f /tmp/lab-btrfs.img; sudo rmdir /mnt/lab-btrfs</code>.
+Postcondition: A hallgató látja a checksum észlelési képességét, és
+megérti, hogy a javításhoz redundanciára vagy külön backupra van
+szükség.</p>
+<h3 data-number="11.2.12" id="rövid-összefoglaló"><span
+class="header-section-number">11.2.12</span> Rövid összefoglaló</h3>
+<p>A journaling, a CoW és a checksum három különböző konzisztencia- és
+hibavédelmi mechanizmus. A journaling a metaadatok crash utáni
+konzisztenciáját biztosítja napló-visszajátszással;
+<code>data=journal</code> módban az adatokat is naplózza, de write
+amplificationt okoz. A CoW tranzakciók a régi blokkokat nem írják felül,
+így atomi commitot adnak, és olcsó snapshotot tesznek lehetővé, de
+szintén write amplificationt hoznak. A checksum a torn write-ot és a
+silent data error-t észleli, de a javításhoz redundancia kell. Az
+alkalmazásoknak a fájlrendszer szintű recovery felett saját logikai
+recovery-re is szükségük van.</p>
+<p><strong>Továbbhasznált definíciók</strong>: -
+<strong>Journaling</strong>: append-only napló, amely a
+metaadat-változásokat (opcionálisan adatot is) a valódi írás előtt
+rögzíti, és crash után visszajátszható. - <strong>CoW
+(Copy-on-Write)</strong>: a blokkokat soha nem írjuk felül, hanem új
+helyre kerülnek; a commit a gyökérpointer atomi cseréje. -
+<strong>Checksum + scrub</strong>: blokkonkénti ellenőrzőösszeg tárolása
+és a teljes fájlrendszer időszakos átvizsgálása a csendes adatromlás
+észlelésére és redundancia esetén javítására.</p>
+<h3 data-number="11.2.13" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">11.2.13</span> Források és ellenőrzési
+hiányok</h3>
+<p>A fejezethez megadott kiindulópontok:</p>
+<ul>
+<li><a href="https://docs.kernel.org/">Linux kernel
+documentation</a></li>
+<li><a href="https://man7.org/linux/man-pages/">man7.org Linux man
+pages</a></li>
+<li><a href="https://openzfs.github.io/openzfs-docs/">OpenZFS
+documentation</a></li>
+<li><a href="https://btrfs.readthedocs.io/">Btrfs documentation</a></li>
+</ul>
+<p>Állításonkénti forrásindex (viszonyítási pont: Ubuntu Server 24.04
+LTS, 6.8-as GA kernel, a 24.04 e2fsprogs- és btrfs-progs-csomagja):</p>
+<ul>
+<li>ext4 journal (JBD2), <code>data=</code> módok,
+<code>metadata_csum</code>:
+https://docs.kernel.org/filesystems/ext4/index.html;
+https://docs.kernel.org/admin-guide/ext4.html (mount opciók,
+<code>/sys/fs/ext4/&lt;dev&gt;/lifetime_write_kbytes</code>).</li>
+<li>Btrfs scrub, checksum algoritmusok, profilok (single/dup/raid1),
+<code>btrfs-map-logical</code>, <code>restore</code>,
+<code>replace</code>: https://btrfs.readthedocs.io/en/latest/ – „Scrub”,
+„Checksumming”, „Profiles”, „btrfs-map-logical”, „btrfs-restore”,
+„btrfs-replace” oldalak.</li>
+<li><code>filefrag(8)</code>:
+https://man7.org/linux/man-pages/man8/filefrag.8.html;
+<code>losetup(8)</code>:
+https://man7.org/linux/man-pages/man8/losetup.8.html.</li>
+<li>fio (<code>fsync</code>, <code>numjobs</code>,
+<code>output-format</code>):
+https://fio.readthedocs.io/en/latest/fio_doc.html.</li>
+</ul>
+<p>A példák laborban ellenőrizendők; dátumozott futtatási napló
+(verziók, scrub-kimenet egészséges és sérült ágon, fio JSON) még nem
+készült.</p>
+<p>Ezeket a forrásokat a generálás során nem tekintem olvasottnak vagy
+ellenőrzöttnek. A fenti állítások a stabil POSIX/Linux és
+fájlrendszer-elméleti alapokra támaszkodnak, de a konkrét
+<code>ext4</code> mount opciók, Btrfs parancsok és kernel verziók pontos
+viselkedése verziófüggő. A gyakorlati felhasználás előtt ellenőrizni
+kell a cél kernel (jelen profil: Ubuntu Server 24.04 LTS) és a
+telepített <code>btrfs-progs</code>, <code>e2fsprogs</code> verziójának
+dokumentációját. A lab parancsok futtatása nélkül a mérési értékeket és
+a scrub kimeneteket nem állíthatjuk ténylegesnek; a bemutatott kimenetek
+illusztratívak.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d051.html">← 11.1 Path, inode, link és filesystem namespace</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d053.html">11.3 ext4 és XFS működés és tradeoff →</a></div>
+</nav>
+</body>
+</html>

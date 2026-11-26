@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>18.4 LUKS/dm-crypt és kulcs-életciklus – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch18">18 Block device, partition, LVM és titkosítás adminisztrációja</a></p>
+<div class="links"><a class="prev" rel="prev" href="d088.html">← 18.3 md RAID, multipath és degraded állapot</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d090.html">18.5 Storage bővítés, hiba és recovery labor →</a></div>
+</nav>
+<h2 data-number="18.4" id="d089"><span
+class="header-section-number">18.4</span> LUKS/dm-crypt és
+kulcs-életciklus</h2>
+<p>A nyugalmi állapotú adatok titkosítását akkor lehet üzemeltetni, ha a
+hozzáférés, a visszaállítás és az automatikus provisioning külön
+szerződésként, nem pedig egyetlen jelszóként kezeljük. Egy szenior
+fejlesztő gyakran úgy gondol a titkosításra, mint egy kriptográfiai
+transzformációra. A Linux blokkos tárolásban azonban a kérdés nem csak
+az, hogy milyen algoritmus védi az adatot, hanem az is, hogy a
+kulcsokhoz ki férhet, mi történik bootkor, és mi a visszaút, ha a header
+vagy a jelszó elveszik. A fejezet ezt a működtetési szerződést tanítja
+LUKS/dm-crypt alapon.</p>
+<h3 data-number="18.4.1" id="definíció-és-működés"><span
+class="header-section-number">18.4.1</span> Definíció és működés</h3>
+<p>A <strong>dm-crypt</strong> a kernel device-mapper keretrendszerének
+egyik célmodulja (<code>crypt target</code>). Az alkalmazás vagy
+fájlrendszer blokk-I/O-kéréseket küld egy
+<code>/dev/mapper/&lt;név&gt;</code> eszköznek, a dm-crypt ezeket
+titkosítja, mielőtt továbbadná a mögöttes blokkeszköznek. A dm-crypt
+önmagában nem tárolja a titkosítási metaadatot; a kulcsok és a
+slotszerkezet a felette lévő formátum feladata.</p>
+<p>A <strong>LUKS</strong> (Linux Unified Key Setup) ezt a metaadatot
+valósítja meg. A jelenlegi <strong>LUKS2</strong> formátum fejléce
+tartalmazza a titkosítási paramétereket, a <strong>keyslot</strong>okat,
+a digeste ket, és opcionálisan tokeneket. A tényleges adatokat egy
+mesterkulcs (<strong>volume key</strong>) védi; ezt a mesterkulcsot a
+keyslotokban tárolt, jelszóval vagy kulcsfájllal védett kulcsok nyitják.
+A LUKS2 alapesetben argon2id <strong>KDF</strong>-et használ, amely
+lassítja a brute force támadást. A feloldás során a megadott
+passphrase-ből a KDF keyslot-kulcsot számít, azzal dekódolja a
+mesterkulcsot, és a dm-crypt ezt a mesterkulcsot kapja meg.</p>
+<p>A <strong>header backup</strong> a LUKS-fejléc másolata. A fejléc
+nélkül a keyslotok és a titkosított mesterkulcs elérhetetlenek, így a
+teljes adat elveszik. A header backup tehát nem az adatmentést
+helyettesíti, hanem a kulcshozzáférés metaadatának visszaállítását teszi
+lehetővé.</p>
+<p>A működtetés szempontjából három fázist érdemes megkülönböztetni:</p>
+<ul>
+<li><strong>Provisioning:</strong> a titkosított eszköz létrehozása, a
+kezdeti passphrase és a kulcsfájlok elhelyezése, valamint a boot-időbeni
+automatikus mapping beírása.</li>
+<li><strong>Access:</strong> a futó rendszeren történő
+<code>cryptsetup open</code>, a kulcsfájlok jogosultsága, a mountpoint
+hozzáférés és a naplózott adminisztráció.</li>
+<li><strong>Recovery:</strong> a fejléc-visszaállítás, a recovery kulcs,
+a keyslotok rotációja és a mentésből való visszatöltés.</li>
+</ul>
+<p>A tanulási cél az, hogy e három fázis mindegyikére dokumentált
+válaszunk legyen.</p>
+<h3 data-number="18.4.2" id="kidolgozott-példa"><span
+class="header-section-number">18.4.2</span> Kidolgozott példa</h3>
+<p>A példa a <code>labvm01</code> nevű, Ubuntu Server 24.04 LTS
+labhoston fut. A labadmin (<code>UID 1100</code>) <code>sudo</code>
+jogosultsággal rendelkezik. A dispozíciós labdisk
+<code>ata-LAB_CRYPT_01</code> by-id linken érhető el, rajta nincs
+szükséges állapot. A későbbi mapping neve <code>lab-crypt-data</code>, a
+kulcsfájl <code>/etc/lab-crypt/data.key</code>, a mountpoint
+<code>/mnt/lab-crypt-data</code>.</p>
+<p>Előfeltétel: a labdisk üres, és a <code>d088</code> fejezetből nincs
+rajta RAID vagy multipath. A <code>luksFormat</code> destruktív: csak a
+labor eldobható adatlemezén fut, előtte VM-pillanatkép készül, éles
+diszken soha.</p>
+<p>Első lépés a jelenlegi állapot ellenőrzése. A <code>FSTYPE</code>
+hiánya önmagában nem bizonyítja, hogy a lemez üres vagy nem használt,
+ezért a serialt, a méretet, a mountokat, a holdereket és a szignatúrákat
+is ellenőrizzük, a végén kézi megerősítéssel:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, user: labadmin (UID 1100), privilege: sudo</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Előfeltétel: a labdisk by-id link létezik és nincs fontos adat rajta</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="va">DISK</span><span class="op">=</span>/dev/disk/by-id/ata-LAB_CRYPT_01</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="va">DEV</span><span class="op">=</span><span class="va">$(</span><span class="fu">readlink</span> <span class="at">-f</span> <span class="st">&quot;</span><span class="va">$DISK</span><span class="st">&quot;</span><span class="va">)</span><span class="kw">;</span> <span class="bu">echo</span> <span class="st">&quot;</span><span class="va">$DISK</span><span class="st"> -&gt; </span><span class="va">$DEV</span><span class="st">&quot;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="co"># serial és méret az inventoryval összevetve (a SIZE bájtban)</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="ex">lsblk</span> <span class="at">-dn</span> <span class="at">-b</span> <span class="at">-o</span> NAME,SERIAL,SIZE,WWN,TYPE <span class="st">&quot;</span><span class="va">$DEV</span><span class="st">&quot;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> blockdev <span class="at">--getsize64</span> <span class="st">&quot;</span><span class="va">$DEV</span><span class="st">&quot;</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="co"># nincs partíció, mount, holder, swap</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="ex">lsblk</span> <span class="at">-o</span> NAME,FSTYPE,MOUNTPOINTS <span class="st">&quot;</span><span class="va">$DEV</span><span class="st">&quot;</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="ex">findmnt</span> <span class="at">--source</span> <span class="st">&quot;</span><span class="va">$DEV</span><span class="st">&quot;</span><span class="kw">;</span> <span class="fu">ls</span> /sys/class/block/<span class="st">&quot;</span><span class="va">${DEV</span><span class="op">#</span>/dev/<span class="va">}</span><span class="st">&quot;</span>/holders/</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="ex">swapon</span> <span class="at">--show</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="co"># szignatúrák keresése módosítás nélkül (-n = no-act)</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> wipefs <span class="at">-n</span> <span class="st">&quot;</span><span class="va">$DEV</span><span class="st">&quot;</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> file <span class="at">-s</span> <span class="st">&quot;</span><span class="va">$DEV</span><span class="st">&quot;</span></span></code></pre></div>
+<p>Várt: a serial és a méret egyezik a labor inventoryjában rögzítettel,
+az <code>lsblk</code> nem mutat gyermekeszközt, a <code>findmnt</code>,
+a holders-lista és a <code>swapon</code> nem említi az eszközt, a
+<code>wipefs -n</code> üres, a <code>file -s</code> <code>data</code>-t
+ad. Ha bármelyik eltér, megállunk. A formázás előtt kézi megerősítést
+kérünk:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="bu">read</span> <span class="at">-r</span> <span class="at">-p</span> <span class="st">&quot;A torlendo lemez serialja: &quot;</span> <span class="va">ans</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="bu">[</span> <span class="st">&quot;</span><span class="va">$ans</span><span class="st">&quot;</span> <span class="ot">=</span> <span class="st">&quot;LAB_CRYPT_01&quot;</span> <span class="bu">]</span> <span class="kw">||</span> <span class="bu">echo</span> <span class="st">&quot;STOP: nem egyezik, ne formazd&quot;</span></span></code></pre></div>
+<p>A formázást interaktív passphrase-szel kezdeményezzük. A labban ez a
+<strong>recovery passphrase</strong> (slot 0; éles rendszerben offline
+tárolandó), a dummy értéke <code>lab-passphrase-1</code>, amit nem
+parancssori argumentumban adunk át.</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Módosító parancs: LUKS2 formátum létrehozása</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cryptsetup luksFormat <span class="at">--type</span> luks2 <span class="at">--pbkdf</span> argon2id <span class="dt">\</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--label</span> lab-crypt-data /dev/disk/by-id/ata-LAB_CRYPT_01</span></code></pre></div>
+<p>A <code>cryptsetup</code> kétszer kéri a jelszót. Utána létrehozzuk a
+kulcsfájlt és hozzáadjuk második keyslotként (slot 1):</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> install <span class="at">-d</span> <span class="at">-m</span> 700 /etc/lab-crypt</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> sh <span class="at">-c</span> <span class="st">&#39;umask 077; dd if=/dev/urandom \</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="st">  of=/etc/lab-crypt/data.key bs=32 count=1 status=none&#39;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cryptsetup luksAddKey /dev/disk/by-id/ata-LAB_CRYPT_01 <span class="dt">\</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>  /etc/lab-crypt/data.key</span></code></pre></div>
+<p>A <code>luksAddKey</code> előbb bekéri az érvényes passphrase-t, majd
+beírja a kulcsfájlt a következő szabad keyslotba. A header backup és a
+kulcsfájl jogosultsága:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cryptsetup luksHeaderBackup /dev/disk/by-id/ata-LAB_CRYPT_01 <span class="dt">\</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--header-backup-file</span> /etc/lab-crypt/data.header</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> chmod 600 /etc/lab-crypt/data.header</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> chown root:root /etc/lab-crypt/data.header</span></code></pre></div>
+<p>A header backupot nem a titkosított volume-on belül tároljuk, hanem a
+root filerendszeren. A mapping megnyitása a kulcsfájllal:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cryptsetup open <span class="at">--type</span> luks /dev/disk/by-id/ata-LAB_CRYPT_01 <span class="dt">\</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>  lab-crypt-data <span class="at">--key-file</span> /etc/lab-crypt/data.key</span></code></pre></div>
+<p>Ellenőrizzük a mappinget:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-l</span> /dev/mapper/lab-crypt-data</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cryptsetup status lab-crypt-data</span></code></pre></div>
+<p>A fájlrendszer elkészítése és mountolása:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkfs.ext4 <span class="at">-m</span> 0 <span class="at">-L</span> lab-crypt-data /dev/mapper/lab-crypt-data</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkdir <span class="at">-p</span> /mnt/lab-crypt-data</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mount <span class="at">-o</span> nodev,nosuid /dev/mapper/lab-crypt-data /mnt/lab-crypt-data</span></code></pre></div>
+<p>Az integritás-fixture: egy determinisztikus tesztfájl és az
+ellenőrzőösszege, amelyet a köteten kívül tárolunk (a 3. feladat erre
+épül):</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> dd if=/dev/urandom of=/mnt/lab-crypt-data/lab-probe bs=1M count=8 <span class="dt">\</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>  status=none</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sha256sum</span> /mnt/lab-crypt-data/lab-probe <span class="kw">|</span> <span class="fu">sudo</span> tee /etc/lab-crypt/probe.sha256</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sync</span></span></code></pre></div>
+<p>A <code>/etc/crypttab</code> bejegyzése automatikus feloldást ad a
+boot után. Az UUID-t a tényleges labkörnyezetből kell kiolvasni:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cryptsetup luksUUID /dev/disk/by-id/ata-LAB_CRYPT_01</span></code></pre></div>
+<p>A crypttab a következő példa szerint néz ki; az itt szereplő UUID
+illusztratív placeholder:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode ini"><code class="sourceCode ini"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># /etc/crypttab – &lt;név&gt; &lt;eszköz&gt; &lt;kulcs&gt; &lt;opciók&gt;, egy sorban;</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="co"># a &lt;LUKS-UUID&gt; helyére a luksUUID kimenete kerül</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="dt">lab-crypt-data UUID</span><span class="ot">=</span><span class="st">&lt;LUKS-UUID&gt; /etc/lab-crypt/data.key luks,nofail</span></span></code></pre></div>
+<p>A crypttab nem ismer sorfolytatást, ezért a bejegyzés egyetlen sor
+marad.</p>
+<p>A <code>nofail</code> opció azt jelenti, hogy ha a lemez nem
+elérhető, a boot ne akadjon fenn, miközben a függő mountok
+szabályozottan kimaradnak. A systemd a crypttabot egy
+<strong>systemd-cryptsetup@</strong> unitra fordítja le, amely a
+<code>cryptsetup open</code>-t hívja meg. Az automatikus feloldás
+azonban csak a mappinget hozza létre, a fájlrendszert nem mountolja:
+ehhez külön, a fájlrendszer UUID-jára (nem a LUKS UUID-ra) hivatkozó
+fstab-bejegyzés kell. A systemd a <code>/dev/mapper/…</code> és az
+UUID-alapú forrás alapján a mount unitot automatikusan a
+<code>systemd-cryptsetup@lab-crypt-data.service</code> után rendezi:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># a fájlrendszer UUID-ja (a feloldott mapping tartalma)</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="va">FSUUID</span><span class="op">=</span><span class="va">$(</span><span class="fu">sudo</span> blkid <span class="at">-s</span> UUID <span class="at">-o</span> value /dev/mapper/lab-crypt-data<span class="va">)</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;UUID=</span><span class="va">$FSUUID</span><span class="st"> /mnt/lab-crypt-data ext4 nodev,nosuid,nofail 0 2&quot;</span> <span class="dt">\</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>  <span class="kw">|</span> <span class="fu">sudo</span> tee <span class="at">-a</span> /etc/fstab</span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> findmnt <span class="at">--verify</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl daemon-reload</span></code></pre></div>
+<p>A labhoston a crypttab és az fstab beolvasása után az alábbi módon
+ellenőrizhetők a generált unitok és a függőségük:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> status systemd-cryptsetup@lab-crypt-data.service</span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="va">U</span><span class="op">=</span><span class="va">$(</span><span class="ex">systemd-escape</span> <span class="at">-p</span> <span class="at">--suffix</span><span class="op">=</span>mount /mnt/lab-crypt-data<span class="va">)</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> status <span class="st">&quot;</span><span class="va">$U</span><span class="st">&quot;</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> list-dependencies <span class="st">&quot;</span><span class="va">$U</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="fu">grep</span> cryptsetup</span></code></pre></div>
+<p>Elérhetetlenségi teszt (csak VM-ben): a labdisket a hipervizorban
+leválasztva és a VM-et újraindítva a boot a <code>nofail</code> miatt
+nem esik emergency módba; a
+<code>systemd-cryptsetup@lab-crypt-data.service</code> és a mount unit
+<code>inactive</code>/<code>failed</code>, a rendszer többi része fut. A
+lemez visszacsatolása után a reboot ismét feloldja és mountolja a
+kötetet.</p>
+<p>Ha a volume a root filerendszeren van, vagy initramfsban kell
+feloldani, a <code>cryptsetup-initramfs</code> csomagot és a crypttab
+<code>initramfs</code> opcióját is használnunk kell. Ebben a példában a
+labdisk adatlemez, ezért elegendő a host boot utáni mapping.</p>
+<p><strong>Fenyegetési modell.</strong> Ez a labor a boot-automatizálást
+tanítja, nem teljes nyugalmi védelmet. A kulcsfájl
+(<code>/etc/lab-crypt/data.key</code>) a titkosítatlan root
+fájlrendszeren van: ha a host és az adatlemez együtt kerül illetéktelen
+kézbe, a támadó a kulcsfájllal feloldja a kötetet. Ez a konfiguráció
+csak az adatlemez <em>önálló</em> elvesztése vagy selejtezése ellen véd.
+Teljes host-szintű nyugalmi védelemhez a root fájlrendszert is
+titkosítani kell, és a kulcsot a hoston kívül kell tartani vagy
+hardverhez kötni: TPM+PCR
+(<code>systemd-cryptenroll --tpm2-device</code>), FIDO2-token, hálózati
+feloldás (Clevis/Tang) vagy külső KMS; a recovery passphrase mindegyik
+mellett offline marad.</p>
+<h3 data-number="18.4.3" id="automatikus-feloldás-és-trust-chain"><span
+class="header-section-number">18.4.3</span> Automatikus feloldás és
+trust chain</h3>
+<p>Az automatikus feloldásnál a kulcsfájl nem az egyetlen lehetséges
+módszer. A <strong>TPM</strong>-alapú feloldás során a rendszer a
+platform állapotát mérő PCR-értékekhez köti a LUKS-kulcsot. Az Ubuntu
+24.04 <code>systemd-cryptenroll</code> parancsa támogatja a TPM2- és
+FIDO2-tokent, de a labor virtuális gépén TPM nem feltétlenül érhető el.
+Illusztratív parancs, amelyet csak TPM-mel rendelkező környezetben
+szabad futtatni:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemd-cryptenroll <span class="at">--tpm2-device</span><span class="op">=</span>auto <span class="at">--tpm2-pcrs</span><span class="op">=</span>0+7 <span class="dt">\</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a>  /dev/disk/by-id/ata-LAB_CRYPT_01</span></code></pre></div>
+<p>A trust chain ebben az esetben a firmware-től indul: Secure Boot
+betölti a shim-et, az a boot loadert, majd a kernelt és az initrd-t; a
+lépések mérései különböző PCR-ekbe kerülnek. A
+<code>man systemd-cryptenroll</code> PCR-táblázata szerint a PCR 0 a
+firmware-kódot (platform-code), a PCR 7 a Secure Boot policyt/állapotot
+(secure-boot-policy) méri; a boot loader és a kernel image a PCR 4-be
+(boot-loader-code), systemd-stub esetén a kernel boot a PCR 11-be kerül
+(GRUB a parancssort és a betöltött fájlokat a PCR 8/9-be méri). PCR 0+7
+kötésnél tehát a TPM Secure Boot-kikapcsolás, db/dbx-csere vagy
+firmware-frissítés esetén tagadja meg a kulcsot; az ugyanazzal a
+kulccsal aláírt kernel/initrd frissítése ezeket nem változtatja, a kulcs
+kiadódik. Kernel/initrd-kötéshez további PCR-ek (pl. 4, 9, 11) kellenek,
+de ezek minden frissítésnél újraregisztrálást igényelnek. Ezt a működést
+karbantartási szempontból úgy kell kezelni, hogy mindig legyen egy
+offline <strong>recovery key</strong>, amelyet a TPM-policy nem köt.</p>
+<p>A távon történő feloldásra a <strong>Clevis/Tang</strong> kombináció
+használható. A <code>clevis luks bind</code> egy Tang-szerveren
+publikált, állandó kulccsal titkosítja a LUKS-kulcsot, így a gép
+újraindulás után a hálózati szerverről oldhatja fel a volume-ot. Ennek a
+trust chainje a Tang-szerver elérhetőségét és a hálózati path
+integritását is magában foglalja, ezért a recovery kulcs itt is
+elengedhetetlen.</p>
+<h3 data-number="18.4.4" id="kulcs-életciklus"><span
+class="header-section-number">18.4.4</span> Kulcs-életciklus</h3>
+<p>A LUKS-kulcsok menedzsmentje a következő műveleteket jelenti:</p>
+<ul>
+<li><strong>Enrollment:</strong> új passphrase vagy kulcsfájl hozzáadása
+keyslotba: <code>cryptsetup luksAddKey</code>.</li>
+<li><strong>Listázás:</strong> a slotszerkezet ellenőrzése:
+<code>cryptsetup luksDump</code>.</li>
+<li><strong>Revocation:</strong> egy keyslot eltávolítása:
+<code>cryptsetup luksRemoveKey</code> vagy
+<code>luksKillSlot</code>.</li>
+<li><strong>Rotation:</strong> a jelszóváltás gyakorlatilag egy új
+passphrase felvétele, majd a régi keyslot törlése.</li>
+</ul>
+<p>A mesterkulcs rotációja külön fogalom. A passphrase rotation nem
+változtatja a mesterkulcsot, csak a fejlécben lévő kulcsbecsomagolást
+cseréli. Ha a mesterkulcs is megismert lehetett, akkor a
+<code>cryptsetup reencrypt</code> használható, de ez hosszadalmas
+adat-újratitkosítást igényel. A labpéldában a passphrase rotation
+elegendő a kulcs-hozzáférés cseréjéhez.</p>
+<h3 data-number="18.4.5" id="hibák-és-ellenpróbák"><span
+class="header-section-number">18.4.5</span> Hibák és ellenpróbák</h3>
+<p><strong>A header backup a titkosított köteten van.</strong> Ha a
+fejléc megsérül, a backupot ugyanarról a lemezről nem lehet elérni. A
+headert külön, off-host vagy legalább másik fizikai eszközön kell
+tárolni. A labban a root filerendszeren elfogadható, de éles rendszerben
+dokumentálni kell a másolat helyét.</p>
+<p><strong>A kulcsfájl a titkosított köteten van.</strong> A boot
+folyamat nem tudja feloldani a volume-ot, mert a kulcsot tartalmazó fájl
+maga is a lezárt adaton található. Az ilyen konfiguráció önzáróvá
+válik.</p>
+<p><strong>A crypttabban hiányzik a <code>nofail</code>.</strong> Ha a
+lemez nem elérhető, a systemd-cryptsetup unit időtúllépésre futhat, és a
+boot az emergency targetbe esik. A <code>nofail</code> nem rejti el a
+hibát, de szabályozottá teszi a kiesést.</p>
+<p><strong>A TPM PCR-értékeket túl szűken rögzítették.</strong> Ha a
+policy a 0+7 mellé kernel- vagy initrd-mérést (pl. PCR 4, 9, 11) is köt,
+kernelfrissítés vagy boot konfigurációváltozás után a TPM nem adja ki a
+kulcsot (0+7 kötésnél ezt firmware-frissítés vagy Secure Boot-változás
+okozza), és a rendszer nem tud automatikusan feloldani. A recovery kulcs
+nélkül ilyenkor az adatok zárolva maradnak.</p>
+<p><strong>A titkosítást backupnak vagy hozzáférés-szabályozásnak
+nézik.</strong> A LUKS nem ad vissza törölt fájlokat, és nem állítja meg
+a feltört, feloldott rendszeren a rosszindulatú olvasást. A titkosítás
+célja a nyugalmi állapotú adatok védelme, ha a fizikai médium
+illetéktelenül kerül ki a rendszerből.</p>
+<h3 data-number="18.4.6" id="feladatok"><span
+class="header-section-number">18.4.6</span> Feladatok</h3>
+<ol type="1">
+<li><p><strong>Magyarázó feladat.</strong> Írja le egy LUKS2-alapú
+adatvolume-hoz az access, recovery és provision szerződés fő elemeit.
+TPM-alapú automatikus feloldásnál azonosítsa a trust chain minden
+pontját, és jelölje, melyik pontnál van szükség offline recovery
+kulcsra.</p></li>
+<li><p><strong>Adminisztrációs feladat.</strong> A <code>labvm01</code>
+hoston hozzon létre egy LUKS2 volumet a <code>ata-LAB_CRYPT_01</code>
+labdisken. A <code>luksFormat</code> passphrase-e legyen a recovery
+passphrase (offline tárolandó, a labban <code>lab-passphrase-1</code>);
+adjon hozzá egy <code>/etc/lab-crypt/data.key</code> kulcsfájlt.
+Készítsen header backupot, nyissa meg a mappinget, hozzon létre ext4
+fájlrendszert, mountolja <code>/mnt/lab-crypt-data</code> alá, és írja
+be a crypttab- és fstab-bejegyzést. Ellenőrizze, hogy a
+<code>cryptsetup luksDump</code> pontosan két keyslotot (0: recovery
+passphrase, 1: kulcsfájl) mutat, és a header backup fájl
+létezik.</p></li>
+<li><p><strong>Diagnosztikai/recovery feladat.</strong> Szimulálja a
+LUKS-fejléc elvesztését egy eldobható loopback-képfájlon (vagy
+VM-pillanatkép után, lezárt kötettel): hozzon létre rajta LUKS2 kötetet
+recovery passphrase-szel, írjon rá tesztfájlt és rögzítse az
+ellenőrzőösszegét, készítsen header backupot, zárja le a kötetet, majd
+írja felül az első 16 MiB-ot véletlenszerű adattal. Állítsa vissza a
+fejlécet a header backupból, a recovery passphrase-szel nyissa meg a
+volume-ot, és igazolja checksummal, hogy a tesztfájl sértetlen.</p></li>
+</ol>
+<h3 data-number="18.4.7" id="megoldások"><span
+class="header-section-number">18.4.7</span> Megoldások</h3>
+<ol type="1">
+<li><p>Az access szerződés rögzíti, ki és milyen hoston férhet a
+feloldott volume-hoz, milyen mount opciók és POSIX jogosultságok
+érvényesek, és hogyan naplózódik az unlock. A recovery szerződés rögzíti
+a header backup helyét, a recovery kulcs tárolását, a
+<code>cryptsetup luksDump</code> slotlistát és a visszaállítási tesztet.
+A provision szerződés rögzíti a volume létrehozásának paramétereit
+(<code>--type luks2</code>, argon2id, kulcsfájl), a crypttab bejegyzést
+és az initramfs-igényt. A TPM trust chain: firmware (PCR 0); Secure Boot
+policy (PCR 7); shim és boot loader; kernel/initrd (0+7 kötésnél nem
+mért, csak PCR 4/9/11 kötésnél); TPM PCR 0+7; a TPM által tárolt policy;
+a LUKS keyslotot felnyitó TPM token; végül a dm-crypt mapping. Bármelyik
+mért láncszem változása megtagadhatja az automatikus feloldást, ezért a
+recovery kulcsot offline, a TPM-től függetlenül tároljuk.</p></li>
+<li><p>A kidolgozott példa parancsai adják a megoldást: a
+<code>luksFormat</code> passphrase-e a recovery passphrase (slot 0,
+<code>lab-passphrase-1</code>), a <code>luksAddKey</code> a kulcsfájlt
+veszi fel (slot 1); további passphrase-t nem adunk hozzá, különben három
+slot lenne. Ellenőrzés:</p></li>
+</ol>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cryptsetup luksDump /dev/disk/by-id/ata-LAB_CRYPT_01 <span class="dt">\</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a>  <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-cE</span> <span class="st">&#39;^\s+[0-9]+: luks2&#39;</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> ls <span class="at">-l</span> /etc/lab-crypt/data.header /etc/lab-crypt/data.key</span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cryptsetup status lab-crypt-data</span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a><span class="ex">findmnt</span> /mnt/lab-crypt-data</span></code></pre></div>
+<p>Postcondition: a <code>grep -c</code> értéke <code>2</code> (slot 0
+és 1), a mapping <code>lab-crypt-data</code> aktív, a fájlrendszer
+mountolva van, a crypttab és az fstab bejegyzését a systemd generator
+elfogadta
+(<code>systemctl status systemd-cryptsetup@lab-crypt-data.service</code>).</p>
+<ol start="3" type="1">
+<li>A header sérülését kizárólag eldobható loopback-képfájlon
+gyakoroljuk, soha nem élő, felcsatolt kötet alatti eszközön. Az
+állapotgép: fixture → sync, umount, close → header backup → kontrollált
+károsítás → restore → open → fsck → mount → checksum.</li>
+</ol>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, labadmin, sudo; csak eldobható képfájl</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="fu">truncate</span> <span class="at">-s</span> 256M /var/tmp/lab-luks.img</span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="va">LOOP</span><span class="op">=</span><span class="va">$(</span><span class="fu">sudo</span> losetup <span class="at">--find</span> <span class="at">--show</span> /var/tmp/lab-luks.img<span class="va">)</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a><span class="co"># recovery passphrase: lab-passphrase-1 (interaktív)</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cryptsetup luksFormat <span class="at">--type</span> luks2 <span class="st">&quot;</span><span class="va">$LOOP</span><span class="st">&quot;</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cryptsetup open <span class="st">&quot;</span><span class="va">$LOOP</span><span class="st">&quot;</span> lab-luks-test</span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkfs.ext4 <span class="at">-q</span> /dev/mapper/lab-luks-test</span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkdir <span class="at">-p</span> /mnt/lab-luks-test</span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mount /dev/mapper/lab-luks-test /mnt/lab-luks-test</span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a><span class="co"># fixture: tesztfájl és checksum a köteten kívül</span></span>
+<span id="cb16-11"><a href="#cb16-11" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> dd if=/dev/urandom of=/mnt/lab-luks-test/lab-probe bs=1M count=8 <span class="dt">\</span></span>
+<span id="cb16-12"><a href="#cb16-12" aria-hidden="true" tabindex="-1"></a>  status=none</span>
+<span id="cb16-13"><a href="#cb16-13" aria-hidden="true" tabindex="-1"></a><span class="fu">sha256sum</span> /mnt/lab-luks-test/lab-probe <span class="op">&gt;</span> /var/tmp/lab-probe.sha256</span>
+<span id="cb16-14"><a href="#cb16-14" aria-hidden="true" tabindex="-1"></a><span class="co"># lezárás a károsítás előtt</span></span>
+<span id="cb16-15"><a href="#cb16-15" aria-hidden="true" tabindex="-1"></a><span class="fu">sync</span></span>
+<span id="cb16-16"><a href="#cb16-16" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> umount /mnt/lab-luks-test</span>
+<span id="cb16-17"><a href="#cb16-17" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cryptsetup close lab-luks-test</span>
+<span id="cb16-18"><a href="#cb16-18" aria-hidden="true" tabindex="-1"></a><span class="co"># header backup a köteten kívülre</span></span>
+<span id="cb16-19"><a href="#cb16-19" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cryptsetup luksHeaderBackup <span class="st">&quot;</span><span class="va">$LOOP</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb16-20"><a href="#cb16-20" aria-hidden="true" tabindex="-1"></a>  <span class="at">--header-backup-file</span> /var/tmp/lab-luks.header</span>
+<span id="cb16-21"><a href="#cb16-21" aria-hidden="true" tabindex="-1"></a><span class="co"># kontrollált károsítás: a LUKS2 header (alapból 16 MiB) felülírása</span></span>
+<span id="cb16-22"><a href="#cb16-22" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> dd if=/dev/urandom of=<span class="st">&quot;</span><span class="va">$LOOP</span><span class="st">&quot;</span> bs=1M count=16 conv=fsync status=none</span>
+<span id="cb16-23"><a href="#cb16-23" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cryptsetup luksDump <span class="st">&quot;</span><span class="va">$LOOP</span><span class="st">&quot;</span>   <span class="co"># várt: hiba, nem LUKS eszköz</span></span>
+<span id="cb16-24"><a href="#cb16-24" aria-hidden="true" tabindex="-1"></a><span class="co"># visszaállítás és megnyitás a recovery passphrase-szel</span></span>
+<span id="cb16-25"><a href="#cb16-25" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cryptsetup luksHeaderRestore <span class="st">&quot;</span><span class="va">$LOOP</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb16-26"><a href="#cb16-26" aria-hidden="true" tabindex="-1"></a>  <span class="at">--header-backup-file</span> /var/tmp/lab-luks.header</span>
+<span id="cb16-27"><a href="#cb16-27" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cryptsetup open <span class="st">&quot;</span><span class="va">$LOOP</span><span class="st">&quot;</span> lab-luks-test</span>
+<span id="cb16-28"><a href="#cb16-28" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> fsck.ext4 <span class="at">-n</span> /dev/mapper/lab-luks-test</span>
+<span id="cb16-29"><a href="#cb16-29" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mount /dev/mapper/lab-luks-test /mnt/lab-luks-test</span>
+<span id="cb16-30"><a href="#cb16-30" aria-hidden="true" tabindex="-1"></a><span class="fu">sha256sum</span> <span class="at">-c</span> /var/tmp/lab-probe.sha256</span></code></pre></div>
+<p>Postcondition: a károsítás után a <code>luksDump</code> hibát ad, a
+visszaállított header <code>luksDump</code>-pal olvasható, a recovery
+passphrase-szel a mapping létrejön, az <code>fsck -n</code> nem talál
+hibát, és a <code>sha256sum -c</code> <code>OK</code>-t ad. Takarítás:
+<code>sudo umount /mnt/lab-luks-test; sudo cryptsetup close lab-luks-test; sudo losetup -d "$LOOP"</code>,
+a képfájl és a header backup a scratch helyre mozgatható. Ha a
+gyakorlatot mégis a <code>ata-LAB_CRYPT_01</code> labdisken végezzük,
+előtte VM-pillanatkép kell, és a <code>lab-crypt-data</code> mappinget
+le kell zárni (<code>umount</code>, <code>cryptsetup close</code>) –
+nyitott fájlrendszer alatt az alapeszközt nyersen írni tilos.</p>
+<h3 data-number="18.4.8" id="rövid-összefoglaló"><span
+class="header-section-number">18.4.8</span> Rövid összefoglaló</h3>
+<p>A LUKS2/dm-crypt egy blokkos réteget ad a nyugalmi állapotú adatok
+védelmére: a dm-crypt a kernelben titkosítja az I/O-t, a LUKS2 fejléc
+pedig a keyslotokban tárolja a jelszóval védett mesterkulcsot. Az
+üzemeltetés során a provisioning, az access és a recovery külön
+szerződés; a header backup és a recovery key a kulcsvisszaállítás
+feltételeit rögzíti. Az automatikus feloldás trust chainje a
+firmware-től a TPM-ig terjed, és minden változásnál a recovery kulcs
+biztosít visszautat. A titkosítás nem helyettesíti a mentést, és nem
+hozzáférés-szabályozás.</p>
+<p>Továbbhasznált definíciók: <strong>LUKS2</strong> — keyslotokkal
+rendelkező, jelszavas kulcskezelő fejléc a dm-crypt felett;
+<strong>dm-crypt mapping</strong> — device-mapper crypt target által
+létrehozott <code>/dev/mapper/&lt;név&gt;</code> eszköz;
+<strong>recovery key</strong> — olyan, offline tárolt passphrase vagy
+kulcsfájl, amely független a boot-time trust chain-től.</p>
+<h3 data-number="18.4.9" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">18.4.9</span> Források és ellenőrzési
+hiányok</h3>
+<p>Állításonkénti forrásindex (hivatkozott verzió: Ubuntu Server 24.04
+LTS <code>cryptsetup</code> 2.7-es sorozat és systemd 255; a pontos
+verziót a labhoston <code>cryptsetup --version</code> és
+<code>systemctl --version</code> rögzíti):</p>
+<ul>
+<li><a
+href="https://man7.org/linux/man-pages/man8/cryptsetup.8.html">cryptsetup(8)</a>
+– <code>luksFormat</code>, <code>luksAddKey</code>,
+<code>luksDump</code>,
+<code>luksHeaderBackup</code>/<code>luksHeaderRestore</code>,
+<code>open</code>/<code>close</code>, <code>reencrypt</code>.</li>
+<li><a
+href="https://gitlab.com/cryptsetup/cryptsetup/-/wikis/home">cryptsetup
+wiki</a> – LUKS2 on-disk formátum, keyslotok, header-méret.</li>
+<li><a
+href="https://docs.kernel.org/admin-guide/device-mapper/dm-crypt.html">Linux
+kernel: dm-crypt</a> – a crypt target.</li>
+<li><a
+href="https://www.freedesktop.org/software/systemd/man/latest/crypttab.html">crypttab(5)</a>
+és <a
+href="https://www.freedesktop.org/software/systemd/man/latest/systemd-cryptsetup-generator.html">systemd-cryptsetup-generator(8)</a>
+– crypttab-mezők, <code>nofail</code>, generált unitok.</li>
+<li><a
+href="https://www.freedesktop.org/software/systemd/man/latest/systemd.mount.html">systemd.mount(5)</a>
+– fstab-alapú mount unitok, <code>nofail</code>, függőségek.</li>
+<li><a
+href="https://www.freedesktop.org/software/systemd/man/latest/systemd-cryptenroll.html">systemd-cryptenroll(1)</a>
+– TPM2/FIDO2 enrollment és a PCR-táblázat.</li>
+</ul>
+<p>Ellenőrzési hiány: a példák laborban ellenőrizendők; dátumozott
+reprodukciós napló (tool <code>--version</code>, sikeres és hibás ág
+kimenete) még nem készült. Egyéb nyitott pontok: a
+<code>systemd-cryptenroll</code> TPM paraméterei, a Clevis/Tang és a TPM
+support az Ubuntu 24.04 laborban, a
+<code>cryptsetup luksHeaderRestore</code> pontos viselkedése sérült
+header esetén, valamint a labVM által ténylegesen látható by-id link
+neve. A fejezet nem állítja, hogy a példa TPM- vagy Tang-műveletei a
+labban elérhetők; ezeket a megfelelő hardveres vagy hálózati trust
+anchor megléte nélkül nem lehet ellenőrizni.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d088.html">← 18.3 md RAID, multipath és degraded állapot</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d090.html">18.5 Storage bővítés, hiba és recovery labor →</a></div>
+</nav>
+</body>
+</html>

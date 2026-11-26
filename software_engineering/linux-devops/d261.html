@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>53.1 Database kapcsolatok, resource és health – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch53">53 Database, cache és messaging működtetése</a></p>
+<div class="links"><a class="prev" rel="prev" href="d260.html">← 52.5 Supply-chain és secret incident labor</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d262.html">53.2 Replication, failover, backup és PITR →</a></div>
+</nav>
+<h2 data-number="53.1" id="d261"><span
+class="header-section-number">53.1</span> Database kapcsolatok, resource
+és health</h2>
+<h3 data-number="53.1.1" id="motiváció-és-működtetési-feladat"><span
+class="header-section-number">53.1.1</span> Motiváció és működtetési
+feladat</h3>
+<p>Egy szenior C++ fejlesztő számára az adatbázis gyakran „fekete
+doboz”: a szerveroldali kód kiad egy SQL lekérdezést, majd valamilyen
+későbbi időpontban választ kap. A Linux/DevOps rendszerszemléletben
+azonban a PostgreSQL-szolgáltatás nem egyetlen komponens, hanem
+<strong>több rétegen átívelő adatút</strong>, amelyben a
+kapcsolatfelvétel, a tranzakció, a lock, a memória és a storage mind
+saját latency- és erőforrásköltséggel rendelkezik. Amikor egy C++
+alkalmazás p95 latency romlását tapasztalja, a hiba lehet a
+TCP-kapcsolat felépítésében, a connection pool kimerülésében, egy nem
+indexelt lekérdezésben, lock-várakozásban vagy éppen a WAL flush
+lassúságában. A d261 alfejezet célja, hogy ezeket a rétegeket egy
+referencia PostgreSQL-szolgáltatáson működtetési szempontból láttassa:
+ne csak a DB belső állapotát, hanem az OS/network/storage jeleket is
+együtt kezeljük.</p>
+<p><strong>Előfeltételek:</strong> izolált labVM (például Ubuntu Server
+24.04 LTS), telepített PostgreSQL (a pontos verziót az apt release
+rögzíti; itt illusztrációként <code>postgresql</code> és
+<code>postgresql-contrib</code> csomagok), root vagy sudo jogosultság a
+rendszerbeállításokhoz, valamint a d047 alfejezetben tárgyalt
+<code>fsync</code>/dirty page és a d223 storage fogalmai. A példákban a
+labhost neve <code>labhost01</code>, a lab database <code>lab_db</code>,
+az alkalmazás role <code>lab_app</code>.</p>
+<h3 data-number="53.1.2" id="definíciók-és-scope"><span
+class="header-section-number">53.1.2</span> Definíciók és scope</h3>
+<ul>
+<li><strong>Database latency</strong> alatt a kliens oldaláról mért
+teljes válaszidőt értjük, amely felbontható: connection establishment +
+query planning/execution + lock wait + storage I/O + hálózati oda-vissza
+idő. E rétegek mindegyike külön mérhető, és eltérő diagnosztikai
+paranccsal figyelhető.</li>
+<li><strong>Connection pool/limit</strong> egy olyan
+erőforrásgazdálkodási korlát, amely meghatározza, hány egyidejű
+háttérfolyamatot (backend) indít a PostgreSQL, és ebből mennyit
+használhat egy alkalmazás. A pool célja a process-indítási költség
+elkerülése és a DB memória védelme.</li>
+<li><strong>Working set</strong> a gyakran elért adat- és indexoldalak
+halmaza. Ha ez nem fér a <code>shared_buffers</code> és az OS page cache
+együttes méretébe, a lekérdezések fizikai blokkiolvasásra kényszerülnek,
+ami nagyságrendi latency növekedést okoz.</li>
+<li><strong>WAL (Write-Ahead Log)</strong> a tranzakciók redo
+rekordjainak folyamatos naplója; a commit tartóssága a WAL
+<code>fsync</code>-jén múlik, nem közvetlenül a data file kiírásán.</li>
+</ul>
+<p>A Database latency rétegeinek időbeli helyét az alábbi ábra mutatja:
+a kliens által mért végponti időből csak a <code>PQexec</code> hívás
+ideje tartalmazza a szerveroldali végrehajtást, a lock-várakozást és az
+I/O-t.</p>
+<figure id="fig-d261-latency-timeline">
+<div class="fig-interactive"><iframe src="figures/html/d261-latency-timeline.html" title="Idővonal 0-tól 120 ms-ig; az első 100 ms DNS, pool-várakozás és kapcsolatfelvétel, az utolsó 20 ms a PQexec, benne parse, végrehajtás és I/O." loading="lazy" style="width:100%;border:0;height:520px"></iframe><noscript><img src="figures/img/d261-latency-timeline.png" style="width:95.0%"
+alt="Idővonal 0-tól 120 ms-ig; az első 100 ms DNS, pool-várakozás és kapcsolatfelvétel, az utolsó 20 ms a PQexec, benne parse, végrehajtás és I/O." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d261-latency-timeline.png" style="width:95.0%"
+alt="Idővonal 0-tól 120 ms-ig; az első 100 ms DNS, pool-várakozás és kapcsolatfelvétel, az utolsó 20 ms a PQexec, benne parse, végrehajtás és I/O." /></details></div>
+<figcaption>Kliensoldali DB-latency felbontása (számított,
+illusztratív): a PQexec-en kívüli 100 ms DNS, pool-várakozás,
+kapcsolatfelvétel és alkalmazásmunka, nem lehet lock wait vagy storage
+I/O; a lock wait és az I/O a 20 ms-os PQexec kereten belül
+van</figcaption>
+</figure>
+<p>A scope itt egyetlen PostgreSQL instance működtetése:
+kapcsolatkezelés, erőforráskorlát, tranzakciós lockok, memória, WAL,
+hitelesítés/TLS és telemetria. Nem tárgyaljuk a replikációt, failovert
+vagy backupot (későbbi alfejezetekben), és nem tanítunk SQL-t vagy C++
+szintaxist.</p>
+<h3 data-number="53.1.3" id="rétegek-és-operatív-következmények"><span
+class="header-section-number">53.1.3</span> Rétegek és operatív
+következmények</h3>
+<h4 data-number="53.1.3.1" id="kapcsolat-pool-limit-és-timeout"><span
+class="header-section-number">53.1.3.1</span> Kapcsolat, pool, limit és
+timeout</h4>
+<p>A PostgreSQL process-modellt használ: a <code>postmaster</code>
+főfolyamat minden klienskapcsolathoz egy-egy backend process-t indít
+(<code>fork</code>). Ezért minden új kapcsolat drága: memória (kb. 5–10
+MiB privát terület kapcsolatonként), process-létrehozás, authentikáció
+és TCP handshake. A <code>superuser_reserved_connections</code> néhány
+külön slotot tart fenn adminisztrációnak, ezért egy alkalmazáspool
+kimerülése nem zárja ki a diagnosztikát. Egy nem szuperuser kliens ezért
+már a <code>max_connections - superuser_reserved_connections</code>
+határon hibát kap:
+<code>FATAL: remaining connection slots are reserved for roles with the SUPERUSER attribute</code>
+(PostgreSQL 16 szövege; a pontos üzenetet a telepített verzió logjából
+kell rögzíteni). A <code>FATAL: sorry, too many clients already</code>
+akkor jelenik meg, ha a fenntartott slotok is elfogytak, például
+szuperuser kapcsolatoknál.</p>
+<p>Működtetési gyakorlat: alkalmazás és DB közé
+<strong>PgBouncer</strong> (transaction mode connection pooler)
+ajánlott, mert így az alkalmazás sok kliensét kevés valódi PostgreSQL
+backend szolgálja ki, a process-per-connection modell hátrányai nélkül.
+Korlát: transaction módban a kliens tranzakciónként más
+szerver-backendet kaphat, ezért a session-szintű állapot
+(<code>SET</code>, session advisory lock, <code>LISTEN</code>, temp
+table, prepared statement – utóbbit a PgBouncer 1.21+ a
+<code>max_prepared_statements</code> beállítással protokollszinten
+kezeli) nem marad meg tranzakciók között. Ha az alkalmazás ilyet használ
+(például <code>PQprepare</code>-t vagy session-szintű
+<code>SET statement_timeout</code>-ot), session mode vagy
+alkalmazásoldali pool kell; a pontos képességet a telepített
+PgBouncer-verzió dokumentációjából kell ellenőrizni. Időtúllépéseket a
+<code>statement_timeout</code> (egy SQL utasítás maximális futásideje),
+a <code>connect_timeout</code> (kliens oldali kapcsolódási timeout) és
+az <code>idle_in_transaction_session_timeout</code> (nyitott
+tranzakcióban tétlenül álló session lelövése) szabályoz. Ha egy C++
+szolgáltatás RAII-vezérelt tranzakciója elfelejti a
+<code>COMMIT</code>-et, az utóbbi timeout nélkül hosszú ideig lockot
+tarthat.</p>
+<h4 data-number="53.1.3.2"
+id="tranzakció-lock-isolation-operatív-következményei"><span
+class="header-section-number">53.1.3.2</span> Tranzakció, lock,
+isolation operatív következményei</h4>
+<p>A PostgreSQL alapértelmezett izolációs szintje <strong>Read
+Committed</strong>. Minden <code>UPDATE</code>/<code>DELETE</code> a
+táblán <code>RowExclusiveLock</code> módot szerez (ez táblaszintű,
+egymással kompatibilis lock mód), az érintett sorokon pedig sorszintű
+zárat (ez a sor fejlécében tárolódik, nem
+<code>RowExclusiveLock</code>-ként látszik a <code>pg_locks</code>-ban).
+Ha egy másik tranzakció már zárolta a sort, a várakozó a zároló
+tranzakció ID-jére vár: <code>wait_event_type = 'Lock'</code>,
+<code>wait_event = 'transactionid'</code>. A hosszú
+<code>idle in transaction</code> a sorzárral más írókat blokkol, a régi
+snapshotjával (<code>backend_xmin</code>) pedig visszatartja a VACUUM
+takarítását: a halott sorverziók nem távolíthatók el, ami bloatot okoz.
+A <strong>deadlock</strong> (kölcsönös várakozás) a PostgreSQL által
+automatikusan felismerésre kerül, és az egyik tranzakció
+<code>ERROR: deadlock detected</code> hibával visszagördül. A
+<code>log_lock_waits = on</code> bekapcsolása naplózza a
+lockvárakozásokat; a <code>deadlock_timeout</code> alapértelmezetten 1
+s.</p>
+<p>Működtetési nézet: a <code>pg_stat_activity</code> <code>state</code>
+oszlopa (<code>active</code>, <code>idle</code>,
+<code>idle in transaction</code>,
+<code>idle in transaction (aborted)</code>, ritkábban
+<code>fastpath function call</code>, <code>disabled</code>) és a
+<code>wait_event</code> írja le, hogy a process éppen CPU-n fut, I/O-ra
+vár, lockra vár, vagy nincs teendője. A hibadiagnosztika ezért itt
+kezdődik, nem az alkalmazás logjában.</p>
+<h4 data-number="53.1.3.3" id="query-index-és-working-set-memória"><span
+class="header-section-number">53.1.3.3</span> Query, index és working
+set memória</h4>
+<p>A PostgreSQL memóriahasználata három fő részből áll: a
+<strong>shared_buffers</strong> (a DB saját page cache-e, általában a
+RAM 25%-a), az OS <strong>page cache</strong> (a fájlok bufferelt
+olvasása), és a <strong>work_mem</strong> (egy rendezési vagy hash
+plan-csomópont felső korlátja; egy lekérdezés több ilyen csomópontot és
+parallel workert is használhat, a hash-műveletek a
+<code>hash_mem_multiplier</code>-rel – PG15+ alapérték 2.0 – szorzott
+keretig). Durva felső becslés:
+<code>max_connections × (csomópontok/lekérdezés) × work_mem</code>,
+ezért a <code>work_mem</code>-et a <code>max_connections</code>-szel
+együtt kell budgetelni. A query tervező akkor választ sequential scan-t,
+ha az index nem szelektív, vagy ha a költségbecslés szerint kevesebb
+I/O-t igényel. A <code>work_mem</code> túl alacsony értéke külső sort
+eredményez (<code>external merge</code>, temp file a
+<code>pgsql_tmp</code> alatt), ami felesleges lemez I/O-t és latency-t
+hoz be. A working set mérete akkor optimális, ha a gyakran olvasott
+adatok a shared_buffers-ben találhatók; ezt a
+<code>pg_stat_database.blks_hit</code> és <code>blks_read</code>
+arányával mérjük. Ha a <code>blks_hit</code> aránya 99% alatt van, az OS
+page cache és a shared_buffers mérete felülvizsgálandó.</p>
+<h4 data-number="53.1.3.4" id="wal-checkpoint-és-fsync-adatút"><span
+class="header-section-number">53.1.3.4</span> WAL, checkpoint és fsync
+adatút</h4>
+<p>A commit tranzakció a WAL-ba írja a redo rekordot, majd a
+<code>synchronous_commit = on</code> esetén a
+<code>wal_sync_method</code> (gyakran <code>fdatasync</code>) kiírja a
+WAL fájlt a storage-ra. A data file-ok csak később, a
+<strong>checkpoint</strong> során frissülnek. A
+<code>checkpoint_timeout</code> (alapértelmezetten 5 perc) és a
+<code>max_wal_size</code> szabályozza, milyen gyakran fut a checkpoint.
+Ha a storage fsync latency magas (például write cache nem védett power
+loss ellen), a commit latency minden tranzakciónál megjelenik. Az OS
+szintű <code>iostat</code> és a PostgreSQL <code>pg_stat_bgwriter</code>
+(<code>checkpoint_write_time</code>, <code>checkpoint_sync_time</code>;
+PostgreSQL 17-től a <code>pg_stat_checkpointer</code> nézet
+<code>write_time</code>/<code>sync_time</code> oszlopai) együttesen
+mutatják meg, hogy a tartóssági határ hol szűk keresztmetszet.</p>
+<h4 data-number="53.1.3.5" id="auth-tls-role-és-migration"><span
+class="header-section-number">53.1.3.5</span> Auth, TLS, role és
+migration</h4>
+<p>A PostgreSQL hitelesítési lánca a <code>pg_hba.conf</code>
+szabályokból áll: <code>local</code> kapcsolatok peer módon (OS user
+alapján), <code>host</code> kapcsolatok <code>scram-sha-256</code>
+jelszóval vagy <code>cert</code>, illetve
+<code>gssapi</code>/<code>ldap</code> nagyobb környezetben. A
+<code>ssl = on</code> és a tanúsítvány beállításával a TCP kapcsolat
+TLS-titkosított. Működtetési szempontból a <strong>migration</strong>
+(séma) jogosultsága ne keveredjen az alkalmazás runtime jogosultságával:
+a <code>lab_app</code> role csak
+<code>SELECT/INSERT/UPDATE/DELETE</code> jogokat kapjon a szükséges
+táblákon, míg a <code>lab_migrator</code> role tulajdonosként futtathat
+<code>DDL</code>-t. A <code>GRANT ... ON ALL TABLES IN SCHEMA</code>
+folytatható, de új tábláknál a <code>DEFAULT PRIVILEGES</code>
+biztosítja a folyamatos hozzáférést.</p>
+<h4 data-number="53.1.3.6" id="dbapphost-telemetry"><span
+class="header-section-number">53.1.3.6</span> DB/app/host telemetry</h4>
+<p>A DB belső telemetriája a <code>pg_stat_activity</code>,
+<code>pg_stat_database</code>, <code>pg_stat_bgwriter</code>,
+<code>pg_stat_statements</code> (bővítmény) nézetekből olvasható. A
+<code>pg_stat_statements</code> per query-kulcsot tárolja a
+<code>total_exec_time</code>, <code>mean_exec_time</code>,
+<code>rows</code>, <code>blk_read_time</code>,
+<code>blk_write_time</code>, <code>wal_bytes</code> statisztikákat, így
+pontosan azonosítható a legdrágább SQL és annak I/O/fsync költsége. Az
+OS telemetria: <code>vmstat</code> (CPU, swap, context switch),
+<code>iostat -x</code> (átlagos várólista, await, utilization),
+<code>sar -n ETCP 1 5</code> (<code>retrseg/s</code>: újraküldött
+TCP-szegmensek), <code>sar -n TCP 1 5</code> (új kapcsolatok
+<code>active/s</code>/<code>passive/s</code> – kapcsolat-churn
+jelzésére), <code>ss -tnp</code> (kapcsolatok állapota). A
+réteghatár-diagnosztika sorrendje: először a DB aktív sessionök és
+lockok, majd a lassú query-k, végül az OS I/O és CPU telítettség.</p>
+<h3 data-number="53.1.4"
+id="kidolgozott-példa-postgresql-health-baseline-labhost01-en"><span
+class="header-section-number">53.1.4</span> Kidolgozott példa:
+PostgreSQL health baseline labhost01-en</h3>
+<p>A cél egy ésszerű resource budget beállítása, mérhető baseline és egy
+kapcsolatkimerülési hibadiagnosztika. <strong>Target:</strong>
+<code>labhost01</code>, UID 1000, <code>sudo</code> szükséges; DB
+target: Unix socket mint <code>postgres</code> rendszerfelhasználó.</p>
+<h4 data-number="53.1.4.1" id="telepítés-és-service-ellenőrzés"><span
+class="header-section-number">53.1.4.1</span> 1. Telepítés és service
+ellenőrzés</h4>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost01, sudo szükséges</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> apt-get update</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> apt-get install <span class="at">-y</span> postgresql postgresql-contrib</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> status postgresql@16-main <span class="at">--no-pager</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="ex">ss</span> <span class="at">-lnt</span> <span class="kw">|</span> <span class="fu">grep</span> 5432</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-l</span> /var/run/postgresql/.s.PGSQL.5432</span></code></pre></div>
+<p>Várható kimenet: a <code>postgresql@16-main</code> aktív; az
+alapértelmezett <code>listen_addresses = 'localhost'</code> miatt a
+szerver TCP-n is hallgat: az <code>ss -lnt</code> a
+<code>127.0.0.1:5432</code> és a <code>[::1]:5432</code> LISTEN sort
+mutatja, a Unix socket pedig a
+<code>/var/run/postgresql/.s.PGSQL.5432</code>. A labor a
+<code>listen_addresses = '127.0.0.1'</code> beállítással explicit, csak
+IPv4 loopbackre szűkít, mert a C++ kliens ezen a címen csatlakozik.</p>
+<h4 data-number="53.1.4.2" id="erőforráskorlátok-és-wanted-state"><span
+class="header-section-number">53.1.4.2</span> 2. Erőforráskorlátok és
+wanted state</h4>
+<p>A konfigurációs <code>postgresql.conf</code> kivonata (illusztratív,
+verziófüggő; a pontos fájl elérési útja az apt telepített verziójától
+függ, például <code>/etc/postgresql/16/main/postgresql.conf</code>):</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode ini"><code class="sourceCode ini"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># /etc/postgresql/16/main/postgresql.conf (labhost01)</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="dt">listen_addresses </span><span class="ot">=</span><span class="st"> &#39;127.0.0.1&#39;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="dt">port </span><span class="ot">=</span><span class="st"> </span><span class="dv">5432</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="dt">max_connections </span><span class="ot">=</span><span class="st"> </span><span class="dv">50</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="dt">superuser_reserved_connections </span><span class="ot">=</span><span class="st"> </span><span class="dv">3</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="dt">password_encryption </span><span class="ot">=</span><span class="st"> &#39;scram-sha-256&#39;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="dt">ssl </span><span class="ot">=</span><span class="st"> </span><span class="kw">on</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="dt">ssl_cert_file </span><span class="ot">=</span><span class="st"> &#39;/etc/ssl/certs/lab-pg.crt&#39;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="dt">ssl_key_file  </span><span class="ot">=</span><span class="st"> &#39;/etc/ssl/private/lab-pg.key&#39;</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="dt">shared_buffers </span><span class="ot">=</span><span class="st"> &#39;256MB&#39;</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="dt">effective_cache_size </span><span class="ot">=</span><span class="st"> &#39;1GB&#39;</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="dt">work_mem </span><span class="ot">=</span><span class="st"> &#39;8MB&#39;</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="dt">maintenance_work_mem </span><span class="ot">=</span><span class="st"> &#39;64MB&#39;</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="dt">synchronous_commit </span><span class="ot">=</span><span class="st"> &#39;on&#39;</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="dt">checkpoint_timeout </span><span class="ot">=</span><span class="st"> &#39;5min&#39;</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="dt">max_wal_size </span><span class="ot">=</span><span class="st"> &#39;1GB&#39;</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="dt">statement_timeout </span><span class="ot">=</span><span class="st"> &#39;10s&#39;</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="dt">idle_in_transaction_session_timeout </span><span class="ot">=</span><span class="st"> &#39;5min&#39;</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="dt">log_connections </span><span class="ot">=</span><span class="st"> &#39;on&#39;</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="dt">log_disconnections </span><span class="ot">=</span><span class="st"> &#39;on&#39;</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a><span class="dt">log_lock_waits </span><span class="ot">=</span><span class="st"> &#39;on&#39;</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a><span class="dt">log_min_duration_statement </span><span class="ot">=</span><span class="st"> &#39;1000&#39;</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a><span class="dt">track_activities </span><span class="ot">=</span><span class="st"> &#39;on&#39;</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a><span class="dt">track_counts </span><span class="ot">=</span><span class="st"> &#39;on&#39;</span></span></code></pre></div>
+<p>A <code>listen_addresses</code>, <code>port</code>,
+<code>max_connections</code>,
+<code>superuser_reserved_connections</code> és
+<code>shared_buffers</code> <code>postmaster</code> kontextusú
+paraméterek: csak újraindítással lépnek életbe. Reload
+(<code>SIGHUP</code>, <code>pg_reload_conf()</code>) után a
+<code>pg_settings.pending_restart</code> igaz lesz, az érték változatlan
+marad. A timeoutok és a naplózási kulcsok reloaddal is érvényesek. Ezért
+itt restart kell, utána ellenőrzés:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost01, sudo szükséges</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart postgresql@16-main</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="at">-Atc</span> <span class="st">&quot;SELECT name, setting, pending_restart</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="st">  FROM pg_settings WHERE name IN (&#39;max_connections&#39;,</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="st">  &#39;listen_addresses&#39;, &#39;shared_buffers&#39;, &#39;statement_timeout&#39;);&quot;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="co"># várt többek közt: max_connections|50|f</span></span></code></pre></div>
+<p><code>pg_hba.conf</code> (labhost01, host-specific; mivel a szerver
+csak <code>127.0.0.1</code>-en hallgat, <code>::1/128</code> sor nem
+kell – ha IPv6 loopback is kell, a <code>listen_addresses</code> legyen
+<code>'127.0.0.1,::1'</code>):</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode ini"><code class="sourceCode ini"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># TYPE  DATABASE USER      ADDRESS       METHOD</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="dt">local   all      postgres               peer</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="dt">host    lab_db   lab_app   127.0.0.1/32 scram-sha-256</span></span></code></pre></div>
+<p>Szerepkörök és jogosultságok:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode sql"><code class="sourceCode sql"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- Futtatva: sudo -u postgres psql -v ON_ERROR_STOP=1</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">ROLE</span> lab_app LOGIN <span class="kw">PASSWORD</span> <span class="st">&#39;dummy_pw&#39;</span>;</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">ROLE</span> lab_migrator LOGIN <span class="kw">PASSWORD</span> <span class="st">&#39;dummy_pw&#39;</span>;</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">DATABASE</span> lab_db OWNER lab_migrator;</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="kw">GRANT</span> <span class="kw">CONNECT</span> <span class="kw">ON</span> <span class="kw">DATABASE</span> lab_db <span class="kw">TO</span> lab_app;</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- a séma és a jogok a lab_db-ben jöjjenek létre, ne a postgres DB-ben:</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>\<span class="kw">connect</span> lab_db</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">SCHEMA</span> lab <span class="kw">AUTHORIZATION</span> lab_migrator;</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="kw">GRANT</span> <span class="kw">USAGE</span> <span class="kw">ON</span> <span class="kw">SCHEMA</span> lab <span class="kw">TO</span> lab_app;</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="kw">GRANT</span> <span class="kw">SELECT</span>, <span class="kw">INSERT</span>, <span class="kw">UPDATE</span>, <span class="kw">DELETE</span> <span class="kw">ON</span> <span class="kw">ALL</span> <span class="kw">TABLES</span> <span class="kw">IN</span> <span class="kw">SCHEMA</span> lab</span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>  <span class="kw">TO</span> lab_app;</span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- a lab_migrator által JÖVŐBEN létrehozott objektumokra:</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">DEFAULT</span> <span class="kw">PRIVILEGES</span> <span class="cf">FOR</span> <span class="kw">ROLE</span> lab_migrator <span class="kw">IN</span> <span class="kw">SCHEMA</span> lab</span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>  <span class="kw">GRANT</span> <span class="kw">SELECT</span>, <span class="kw">INSERT</span>, <span class="kw">UPDATE</span>, <span class="kw">DELETE</span> <span class="kw">ON</span> <span class="kw">TABLES</span> <span class="kw">TO</span> lab_app;</span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">DEFAULT</span> <span class="kw">PRIVILEGES</span> <span class="cf">FOR</span> <span class="kw">ROLE</span> lab_migrator <span class="kw">IN</span> <span class="kw">SCHEMA</span> lab</span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>  <span class="kw">GRANT</span> <span class="kw">USAGE</span>, <span class="kw">SELECT</span> <span class="kw">ON</span> SEQUENCES <span class="kw">TO</span> lab_app;</span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="co">-- ellenőrzés: \ddp lab  és  \dn+ lab</span></span></code></pre></div>
+<p>A <code>FOR ROLE lab_migrator</code> nélkül a default privilege csak
+az azt kiadó szerepkör (itt <code>postgres</code>) által létrehozott
+objektumokra hatna, a migrációt futtató <code>lab_migrator</code>
+tábláira nem.</p>
+<h4 data-number="53.1.4.3" id="kapcsolódási-teszt-és-telemetria"><span
+class="header-section-number">53.1.4.3</span> 3. Kapcsolódási teszt és
+telemetria</h4>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost01, UID 1000, kliens oldali timeout beállítás</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="va">PGPASSWORD</span><span class="op">=</span>dummy_pw <span class="ex">psql</span> <span class="dt">\</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>  <span class="st">&quot;host=127.0.0.1 port=5432 dbname=lab_db user=lab_app</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="st">   sslmode=require connect_timeout=3&quot;</span> <span class="dt">\</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">-c</span> <span class="st">&#39;SELECT 1 AS ok;&#39;</span></span></code></pre></div>
+<p>(A libpq kapcsolati sztringben a kulcs–érték párokat tetszőleges
+szóköz, sortörés is elválaszthatja.)</p>
+<p>Várható kimenet: <code>ok</code> oszlop <code>1</code> értékkel. Ha a
+<code>pg_hba.conf</code> hibás, a hiba
+<code>FATAL: no pg_hba.conf entry for host ...</code>; ha a
+<code>statement_timeout</code> túl alacsony, a hosszú query
+<code>ERROR: canceling statement due to statement timeout</code>
+üzenetet ad.</p>
+<p>Aktív sessionök és lockok ellenőrzése:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode sql"><code class="sourceCode sql"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- sudo -u postgres psql -d lab_db</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> state, <span class="fu">count</span>(<span class="op">*</span>) </span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity </span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="kw">GROUP</span> <span class="kw">BY</span> state;</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> a.pid, a.usename, a.state, a.wait_event_type, a.wait_event,</span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>       now() <span class="op">-</span> a.query_start <span class="kw">AS</span> duration, <span class="kw">left</span>(a.<span class="kw">query</span>, <span class="dv">80</span>) <span class="kw">AS</span> <span class="kw">query</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity a</span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> a.state <span class="op">&lt;&gt;</span> <span class="st">&#39;idle&#39;</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> a.query_start;</span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> l.pid, l.locktype, l.<span class="kw">mode</span>, l.granted, a.<span class="kw">query</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_locks l</span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_stat_activity a <span class="kw">ON</span> l.pid <span class="op">=</span> a.pid</span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> l.granted <span class="op">=</span> <span class="kw">false</span>;</span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a><span class="co">-- ki blokkol kit: a várakozók és a blokkoló PID-ek</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, state, wait_event_type, wait_event,</span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>       pg_blocking_pids(pid) <span class="kw">AS</span> blocked_by</span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> <span class="fu">cardinality</span>(pg_blocking_pids(pid)) <span class="op">&gt;</span> <span class="dv">0</span>;</span></code></pre></div>
+<p>Illusztratív kimenet: egy aktív process
+<code>wait_event_type='Lock'</code>,
+<code>wait_event='transactionid'</code>, <code>granted='f'</code> egy
+másik tranzakcióval szemben. A lock tulajdonosát a
+<code>pg_blocking_pids()</code> adja meg. A beavatkozás a blokkoló
+állapotától függ: ha <code>active</code> (futó lekérdezés), a
+<code>SELECT pg_cancel_backend(pid)</code> megszakítja az utasítást; ha
+<code>idle in transaction</code>, nincs futó utasítás, amit a cancel
+megszakíthatna – ilyenkor a
+<code>SELECT pg_terminate_backend(pid)</code> bontja a kapcsolatot (a
+tranzakció ROLLBACK-kel végződik), vagy a hibás alkalmazás zárja le a
+tranzakciót.</p>
+<h4 data-number="53.1.4.4"
+id="egy-hibás-állapot-szimulációja-és-javítása"><span
+class="header-section-number">53.1.4.4</span> 4. Egy hibás állapot
+szimulációja és javítása</h4>
+<p>Simuláljuk a connection limit kimerülést: az alábbi snippet 50
+kapcsolatot indít, mindegyik 30 másodpercig alszik. A háttérben futó
+<code>psql</code> jelszót kap (exportált <code>PGPASSWORD</code>; éles
+helyett <code>~/.pgpass</code> 0600 joggal), és a session szintű
+<code>SET statement_timeout = '60s'</code> felülírja a 10 s-os
+alapértéket, különben a <code>pg_sleep(30)</code>-at a szerver 10 s után
+megszakítaná. <strong>Csak izolált labhoston, az alkalmazás leállított
+poolja mellett futtassuk.</strong></p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost01, tesztelési szándékkal, ne élesben</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">PGPASSWORD</span><span class="op">=</span>dummy_pw</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="va">$(</span><span class="fu">seq</span> 1 50<span class="va">)</span><span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>  <span class="ex">psql</span> <span class="st">&quot;host=127.0.0.1 dbname=lab_db user=lab_app sslmode=require&quot;</span> <span class="dt">\</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">-c</span> <span class="st">&quot;SET statement_timeout = &#39;60s&#39;; SELECT pg_sleep(30);&quot;</span> <span class="dt">\</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">&gt;</span>/dev/null <span class="dv">2</span><span class="op">&gt;</span><span class="st">&quot;/tmp/lab-conn-</span><span class="va">$i</span><span class="st">.err&quot;</span> <span class="kw">&amp;</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 2</span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-h</span> FATAL /tmp/lab-conn-<span class="pp">*</span>.err <span class="kw">|</span> <span class="fu">sort</span> <span class="kw">|</span> <span class="fu">uniq</span> <span class="at">-c</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a><span class="bu">wait</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="bu">unset</span> <span class="va">PGPASSWORD</span></span></code></pre></div>
+<p>Várható (szemléltető) kimenet: 50 − 3 = 47 kapcsolat sikerül, a
+48.-tól kezdve a kapcsolatok a fenntartott slotokba ütköznek, és a
+<code>grep</code> ilyen sorokat számol:
+<code>FATAL:  remaining connection slots are reserved for roles with the SUPERUSER attribute</code>
+(PostgreSQL 16; a pontos szöveget a telepített verzió logjából kell
+rögzíteni). A diagnosztika
+<code>SELECT count(*) FROM pg_stat_activity WHERE usename='lab_app';</code>
+mutatja, hogy elérte a
+<code>max_connections - superuser_reserved_connections</code> korlátot.
+Rollback: a <code>wait</code> után a tesztprocessek kilépnek és a slotok
+felszabadulnak; azonnali leállításhoz
+<code>pkill -u "$USER" -f 'pg_sleep\(30\)'</code>. Működtetési megoldás:
+PgBouncer bevezetése transaction poolinggal (a session-állapot fent
+leírt korlátjával), vagy alkalmazás oldali connection timeout és
+retry.</p>
+<h3 data-number="53.1.5" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">53.1.5</span> Tipikus hibák és
+ellenpróbák</h3>
+<ol type="1">
+<li><strong>Kapcsolatkimerülés</strong> – tünet: új kapcsolat hibával
+tér vissza (<code>remaining connection slots are reserved …</code> a nem
+szuperuser kliensnél, <code>sorry, too many clients already</code>, ha a
+fenntartott slotok is elfogytak), a régi kliensek még működnek.
+Hipotézis: a <code>max_connections</code> kimerült; a
+<code>pg_stat_activity</code> szerint a sessionök <code>idle</code> vagy
+<code>idle in transaction</code> állapotban ülnek. Adatgyűjtés:
+<code>SELECT count(*) FROM pg_stat_activity WHERE state='idle';</code>
+Egy változtatás: <code>idle_in_transaction_session_timeout</code>
+csökkentése vagy pool bevezetése. Verifikáció: a hiba eltűnik, a
+sessionök száma a korlát alatt marad.</li>
+<li><strong>Hosszú query, de a CPU nem telített</strong> – tünet: p95
+query latency magas, <code>vmstat</code> CPU idle magas. Hipotézis: lock
+wait vagy I/O várakozás. Adatgyűjtés:
+<code>pg_stat_activity.wait_event_type</code> mutatja, hogy
+<code>Lock</code> vagy <code>IO</code>. Ha <code>Lock</code>, a
+<code>log_lock_waits</code> naplóbejegyzések megadják a várakozó PID-et;
+ha <code>IO</code>, az <code>iostat -x</code> await értéke magas, és a
+<code>pg_stat_statements</code> <code>blk_read_time</code> szintén. Egy
+változtatás: index hozzáadása (lock esetben a tranzakció rövidítése, IO
+esetben cache növelés). Verifikáció: a <code>wait_event</code> eltűnik
+az aktív processekből.</li>
+<li><strong>Checkpoint I/O burst diszket telít</strong> – tünet:
+időszakos storage latency kiugrás <code>iostat</code> await-ben.
+Hipotézis: a <code>max_wal_size</code> túl kicsi az írási terheléshez,
+ezért sok a kért checkpoint (<code>checkpoints_req</code> ≫
+<code>checkpoints_timed</code>, a logban
+<code>checkpoints are occurring too frequently</code>). Adatgyűjtés:
+<code>pg_stat_bgwriter</code> <code>checkpoints_timed</code>,
+<code>checkpoints_req</code>, <code>checkpoint_write_time</code>,
+<code>checkpoint_sync_time</code> (PG17-től
+<code>pg_stat_checkpointer</code>). Egy változtatás: a
+<code>max_wal_size</code> emelése (például 1GB → 4GB, a WAL-kötet
+kapacitásának ellenőrzésével). A
+<code>checkpoint_completion_target</code> PostgreSQL 14 óta 0.9
+alapértékű, így PG16-on az írás szétterítése már alapból adott; régebbi
+verzión ez is jelölt. Verifikáció: a <code>checkpoints_req</code> aránya
+csökken, a burst await csökken.</li>
+</ol>
+<h3 data-number="53.1.6" id="feladatok"><span
+class="header-section-number">53.1.6</span> Feladatok</h3>
+<h4 data-number="53.1.6.1"
+id="magyarázó-feladat-latency-breakdown-rétegenként"><span
+class="header-section-number">53.1.6.1</span> 1. Magyarázó feladat:
+latency breakdown rétegenként</h4>
+<p>Adott egy C++ alkalmazás, amely
+<code>SELECT count(*) FROM large_table</code> lekérdezést futtat, és a
+p95 latency 120 ms. Az alkalmazás naplója szerint a <code>PQexec</code>
+hívás 20 ms-ot vár. Hol lehet a maradék 100 ms? Nevezd meg legalább
+három réteget, és mindegyikhez rendelj egy PostgreSQL vagy OS parancsot,
+amely igazolja vagy cáfolja a réteg érintettségét. Ne írj C++ kódot. (A
+rétegek időbeli helyét a „Database latency” definíciója utáni
+idővonal-ábra mutatja.)</p>
+<h4 data-number="53.1.6.2"
+id="adminisztrációskonfigurációs-feladat-connection-budget-és-pool"><span
+class="header-section-number">53.1.6.2</span> 2.
+Adminisztrációs/konfigurációs feladat: connection budget és pool</h4>
+<p>Készíts egy <code>lab_db</code> adatbázist <code>lab_app</code>
+role-lal, ahol a <code>max_connections = 50</code>,
+<code>statement_timeout = 5 s</code>,
+<code>idle_in_transaction_session_timeout = 2 min</code>, és csak
+127.0.0.1-ről engedélyezett SCRAM hitelesítés. A megoldás részeként írd
+le a <code>postgresql.conf</code> és <code>pg_hba.conf</code>
+módosításokat, valamint a szükséges <code>systemctl reload</code> vagy
+<code>restart</code> parancsot – indokold, melyik kell. Miért nem
+elegendő a <code>max_connections</code> emelése a pool nélkül?</p>
+<h4 data-number="53.1.6.3"
+id="diagnosztikaifailure-feladat-lock-contention-helyreállítása"><span
+class="header-section-number">53.1.6.3</span> 3. Diagnosztikai/failure
+feladat: lock contention helyreállítása</h4>
+<p>Egy élesnek nevezett labkörnyezetben a <code>pg_stat_activity</code>
+a következőt mutatja (illusztratív):</p>
+<pre><code>pid  | usename  | state       | wait_event_type | wait_event      | duration
+-----+----------+-------------+-----------------+-----------------+----------
+101  | lab_app  | active      | Lock            | transactionid   | 00:04:21
+102  | lab_app  | idle in transaction |       |                 | 00:04:25</code></pre>
+<p>Melyik session blokkol, és miért? Írd le a diagnosztikai lekérdezést
+a lock tulajdonos azonosítására, majd a beavatkozás parancsát. Mi a
+postcondition?</p>
+<h3 data-number="53.1.7" id="megoldások"><span
+class="header-section-number">53.1.7</span> Megoldások</h3>
+<h4 data-number="53.1.7.1" id="latency-breakdown"><span
+class="header-section-number">53.1.7.1</span> 1. Latency breakdown</h4>
+<p>A <code>PQexec</code> szinkron hívás: a szerver válaszáig blokkol,
+így a szerveroldali végrehajtás, a lock-várakozás, a storage I/O és a
+WAL-írás mind a 20 ms-on belül van. A maradék 100 ms tehát a hívás előtt
+vagy után keletkezik; lehetséges rétegei:</p>
+<ul>
+<li><strong>Kapcsolatfelvétel</strong>, ha a kód kérésenként nyit
+kapcsolatot: TCP handshake + TLS handshake + SCRAM-hitelesítés + backend
+<code>fork</code>. Ellenőrzés: a
+<code>log_connections</code>/<code>log_disconnections</code> sorok
+gyakorisága,
+<code>ss -tan state time-wait '( dport = :5432 )' | wc -l</code>,
+<code>sar -n TCP 1 5</code> (<code>active/s</code>).</li>
+<li><strong>Pool-várakozás</strong> az alkalmazásban vagy a
+PgBouncerben: a kérés szabad kapcsolatra vár. Ellenőrzés: PgBouncer
+<code>SHOW POOLS;</code> (<code>cl_waiting</code>,
+<code>maxwait</code>), illetve az alkalmazás pool-acquire
+metrikája.</li>
+<li><strong>DNS-feloldás</strong> a DB host nevére: ellenőrzés
+<code>resolvectl query &lt;host&gt;</code> időzítésével.</li>
+<li><strong>Az alkalmazás saját feldolgozása és CPU-ütemezése</strong>
+(eredmény-feldolgozás, szerializálás, várakozás a run queue-ban):
+<code>vmstat 1</code> (run queue), <code>pidstat -t 1</code>.</li>
+</ul>
+<p>A 20 ms-on belüli bontáshoz külön mérés kell: a
+<code>pg_stat_statements.mean_exec_time</code> a szerveroldali
+végrehajtási időt adja; a kettő különbsége (20 ms − szerveroldali idő) a
+hálózati oda-vissza időt és a protokoll-többletet mutatja. Ezen belül
+lehet lock wait (<code>wait_event_type='Lock'</code>) vagy storage I/O
+(<code>blk_read_time</code>, <code>iostat -x</code>), de ezek a hiányzó
+100 ms-ot nem magyarázhatják.</p>
+<h4 data-number="53.1.7.2" id="postgresql-connection-budget"><span
+class="header-section-number">53.1.7.2</span> 2. PostgreSQL connection
+budget</h4>
+<p>A <code>postgresql.conf</code> releváns sorai (a teljes fájlba
+illesztendők):</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode ini"><code class="sourceCode ini"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="dt">listen_addresses </span><span class="ot">=</span><span class="st"> &#39;127.0.0.1&#39;</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="dt">max_connections </span><span class="ot">=</span><span class="st"> </span><span class="dv">50</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="dt">superuser_reserved_connections </span><span class="ot">=</span><span class="st"> </span><span class="dv">3</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="dt">password_encryption </span><span class="ot">=</span><span class="st"> &#39;scram-sha-256&#39;</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="dt">statement_timeout </span><span class="ot">=</span><span class="st"> &#39;5s&#39;</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="dt">idle_in_transaction_session_timeout </span><span class="ot">=</span><span class="st"> &#39;2min&#39;</span></span></code></pre></div>
+<p>A <code>pg_hba.conf</code>:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode ini"><code class="sourceCode ini"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># TYPE  DATABASE USER      ADDRESS       METHOD</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="dt">local   all      postgres               peer</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="dt">host    lab_db   lab_app   127.0.0.1/32 scram-sha-256</span></span></code></pre></div>
+<p>Alkalmazási parancs: a <code>max_connections</code>, a
+<code>superuser_reserved_connections</code> és a
+<code>listen_addresses</code> <code>postmaster</code> kontextusú, ezért
+restart kell (a reload csak a timeoutokat és a
+<code>pg_hba.conf</code>-ot venné át, a többinél
+<code>pending_restart = t</code> maradna):</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost01, sudo szükséges</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart postgresql@16-main</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="at">-Atc</span> <span class="st">&quot;SHOW max_connections;&quot;</span>   <span class="co"># várt: 50</span></span></code></pre></div>
+<p>A <code>max_connections</code> emelése önmagában nem oldja meg a
+terhelést, mert minden kapcsolat privát backend process-t és memóriát
+fogyaszt; ha az alkalmazás 1000 kliensből nyitna kapcsolatot, a rendszer
+memóriája és a processütemező nyomása nő. A PgBouncer transaction
+pooling révén kevés valódi backend szolgál ki sok klienst, és a várakozó
+kliensek a pooler szintjén sorban állnak, nem fogyasztanak DB
+process-slotot.</p>
+<h4 data-number="53.1.7.3" id="lock-contention-helyreállítás"><span
+class="header-section-number">53.1.7.3</span> 3. Lock contention
+helyreállítás</h4>
+<p>A <code>pid=102</code> a blokkoló: <code>idle in transaction</code>
+állapotban tart nyitva egy tranzakciót, amely sorzárat tart. A
+<code>pid=101</code> <code>Lock</code> wait-en van. A tulajdonos
+azonosítása a <code>pg_blocking_pids()</code> függvénnyel:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode sql"><code class="sourceCode sql"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, usename, state, wait_event_type, wait_event,</span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a>       pg_blocking_pids(pid) <span class="kw">AS</span> blocked_by,</span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a>       now() <span class="op">-</span> xact_start <span class="kw">AS</span> xact_age, <span class="kw">left</span>(<span class="kw">query</span>, <span class="dv">80</span>) <span class="kw">AS</span> last_query</span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> <span class="fu">cardinality</span>(pg_blocking_pids(pid)) <span class="op">&gt;</span> <span class="dv">0</span>;</span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- a blokkoló részletei</span></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, state, now() <span class="op">-</span> xact_start <span class="kw">AS</span> xact_age,</span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a>       now() <span class="op">-</span> state_change <span class="kw">AS</span> idle_for, <span class="kw">left</span>(<span class="kw">query</span>, <span class="dv">80</span>) <span class="kw">AS</span> last_query</span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> pid <span class="op">=</span> <span class="dv">102</span>;</span></code></pre></div>
+<p>A pid=102 <code>query</code> oszlopa nem <code>NULL</code>: az
+utoljára futtatott utasítást mutatja (például a lockot szerző
+<code>UPDATE</code>-et), nem a most futót – ez a diagnosztika egyik
+legfontosabb nyoma. Beavatkozás: az <code>idle in transaction</code>
+sessionnek nincs futó utasítása, ezért a
+<code>pg_cancel_backend()</code> nem hat rá; a tranzakciót csak a
+kapcsolat bontása zárja le:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode sql"><code class="sourceCode sql"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_terminate_backend(<span class="dv">102</span>);</span></code></pre></div>
+<p>A nyitott tranzakció ROLLBACK-kel végződik, az alkalmazás kapcsolati
+hibát kap. A <code>pg_cancel_backend()</code> akkor használható, ha a
+blokkoló <code>active</code> állapotú, futó lekérdezés. Hosszabb távú
+javítás: <code>idle_in_transaction_session_timeout</code> és az
+alkalmazás tranzakciókezelésének javítása.
+<strong>Postcondition:</strong> a pid=102 nincs a
+<code>pg_stat_activity</code>-ben, a <code>pg_blocking_pids(101)</code>
+üres, a pid=101 végrehajtja a query-t, és
+<code>SELECT count(*) FROM pg_locks WHERE NOT granted</code> = 0.</p>
+<h3 data-number="53.1.8" id="rövid-összefoglaló"><span
+class="header-section-number">53.1.8</span> Rövid összefoglaló</h3>
+<p>A PostgreSQL működtetéséhez a latency-t connection, query, lock és
+storage rétegre kell bontani, mert mindegyik más diagnosztikai nézetben
+és más beavatkozással kezelhető. A connection pool csökkenti a
+process-per-connection modell költségét, a timeoutok pedig
+megakadályozzák az elhúzódó tranzakciók lock-tartását. A memória
+(shared_buffers, work_mem, page cache) és a WAL/checkpoint/fsync adatút
+közvetlenül befolyásolja a query és commit latency-t. A telemetria a
+<code>pg_stat_activity</code>, <code>pg_stat_database</code>,
+<code>pg_stat_bgwriter</code> és <code>pg_stat_statements</code>
+nézetekből, valamint az OS <code>vmstat</code>, <code>iostat</code> és
+<code>ss</code> parancsokból áll össze.</p>
+<p><strong>Továbbhasznált definíciók:</strong></p>
+<ul>
+<li><strong>Connection pool:</strong> kapcsolat-újrafelhasználó réteg,
+amely kevés valódi DB backendet oszt meg sok kliens között, csökkentve a
+process-indítási és memóriaköltséget.</li>
+<li><strong>Working set:</strong> a gyakran elért adat- és indexoldalak
+halmaza; ha nagyobb a <code>shared_buffers</code> + OS page cache
+együttes méreténél, a lekérdezések fizikai olvasásra kényszerülnek, és a
+latency az I/O miatt nő.</li>
+<li><strong>WAL/fsync:</strong> a commit tartóssága a write-ahead log
+<code>fsync</code>-jén múlik; a data file-ok később, checkpointtal
+frissülnek.</li>
+</ul>
+<h3 data-number="53.1.9" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">53.1.9</span> Források és ellenőrzési
+hiányok</h3>
+<p>Forrásindex (állítás → hivatalos forrás → hivatkozott verzió; a labor
+az Ubuntu 24.04 PostgreSQL 16-os csomagja):</p>
+<ul>
+<li>Kapcsolati paraméterek, <code>postmaster</code> kontextus,
+<code>superuser_reserved_connections</code>: <a
+href="https://www.postgresql.org/docs/16/runtime-config-connection.html">PostgreSQL
+16 – Connections and Authentication</a>; <code>pending_restart</code>:
+<a
+href="https://www.postgresql.org/docs/16/view-pg-settings.html">pg_settings</a>.</li>
+<li><code>work_mem</code>, <code>hash_mem_multiplier</code>,
+<code>shared_buffers</code>: <a
+href="https://www.postgresql.org/docs/16/runtime-config-resource.html">PostgreSQL
+16 – Resource Consumption</a>.</li>
+<li>WAL, checkpoint, <code>checkpoint_completion_target</code>,
+<code>max_wal_size</code>: <a
+href="https://www.postgresql.org/docs/16/runtime-config-wal.html">PostgreSQL
+16 – Write Ahead Log</a> és <a
+href="https://www.postgresql.org/docs/16/wal-configuration.html">WAL
+Configuration</a>.</li>
+<li><code>pg_stat_activity</code> (<code>state</code> értékei),
+<code>pg_stat_bgwriter</code>: <a
+href="https://www.postgresql.org/docs/16/monitoring-stats.html">PostgreSQL
+16 – The Cumulative Statistics System</a>; PG17
+<code>pg_stat_checkpointer</code>: <a
+href="https://www.postgresql.org/docs/17/monitoring-stats.html">PostgreSQL
+17 – monitoring-stats</a>.</li>
+<li>Lock módok, sorzár, <code>pg_blocking_pids</code>,
+<code>pg_cancel_backend</code>/<code>pg_terminate_backend</code>: <a
+href="https://www.postgresql.org/docs/16/explicit-locking.html">Explicit
+Locking</a>, <a
+href="https://www.postgresql.org/docs/16/functions-info.html">System
+Information Functions</a>, <a
+href="https://www.postgresql.org/docs/16/functions-admin.html">Server
+Signaling Functions</a>.</li>
+<li><code>ALTER DEFAULT PRIVILEGES … FOR ROLE</code>: <a
+href="https://www.postgresql.org/docs/16/sql-alterdefaultprivileges.html">ALTER
+DEFAULT PRIVILEGES</a>; <code>pg_hba.conf</code>: <a
+href="https://www.postgresql.org/docs/16/auth-pg-hba-conf.html">Client
+Authentication</a>; libpq: <a
+href="https://www.postgresql.org/docs/16/libpq-exec.html">PQexec</a>.</li>
+<li>PgBouncer pool módok, <code>max_prepared_statements</code>,
+<code>SHOW POOLS</code>: <a
+href="https://www.pgbouncer.org/features.html">PgBouncer – Features</a>
+és <a href="https://www.pgbouncer.org/config.html">Configuration</a> — a
+telepített 1.2x kiadás.</li>
+<li><code>sar -n TCP</code>/<code>ETCP</code>: <a
+href="https://sysstat.github.io/">sysstat sar(1)</a> — az Ubuntu 24.04
+sysstat csomagja.</li>
+<li>Kapcsolódó szemlélet: <a href="https://sre.google/books/">Google SRE
+könyv</a>.</li>
+</ul>
+<p>A példák laborban ellenőrizendők; dátumozott futtatási napló még
+nincs. A példák a PostgreSQL stabil fogalmi alapjain (process-modell,
+<code>pg_stat_activity</code>, <code>pg_locks</code>,
+<code>pg_hba.conf</code>, WAL, <code>shared_buffers</code>,
+<code>work_mem</code>, <code>synchronous_commit</code>) nyugszanak, de a
+pontos verziófüggő defaultok, a <code>pg_stat_statements</code>
+oszlopnevek, a PgBouncer aktuális <code>transaction</code> módjának
+pontos paraméterei és a <code>scram-sha-256</code> elérhetősége a
+telepített verzióban ellenőrizendők. A <code>max_connections</code> és
+<code>work_mem</code> értékek lab-specifikus, hipotetikus baseline-ok,
+nem production tuning-szabályok. A tényleges működtetés előtt
+ellenőrizni kell az adott PostgreSQL-kiadás release notes-ját és a
+distro backport szintjét.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d260.html">← 52.5 Supply-chain és secret incident labor</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d262.html">53.2 Replication, failover, backup és PITR →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>46.2 Remote state, locking és recovery – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch46">46 Infrastructure as Code: OpenTofu/Terraform és állapot</a></p>
+<div class="links"><a class="prev" rel="prev" href="d226.html">← 46.1 Declarative infrastructure, provider és state</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d228.html">46.3 Module, environment és változási határ →</a></div>
+</nav>
+<h2 data-number="46.2" id="d227"><span
+class="header-section-number">46.2</span> Remote state, locking és
+recovery</h2>
+<h3 data-number="46.2.1" id="motiváció"><span
+class="header-section-number">46.2.1</span> Motiváció</h3>
+<p>Amikor egy csapat egyetlen fejlesztő helyett több emberrel üzemelteti
+ugyanazt az infrastruktúrát, a lokális <code>terraform.tfstate</code>
+fájl azonnal szűk keresztmetszetté válik. Két párhuzamos
+<code>apply</code> felülírhatja egymás állapotát, a titkos adatokat
+tartalmazó fájl a laptopon utazik, a rosszul mentett verzióból pedig nem
+tudunk visszaállni. A remote state ezt a problémát úgy oldja meg, hogy a
+state egy megosztott, védett, verziózott objektumtárolóba kerül, ahol a
+hozzáférés, a konkurencia és a helyreállítás szerződésbe foglalható. Ez
+az alfejezet azt tanítja meg, hogyan adjunk a state-hez ownership-,
+access-, backup- és concurrency-szerződést, és mi a különbség a state
+helyreállítása és a tényleges felhőerőforrás helyreállítása között.</p>
+<h3 data-number="46.2.2" id="definíció-és-működés"><span
+class="header-section-number">46.2.2</span> Definíció és működés</h3>
+<h4 data-number="46.2.2.1" id="remote-state-és-backend"><span
+class="header-section-number">46.2.2.1</span> Remote state és
+backend</h4>
+<p>A <strong>remote state</strong> az OpenTofu/Terraform
+állapotfájljának olyan tárolása, amely nem a lokális fájlrendszeren,
+hanem egy megosztott, hálózati szolgáltatásban él. A
+<strong>backend</strong> az a konfigurációs blokk, amely meghatározza,
+hová kerül a state, hogyan történik a lock, és milyen identitással
+férünk hozzá. A remote backend tipikusan objektumtárolóra (például AWS
+S3, Google Cloud Storage, Azure Blob) és egy lock-táblára (például AWS
+DynamoDB) épül.</p>
+<p>A remote state egy állapotfájl, amely nemcsak az erőforrások
+azonosítóit és függőségeit tartalmazza, hanem olyan érzékeny
+attribútumokat is, mint:</p>
+<ul>
+<li>adatbázis jelszavak,</li>
+<li>TLS privát kulcsok,</li>
+<li>IAM access key szövege,</li>
+<li>belső végpontok és VPC CIDR-ek.</li>
+</ul>
+<p>Ezért a remote state-et nem szabad verziókezelőbe (Git) commitolni,
+és a tárolón titkosítást, verziózást és szigorú hozzáférést kell
+biztosítani.</p>
+<h4 data-number="46.2.2.2" id="remote-backend-és-identity"><span
+class="header-section-number">46.2.2.2</span> Remote backend és
+identity</h4>
+<p>A remote backendhez a klienst (OpenTofu CLI, CI runner, lokális
+fejlesztő) egy adott felhő-identitás nevében fér hozzá. Ez lehet:</p>
+<ul>
+<li>lokális fejlesztő esetén egy IAM user vagy egy role-t felvevő
+<code>sso login</code>,</li>
+<li>CI rendszernél egy ephemerális role,</li>
+<li>szolgáltatás esetén workload identity.</li>
+</ul>
+<p>A backendnek adott jogosultságot a legkisebb jogkör elve szerint kell
+meghatározni: a state olvasásához, írásához, lockoláshoz és feloldáshoz
+külön policy elemek tartoznak. Például AWS S3 esetén az
+<code>s3:ListBucket</code> a bucketre (a key prefixre szűkítve), a
+<code>s3:GetObject</code>, <code>s3:PutObject</code>,
+<code>s3:DeleteObject</code> engedélyek a state fájlra, a DynamoDB-nél
+pedig <code>dynamodb:GetItem</code>, <code>dynamodb:PutItem</code>,
+<code>dynamodb:DeleteItem</code> a lock-táblára. Ügyelni kell arra, hogy
+a titkosítás (például SSE-KMS) további IAM jogot igényelhet a KMS
+kulcsra is.</p>
+<h4 data-number="46.2.2.3" id="state-lock-és-lease"><span
+class="header-section-number">46.2.2.3</span> State lock és lease</h4>
+<p>A <strong>state lock</strong> olyan kölcsönös kizárási mechanizmus,
+amely biztosítja, hogy egyszerre csak egy folyamat módosíthassa a
+state-et. Mivel a state az infrastruktúra „source of truth”-ja, két
+párhuzamos <code>apply</code> esetén az egyik a másik által már
+megváltoztatott valóságot próbálná frissíteni, ami elveszett update-hez
+vagy inkonzisztens tervekhez vezetne.</p>
+<p>A Terraform/OpenTofu S3 backendjének lockja <strong>nem
+lease</strong>: a lock-tábla rekordja egy egyedi kulcsot (LockID) és egy
+<code>Info</code> mezőt tartalmaz (ID, Operation, Who, Created),
+lejárati időbélyeg vagy TTL nélkül. Ha a folyamat szabályosan befejezi a
+műveletet, törli a rekordot; ha a folyamat keményen megszakad, a rekord
+lejárat nélkül ott marad, amíg a tulajdonos el nem engedi, vagy
+<code>force-unlock</code> nem törli. Várakozással tehát nem oldódik fel;
+a hibajelenséget diagnosztizálni kell.</p>
+<p>A <strong>lease</strong> ezzel szemben a lock időhöz kötött bérlete:
+a tulajdonosnak rendszeresen meg kell újítania, különben lejár, és más
+átveheti. Lease-alapú (TTL-es) lockot más rendszerek adnak, például az
+etcd lease vagy a Kubernetes <code>Lease</code> objektum; ott a lejárat
+a fencing-problémát hozza (lásd M1).</p>
+<h4 data-number="46.2.2.4" id="interrupted-apply"><span
+class="header-section-number">46.2.2.4</span> Interrupted apply</h4>
+<p>Ha az <code>apply</code> futása közben a hálózat megszakad, a CI
+folyamat kemény leállítást kap (például SIGKILL timeout után), vagy a
+lokális gép lefagy, a lock-rekord a táblában maradhat. (Egy SIGINT, azaz
+Ctrl-C, erre nem elég: a Terraform/OpenTofu ilyenkor „graceful stop”-ot
+végez – megvárja a folyamatban lévő provider-hívásokat, kiírja a
+state-et és elengedi a lockot.) A következő <code>plan</code> vagy
+<code>apply</code> ekkor hasonló hibát ad:</p>
+<pre><code>Error acquiring the state lock</code></pre>
+<p>Ilyenkor meg kell győződni arról, hogy valóban nincs másik aktív
+folyamat. Ha a lock gazdája már nem fut, akkor a
+<code>force-unlock</code> parancs törli a rekordot. A force-unlock
+veszélyes művelet, mert ha tévedünk, és mégis fut egy másik
+<code>apply</code>, akkor két folyamat fogja módosítani a state-et és a
+felhőerőforrásokat. Ezért a lock ID-t a hibaüzenet
+<code>Lock Info</code> blokkjából kell kivenni, és a tulajdonos folyamat
+kilétét ellenőrizni kell.</p>
+<h4 data-number="46.2.2.5" id="import-moved-és-state-műveletek"><span
+class="header-section-number">46.2.2.5</span> Import, moved és state
+műveletek</h4>
+<p>A state nemcsak a <code>plan</code>/<code>apply</code> terméke, hanem
+explicit módon is manipulálható. A fontosabb műveletek:</p>
+<ul>
+<li><strong>Import</strong>: a configban már deklarált resource-címhez a
+meglévő valós erőforrás felvétele a state-be
+(<code>tofu import ADDRESS ID</code>; a <code>resource</code> blokknak
+léteznie kell, különben a parancs hibát ad). Deklaratívan
+<code>import { to = …, id = … }</code> blokkal is megtehető (OpenTofu
+1.5+/Terraform 1.5+); ennél a
+<code>tofu plan -generate-config-out=generated.tf</code> a hiányzó
+resource blokk vázlatát is legenerálhatja. Ezután a <code>plan</code>
+már követni tudja a driftet.</li>
+<li><strong>Moved</strong>: amikor egy erőforrás címét megváltoztatjuk a
+konfigurációban, a <code>moved</code> blokk jelzi a state-nek, hogy a
+régi címet az újra kell képezni, elkerülve a törlés/újraépítés
+folyamatot.</li>
+<li><strong>State operation</strong>: <code>tofu state list</code>,
+<code>tofu state mv</code>, <code>tofu state rm</code>,
+<code>tofu state pull</code>, <code>tofu state push</code> – ezek a
+state fájl tartalmának ellenőrzésére és alacsony szintű javítására
+szolgálnak. A <code>mv</code> egy erőforrás áthelyezése egy másik címre,
+a <code>rm</code> eltávolítása a state-ből anélkül, hogy a valós
+erőforrás megsemmisülne.</li>
+</ul>
+<p>Ezek a műveletek mind potenciálisan veszélyesek, mert a state
+módosítása anélkül, hogy a valós erőforrást is módosítanánk, driftet
+okozhat. Ezért minden ilyen parancs előtt backupot kell készíteni.</p>
+<h4 data-number="46.2.2.6" id="backup-encryption-és-restore"><span
+class="header-section-number">46.2.2.6</span> Backup, encryption és
+restore</h4>
+<p>A remote state backend általában támogatja a verziózást. Ennek
+segítségével a state minden alkalommal mentésre kerül, amikor
+megváltozik. A verziózás nem helyettesíti a valós backupot, de
+biztosítja a rövid távú visszamenő visszaállítást. Emellett
+<code>tofu state pull</code> parancsot rendszeresen futtathatunk, és a
+kimenetet titkosított, hosszú távú tárolóba menthetjük.</p>
+<p>A titkosítás két szinten történik:</p>
+<ul>
+<li><strong>Encryption at rest</strong>: a bucket szintjén bekapcsolt
+SSE-S3 a fizikai adathordozó ellen véd, de átlátszó: aki
+<code>s3:GetObject</code> jogot kap, a visszafejtett state-et olvassa.
+Ha a hozzáférést a bucket-jogtól függetlenül szűkíteni kell, SSE-KMS
+customer managed kulcs kell, amelynek kulcspolicyja csak a
+state-szerepköröknek ad
+<code>kms:Decrypt</code>/<code>kms:GenerateDataKey</code> jogot.</li>
+<li><strong>Encryption in transit</strong>: minden kérés TLS-en
+keresztül történik.</li>
+</ul>
+<p>A restore akkor hiteles, ha utána <code>tofu plan</code> nem mutat
+semmilyen különbséget a jelenlegi konfiguráció és a visszaállított state
+között. Ha a state elveszett, a visszaállítás csupán a state-et hozza
+vissza, de a valós erőforrásokhoz képest drift lehet; ilyenkor a
+<code>tofu import</code> szükséges lehet.</p>
+<h4 data-number="46.2.2.7"
+id="state-workspace-account-és-environment-isolation"><span
+class="header-section-number">46.2.2.7</span> State workspace, account
+és environment isolation</h4>
+<p>A state-t érdemes erős határokkal elkülöníteni a különböző
+környezetek között. Két elterjedt modell:</p>
+<ul>
+<li><strong>Workspace</strong>: ugyanazon backend konfigurációban a
+<code>workspace</code> megváltoztatja a state kulcsát (például a
+<code>dev</code> workspace state-je az S3 backendben
+<code>env:/dev/environments/dev/terraform.tfstate</code> kulcson él; a
+prefix a <code>workspace_key_prefix</code> argumentummal állítható,
+alapértéke <code>env:</code>). Ez hasznos ideiglenes ágaknál, de nem ad
+elég erős izolációt, mert ugyanaz a bucket és lock-tábla.</li>
+<li><strong>Separate backend config</strong>: minden környezetnek külön
+backend-kulcs és gyakran külön bucket, külön lock-tábla, sőt külön
+felhő-account. Ez a production-recommended megoldás, mert az account
+határ hiba esetén is védi a production state-et.</li>
+</ul>
+<p>A workspace-ek és a state fájlok elkülönítése nemcsak a szervezést
+szolgálja, hanem a failure domain csökkentését is: ha egy fejlesztő
+véletlenül törli a <code>staging</code> state-et, az ne érintse a
+<code>production</code>-t.</p>
+<h3 data-number="46.2.3"
+id="kidolgozott-példa-s3-remote-state-dynamodb-lockkal"><span
+class="header-section-number">46.2.3</span> Kidolgozott példa: S3 remote
+state DynamoDB lockkal</h3>
+<p>A példa egy AWS sandbox accountot használ. Hipotetikus, nem futtatott
+parancsok; az azonosítók és a régió tetszőlegesek, de a labon kívül nem
+léteznek. Cél: egy kis S3 bucket létrehozása OpenTofuval, remote
+state-tel és lockkal.</p>
+<p>Előfeltételek:</p>
+<ul>
+<li>AWS sandbox account, <code>lab-tfstate-123456789012</code> nevű S3
+bucket és <code>lab-tfstate-lock</code> nevű DynamoDB tábla a
+<code>us-east-1</code> régióban.</li>
+<li>A lokális gép (labVM) rendelkezik friss OpenTofu CLI-vel és IAM
+credentialokkal.</li>
+</ul>
+<p>Hozzuk létre a <code>main.tf</code> fájlt a backend blokkal és egy
+egyszerű erőforrással:</p>
+<pre class="hcl"><code>terraform {
+  required_version = &quot;&gt;= 1.6&quot;
+  backend &quot;s3&quot; {
+    bucket         = &quot;lab-tfstate-123456789012&quot;
+    key            = &quot;environments/dev/terraform.tfstate&quot;
+    region         = &quot;us-east-1&quot;
+    encrypt        = true
+    dynamodb_table = &quot;lab-tfstate-lock&quot;
+  }
+}
+
+resource &quot;aws_s3_bucket&quot; &quot;example&quot; {
+  bucket = &quot;lab-example-bucket-123456789012&quot;
+}</code></pre>
+<p>A <code>dynamodb_table</code> alapú lock a példa
+<code>&gt;= 1.6</code> verzióprofiljában a szokásos megoldás. Újabb
+kiadásokban (a Terraform 1.10–1.11, illetve az OpenTofu 1.10 körül; a
+pontos verzió a hivatalos changelogból ellenőrizendő) a natív S3-lock
+(<code>use_lockfile = true</code>) az ajánlott, a
+<code>dynamodb_table</code> pedig elavult; a labor verzióprofiljához
+kell igazítani.</p>
+<p>Futtassuk az inicializálást és az alkalmazást:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: labVM (UID=1000), us-east-1 sandbox account</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> init</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> plan</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> apply</span></code></pre></div>
+<p>Várt kimenet <code>init</code> után: a backend inicializálódik, a
+state elérési útja a S3 bucketben van. A <code>plan</code> során a CLI
+lockot szerez a DynamoDB táblán, majd a zárás után elengedi. A táblában
+emellett tartósan megmarad egy
+<code>lab-tfstate-123456789012/environments/dev/terraform.tfstate-md5</code>
+LockID-jú, <code>Digest</code> mezős rekord: az S3 backend ezzel
+ellenőrzi a state konzisztenciáját, ez nem lock. A
+<code>tofu apply</code> létrehozza a bucketet, és a state fájl a távoli
+bucketbe kerül.</p>
+<p>A state megtekintése:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> state list</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Várt: aws_s3_bucket.example</span></span></code></pre></div>
+<p>A lock működésének ellenőrzéséhez indítsunk egy hosszú
+<code>apply</code> folyamatot egy terminálban, majd egy másik
+terminálban próbáljunk <code>plan</code>-t futtatni:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. terminál: hosszú apply; a meglévő bucket mellett &quot;No changes&quot; lenne,</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co"># ezért a lab egy time_sleep resource-ot (create_duration = &quot;120s&quot;) ad hozzá</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> apply <span class="at">-auto-approve</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. terminál: rögtön ezután</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> plan</span></code></pre></div>
+<p>A második parancs várhatóan hibát ad:</p>
+<pre><code>Error acquiring the state lock: ConditionalCheckFailedException</code></pre>
+<p>A lock ID a hibaüzenet <code>Lock Info</code> blokkjában látható. Ha
+az első folyamat szabályosan véget ér (vagy Ctrl-C-vel, gracefully áll
+le), a lock eltűnik, és a második parancs lefut. Ha az első folyamat
+keményen megszakad (SIGKILL, gép- vagy hálózatkiesés), a lock lejárat
+nélkül fennmarad.</p>
+<h3 data-number="46.2.4" id="hibák-és-ellenpróbák"><span
+class="header-section-number">46.2.4</span> Hibák és ellenpróbák</h3>
+<h4 data-number="46.2.4.1"
+id="tünet-error-acquiring-the-state-lock"><span
+class="header-section-number">46.2.4.1</span> Tünet:
+<code>Error acquiring the state lock</code></h4>
+<p><strong>Hipotézis</strong>: egy másik folyamat tartja a lockot, vagy
+egy korábbi megszakadt futás hagyta hátra.</p>
+<p><strong>Adatgyűjtés</strong>: A hibaüzenet <code>Lock Info</code>
+blokkjából (ID, Who, Operation, Created) azonosítsuk a tulajdonost, és
+ellenőrizzük azon a gépen vagy CI-jobon, hogy fut-e még (pl.
+<code>pgrep -a tofu</code>, illetve a CI-job állapota). A DynamoDB tábla
+<code>Info</code> mezős rekordja ugyanezt mutatja.</p>
+<p><strong>Egy változtatás</strong>: Ha nincs aktív folyamat, használjuk
+a <code>tofu force-unlock -force &lt;lock_id&gt;</code> parancsot (a
+kapcsoló a lock ID előtt áll). Ha van aktív folyamat, ne
+force-unlockoljunk, hanem várjuk meg, amíg befejeződik, vagy állítsuk le
+azt a folyamatot; a lock magától nem jár le.</p>
+<p><strong>Verifikáció</strong>: Újra <code>tofu plan</code>, ami
+sikeresen lefut.</p>
+<p><strong>Ellenpróba</strong>: Ha force-unlock után a <code>plan</code>
+ismét lock hibát ad, akkor egy másik folyamat (újra) lockot szerzett; a
+<code>Lock Info</code> új ID-jét és tulajdonosát kell megvizsgálni.</p>
+<h4 data-number="46.2.4.2" id="state-vs-resource-recovery"><span
+class="header-section-number">46.2.4.2</span> State vs resource
+recovery</h4>
+<p>A tünet: a state fájl sérült vagy törlődött, de az erőforrások a
+felhőben megvannak. Ha csak a state-t állítjuk vissza egy backupból, a
+<code>tofu plan</code> diff-et mutat, mert a state nem tartalmazza az
+aktuális resource konfigurációt. Ekkor nem a backupot kell erőltetni,
+hanem a state-et kell a valósághoz igazítani: <code>tofu import</code> a
+hiányzó leképezésekre (a configban deklarált címekre),
+<code>moved</code> blokk az átnevezett címekre. A resource recovery más:
+ha a felhőerőforrás törlődik, a state-ben továbbra is szerepel, és a
+<code>tofu apply</code> újból létrehozza, ha a konfiguráció
+változatlan.</p>
+<p>Ezért a kettőt mindig külön kell kezelni:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Művelet</th>
+<th>State hatás</th>
+<th>Resource hatás</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>tofu state rm</code></td>
+<td>eltávolítja a state-ből</td>
+<td>nem törli a felhőerőforrást</td>
+</tr>
+<tr>
+<td><code>tofu destroy</code></td>
+<td>eltávolítja a state-ből</td>
+<td>törli a felhőerőforrást</td>
+</tr>
+<tr>
+<td><code>tofu import</code></td>
+<td>hozzáadja a state-hez</td>
+<td>nem hozza létre, csak felveszi</td>
+</tr>
+<tr>
+<td>Backup restore</td>
+<td>visszaállítja a state-et</td>
+<td>nem érinti a felhőerőforrásokat</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="46.2.5" id="feladatok"><span
+class="header-section-number">46.2.5</span> Feladatok</h3>
+<h4 data-number="46.2.5.1" id="f1-magyarázó-feladat"><span
+class="header-section-number">46.2.5.1</span> F1 – Magyarázó
+feladat</h4>
+<p>Magyarázza el, mi a különbség a Terraform/OpenTofu S3 backend lejárat
+nélküli state lockja és egy lease-alapú (TTL-es) lock között, és miért
+nem elegendő egy lokális fájlrendszerbeli lock fájl remote csapat
+esetén. Adjon meg egy-egy hibajelenséget mindkét modellre (beragadt
+lock, illetve lejárt, de még élő tulajdonos), és írja le, mit tesz.</p>
+<p><strong>Postcondition</strong>: A hallgató szövegesen meg tudja
+indokolni a lock szükségességét, a két modell különbségét, és a
+force-unlock kockázatát.</p>
+<h4 data-number="46.2.5.2"
+id="f2-adminisztrációs-és-konfigurációs-feladat"><span
+class="header-section-number">46.2.5.2</span> F2 – Adminisztrációs és
+konfigurációs feladat</h4>
+<p>Állítson be OpenTofu remote S3 backendet DynamoDB lockkal egy sandbox
+accountban. A bucketben kapcsolja be a verziózást és a titkosítást
+(SSE-S3). Hozzon létre egy egyszerű erőforrást (például egy S3
+bucketet), majd ellenőrizze, hogy a state fájl a távoli bucketben van,
+és hogy a lock tábla rekordja létrejön-e az <code>apply</code>
+alatt.</p>
+<p><strong>Postcondition</strong>: A <code>tofu state list</code>
+mutatja az erőforrást. A S3 bucketben létezik a
+<code>environments/dev/terraform.tfstate</code> objektum. A DynamoDB
+táblában az <code>apply</code> befejezése után nincs <code>Info</code>
+mezős lock-rekord
+(<code>aws dynamodb scan --table-name lab-tfstate-lock --filter-expression 'attribute_exists(Info)'</code>
+→ <code>Count: 0</code>); a
+<code>lab-tfstate-123456789012/environments/dev/terraform.tfstate-md5</code>
+digest rekord megmarad.</p>
+<h4 data-number="46.2.5.3"
+id="f3-diagnosztikai-és-recovery-feladat"><span
+class="header-section-number">46.2.5.3</span> F3 – Diagnosztikai és
+recovery feladat</h4>
+<p>Szimuláljon interrupted apply-t: indítson egy legalább egy percig
+tartó <code>tofu apply</code> parancsot, majd szakítsa meg keményen
+(<code>kill -KILL</code>; a Ctrl-C graceful stopot végez és elengedi a
+lockot). Ellenőrizze, hogy a lock a DynamoDB táblában marad. Készítsen a
+megszakítás után, a force-unlock előtt <code>tofu state pull</code>
+segítségével backupot a state-ről, majd használja a
+<code>tofu force-unlock</code> parancsot a lock felszabadítására.
+Törölje a state fájlt a bucketből (vagy ürítse ki), majd állítsa vissza
+a backup segítségével <code>tofu state push</code> parancsot használva.
+Ellenőrizze <code>tofu plan</code> futásával, hogy nincs diff.</p>
+<p><strong>Postcondition</strong>: A lock megszűnt, a state visszaállt,
+és a <code>tofu plan</code> nem mutat változtatást a jelenlegi
+konfigurációhoz képest.</p>
+<h3 data-number="46.2.6" id="megoldások"><span
+class="header-section-number">46.2.6</span> Megoldások</h3>
+<h4 data-number="46.2.6.1" id="m1-magyarázó"><span
+class="header-section-number">46.2.6.1</span> M1 – Magyarázó</h4>
+<p>A <strong>state lock</strong> kizárólagos jog a state módosítására. A
+Terraform/OpenTofu S3 backendjében ez egy lejárat nélküli rekord (LockID
++ <code>Info</code>): a tulajdonos elengedi, vagy
+<code>force-unlock</code> törli; magától soha nem jár le. A
+<strong>lease</strong> általános fogalomként a lock időkorlátos bérlete
+(például etcd lease, Kubernetes <code>Lease</code>): a tulajdonosnak meg
+kell újítania, különben lejár, és más átveheti. A lokális
+fájlrendszerbeli lock fájl nem működik remote csapatban, mert minden gép
+saját fájlrendszerrel rendelkezik, és nem látják egymás lockját.</p>
+<p>Hibajelenség a lejárat nélküli lockkal: a keményen megszakított apply
+után a lock beragad, és várakozással nem oldódik fel; a tulajdonos
+ellenőrzése után <code>force-unlock</code> kell. Hibajelenség a
+lease-zel: a lease lejár (például a tulajdonos szünetel vagy hálózatilag
+elszigetelődik), de a régi folyamat ténylegesen még fut, és egy új
+folyamat megszerzi a lockot, miközben a régi még ír. Ilyenkor a lejárat
+hamis biztonságot ad; ezt fencing tokennel (monoton növekvő
+lock-sorszám, amelyet a tároló ellenőriz) lehet kivédeni. Mindkét
+esetben ellenőrizni kell a tulajdonos folyamat állapotát.</p>
+<h4 data-number="46.2.6.2" id="m2-konfigurációs"><span
+class="header-section-number">46.2.6.2</span> M2 – Konfigurációs</h4>
+<p>A backend blokk a fentiekben látható. A bucket verziózását és
+titkosítását manuálisan kell bekapcsolni az AWS konzolon vagy CLI-vel. A
+CLI parancsok:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: labVM (UID=1000), us-east-1 sandbox account</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">aws</span> s3api put-bucket-versioning <span class="dt">\</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--bucket</span> lab-tfstate-123456789012 <span class="dt">\</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--versioning-configuration</span> Status=Enabled</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="ex">aws</span> s3api put-bucket-encryption <span class="dt">\</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--bucket</span> lab-tfstate-123456789012 <span class="dt">\</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--server-side-encryption-configuration</span> <span class="st">&#39;{</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="st">    &quot;Rules&quot;: [{</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="st">      &quot;ApplyServerSideEncryptionByDefault&quot;: {</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="st">        &quot;SSEAlgorithm&quot;: &quot;AES256&quot;</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="st">      }</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="st">    }]</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="st">  }&#39;</span></span></code></pre></div>
+<p>(Megjegyzés: a <code>aws</code> parancs itt illusztratív; a pontos
+API a jelenlegi AWS CLI verziójában ellenőrizendő. Az SSE-S3 csak a
+fizikai adathordozó ellen véd: aki <code>s3:GetObject</code> jogot kap,
+olvassa a state-et. Szűkebb olvasási körhöz SSE-KMS customer managed
+kulcs és szűk kulcspolicy kell.)</p>
+<p>Ezután <code>tofu init</code> és <code>tofu apply</code>. A
+<code>tofu apply</code> közben a DynamoDB táblában a digest rekord
+mellett egy <code>Info</code> mezős lock-rekord is van; a befejezés után
+a lock-rekord eltűnik, a <code>…/terraform.tfstate-md5</code> digest
+rekord megmarad. Ezt ellenőrizheti:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aws</span> dynamodb scan <span class="at">--table-name</span> lab-tfstate-lock <span class="dt">\</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--filter-expression</span> <span class="st">&#39;attribute_exists(Info)&#39;</span> <span class="at">--select</span> COUNT</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="co"># várt az apply után: &quot;Count&quot;: 0</span></span></code></pre></div>
+<h4 data-number="46.2.6.3" id="m3-diagnosztikai-és-recovery"><span
+class="header-section-number">46.2.6.3</span> M3 – Diagnosztikai és
+recovery</h4>
+<ol type="1">
+<li>Indítsunk egy legalább 60 s-ig tartó applyt: a configba egy
+<code>time_sleep</code> resource kerül (<code>hashicorp/time</code>
+provider, <code>create_duration = "120s"</code>), majd
+<code>tofu apply -auto-approve</code>. Egy másik terminálban keményen
+leállítjuk a folyamatot (Ctrl-C vagy <code>kill -INT</code> erre nem jó,
+mert graceful stopot végez és elengedi a lockot):</li>
+</ol>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="bu">kill</span> <span class="at">-KILL</span> <span class="st">&quot;</span><span class="va">$(</span><span class="ex">pgrep</span> <span class="at">-f</span> <span class="st">&#39;tofu apply&#39;</span><span class="va">)</span><span class="st">&quot;</span></span></code></pre></div>
+<p>A lock a táblában marad. A lock ID lekérdezése:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aws</span> dynamodb scan <span class="at">--table-name</span> lab-tfstate-lock <span class="dt">\</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--filter-expression</span> <span class="st">&#39;attribute_exists(Info)&#39;</span></span></code></pre></div>
+<ol start="2" type="1">
+<li>Készítsünk backupot a megszakítás után, a force-unlock előtt (így a
+backup a félbeszakadt apply utáni állapotot rögzíti, nem az apply
+előttit):</li>
+</ol>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> state pull <span class="op">&gt;</span> /tmp/dev-state-backup.tfstate</span></code></pre></div>
+<ol start="3" type="1">
+<li>Force-unlock (a <code>-force</code> kapcsoló a lock ID előtt
+áll):</li>
+</ol>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># LOCK_ID: a Lock Info / a lock-rekord ID mezője</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> force-unlock <span class="at">-force</span> <span class="st">&quot;</span><span class="va">$LOCK_ID</span><span class="st">&quot;</span></span></code></pre></div>
+<ol start="4" type="1">
+<li>Töröljük a state objektumot:</li>
+</ol>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aws</span> s3 rm s3://lab-tfstate-123456789012/environments/dev/terraform.tfstate</span></code></pre></div>
+<ol start="5" type="1">
+<li>Pusholjuk vissza a backupot:</li>
+</ol>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> state push /tmp/dev-state-backup.tfstate</span></code></pre></div>
+<ol start="6" type="1">
+<li>Ellenőrizzük:</li>
+</ol>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> plan</span></code></pre></div>
+<p>Várt:
+<code>No changes. Your infrastructure matches the configuration.</code>
+Ha a megszakított apply félig létrehozott erőforrást hagyott (például a
+<code>time_sleep</code> nem került a state-be), a plan ezt
+létrehozandóként mutatja; ezt a következő applyval vagy – külső
+erőforrásnál – <code>tofu import</code>-tal kell rendezni, mielőtt a „No
+changes” állapotot elfogadjuk.</p>
+<p><strong>Postcondition</strong>: A <code>tofu plan</code> sikeres,
+nincs törlés vagy létrehozás, a lock táblában nincs <code>Info</code>
+mezős lock-rekord (a digest rekord megmaradhat), a state fájl
+visszaállt.</p>
+<h3 data-number="46.2.7" id="rövid-összefoglaló"><span
+class="header-section-number">46.2.7</span> Rövid összefoglaló</h3>
+<p>A remote state a Terraform/OpenTofu állapotfájljának megosztott,
+védett, verziózott tárolása, amely lehetővé teszi a csapatos,
+reprodukálható infrastruktúrakezelést. A backendhez identitáskötött
+hozzáférés tartozik, a state érzékeny adatai miatt titkosítás és szigorú
+IAM szükséges. A state lock biztosítja, hogy egyszerre csak egy folyamat
+módosítsa a state-et; az S3 backend lockja nem jár le magától, ezért a
+keményen megszakadt folyamatok által hátrahagyott lockot a
+<code>force-unlock</code> kezeli, de csak a tulajdonos ellenőrzése után.
+A state módosítható <code>import</code>, <code>moved</code> és
+<code>state</code> parancsokkal, amelyek nem érintik a valós
+erőforrásokat; a recovery során a state és a resource helyreállítása két
+külön folyamat, és a kettőt össze kell hangolni.</p>
+<p><strong>Továbbhasznált definíciók</strong>: <strong>remote
+state</strong> — az IaC állapotfájl megosztott, hálózati tárolóban lévő,
+verziózott és titkosított példánya; <strong>state lock</strong> — a
+state módosítására vonatkozó kizárólagos jog, amely megakadályozza a
+párhuzamos írást (az S3 backendben lejárat nélküli rekord);
+<strong>lease</strong> — időkorlátos, megújítandó lock, amelynél a
+lejárat fencinget igényel; <strong>state recovery vs resource
+recovery</strong> — a state fájl backupból való visszaállítása, illetve
+a valós felhőerőforrás helyreállítása, amelyek egymástól független, de
+összehangolandó műveletek.</p>
+<h3 data-number="46.2.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">46.2.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>Az alábbi hivatkozások kiindulópontok, nem olvasott, ellenőrzött
+bizonyítékok. A backendek pontos szintaxisa, a lock-tábla viselkedése, a
+verziózás és titkosítás opciói, valamint az AWS API-k a jelenlegi
+verziókban változhatnak, ezért a konkrét labkörnyezetben
+ellenőrizendők.</p>
+<ul>
+<li><a href="https://opentofu.org/docs/">OpenTofu documentation</a> —
+„Backend Type: s3” (<code>dynamodb_table</code>,
+<code>use_lockfile</code>, <code>workspace_key_prefix</code>, szükséges
+IAM-jogok), „Command: force-unlock”, „Command: import” és „Import”
+blokk, „State: Locking”; hivatkozott verzió: OpenTofu 1.6.x (a példa
+<code>required_version = "&gt;= 1.6"</code> korlátja), a natív
+S3-lockhoz a későbbi kiadások changelogja.</li>
+<li><a href="https://developer.hashicorp.com/terraform/docs">Terraform
+documentation</a> — ugyanezek a Terraform S3 backendre; a
+<code>dynamodb_table</code> elavulását a changelog jelzi.</li>
+<li><a
+href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/">Amazon S3
+User Guide</a> — „Protecting data with server-side encryption” (SSE-S3
+vs SSE-KMS), versioning; <a
+href="https://docs.aws.amazon.com/kms/latest/developerguide/">AWS KMS
+Developer Guide</a> — „Key policies”; DynamoDB <code>scan</code> a <a
+href="https://docs.aws.amazon.com/">AWS documentation</a> DynamoDB
+API-referenciájában.</li>
+<li>Lease és fencing token általános fogalma: az etcd dokumentáció
+„lease” API-ja és a Kubernetes <code>Lease</code> objektum
+(<code>https://kubernetes.io/docs/concepts/architecture/leases/</code>).</li>
+</ul>
+<p><strong>Ellenőrzési státusz:</strong> a backend-labor sikeres ága és
+hibaágai (beragadt lock SIGKILL után, state push/restore) sandbox
+accountban ellenőrizendők; dátumozott futtatási napló még nem
+készült.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d226.html">← 46.1 Declarative infrastructure, provider és state</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d228.html">46.3 Module, environment és változási határ →</a></div>
+</nav>
+</body>
+</html>

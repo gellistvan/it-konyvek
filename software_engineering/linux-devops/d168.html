@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>34.3 vCPU, memória, overcommit és NUMA – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch34">34 Virtualizáció, hypervisor és KVM/QEMU</a></p>
+<div class="links"><a class="prev" rel="prev" href="d167.html">← 34.2 KVM, QEMU és libvirt komponensek</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d169.html">34.4 Virtio, passthrough, SR-IOV és IOMMU →</a></div>
+</nav>
+<h2 data-number="34.3" id="d168"><span
+class="header-section-number">34.3</span> vCPU, memória, overcommit és
+NUMA</h2>
+<h3 data-number="34.3.1" id="motiváció"><span
+class="header-section-number">34.3.1</span> Motiváció</h3>
+<p>A virtualizáció egyik legfélrevezetőbb telemetriája, amikor a vendég
+operációs rendszer (guest OS) szerint a CPU telített, a host hypervisor
+szerint viszont bőven van szabad processzor. KVM/QEMU környezetben a
+vendég CPU-ját egy host szál ütemezi; ha a host túlvállalt, akkor a
+vendég időt lopnak el a számításból, amit a guest külön mutatóként lát.
+A memóriánál hasonló kettősség: a guest láthat 2 GiB szabad memóriát, a
+host viszont ugyanazt a lapokat már swapra vagy ballooningba
+kényszerítette. A fejlesztői gyakorlatban ez a támogatási hívás tipikus
+félreértése: a guest high CPU nem jelenti automatikusan, hogy a workload
+túl lassú; könnyen lehet, hogy a hypervisor egyszerűen nem ad neki
+processzort. Ebben az alfejezetben a vCPU ütemezés, memory backing, NUMA
+elhelyezés és a host erőforrás-controller együttes modelljét építjük
+fel, hogy az üzemeltető a guest és a host telemetriát egyben
+értelmezze.</p>
+<h3 data-number="34.3.2" id="definíció-és-működés"><span
+class="header-section-number">34.3.2</span> Definíció és működés</h3>
+<h4 data-number="34.3.2.1"
+id="vcpu-scheduling-oversubscription-és-steal"><span
+class="header-section-number">34.3.2.1</span> vCPU, scheduling,
+oversubscription és steal</h4>
+<p>A KVM guest minden virtuális CPU-ja (vCPU) a QEMU processz egy-egy
+host threadje. A hardware virtualizációs kiterjesztések (Intel VMX vagy
+AMD SVM) a guest user/kernel módú utasításait többnyire közvetlenül a
+fizikai magon futtatják; a KVM a virtuális megszakításokat, I/O-t és az
+időzítőket emulálja. Amikor a guest idle, a vCPU végrehajt egy HLT
+utasítást, és a host thread elalszik. Amikor a guest dolgozik, a vCPU
+thread futni szeretne, és a host Linux scheduler ugyanúgy ütemezi, mint
+bármely más threadet.</p>
+<p><strong>CPU oversubscription</strong> (CPU túlvállalás) azt jelenti,
+hogy az összes guest vCPU összege nagyobb, mint a host fizikai
+processzorok száma. Ez nem tiltott állapot; a legtöbb virtualizált
+szerveren ez a bevált gyakorlat, mert a guestek ritkán futnak egyszerre
+100%-on. Ha mégis, akkor a runnable vCPU-k versenyeznek a host CPU-ért,
+a host scheduler várakozási sora nő, a guest pedig CPU steal-t vagy
+scheduler jitter-t érzékel.</p>
+<p><strong>CPU steal</strong> a guest operációs rendszer
+<code>/proc/stat</code> jában megjelenő idő, ami alatt a vCPU runnable
+volt, de a hypervisor nem adott neki host processzort. A guest kernel a
+hypervisor által szolgáltatott paravirtualizált óra alapján méri ezt. A
+guest <code>top</code> az adott ablakban a <code>%st</code> oszlopban
+mutatja; a guest <code>/proc/stat</code> CPU sorában a
+<code>steal</code> mező a teljes időhöz viszonyítva:<br />
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">steal arány</mtext><mo>=</mo><mfrac><mtext mathvariant="normal">steal</mtext><mrow><mtext mathvariant="normal">user</mtext><mo>+</mo><mtext mathvariant="normal">nice</mtext><mo>+</mo><mtext mathvariant="normal">system</mtext><mo>+</mo><mtext mathvariant="normal">idle</mtext><mo>+</mo><mtext mathvariant="normal">iowait</mtext><mo>+</mo><mtext mathvariant="normal">irq</mtext><mo>+</mo><mtext mathvariant="normal">softirq</mtext><mo>+</mo><mtext mathvariant="normal">steal</mtext></mrow></mfrac></mrow><annotation encoding="application/x-tex">\text{steal arány} = \frac{\text{steal}}{\text{user} + \text{nice} + \text{system} + \text{idle} + \text{iowait} + \text{irq} + \text{softirq} + \text{steal}}</annotation></semantics></math></p>
+<p><strong>CPU throttling</strong> különbözik a steal általános
+versenyétől: ha a hypervisor felső CPU-kvótát szab, a vCPU a kvóta
+túllépése után mesterségesen futásra képtelen, akkor is, ha a host üres.
+Ez a host oldali cgroup v2 <code>cpu.max</code> vagy a libvirt
+<code>cputune</code> quota korlát következménye. A guest ezt is
+steal-ként látja, de a host oldalon a cgroup v2 <code>cpu.stat</code>
+<code>nr_throttled</code> és <code>throttled_usec</code> mezője
+megkülönbözteti a scheduler contentiontől (a <code>throttled_time</code>
+a cgroup v1 mezője), például
+<code>grep -E 'nr_throttled|throttled_usec' /sys/fs/cgroup/machine.slice/machine-qemu*lab-cpp-guest*.scope/cpu.stat</code>.</p>
+<h4 data-number="34.3.2.2" id="memória-balloon-és-hugepages"><span
+class="header-section-number">34.3.2.2</span> Memória, balloon és
+hugepages</h4>
+<p>A guest RAM mögötti host memória a QEMU processz anonim vagy
+file-backed lapja. KVM a guest fizikai címeket második szintű
+címfordításon (Extended Page Table, EPT vagy Nested Page Table, NPT)
+keresztül a host fizikai lapokra képezi. A fordítás sebessége
+nagymértékben függ a host lapok nagyságától: a 2 MiB vagy 1 GiB
+<strong>hugepages</strong> lapok csökkentik a TLB miss-eket és a második
+szintű page walk költségét. A libvirt
+<code>memoryBacking/hugepages</code> beállítása statikus, előre
+elkülönített 2 MiB-os lapokat igényel a hoston.</p>
+<p><strong>Ballooning</strong> a virtio-balloon eszköz: a guest kernel
+együttműködik, és a hostnak visszaadhat fel nem használt lapokat; a
+guestben ez memórianyomást okoz, mert a visszavett lapoknál a guest
+kernel reclaimot vagy swapot indít be. A balloon nem a host swap, hanem
+a guest szabad memóriájának hypervisor általi visszavétele; a guest
+<code>free</code> nem feltétlenül tükrözi a host látható fizikai
+hátteret. A hoston a <code>virsh dommemstat</code> vagy a balloon driver
+mutatja a ténylegesen visszavett lapokat.</p>
+<h4 data-number="34.3.2.3" id="numa-topology-vnuma-és-pinning"><span
+class="header-section-number">34.3.2.3</span> NUMA topology, vNUMA és
+pinning</h4>
+<p>A host <strong>NUMA</strong> (Non-Uniform Memory Access) node
+processzorokból és a hozzájuk tartozó memóriavezérlőből áll. A KVM guest
+virtuális NUMA topológiát kaphat, ha a libvirt
+<code>&lt;cpu&gt;&lt;numa&gt;</code> cellákat definiál. Ez azért fontos,
+mert a guest kernel saját ütemezője a cellákon belül próbálja tartani a
+feladatokat és a memóriát; ha a vCPU-k a 0. host node-on futnak, de a
+memória a 1. node-on van, akkor a guest futása remote memóriahozzáférést
+szül. A <strong>vNUMA</strong> és a <strong>pin</strong> nem önmagában
+oldja meg a dolgot: a vCPU pin mellett explicit memória-node elhelyezés
+kell (libvirt <code>numatune</code>; a <code>memoryBacking</code>
+hugepages <code>nodeset</code> attribútuma a vendég NUMA-cellát jelöli,
+nem a host node-ot). A <code>virsh numatune</code> a beállított
+elhelyezést mutatja; a ténylegeset a
+<code>numastat -p &lt;QEMU PID&gt;</code> node-onkénti MB-felhasználása
+mutatja meg.</p>
+<h4 data-number="34.3.2.4" id="cgroup-és-host-resource-quota"><span
+class="header-section-number">34.3.2.4</span> Cgroup és host resource
+quota</h4>
+<p>A libvirt által indított QEMU folyamatok a systemd
+<code>/machine.slice</code> alá tartoznak. A <strong>cgroup v2</strong>
+<code>cpu.max</code> a CPU-kvótát, a <code>memory.max</code> a memória
+felső határát szabályozza. Alapértelmezésben azonban a libvirt nem állít
+memória-limitet a VM scope-jára, így egy VM a host memóriáját is
+kimerítheti. Ha limitet adunk
+(<code>&lt;memtune&gt;&lt;hard_limit unit='GiB'&gt;3&lt;/hard_limit&gt;&lt;/memtune&gt;</code>,
+ami cgroup v2 <code>memory.max</code>-ra képeződik), a VM nem lépheti
+túl; túllépéskor a cgroup-OOM a scope-ban lévő host-folyamatot, vagyis
+magát a QEMU-t öli meg, ami a teljes VM kiesése (a vendég belső
+folyamatairól a host nem tud). Ellenőrzés:
+<code>cat /sys/fs/cgroup/machine.slice/machine-qemu*lab-cpp-guest*.scope/memory.max</code>
+(<code>max</code> = nincs limit). A host erőforrás-controller tehát
+beállított limit mellett a virtualizációs ütemező alatt, a kernel
+szintjén további kemény korlátot ad.</p>
+<h4 data-number="34.3.2.5" id="noisy-neighbor-és-failure-headroom"><span
+class="header-section-number">34.3.2.5</span> Noisy neighbor és failure
+headroom</h4>
+<p><strong>Noisy neighbor</strong> nek nevezzük a más VM-et, konténert
+vagy host folyamatot, amely ugyanazon fizikai erőforráson (CPU, L3
+cache, memory bandwidth, disk, network) osztozik. Az L3 cache és a
+memory bandwidth contention különösen alattomos: a CPU kihasználtság 50%
+alatt is nagy latency növekedést okoz, mert a vCPU-k evictálják egymás
+cache sorait. A <strong>failure headroom</strong> az a
+kapacitástartalék, amelyet a hoston kihasználatlanul hagyunk, hogy egy
+VM burstje, egy crash loop vagy egy replikált workload ne döntse ki a
+többi VM-et. A pinning csökkenti a CPU topológiai bizonytalanságot, de a
+noisy neighbour cache/bandwidth hatást nem szünteti meg: közös utolsó
+szintű cache (LLC) és memóriavezérlő marad.</p>
+<h4 data-number="34.3.2.6" id="guest-versus-host-telemetria"><span
+class="header-section-number">34.3.2.6</span> Guest versus host
+telemetria</h4>
+<p>A guest önmagában látja a belső futó folyamatokat, a saját idle/steal
+arányt, a saját memórianomást. A host látja a QEMU thread tényleges
+CPU-ját, a scheduler várakozási idejét, a cgroup pressure-t, a balloon
+aktuális méretét, a page fault és a node elérési statisztikákat. A
+diagnosztika szabálya: ha a guest magas CPU-t jelez, de a host QEMU
+thread CPU alacsony, akkor a vCPU contention, nem a guest belső munkája
+a szűk keresztmetszet. Ha a host QEMU thread CPU magas, a guest CPU is
+magas, akkor a workload valóban a vCPU-n dolgozik.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Jelenség</th>
+<th>Guest telemetria</th>
+<th>Host telemetria</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CPU-bound workload</td>
+<td>magas <code>%usr</code></td>
+<td>QEMU thread magas <code>%CPU</code></td>
+</tr>
+<tr>
+<td>CPU oversubscription</td>
+<td>magas <code>%steal</code></td>
+<td>QEMU thread runnable/sleep arány, host CPU saturation</td>
+</tr>
+<tr>
+<td>CPU quota</td>
+<td>magas <code>%steal</code>, alacsony <code>%usr</code></td>
+<td>QEMU thread limitált burst, cgroup <code>cpu.stat</code>
+throttling</td>
+</tr>
+<tr>
+<td>Memória balloon</td>
+<td>guest reclaim, swap</td>
+<td><code>virsh dommemstat</code>, balloon méret</td>
+</tr>
+<tr>
+<td>NUMA remote</td>
+<td>guest nehéz memória hozzáférés</td>
+<td><code>numastat</code>, <code>perf</code>, node distance</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="34.3.3" id="kidolgozott-példa"><span
+class="header-section-number">34.3.3</span> Kidolgozott példa</h3>
+<p>Egy KVM hoston (<code>lab-hv01</code>, Ubuntu 24.04 LTS, root/sudo)
+dedikált lab guestet hozunk létre. Feltételezett host topológia: 8 CPU,
+16 GiB RAM, két NUMA node (0: CPU 0–3, 8 GiB; 1: CPU 4–7, 8 GiB). A
+guest igénye: 4 vCPU, 2 GiB RAM, statikus 2 MiB hugepages backing, vCPU
+pinning a 4–7 CPU-ra, emulatorpin ugyanoda, virtuális topológia 1 socket
+/ 4 core. Desired state: a guest csak a node 1 CPU-it használja, és a
+memóriája is lehetőleg a node 1-en van.</p>
+<p>A libvirt domain XML kulcstöredéke:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode xml"><code class="sourceCode xml"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>&lt;<span class="kw">domain</span> <span class="ot">type=</span><span class="st">&#39;kvm&#39;</span>&gt;</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  &lt;<span class="kw">name</span>&gt;lab-cpp-guest&lt;/<span class="kw">name</span>&gt;</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>  &lt;<span class="kw">uuid</span>&gt;a1b2c3d4-e5f6-4a7b-9c0d-0123456789ab&lt;/<span class="kw">uuid</span>&gt;</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>  &lt;<span class="kw">memory</span> <span class="ot">unit=</span><span class="st">&#39;KiB&#39;</span>&gt;2097152&lt;/<span class="kw">memory</span>&gt;</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>  &lt;<span class="kw">currentMemory</span> <span class="ot">unit=</span><span class="st">&#39;KiB&#39;</span>&gt;2097152&lt;/<span class="kw">currentMemory</span>&gt;</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>  &lt;<span class="kw">vcpu</span> <span class="ot">placement=</span><span class="st">&#39;static&#39;</span>&gt;4&lt;/<span class="kw">vcpu</span>&gt;</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>  &lt;<span class="kw">cputune</span>&gt;</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">vcpupin</span> <span class="ot">vcpu=</span><span class="st">&#39;0&#39;</span> <span class="ot">cpuset=</span><span class="st">&#39;4&#39;</span>/&gt;</span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">vcpupin</span> <span class="ot">vcpu=</span><span class="st">&#39;1&#39;</span> <span class="ot">cpuset=</span><span class="st">&#39;5&#39;</span>/&gt;</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">vcpupin</span> <span class="ot">vcpu=</span><span class="st">&#39;2&#39;</span> <span class="ot">cpuset=</span><span class="st">&#39;6&#39;</span>/&gt;</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">vcpupin</span> <span class="ot">vcpu=</span><span class="st">&#39;3&#39;</span> <span class="ot">cpuset=</span><span class="st">&#39;7&#39;</span>/&gt;</span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">emulatorpin</span> <span class="ot">cpuset=</span><span class="st">&#39;4-7&#39;</span>/&gt;</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>  &lt;/<span class="kw">cputune</span>&gt;</span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>  &lt;<span class="kw">numatune</span>&gt;</span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">memory</span> <span class="ot">mode=</span><span class="st">&#39;strict&#39;</span> <span class="ot">nodeset=</span><span class="st">&#39;1&#39;</span>/&gt;</span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>  &lt;/<span class="kw">numatune</span>&gt;</span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>  &lt;<span class="kw">cpu</span> <span class="ot">mode=</span><span class="st">&#39;host-passthrough&#39;</span> <span class="ot">check=</span><span class="st">&#39;none&#39;</span>&gt;</span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">topology</span> <span class="ot">sockets=</span><span class="st">&#39;1&#39;</span> <span class="ot">dies=</span><span class="st">&#39;1&#39;</span> <span class="ot">cores=</span><span class="st">&#39;4&#39;</span> <span class="ot">threads=</span><span class="st">&#39;1&#39;</span>/&gt;</span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">numa</span>&gt;</span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>      &lt;<span class="kw">cell</span> <span class="ot">id=</span><span class="st">&#39;0&#39;</span> <span class="ot">cpus=</span><span class="st">&#39;0-3&#39;</span> <span class="ot">memory=</span><span class="st">&#39;2097152&#39;</span> <span class="ot">unit=</span><span class="st">&#39;KiB&#39;</span>/&gt;</span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>    &lt;/<span class="kw">numa</span>&gt;</span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>  &lt;/<span class="kw">cpu</span>&gt;</span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a>  &lt;<span class="kw">memoryBacking</span>&gt;</span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">hugepages</span>&gt;</span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>      &lt;<span class="kw">page</span> <span class="ot">size=</span><span class="st">&#39;2048&#39;</span> <span class="ot">unit=</span><span class="st">&#39;KiB&#39;</span> <span class="ot">nodeset=</span><span class="st">&#39;0&#39;</span>/&gt;</span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a>    &lt;/<span class="kw">hugepages</span>&gt;</span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>  &lt;/<span class="kw">memoryBacking</span>&gt;</span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>&lt;/<span class="kw">domain</span>&gt;</span></code></pre></div>
+<p>A fenti XML a kulcstöredék; a <code>uuid</code> a labban egyértelmű,
+a teljes domain XML-nek tartalmaznia kell a szokásos device, firmware és
+boot részt. A <code>numatune memory mode='strict' nodeset='1'</code> a
+guest memória allokációt a 1. NUMA node-ra kényszeríti. A
+<code>memoryBacking hugepages</code> statikus 2 MiB-os lapokat kér; a
+<code>page</code> elem <code>nodeset</code> attribútuma (kisbetűvel; az
+XML case-sensitive) a vendég NUMA-celláját jelöli, itt az egyetlen
+<code>cell id='0'</code>-t (elhagyva minden cellára vonatkozik). A host
+node-ot (node 1) a <code>numatune</code> választja ki, ezért a host node
+1-en előre foglalt 2 MiB-os lapok kellenek:
+<code>echo 1024 | sudo tee /sys/devices/system/node/node1/hugepages/hugepages-2048kB/nr_hugepages</code>.
+A <code>cputune</code> a vCPU-kat a 4–7 CPU-khoz köti, így a guest
+kernel vCPU ütemei a node 1 fizikai magjain maradnak.</p>
+<p>Laborparancsok ellenőrzésre (<code>root</code> szükséges,
+<code>qemu:///system</code>):</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-hv01, UID=0</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system define lab-cpp-guest.xml</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system start lab-cpp-guest</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="co"># CPU pinning és NUMA ellenőrzése</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system vcpupin lab-cpp-guest</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system emulatorpin lab-cpp-guest</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system numatune lab-cpp-guest</span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="co"># Memória és hugepages</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system dommemstat lab-cpp-guest</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-i</span> hugepages /proc/meminfo</span></code></pre></div>
+<p>Várható kimenet (illusztratív, nem mért): a <code>vcpupin</code>
+sorok azt mutatják, hogy <code>VCPU3: 7</code>; a <code>numatune</code>
+<code>nodeset 1</code>; a <code>/proc/meminfo</code>
+<code>HugePages_Total</code> értéke elegendő. A guestben
+<code>lscpu</code> 4 CPU-t, a <code>/proc/cpuinfo</code>
+<code>processor 0-3</code>, a <code>top</code> a <code>%st</code>
+oszlopot mutatja; nyugalmi állapotban a <code>%st</code> nullához
+közeli. Ha a hoston másik VM is fut ugyanazon node-on, akkor a guest CPU
+kihasználtsága mellett a host <code>pidstat</code> a QEMU processzre
+osztozik.</p>
+<h3 data-number="34.3.4" id="hibák-és-ellenpróbák"><span
+class="header-section-number">34.3.4</span> Hibák és ellenpróbák</h3>
+<p>A tipikus hiba az, hogy a guest <code>top</code> 100% CPU-ját a host
+CPU kimerülésnek feleltetjük meg. Ha a host <code>pidstat</code>
+ugyanarra a QEMU processzre alacsony százalékot mutat, akkor a vCPU
+runnable, de nem fut; ilyenkor a guest <code>%steal</code> magas.
+Fordított esetben, ha a host QEMU processz CPU-ja magas, de a guest
+<code>%steal</code> alacsony, akkor a workload tényleg a guest belső
+számítását futtatja.</p>
+<p>A második hiba a pinning elvégzése memóriaelhelyezés nélkül. Ha a
+vCPU-t a node 1-hez kötjük, de a memóriát a node 0-ra tesszük, a remote
+access aránya megnő; a
+<code>numastat -p $(pgrep -f 'qemu.*lab-cpp-guest')</code> node-onkénti
+MB-kimenetében a memória jelentős része a Node 0 oszlopban van, miközben
+a vCPU-k a node 1-en futnak (folyamatszintű <code>foreign</code> oszlop
+nincs; a <code>numa_foreign</code> a rendszerszintű
+<code>numastat</code> számlálója). A javítás a <code>numatune</code>
+helyes beállítása.</p>
+<p>A harmadik hiba a hugepages bekapcsolása anélkül, hogy a host a
+<code>vm.nr_hugepages</code> és a <code>HugePages_Total</code> értékben
+tartalékolná a fogadó lapokat. A QEMU a hugetlbfs-ből foglal, ezért
+elégtelen lapszámnál (<code>HugePages_Free</code> &lt; igény) az indítás
+memóriafoglalási hibával bukik; csendes visszaesés 4 KiB-os lapokra
+nincs. Ellenőrzés:
+<code>grep -E 'HugePages_(Total|Free)' /proc/meminfo</code> és a
+node-onkénti <code>nr_hugepages</code>.</p>
+<p>A negyedik hiba a headroom hiánya: a host CPU túlvállalt 8 physics /
+12 vCPU arányban, és egy noisy neighbour folyamatosan hozza a cache
+pressure-t. Ilyenkor a steal nem magas, a CPU sem 100%, de a latency
+szintje magas. Az ellenpróba a QEMU processz <code>perf stat</code> L3
+cache miss és a <code>virsh schedinfo</code> <code>cpu_shares</code>
+növelése, vagy a noisy neighbour CPU pinningjének szűkítése.</p>
+<h3 data-number="34.3.5" id="feladatok"><span
+class="header-section-number">34.3.5</span> Feladatok</h3>
+<ol type="1">
+<li><p><strong>Magyarázó feladat</strong><br />
+Magyarázd el, miért mutathat a guest <code>top</code> 90% CPU-t,
+miközben a host <code>pidstat</code> a QEMU processzre 5% CPU-t mutat.
+Milyen guest metrika igazolja ezt, és mi a host oldali scheduler
+jelenség neve? Hogyan döntöd el, hogy a vCPU CPU-throttling vagy CPU
+oversubscription okozza a latenciát?</p></li>
+<li><p><strong>Adminisztrációs/konfigurációs feladat</strong><br />
+Egy labhoston 8 CPU, node 0 CPU 0–3, node 1 CPU 4–7. Hozz létre egy
+<code>lab-cpp-guest</code> domain-t 4 vCPU, 2 GiB memória, 2 MiB
+hugepages, vCPU pin 4–7, emulatorpin 4–7, memória elhelyezés node 1. Add
+meg a libvirt XML töredéket és az ellenőrző parancsokat. Írd a desired
+state-et, a rollback parancsot és az expected postconditiont.</p></li>
+<li><p><strong>Diagnosztikai/failure/recovery feladat</strong><br />
+Egy <code>lab-cpp-latency</code> guest lassú: a guest
+<code>mpstat</code> 10-es loadot mutat, a guest <code>%steal</code> 40%,
+a host <code>pidstat</code> a QEMU processzre 120% CPU-t mutat, de a
+host összes CPU kihasználtsága 60%. A hoston két másik VM fut ugyanazon
+a NUMA node-on, az egyik <code>lab-noisy</code> folyamatosan 4 CPU-t
+telít. Gyűjts adatot (<code>virsh vcpuinfo</code>,
+<code>virsh schedinfo</code>, <code>numastat</code>, cgroup
+<code>cpu.stat</code>). Egyetlen beavatkozással javíts a
+<code>lab-cpp-latency</code> guest steal idején, majd igazold a
+javulást. Mi a rollback?</p></li>
+</ol>
+<h3 data-number="34.3.6" id="megoldások"><span
+class="header-section-number">34.3.6</span> Megoldások</h3>
+<ol type="1">
+<li><p>A guest futó feladatai futásra kész processzeket és szálakat
+jelentenek, de a vCPU-k nem kapnak host processzort, mert a host CPU-k
+más runnable vCPU-kat szolgálnak ki. Ezt a guest a hypervisor által
+ellátott <code>steal</code> időként méri. A host oldali jelenség: a vCPU
+thread a scheduler <code>runnable</code> állapotban várakozik, a
+<code>schedstat</code> <code>wait_start</code>/<code>wait_max</code> idő
+hosszú. Ha a guestben magas steal és alacsony CPU quota, akkor
+throttling; ha magas steal és a host CPU telített, akkor
+oversubscription. A döntés a host <code>pidstat</code> és a cgroup v2
+<code>cpu.stat</code>
+<code>nr_throttled</code>/<code>throttled_usec</code> mezőjéből hozható:
+throttlingnál ezek nőnek
+(<code>grep -E 'nr_throttled|throttled_usec' /sys/fs/cgroup/machine.slice/machine-qemu*lab-cpp-guest*.scope/cpu.stat</code>).</p></li>
+<li><p>A szükséges XML-töredék a kidolgozott példában látható: a host
+node-ot a <code>numatune</code> (<code>nodeset='1'</code>) választja ki,
+a hugepages <code>page</code> elem <code>nodeset='0'</code> a vendég
+egyetlen cellájára vonatkozik; előtte a host node 1-en 2 MiB-os lapokat
+kell foglalni. Az adminisztrátornak:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-hv01, root</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system define lab-cpp-guest.xml</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system start lab-cpp-guest</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system vcpupin lab-cpp-guest</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system numatune lab-cpp-guest</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system dominfo lab-cpp-guest</span></code></pre></div>
+<p>Desired state: a guest vCPU-k a CPU 4–7-re pinnal rendelkeznek, a
+memória node 1-re allokált, a hugepages backing aktív. Rollback:
+<code>virsh -c qemu:///system destroy lab-cpp-guest</code> majd
+<code>virsh -c qemu:///system undefine lab-cpp-guest</code>.
+Postcondition: a <code>virsh vcpupin</code> minden vCPU-ra a 4–7 CPU-t
+mutatja, a <code>virsh numatune</code> nodeset 1, a guestben a
+<code>numastat</code> nem mutat távoli node-ot.</p></li>
+<li><p>A diagnózishoz először a guest <code>mpstat</code>
+<code>%steal</code> 40% és a host <code>pidstat</code> QEMU processz
+120% CPU ellentmondását kell feloldani: a guest belső CPU 10-es load, de
+a host processz CPU 120% azt jelenti, hogy a guest tényleg fut, de a
+steal magas, mert a host CPU 60%-os kihasználtsága mellett a
+<code>lab-noisy</code> VM folyamatosan 4 CPU-t telít a közös node-on. A
+steal a guest vCPU-k versengése miatt nő. Az adatgyűjtés:</p>
+<ul>
+<li><code>virsh -c qemu:///system vcpuinfo lab-cpp-latency</code></li>
+<li><code>virsh -c qemu:///system schedinfo lab-cpp-latency</code></li>
+<li><code>virsh -c qemu:///system schedinfo lab-noisy</code></li>
+<li><code>numastat -p $(pgrep -f 'qemu.*lab-cpp-latency')</code></li>
+<li><code>systemd-cgtop</code> vagy
+<code>cat /sys/fs/cgroup/machine.slice/machine-qemu\x2d.../cpu.stat</code></li>
+</ul>
+<p>A noisy neighbour korlátozása egyetlen beavatkozás. A kézenfekvő
+lépés a <code>lab-noisy</code> áttétele a node 0-ra (CPU 0–3), ahol a
+60%-os hostterhelés mellett van tartalék; az 5–7 CPU-ra szűkítés nem
+elég, mert továbbra is átfed a <code>lab-cpp-latency</code> 4–7
+CPU-ival. Előbb rögzítjük a kiinduló állapotot, hogy a rollback pontosan
+visszaállítható legyen:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system vcpupin lab-noisy <span class="op">&gt;</span> /root/lab-noisy-vcpupin.orig</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> v <span class="kw">in</span> 0 1 2 3<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>  <span class="ex">virsh</span> <span class="at">-c</span> qemu:///system vcpupin lab-noisy <span class="st">&quot;</span><span class="va">$v</span><span class="st">&quot;</span> 0-3 <span class="at">--live</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span></code></pre></div>
+<p>Alternatív egyetlen beavatkozás a súly csökkentése. A libvirt
+paraméterneve <code>cpu_shares</code> (a <code>cpu.shares</code> a
+cgroup v1 fájlneve); cgroup v2 alatt a libvirt a
+<code>cpu.weight</code>-re képezi, ahol az alapérték 100, nem 1024.
+Ezért előbb az aktuális értéket kell kiolvasni
+(<code>virsh -c qemu:///system schedinfo lab-noisy | grep cpu_shares</code>),
+majd például a felét beállítani:
+<code>virsh -c qemu:///system schedinfo lab-noisy --live --set cpu_shares=&lt;a rögzített érték fele&gt;</code>.</p>
+<p>A javulást a guest <code>mpstat</code> steal 10% alá csökkenésével és
+a host <code>pidstat</code> értékek stabilizálódásával igazoljuk.
+Rollback: a rögzített eredeti pinning (vagy <code>cpu_shares</code>
+érték) visszaírása <code>--live</code>-val. Postcondition: a
+<code>lab-cpp-latency</code> steal 10% alatt, a <code>lab-noisy</code>
+továbbra is fut, a host CPU fenntartható 80% alatt marad.</p></li>
+</ol>
+<h3 data-number="34.3.7" id="rövid-összefoglaló"><span
+class="header-section-number">34.3.7</span> Rövid összefoglaló</h3>
+<p>A KVM vCPU host szál, a guest CPU-busy nem azonos a host
+CPU-fogyasztással. A guest <code>%steal</code> a hypervisor által el nem
+adott futásidőt méri: CPU oversubscription vagy cgroup quota throttling
+következménye. A memória mögött balloon, hugepages és host oldali
+reclaim áll, ezért a guest <code>free</code> önmagában félrevezető. A
+NUMA pinning csak akkor hatékony, ha a vCPU és a memória egyazon host
+node-on van; a vNUMA topológia önmagában nem garantálja a local
+access-t. A host cgroup v2 és a libvirt schedinfo korlátai tervezhetővé
+teszik a noisy neighbor elleni védelmet, miközben failure headroomot
+hagyunk.</p>
+<p>Továbbhasznált definíciók: <strong>vCPU steal</strong>, <strong>CPU
+oversubscription</strong>, <strong>vNUMA pinning</strong>.</p>
+<h3 data-number="34.3.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">34.3.8</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li><a href="https://docs.kernel.org/admin-guide/cgroup-v2.html">Linux
+kernel – Control Group v2</a>: <code>cpu.max</code>,
+<code>cpu.weight</code>, <code>cpu.stat</code>
+(<code>nr_throttled</code>, <code>throttled_usec</code>),
+<code>memory.max</code> – Ubuntu 24.04 GA kernel (6.8).</li>
+<li><a
+href="https://docs.kernel.org/admin-guide/mm/hugetlbpage.html">Linux
+kernel – HugeTLB Pages</a>: <code>nr_hugepages</code>, node-onkénti
+foglalás, <code>/proc/meminfo</code> mezők.</li>
+<li><a href="https://libvirt.org/formatdomain.html">libvirt – Domain XML
+format</a>: <code>cputune</code>, <code>numatune</code>,
+<code>memoryBacking/hugepages/page nodeset</code>,
+<code>memtune/hard_limit</code>, <code>cpu/numa/cell</code>.</li>
+<li><a href="https://libvirt.org/manpages/virsh.html">virsh(1)</a>:
+<code>vcpupin</code>, <code>emulatorpin</code>, <code>numatune</code>,
+<code>schedinfo</code> (<code>cpu_shares</code>),
+<code>dommemstat</code>.</li>
+<li><a
+href="https://man7.org/linux/man-pages/man8/numastat.8.html">numastat(8)</a>:
+a <code>-p</code> kimenet node-onkénti oszlopai.</li>
+<li><a
+href="https://man7.org/linux/man-pages/man5/proc.5.html">proc(5)</a>:
+<code>/proc/stat</code> CPU-sor <code>steal</code> mezője.</li>
+<li><a href="https://ubuntu.com/server/docs/">Ubuntu Server
+documentation</a>: libvirt/QEMU csomagok Ubuntu 24.04 LTS alatt; a
+laborban <code>virsh version</code> és <code>uname -r</code>
+rögzítendő.</li>
+</ul>
+<p>A példában szereplő CPU-, memória- és pinningértékek illusztratívak,
+nem tényleges laboreredmények. A példák laborban ellenőrizendők; ebben a
+munkamenetben nem történt laborfuttatás, dátumozott futtatási napló még
+nincs. A KVM scheduler viselkedése, a steal idő pontossága és a
+hugepages elérhetősége az adott kernel/hypervisor verzióval validálandó;
+a <code>cpu_shares</code> hatása a versengő VM-ekre a tényleges workload
+mellett mérendő.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d167.html">← 34.2 KVM, QEMU és libvirt komponensek</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d169.html">34.4 Virtio, passthrough, SR-IOV és IOMMU →</a></div>
+</nav>
+</body>
+</html>

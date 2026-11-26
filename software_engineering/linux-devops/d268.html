@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>54.3 Ceph, SAN/NAS és object/block/file fabric – Linux és
+DevOps rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch54">54 HA architektúra, distributed storage és kapacitástervezés</a></p>
+<div class="links"><a class="prev" rel="prev" href="d267.html">← 54.2 Consistency, quorum és split-brain operation</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d269.html">54.4 Capacity, FinOps és performance engineering →</a></div>
+</nav>
+<h2 data-number="54.3" id="d268"><span
+class="header-section-number">54.3</span> Ceph, SAN/NAS és
+object/block/file fabric</h2>
+<h3 data-number="54.3.1" id="motiváció-és-definíciós-határ"><span
+class="header-section-number">54.3.1</span> Motiváció és definíciós
+határ</h3>
+<p>A lokális RAID egyetlen szerveren belül ad blokkszintű redundanciát,
+de a platformszolgáltatások akkor is működnek, ha egy teljes node vagy
+rack kiesik. A szenior C++ fejlesztő számára ez azért releváns, mert a
+modern alkalmazások storage-át nem egyetlen diszk, hanem elosztott
+rendszer adja: a VM-ek RBD image-ből bootolnak, a Kubernetes PVC-k Ceph
+volume-okra mutatnak, az objektumtároló bucketek pedig ugyanabban a
+clusterben laknak. A Ceph egy software-defined storage (SDS) rendszer,
+amely egyetlen <strong>RADOS</strong> (<em>Reliable Autonomic
+Distributed Object Store</em>) rétegre épít block, file és object
+hozzáférést.</p>
+<p>A tárgyalás során három fogalmat használunk újra:</p>
+<ul>
+<li><strong>Placement Group (PG):</strong> objektumok logikai csoportja,
+amely a pool OSD-kre való kiosztásának atomi egysége. Minden pool
+rendelkezik <code>pg_num</code> értékkel; az objektum hash alapján kerül
+PG-be.</li>
+<li><strong>CRUSH:</strong> pseudo-random elhelyezési algoritmus, amely
+a cluster mapból és az OSD súlyokból számítja ki, mely OSD-k tárolják az
+adott PG replikáit vagy erasure coding darabjait. Nincs központi lookup
+tábla, ezért a client is képes kiszámolni a cél OSD-t.</li>
+<li><strong>Recovery headroom:</strong> az a szabad kapacitás és I/O
+sáv, amely lehetővé teszi a PG-k helyreállítását anélkül, hogy a client
+I/O-t megfojtanák. A hiánya full pool és lassú recovery állapothoz
+vezet.</li>
+</ul>
+<p>A fejezet a d267 quorum fogalmaira, a d024 RAID write penalty
+modelljére és a d223 cloud storage durability fogalmaira épít.</p>
+<h3 data-number="54.3.2" id="ceph-architektúra-és-adatút"><span
+class="header-section-number">54.3.2</span> Ceph architektúra és
+adatút</h3>
+<p>A Ceph cluster minimálisan monitorokból, OSD-kből és clientekből áll.
+A komponensek szerepe élesen elkülönül:</p>
+<ul>
+<li><strong>Monitor:</strong> a cluster térképét (monmap, OSD map, PG
+map, CRUSH map) és a hitelesítést tartja. A monitorok quorum alapú
+konzisztenciát használnak; a quorum elvesztése esetén a cluster nem
+frissíthető, és a clientek nem kapnak új mapot.</li>
+<li><strong>OSD (Object Storage Daemon):</strong> egy háttérdiszkért
+felelős daemon. Az OSD tárolja az objektumokat, kezeli a replikációt, a
+recoveryt, a scrubot és a client I/O-t. Egy node-on több OSD futhat, de
+a PG replikái különböző hostokra kerülnek a CRUSH failure domain
+szabályai szerint.</li>
+<li><strong>Metadata Server (MDS):</strong> kizárólag a CephFS
+namespace-ét és metadata műveleteit szolgálja. A fájl tartalma
+objektumokban van, a metadata az MDS-ben.</li>
+<li><strong>RADOS Gateway (RGW):</strong> S3/Swift REST API-t ad;
+bucket, object, versioning, lifecycle és ACL műveleteket kezel.</li>
+</ul>
+<p>Az alábbi ábra a kliensoldali leképezést (objektum → PG → CRUSH →
+OSD) és a replikált írás nyugtázási útját mutatja a lab cluster
+példáján; a primary az acting set minden tagjának commitja után
+nyugtáz.</p>
+<figure id="fig-d268-rbd-write-path">
+<div class="fig-interactive"><iframe src="figures/html/d268-rbd-write-path.html" title="A kliens a 3.2a PG primary OSD-jére ír; a primary párhuzamosan két másik hoston lévő replikára továbbít, és mindkettő visszaigazolása után nyugtáz." loading="lazy" style="width:100%;border:0;height:560px"></iframe><noscript><img src="figures/img/d268-rbd-write-path.png" style="width:95.0%"
+alt="A kliens a 3.2a PG primary OSD-jére ír; a primary párhuzamosan két másik hoston lévő replikára továbbít, és mindkettő visszaigazolása után nyugtáz." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d268-rbd-write-path.png" style="width:95.0%"
+alt="A kliens a 3.2a PG primary OSD-jére ír; a primary párhuzamosan két másik hoston lévő replikára továbbít, és mindkettő visszaigazolása után nyugtáz." /></details></div>
+<figcaption>RBD-írás a lab-rbd-pool-ban: objektum → PG → CRUSH → három
+host; a primary párhuzamosan továbbít a két replikának, és az ack csak
+mindkét replika commitja után megy a kliensnek</figcaption>
+</figure>
+<p>Az írási út egy RBD volume-nál a következő:</p>
+<ol type="1">
+<li>A client (librbd vagy kernel <code>rbd</code>) az image blokkjait
+objektumokra bontja, kiszámítja a PG-t.</li>
+<li>A CRUSH meghatározza a primary OSD-t és a replikákat.</li>
+<li>A client elküldi az írást a primary OSD-nek.</li>
+<li>A primary OSD naplózza, alkalmazza a lokális store-ba, és
+párhuzamosan elküldi a replikáknak.</li>
+<li>A primary akkor küld <code>ack</code>-ot a clientnek, ha az acting
+set minden tagja (egészséges PG-nél <code>size</code> = 3 OSD)
+rögzítette az írást.</li>
+</ol>
+<p>Olvasásnál a client közvetlenül a PG primary OSD-jétől olvas
+(replikált pool, alapértelmezés), nincs központi gateway; az olvasási
+tail latency a primary OSD és diszkje állapotán múlik. Írásnál az ack az
+acting set összes replikájára vár, ezért az írási tail latencyt a
+leglassabb replika határozza meg; a replikációs forgalom a cluster
+(back-side) hálózatot terheli.</p>
+<p>A Ceph három hozzáférési formája:</p>
+<ul>
+<li><strong>RBD (RADOS Block Device):</strong> thin-provisioned
+blokkeszköz, snapshot, clone és layering támogatással. Linux kernel
+<code>rbd</code> modul vagy librbd (QEMU, Kubernetes CSI) használja. Jó
+VM boot volume és adatbázis volume.</li>
+<li><strong>CephFS:</strong> POSIX szemantikájú megosztott fájlrendszer,
+MDS daemonokkal. Jó shared home, log, CI workspace.</li>
+<li><strong>RGW:</strong> S3/Swift API-t adó object gateway. Jó web
+asset, backup cél, data lake.</li>
+</ul>
+<p>A monitorok nem érintik az adatút késleltetését, de a map frissítések
+miatt a client session fenntartása kritikus. A CephFS csak MDS-ekkel
+használható, az RGW pedig HTTP protokollt beszél.</p>
+<p>Egy példa lab cluster topológiája:</p>
+<table>
+<thead>
+<tr>
+<th>Komponens</th>
+<th>Node</th>
+<th>IPv4</th>
+<th>Szerep</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>mon.0..2</td>
+<td>lab-ceph-mon01..03</td>
+<td>10.54.3.11..13</td>
+<td>monitor quorum</td>
+</tr>
+<tr>
+<td>osd.0..11</td>
+<td>lab-ceph-osd01..03</td>
+<td>10.54.3.21..23</td>
+<td>4 OSD/node, 12 OSD</td>
+</tr>
+<tr>
+<td>mds</td>
+<td>lab-ceph-mds01</td>
+<td>10.54.3.31</td>
+<td>CephFS metadata</td>
+</tr>
+<tr>
+<td>rgw</td>
+<td>lab-ceph-rgw01</td>
+<td>10.54.3.32</td>
+<td>S3 gateway</td>
+</tr>
+</tbody>
+</table>
+<p>A címek a 10.54.3.0/24 privát labortartományból valók (RFC 1918), így
+nem ütköznek a 54.5 game day laborjával (10.54.5.0/24).</p>
+<p>A CRUSH szabály úgy van beállítva, hogy egy PG replikái különböző
+hostokra kerüljenek (failure domain: host), így egy node kiesése nem
+veszíti el az adatot. 3 OSD-host mellett azonban a PG-k a node
+visszatéréséig <code>undersized+degraded</code> állapotban maradnak:
+nincs negyedik host, ahová a harmadik replika visszaépülhetne, és a
+cluster egy újabb kiesésre <code>min_size</code> alá esik. Host-kiesés
+utáni teljes helyreállításhoz legalább 4 OSD-host és a kieső host adatát
+befogadó szabad kapacitás kell.</p>
+<h3 data-number="54.3.3"
+id="replication-erasure-coding-és-recovery-headroom"><span
+class="header-section-number">54.3.3</span> Replication, erasure coding
+és recovery headroom</h3>
+<p>A replikáció (<code>size=3</code>) a legegyszerűbb adatvédelmi mód:
+minden PG három példányban van. A kapacitás overhead 3x, tehát 100 TiB
+hasznos adat 300 TiB nyers kapacitást igényel. Az írási I/O overhead:
+minden logikai write 3 fizikai write-ot generál. A
+<code>min_size=2</code> az I/O-fogadás alsó határa: ha egy replika
+kiesik, a PG <code>degraded</code>, de 2 taggal tovább fogad írást (az
+ack ekkor a 2 élő tagra vár); 1 taggal a PG inaktív, és az I/O blokkol,
+hogy ne keletkezzen egymásolatos írás. Egészséges PG-nél az ack mindig
+mind a 3 replikára vár.</p>
+<p>Az erasure coding (EC) parity alapú: például <code>k=4, m=2</code>
+(4+2) esetén az objektumot 4 adatdarabra és 2 parity darabra bontja, 6
+OSD-re írja. A kapacitás overhead 6/4 = 1.5x, tehát 100 TiB hasznos adat
+150 TiB nyers kapacitást igényel. Az írási út drágább, mert a client
+vagy a primary OSD encode-ol, és minden write több OSD-t érint; az
+olvasás csak <code>k</code> darabot igényel, de a small random write
+büntetése nagy. EC-t főleg RGW object pool-hoz és hideg RBD-hez
+használnak. A 4+2 profil host failure domainnel legalább 6 hostot
+igényel
+(<code>ceph osd erasure-code-profile set lab-ec42 k=4 m=2 crush-failure-domain=host</code>);
+a 3 hostos labon csak <code>crush-failure-domain=osd</code>-dal hozható
+létre, ami egy host kiesésekor adatvesztést okozhat (egy hoston 2-nél
+több chunk), ezért ott nem alkalmazható biztonságosan.</p>
+<p>A <strong>rebalance</strong> akkor történik, ha az OSD súlyok
+változnak, új OSD kerül be, vagy a CRUSH map módosul. A
+<code>ceph osd reweight</code>, <code>ceph osd crush reweight</code> és
+a <code>ceph balancer</code> (upmap mód) segítségével a PG-k
+egyenletesebben oszlanak el. A rebalance során a PG-k átkerülnek más
+OSD-kre, ami extra I/O-t generál.</p>
+<p>A recovery headroom a szabad kapacitás és I/O sáv. A
+<code>ceph status</code> mutatja a <code>recovery</code>,
+<code>backfill</code>, <code>degraded</code>, <code>undersized</code>
+állapotokat. A backfill a teljes PG adatátmásolás, a recovery a delta
+szinkronizálás. A Ceph alapértelmezett küszöbei:
+<code>nearfull_ratio</code> 0,85 (<code>HEALTH_WARN</code>),
+<code>backfillfull_ratio</code> 0,90 (az OSD-re backfill nem megy),
+<code>full_ratio</code> 0,95 (az írás leáll); az aktuális értékek:
+<code>ceph osd dump | grep ratio</code>. A recovery headroom
+szempontjából a backfillfull a döntő: ha a helyreállítás után egy OSD
+90% fölé kerülne, a backfill megáll. A kapacitástervezésben legalább
+20-30% szabad kapacitást és egy kieső failure domainnyi (host-szintű
+failure domainnél egy hostnyi, legalább 4 host mellett) headroomot kell
+tartani.</p>
+<h3 data-number="54.3.4"
+id="san-nas-és-ceph-fabric-összehasonlítás"><span
+class="header-section-number">54.3.4</span> SAN, NAS és Ceph fabric
+összehasonlítás</h3>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Tulajdonság</th>
+<th>Block (SAN)</th>
+<th>File (NAS)</th>
+<th>Object (Ceph RGW, S3)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Protokoll</td>
+<td>SCSI, iSCSI, NVMe-oF, FC</td>
+<td>NFS, SMB</td>
+<td>HTTP REST (S3/Swift)</td>
+</tr>
+<tr>
+<td>Hozzáférés</td>
+<td>blokkeszköz, kizárólagos vagy multipath</td>
+<td>megosztott mount, lock</td>
+<td>egész objektum</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>alacsony, jellemzően &lt;1 ms belső FC</td>
+<td>közepes</td>
+<td>magasabb, de skálázható</td>
+</tr>
+<tr>
+<td>Use case</td>
+<td>VM, DB, SAP</td>
+<td>home dir, CAD/EDA, media</td>
+<td>backup, data lake, static web</td>
+</tr>
+<tr>
+<td>Ceph megfelelő</td>
+<td>RBD image</td>
+<td>CephFS</td>
+<td>RGW bucket</td>
+</tr>
+</tbody>
+</table>
+<p>Az iSCSI SCSI parancsokat TCP-n visz, a NVMe-oF az NVMe parancsokat
+RDMA/TCP-n; mindkettő block storage. A NAS fájlrendszer-szemantikát ad,
+a client a fájlon dolgozik, nem a blokkon. A Ceph RBD-t iSCSI
+gateway-jel is ki lehet tenni, de a natív librbd/kernel rbd
+hatékonyabb.</p>
+<h3 data-number="54.3.5" id="csi-és-vmapplication-storage-path"><span
+class="header-section-number">54.3.5</span> CSI és VM/application
+storage path</h3>
+<p>A Kubernetes a Ceph-hez CSI driverekkel csatlakozik:</p>
+<ul>
+<li><code>rbd.csi.ceph.com</code> block volume-ot ad, jellemzően RWO
+(ReadWriteOnce) node attach-tal.</li>
+<li><code>cephfs.csi.ceph.com</code> file volume-ot ad, RWX
+(ReadWriteMany) megosztott mount-tal.</li>
+</ul>
+<p>A StorageClass, PVC, PV lánc: a StorageClass <code>parameters</code>
+tartalmazza a pool nevet, a <code>clusterID</code>-t, a
+<code>csi.storage.k8s.io/provisioner-secret-name</code> és a
+<code>node-stage-secret-name</code> titkokat. A CSI driver a volume
+megkötése után <code>rbd map</code>-pal vagy <code>rbd-nbd</code>-vel
+csatolja a node-hoz, majd a kubelet mountolja a podba.</p>
+<p>VM-eknél: libvirt/QEMU közvetlen librbd-t használ, így a VM
+blokkeszköze Ceph volumeként jelenik meg; a live migration a forrás és
+cél node-on is hozzáfér a Ceph image-hez, nincs szükség
+blokkmásolásra.</p>
+<h3 data-number="54.3.6"
+id="kidolgozott-példa-kapacitástervezés-full-pool-diagnosztika"><span
+class="header-section-number">54.3.6</span> Kidolgozott példa:
+kapacitástervezés, full pool diagnosztika</h3>
+<p>A lab cluster a fenti inventory-val rendelkezik. A cél: RBD pool
+létrehozása replikációval, <code>size=3, min_size=2</code>, 256 PG, 10
+TiB hasznos adat tervezése. A rendelkezésre álló nyers kapacitás 12 OSD
+x 4 TiB = 48 TiB. Hasznos kapacitás 3x replikációval: 16 TiB. A 10 TiB
+hasznos adat 30 TiB nyerset igényel, így a cluster 62,5% telített: a
+85%-os nearfull, a 90%-os backfillfull és a 95%-os full küszöb alatt, de
+egy host kiesése után nincs hova helyreállítani (3 host, lásd fent).</p>
+<p>Parancsok a monitor node-on, <code>ceph</code> user:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-ceph-mon01, UID=ceph, privilege=sudo</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> ceph ceph osd pool create lab-rbd-pool 256 256 replicated</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> ceph ceph osd pool set lab-rbd-pool size 3</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> ceph ceph osd pool set lab-rbd-pool min_size 2</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> ceph ceph osd pool application enable lab-rbd-pool rbd</span></code></pre></div>
+<p>RBD image létrehozása és csatolása a lab VM-hez:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-ceph-mon01</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> ceph rbd create lab-rbd-pool/lab-db-01 <span class="at">--size</span> 100G <span class="dt">\</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--image-feature</span> exclusive-lock,object-map,fast-diff,layering</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-ceph-client01, root</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="ex">rbd</span> map lab-rbd-pool/lab-db-01</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.xfs</span> /dev/rbd0</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> /dev/rbd0 /var/lib/mysql-lab</span></code></pre></div>
+<p>A telítettség megfigyelése:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-ceph-mon01</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> ceph ceph df</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> ceph ceph osd df</span></code></pre></div>
+<p>Várt kimenet (illusztratív, nem mért):</p>
+<pre><code>--- RAW STORAGE ---
+CLASS  SIZE     AVAIL    USED     RAW USED  %RAW USED
+hdd    48 TiB   18 TiB   30 TiB   30 TiB     62.50
+
+--- POOLS ---
+POOL          ID  PGS  STORED  OBJECTS  USED     %USED  MAX AVAIL
+lab-rbd-pool   3  256  10 TiB    2.62M  30 TiB   62.50   5.2 TiB</code></pre>
+<p>A <code>MAX AVAIL</code> a még írható hasznos kapacitás: a szabad
+nyers kapacitás / replikaszám, a legtelítettebb OSD és a full ratio
+alapján
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><mn>48</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>95</mn><mo>−</mo><mn>30</mn><mo stretchy="false" form="postfix">)</mo><mi>/</mi><mn>3</mn><mo>≈</mo><mn>5</mn><mo>,</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">(48 \cdot 0{,}95 - 30)/3 \approx 5{,}2</annotation></semantics></math>
+TiB) — nem a pool teljes hasznos kapacitása (16 TiB). Az
+<code>OBJECTS</code>: 10 TiB 4 MiB-os RBD-objektumokban
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>10</mn><mo>⋅</mo><msup><mn>2</mn><mn>40</mn></msup><mi>/</mi><mo stretchy="false" form="prefix">(</mo><mn>4</mn><mo>⋅</mo><msup><mn>2</mn><mn>20</mn></msup><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mn>2</mn><mspace width="0.167em"></mspace><mn>621</mn><mspace width="0.167em"></mspace><mn>440</mn></mrow><annotation encoding="application/x-tex">10 \cdot 2^{40} / (4 \cdot 2^{20}) = 2\,621\,440</annotation></semantics></math>.</p>
+<p>A <code>ceph osd df</code> megmutatja, ha egy OSD <code>%USE</code>
+magas, és a PG-k nem egyenletesen oszlanak el. Ha az egyik OSD eléri a
+85%-ot (nearfull), a cluster <code>HEALTH_WARN</code> állapotba kerül,
+90%-nál a backfill leáll, 95%-nál (full) az írás leáll. A
+kapacitásprobléma javítása: OSD/host hozzáadása, felesleges
+snapshotok/image-ek törlése, a kiegyensúlyozatlanság javítása
+<code>ceph balancer</code> (upmap) móddal. A <code>pg_num</code>
+módosítása nem szabadít fel helyet (a PG-merge adatot mozgat, de a
+tárolt bájtokat nem csökkenti, és majdnem tele clusteren kifejezetten
+veszélyes).</p>
+<p>A full pool szimulálása és megszüntetése (lab, nem production)
+pool-kvótával, ami célzott és visszafordítható:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-ceph-mon01</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> ceph ceph osd pool set-quota lab-rbd-pool max_bytes <span class="va">$((</span><span class="dv">1024</span><span class="op">**</span><span class="dv">3</span><span class="va">))</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> ceph ceph health detail</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-ceph-client01, root: valódi adatírási kísérlet</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="fu">timeout</span> 30 dd if=/dev/zero of=/var/lib/mysql-lab/lab-fill bs=1M count=10 <span class="dt">\</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>  oflag=direct<span class="kw">;</span> <span class="bu">echo</span> <span class="st">&quot;rc=</span><span class="va">$?</span><span class="st">&quot;</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="co"># rollback (lab-ceph-mon01), majd a lab-fill törlése a kliensen</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> ceph ceph osd pool set-quota lab-rbd-pool max_bytes 0</span></code></pre></div>
+<p>Várt viselkedés: a <code>ceph health detail</code>
+<code>POOL_FULL</code> figyelmeztetést mutat (a pontos szöveget a lab
+kimenetéből rögzítsd), a kliens írása pedig nem azonnali hibával tér
+vissza, hanem blokkol (a librados vár, amíg a full állapot megszűnik) —
+ezt a <code>timeout</code> 124-es kilépési kóddal jelzi. A kvóta
+feloldása után a várakozó írás befejeződik; ezután
+<code>rm /var/lib/mysql-lab/lab-fill</code>.</p>
+<h3 data-number="54.3.7" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">54.3.7</span> Tipikus hibák és
+ellenpróbák</h3>
+<ol type="1">
+<li><strong>Egy OSD full</strong>: a CRUSH nem egyenletesen oszlik el,
+ha az OSD súlyok hibásak. <code>ceph osd df</code> megmutatja,
+<code>ceph osd reweight-by-utilization</code> korrigálhat.</li>
+<li><strong>PG stuck</strong>: <code>ceph health detail</code> jelzi, ha
+a PG <code>down</code>, <code>degraded</code>,
+<code>stuck unclean</code>, <code>stuck inactive</code>. A
+<code>ceph pg dump_stuck</code> megtalálja, a
+<code>ceph pg &lt;pgid&gt; query</code> <code>blocked_by</code> és
+<code>down_osds_we_would_probe</code> mezője megmutatja, melyik OSD
+hiányzik. A javítás: a hiányzó OSD-k visszahozása
+(<code>ceph osd tree</code>); ha egy OSD végleg elveszett, a PG-k
+helyreállítása a többi példányról. A <code>min_size</code> ideiglenes
+csökkentése csak dokumentált kockázatvállalással, a helyreállítás
+idejére megengedett, és utána azonnal vissza kell állítani; a
+<code>size</code> csökkentése nem javítás (kevesebb példány, újabb
+kiesésnél adatvesztés).</li>
+<li><strong>Recovery storm</strong>: egy node kiesésekor az összes PG
+egyszerre kezd backfillt, ami a client I/O-t megfojtja. Az mClock
+ütemezőnél (Quincy óta alapértelmezett) az
+<code>osd_mclock_profile</code> (<code>high_client_ops</code>,
+<code>balanced</code>, <code>high_recovery_ops</code>) szabályozza; a
+régi (wpq) ütemezőnél az <code>osd_max_backfills</code>,
+<code>osd_recovery_max_active</code>, <code>osd_recovery_sleep</code>
+paraméterek.</li>
+<li><strong>Monitor quorum loss</strong>: ha 3 monitorból 2
+elérhetetlen, a cluster nem módosítható, de a meglévő client session-ök
+bizonyos ideig működhetnek. A monitorokat külön failure domainbe kell
+tenni, és a quorumot vissza kell állítani.</li>
+<li><strong>Scrub hibák</strong>: a <code>scrub</code> és
+<code>deep-scrub</code> a PG-k integritását ellenőrzi. Ha a scrub hibát
+talál, a PG <code>inconsistent</code> állapotba kerül; ilyenkor a
+<code>ceph pg repair</code> óvatosan használható, de előbb az adat
+elérhetőségét és a replikákat ellenőrizni kell.</li>
+</ol>
+<h3 data-number="54.3.8" id="feladatok"><span
+class="header-section-number">54.3.8</span> Feladatok</h3>
+<ol type="1">
+<li><p><strong>Magyarázó feladat:</strong> Egy Ceph clusterben 12 OSD
+van, egyenként 8 TiB. Számítsd ki a hasznos kapacitást
+<code>size=3</code> replikációval és <code>4+2</code> EC-vel. Add meg a
+kapacitás overheadet és a szabad recovery headroomot, ha a cluster 70%
+telítettséget céloz.</p></li>
+<li><p><strong>Adminisztrációs/konfigurációs feladat:</strong> Hozz
+létre egy CephFS pool-t és egy RGW bucketet a lab clusterben, majd
+csatold fel a CephFS-t a lab-client node-ra, és írj egy 1 MiB-os fájlt.
+A bucketbe tölts fel egy objektumot az S3 API-val.</p></li>
+<li><p><strong>Diagnosztikai/failure/recovery feladat:</strong> Állíts
+le egy OSD-t a lab clusterben, figyeld meg a <code>ceph status</code>
+kimenetét, majd indítsd újra az OSD-t, és ellenőrizd a recoveryt. Írd
+le, melyik paramétert állítanád be, ha a recovery túl lassú, és
+miért.</p></li>
+</ol>
+<h3 data-number="54.3.9" id="megoldások"><span
+class="header-section-number">54.3.9</span> Megoldások</h3>
+<ol type="1">
+<li><p>Nyers kapacitás = 12 * 8 TiB = 96 TiB. Replikáció size=3: hasznos
+= 96 / 3 = 32 TiB. EC 4+2: overhead = 6/4 = 1.5, hasznos = 96 / 1.5 = 64
+TiB. 70% telítettség replikációnál: 32 * 0.7 = 22.4 TiB használt, szabad
+= 9.6 TiB hasznos (28.8 TiB nyers). EC-nél: 64 * 0.7 = 44.8 TiB
+használt, szabad = 19.2 TiB hasznos (28.8 TiB nyers). A recovery
+headroom a nyers szabad kapacitás; egy OSD kiesésekor 8 TiB nyers adat
+helyreállításához legalább 8 TiB szabad nyers kell replikációnál, tehát
+a 28.8 TiB elegendő. Pontosabban: 70%-os telítettségnél egy 8 TiB-os OSD
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0</mn><mo>,</mo><mn>7</mn><mo>⋅</mo><mn>8</mn><mo>=</mo><mn>5</mn><mo>,</mo><mn>6</mn></mrow><annotation encoding="application/x-tex">0{,}7 \cdot 8 = 5{,}6</annotation></semantics></math>
+TiB nyers adatot tárol, nem 8 TiB-ot; ez a maradék 11 OSD-re épül
+vissza:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>67</mn><mo>,</mo><mn>2</mn><mi>/</mi><mn>88</mn><mo>≈</mo><mn>76</mn><mo>,</mo><mn>4</mn><mi>%</mi></mrow><annotation encoding="application/x-tex">67{,}2 / 88 \approx 76{,}4\%</annotation></semantics></math>,
+a 85%-os nearfull és a 90%-os backfillfull küszöb alatt — elfogadható.
+Host-kiesésnél (3 host × 4 OSD esetén 4 OSD = 32 TiB) a maradék 64 TiB
+nyersre 67,2 TiB adat kellene, ami nem fér el (és 3 hostnál host failure
+domainnel amúgy sincs hova); host-kiesésre ezért 70%-os cél mellett
+nincs recovery headroom, ehhez kb. 60% alatti telítettség és legalább 4
+host kell. Az EC 4+2 host failure domainnel legalább 6 hostot igényel, 3
+hoston nem hozható létre biztonságosan.</p></li>
+<li><p>Példa parancsok:</p></li>
+</ol>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-ceph-mon01</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> ceph ceph osd pool create lab-cephfs-metadata 64 64</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> ceph ceph osd pool create lab-cephfs-data 256 256</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> ceph ceph fs new lab-cephfs lab-cephfs-metadata lab-cephfs-data</span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="co"># fs-re korlátozott kliens, nem az admin kulcs</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> ceph fs authorize lab-cephfs client.lab-fs / rw <span class="dt">\</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>  <span class="kw">|</span> <span class="fu">sudo</span> tee /etc/ceph/ceph.client.lab-fs.keyring <span class="op">&gt;</span>/dev/null</span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="co"># S3-felhasználó; a kimenet keys[0] mezőit a lab secret store-ba</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> radosgw-admin user create <span class="at">--uid</span><span class="op">=</span>lab-s3 <span class="at">--display-name</span><span class="op">=</span><span class="st">&#39;lab S3 user&#39;</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-client01 (a keyring és a ceph.conf átmásolva /etc/ceph alá)</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkdir /mnt/lab-cephfs</span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mount <span class="at">-t</span> ceph 10.54.3.11,10.54.3.12,10.54.3.13:/ /mnt/lab-cephfs <span class="dt">\</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>  <span class="at">-o</span> name=lab-fs,fs=lab-cephfs</span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> dd if=/dev/zero of=/mnt/lab-cephfs/lab-test.bin bs=1M count=1</span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a><span class="co"># RGW S3, path-style, sima HTTP a lab RGW alapportján (beast: 7480)</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> apt install s3cmd <span class="at">-y</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="op">&gt;</span> ~/.s3cfg-lab <span class="op">&lt;&lt;&#39;CFG&#39;</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a><span class="st">[default]</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a><span class="st">host_base = lab-ceph-rgw01:7480</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a><span class="st">host_bucket = lab-ceph-rgw01:7480</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a><span class="st">use_https = False</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a><span class="st">access_key = &lt;a radosgw-admin kimenetéből&gt;</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a><span class="st">secret_key = &lt;a radosgw-admin kimenetéből&gt;</span></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a><span class="op">CFG</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a><span class="fu">chmod</span> 600 ~/.s3cfg-lab</span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a><span class="ex">s3cmd</span> <span class="at">-c</span> ~/.s3cfg-lab mb s3://lab-test-bucket</span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> test <span class="kw">|</span> <span class="ex">s3cmd</span> <span class="at">-c</span> ~/.s3cfg-lab put <span class="at">-</span> s3://lab-test-bucket/lab-object.txt</span></code></pre></div>
+<p>A <code>host_bucket</code> a virtual-host stílus sablonja;
+path-style-hoz a hosttal azonos érték kell. A cephadm-mel telepített RGW
+portja eltérhet (gyakran 80), ezt a <code>ceph orch ls rgw</code>
+mutatja.</p>
+<ol start="3" type="1">
+<li>Az OSD leállítása:</li>
+</ol>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-ceph-osd01</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl stop ceph-osd@0</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-ceph-mon01</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> ceph ceph status</span></code></pre></div>
+<p>Várt kimenet: leállítás után <code>1 osds down</code>, a PG-k
+<code>active+undersized+degraded</code> állapotúak. A monitor az OSD-t
+csak <code>mon_osd_down_out_interval</code> (alapértelmezésben 600 s)
+után jelöli <code>out</code>-nak; ekkor indul backfill a többi OSD-re.
+Ha az OSD előbb visszatér, log-alapú recovery pótolja a kimaradt
+írásokat. A <code>ceph status</code> <code>HEALTH_OK</code> lesz, amikor
+a recovery kész.</p>
+<p>Ha a recovery túl lassú, és a client I/O-ban van tartalék: mClock
+ütemezőnél (Quincy óta alapértelmezett)
+<code>sudo -u ceph ceph config set osd osd_mclock_profile high_recovery_ops</code>;
+mClock mellett az
+<code>osd_max_backfills</code>/<code>osd_recovery_max_active</code> kézi
+értékei alapból nem érvényesülnek
+(<code>osd_mclock_override_recovery_settings</code>). A régi (wpq)
+ütemezőnél az <code>osd_max_backfills</code> (pl. 2–3) és az
+<code>osd_recovery_max_active</code> emelése, az
+<code>osd_recovery_sleep_hdd</code> csökkentése gyorsít. Ellenőrzés: a
+<code>ceph -s</code> recovery-sebessége (objects/s) nő, közben a client
+p99 latencyt figyelni kell; a végén az értékeket vissza kell állítani.
+Ha viszont a client I/O szenved, az ellenkező irány a helyes
+(<code>high_client_ops</code>, illetve alacsonyabb backfill/recovery
+értékek).</p>
+<h3 data-number="54.3.10" id="rövid-összefoglaló"><span
+class="header-section-number">54.3.10</span> Rövid összefoglaló</h3>
+<p>A Ceph egyetlen RADOS objekt tárolóra épít block (RBD), file (CephFS)
+és object (RGW) hozzáférést. A monitor quorum a cluster mapet tartja, az
+OSD-k a PG-ket replikálják vagy erasure codinggal kódolják a CRUSH által
+kiszámított failure domainek szerint. A replikáció egyszerűbb, de
+nagyobb kapacitás overhead; az EC jobb kapacitás, de drágább write. A
+recovery headroom a szabad kapacitás és I/O sáv, amely nélkül a full
+pool leállítja az írást. A CSI és a QEMU librbd adja a VM/container
+storage pathot; a block SAN alacsony latency, a file NAS megosztást, az
+object REST skálázhatóságot ad.</p>
+<p><strong>Továbbhasznált definíciók:</strong></p>
+<ul>
+<li><strong>Placement Group (PG):</strong> objektumok logikai csoportja,
+amely a pool OSD-kre való kiosztásának atomi egysége.</li>
+<li><strong>Recovery headroom:</strong> az a szabad kapacitás és I/O
+sáv, amely lehetővé teszi a PG-k helyreállítását anélkül, hogy a client
+I/O-t megfojtanák.</li>
+<li><strong>CRUSH:</strong> pseudo-random elhelyezési algoritmus, amely
+a cluster mapból számítja ki a PG replikáinak OSD helyét.</li>
+</ul>
+<h3 data-number="54.3.11" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">54.3.11</span> Források és ellenőrzési
+hiányok</h3>
+<p>A fejezethez kiindulópontként megadott források (nem olvasott, nem
+ellenőrzött bizonyítékok ebben a kérésben):</p>
+<ul>
+<li><a href="https://docs.ceph.com/en/latest/releases/">Ceph release
+documentation</a></li>
+<li><a href="https://www.postgresql.org/docs/">PostgreSQL
+documentation</a></li>
+<li><a href="https://sre.google/books/">SRE books</a></li>
+<li><a href="https://www.rfc-editor.org/">RFC Editor</a></li>
+</ul>
+<p>Állításonkénti hivatalos források (hivatkozott verzió: Ceph Reef 18.2
+/ Squid 19.2; a docs.ceph.com <code>latest</code> ága a legújabb stabil
+kiadást követi):</p>
+<ul>
+<li>Replikált írás, <code>size</code>/<code>min_size</code>, pool-kvóta:
+<a href="https://docs.ceph.com/en/latest/rados/operations/pools/"
+class="uri">https://docs.ceph.com/en/latest/rados/operations/pools/</a></li>
+<li>CRUSH failure domain: <a
+href="https://docs.ceph.com/en/latest/rados/operations/crush-map/"
+class="uri">https://docs.ceph.com/en/latest/rados/operations/crush-map/</a>;
+EC-profilok: <a
+href="https://docs.ceph.com/en/latest/rados/operations/erasure-code/"
+class="uri">https://docs.ceph.com/en/latest/rados/operations/erasure-code/</a></li>
+<li>nearfull/backfillfull/full ratio,
+<code>mon_osd_down_out_interval</code>: <a
+href="https://docs.ceph.com/en/latest/rados/configuration/mon-config-ref/"
+class="uri">https://docs.ceph.com/en/latest/rados/configuration/mon-config-ref/</a>;
+PG-állapotok és hibakeresés: <a
+href="https://docs.ceph.com/en/latest/rados/operations/pg-states/"
+class="uri">https://docs.ceph.com/en/latest/rados/operations/pg-states/</a>,
+<a
+href="https://docs.ceph.com/en/latest/rados/troubleshooting/troubleshooting-pg/"
+class="uri">https://docs.ceph.com/en/latest/rados/troubleshooting/troubleshooting-pg/</a></li>
+<li>mClock ütemező és profilok: <a
+href="https://docs.ceph.com/en/latest/rados/configuration/mclock-config-ref/"
+class="uri">https://docs.ceph.com/en/latest/rados/configuration/mclock-config-ref/</a></li>
+<li><code>ceph df</code> mezők: <a
+href="https://docs.ceph.com/en/latest/rados/operations/monitoring/"
+class="uri">https://docs.ceph.com/en/latest/rados/operations/monitoring/</a></li>
+<li>CephFS kliens-hitelesítés és mount: <a
+href="https://docs.ceph.com/en/latest/cephfs/client-auth/"
+class="uri">https://docs.ceph.com/en/latest/cephfs/client-auth/</a>, <a
+href="https://docs.ceph.com/en/latest/man/8/mount.ceph/"
+class="uri">https://docs.ceph.com/en/latest/man/8/mount.ceph/</a></li>
+<li>RGW felhasználók: <a
+href="https://docs.ceph.com/en/latest/radosgw/admin/"
+class="uri">https://docs.ceph.com/en/latest/radosgw/admin/</a></li>
+</ul>
+<p>Reprodukciós státusz: a példák laborban ellenőrizendők; dátumozott
+futtatási napló még nem készült, a kimenetek illusztratívak. Jelen
+kérésben nincs webes keresőeszköz, ezért a konkrét Ceph verzió, release
+support matrix, CSI driver verzió, NVMe-oF specifikáció és a command
+outputok nem minősülnek ellenőrzöttnek. A példák fogalmi szintűek; éles
+clusterben a release dokumentációt és a support matrixot ellenőrizni
+kell.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d267.html">← 54.2 Consistency, quorum és split-brain operation</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d269.html">54.4 Capacity, FinOps és performance engineering →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

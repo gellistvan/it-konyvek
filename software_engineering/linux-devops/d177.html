@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>36.2 cgroup v2 CPU/memória/IO és OOM – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch36">36 Konténerek Linux kernel alapjai és OCI</a></p>
+<div class="links"><a class="prev" rel="prev" href="d176.html">← 36.1 Process, namespace és konténerizoláció</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d178.html">36.3 Image layer, overlayfs és persistens adat →</a></div>
+</nav>
+<h2 data-number="36.2" id="d177"><span
+class="header-section-number">36.2</span> cgroup v2 CPU/memória/IO és
+OOM</h2>
+<h3 data-number="36.2.1" id="motiváció"><span
+class="header-section-number">36.2.1</span> Motiváció</h3>
+<p>A konténer nem virtuális gép: a host kernel ugyanabból a processz-,
+memória- és I/O-készletéből fogyaszt minden névtérbe zárt munkafolyamat.
+Ha egy C++ szolgáltatás konténerben indul, akkor a
+<code>std::thread</code>-ek, a <code>malloc</code> által anon memória, a
+<code>std::fstream</code>/<code>read</code>/<code>write</code> és a
+socketek host erőforrásokat használnak. Kérdés: ki garantálja, hogy a
+“limit” tényleg a mi konténerünkre vonatkozik, és hogyan látszik a
+számlálás a hoston? A cgroup v2 a válasz: kernel szintű
+erőforrás-controller, amelyet a konténer runtime a systemd felé delegál.
+A <a href="d176.html">Process, namespace és konténerizoláció</a> a
+láthatóságot izolálja; a <a href="d044.html">cgroup v2
+erőforrásmodell</a> a fizikai erőforrás-korlátok alapját adja. Ebben az
+alfejezetben a konténer accountingot host- és cgroup-szinten
+értelmezzük, majd CPU-throttle és OOM hibát diagnosztizálunk config és
+metrikák alapján.</p>
+<h3 data-number="36.2.2" id="definíció-és-működés"><span
+class="header-section-number">36.2.2</span> Definíció és működés</h3>
+<p><strong>Konténer cgroup accounting:</strong> a konténer runtime
+minden konténerhez létrehoz egy cgroup v2 al-hierarchia csomópontot, és
+a konténer összes processzét abba a cgroupba helyezi. A kernel minden
+erőforrás-felhasználást (CPU-idő, memória, I/O, PID-ek) az adott cgroup
+számlálójába könyveli, függetlenül attól, hogy a processz milyen
+namespace-ben fut. A host
+<code>top</code>/<code>htop</code>/<code>systemd-cgtop</code> tehát a
+host szemével látja a fogyasztást, még akkor is, ha a konténer
+belsejében csak a saját limitjét figyelheti.</p>
+<p>A modern konténer runtime-ok (Docker, Podman, containerd) cgroup v2
+hierarchiában, <strong>systemd cgroup driver</strong>rel dolgoznak. Ez
+azt jelenti, hogy a konténer cgroupját a systemd slice fája alá
+helyezik, például <code>machine.slice</code> vagy a user manager
+<code>user@&lt;uid&gt;.service</code> alá. A konténer runtime a
+<code>Delegate=yes</code> és a <code>cgroup.subtree_control</code>
+mechanizmussal kap korlátos al-hierarchiát. A korábbi
+<code>cgroupfs</code> driver közvetlenül a <code>/sys/fs/cgroup</code>
+alá írt, de a systemd driver az egyetlen tulajdonos, így elkerüli a
+konfliktust. Ubuntu Server 24.04 baseline-on a systemd a default.</p>
+<h4 data-number="36.2.2.1" id="cpu-quotaweight-és-throttling"><span
+class="header-section-number">36.2.2.1</span> CPU quota/weight és
+throttling</h4>
+<p>A cgroup v2 CPU-controllere két fő működési módot kínál:</p>
+<ul>
+<li><strong><code>cpu.max</code> – quota/period:</strong> abszolút
+CPU-idő plafon. Formátuma <code>$QUOTA $PERIOD</code>, például
+<code>50000 100000</code> mikroszekundumban: minden 100 ms periódusban
+legfeljebb 50 ms CPU-időt fogyaszthat a cgroup összes processze együtt.
+Ha a futó thread-ek többet kérnének, a kernel
+<strong>throttling</strong>ot alkalmaz: leállítja a futást a periódus
+hátralévő részére. Ez akkor is bekövetkezik, ha a host teljesen idle: a
+quota abszolút, nem work-conserving. A <code>--cpus=0.5</code> konténer
+flag általában ezt a <code>cpu.max</code> értéket állítja be.</li>
+<li><strong><code>cpu.weight</code> – relatív súly:</strong>
+work-conserving, csak akkor érvényesül, ha a host CPU túlterhelt. A
+nagyobb súlyú cgroup arányosan több CPU-időt kap. Nem plafon, hanem
+verseny esetén prioritás. A <code>--cpu-shares</code> régebbi flag ezt
+képezi le.</li>
+</ul>
+<p>Az alábbi ábra a <code>cpu.max 50000 100000</code> quota „összes szál
+együtt” jellegét mutatja: minél több szál fut párhuzamosan, annál
+hamarabb fogy el a periódus quotája, és annál hosszabb a
+throttle-ablak.</p>
+<figure id="fig-d177-cpu-max">
+<div class="fig-interactive"><iframe src="figures/html/d177-cpu-max.html" title="Három forgatókönyv 0 és 300 ms között, 100 ms-os periódushatárokkal. Az a esetben egy szál minden periódusban 50 ms-ig fut, majd 50 ms-ig throttled. A b esetben két szál egyszerre fut 25 ms-ig, majd 75 ms-ig throttled. A c esetben négy szál 12,5 ms-ig fut, majd 87,5 ms-ig throttled. Periódusonként nr_periods és nr_throttled is eggyel nő." loading="lazy" style="width:100%;border:0;height:400px"></iframe><noscript><img src="figures/img/d177-cpu-max.png" style="width:100.0%"
+alt="Három forgatókönyv 0 és 300 ms között, 100 ms-os periódushatárokkal. Az a esetben egy szál minden periódusban 50 ms-ig fut, majd 50 ms-ig throttled. A b esetben két szál egyszerre fut 25 ms-ig, majd 75 ms-ig throttled. A c esetben négy szál 12,5 ms-ig fut, majd 87,5 ms-ig throttled. Periódusonként nr_periods és nr_throttled is eggyel nő." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d177-cpu-max.png" style="width:100.0%"
+alt="Három forgatókönyv 0 és 300 ms között, 100 ms-os periódushatárokkal. Az a esetben egy szál minden periódusban 50 ms-ig fut, majd 50 ms-ig throttled. A b esetben két szál egyszerre fut 25 ms-ig, majd 75 ms-ig throttled. A c esetben négy szál 12,5 ms-ig fut, majd 87,5 ms-ig throttled. Periódusonként nr_periods és nr_throttled is eggyel nő." /></details></div>
+<figcaption>cpu.max throttling 1, 2 és 4 szálnál (modell, nem mérés): 1
+szál 50 ms fut és 50 ms throttled, 2 szál 25/75 ms, 4 szál 12,5/87,5 ms
+periódusonként</figcaption>
+</figure>
+<p>A cgroup v2 <code>cpu.stat</code> fájl számlálói
+(<code>usage_usec</code>, <code>nr_periods</code>,
+<code>nr_throttled</code>, <code>throttled_usec</code> stb.; a
+<code>throttled_time</code> a cgroup v1 mezője) mutatják a tényleges
+throttlingot. Ha egy C++ szolgáltatás latency SLO-ja romlik, és a
+<code>nr_throttled</code> nő, akkor CPU limit a gyanús, nem a host
+CPU.</p>
+<h4 data-number="36.2.2.2" id="memory-maxhighcacheoom"><span
+class="header-section-number">36.2.2.2</span> Memory
+max/high/cache/OOM</h4>
+<p>A memória-controller kulcsfogalmai:</p>
+<ul>
+<li><strong><code>memory.current</code>:</strong> a cgroup aktuális
+memóriafelhasználása. Ez tartalmazza az anon lapokat (például a C++
+<code>new</code>/<code>malloc</code> által lefoglalt heap) és a file
+lapokat is (page cache, mmap-elt fájlok), viszont a page cache
+visszanyerhető (reclaimable).</li>
+<li><strong><code>memory.max</code>:</strong> hard limit. Ha a cgroup
+eléri, a kernel <strong>OOM kill</strong>t hajt végre a cgroupban:
+kiválaszt egy processzt és SIGKILL-t küld. Az <code>oom_kill</code>
+esemény a <code>memory.events</code> fájlban jelenik meg. A
+<code>memory.max</code> alapértéke <code>max</code>, ez jelenti, hogy
+nincs limit; a <code>0</code> nulla bájtos korlát (a cgroup azonnal
+reclaimel, majd OOM-ol).</li>
+<li><strong><code>memory.high</code>:</strong> soft throttle. Elérésekor
+a kernel intenzívebb reclaimet vált ki, és a cgroup processzei
+lelassulhatnak, de nem kapnak azonnal OOM killt. Jó eszköz a hard OOM
+elkerülésére: a <code>memory.high</code> korábban fékez.</li>
+<li><strong><code>memory.swap.max</code>:</strong> swap limit. Ha 0, a
+cgroup nem swapolhat (pl. <code>--memory-swap</code> egyenlő
+<code>--memory</code>). Ha <code>max</code>, korlátlan.</li>
+<li><strong><code>memory.stat</code>:</strong> részletes bontás:
+<code>anon</code>, <code>file</code>, <code>slab</code>,
+<code>kernel_stack</code>, <code>sock</code>, <code>shmem</code> stb. A
+diagnosztikában meg kell különböztetni a tényleges anon memóriát és a
+visszanyerhető page cache-t.</li>
+</ul>
+<p>A <code>memory.events</code> fontos számlálói: <code>oom_kill</code>,
+<code>oom</code>, <code>max</code>, <code>high</code>. Ha
+<code>oom_kill &gt; 0</code>, akkor valódi OOM történt, és a konténer
+egyik processzét a kernel megölte. A <code>max</code> számláló azt
+jelzi, hogy a cgroup elérte a <code>memory.max</code>-ot.</p>
+<h4 data-number="36.2.2.3" id="iopids-limit"><span
+class="header-section-number">36.2.2.3</span> IO/pids limit</h4>
+<p>A cgroup v2 I/O-controllere a <code>io.weight</code> és a
+<code>io.max</code> segítségével szabályozza a blokk-I/O-t. A
+<code>io.max</code> formátuma
+<code>dev major:minor rbps=... wbps=... riops=... wiops=...</code>,
+például egy adott lemezre. A konténer runtime
+<code>--device-write-bps</code> flagje ezt képezi le. A
+<code>io.stat</code> ad bontást eszközönként.</p>
+<p>A <strong>pids limit</strong> (<code>pids.max</code>) a cgroupban
+lévő processzek/szálak számát korlátozza. A <code>pids.current</code> és
+<code>pids.events</code> (amelyben <code>max</code> esemény van) mutatja
+a túllépést. C++ szolgáltatásnál a <code>std::thread</code> szálak
+kernel szálak, így a <code>pids</code> limit a szálszámot is korlátozza,
+nem csak a processzszámot. A <code>--pids-limit</code> flag ezt
+állítja.</p>
+<h4 data-number="36.2.2.4" id="psihost-pressure-és-noisy-neighbor"><span
+class="header-section-number">36.2.2.4</span> PSI/host pressure és noisy
+neighbor</h4>
+<p>A <strong>PSI (Pressure Stall Information)</strong> a
+<code>cpu.pressure</code>, <code>memory.pressure</code>,
+<code>io.pressure</code> fájlokban a várakozási idő arányát méri,
+például <code>some avg10=...</code> mutatja, hogy a processzek az idő
+egy részében erőforrásra vártak. A host szintű PSI a
+<code>/proc/pressure/</code> alatt olvasható. Ez segít megkülönböztetni
+a saját limit miatti throttlingot a host szintű telítettségtől.
+<strong>Noisy neighbor:</strong> ha egy másik konténer telíti a host
+memóriáját, akkor a kernel globális reclaimet indít, és a mi konténerünk
+page cache-ét is visszaveszi, még akkor is, ha a mi
+<code>memory.high</code>-unk nincs elérve. A PSI itt a host
+memórianyomást mutatja, míg a saját <code>memory.events</code> a saját
+cgroup eseményeit.</p>
+<h4 data-number="36.2.2.5" id="rootless-delegation-és-támogatás"><span
+class="header-section-number">36.2.2.5</span> Rootless delegation és
+támogatás</h4>
+<p>A <strong>rootless konténerek</strong> (Podman rootless, Docker
+rootless) esetén a konténer processzek egy user namespace-ben futnak, és
+a cgroup a user manager alá kerül. A systemd <code>Delegate=yes</code>
+beállítással a user@&lt;uid&gt;.service engedélyezi a saját al-cgroupok
+kezelését. A rootless runtime a felhasználó jogosultságával ír a saját
+cgroupjába. Limit szempontból a legtöbb controller elérhető:
+<code>cpu.max</code>, <code>memory.max</code>, <code>pids.max</code>
+stb. Vannak korlátok: a <code>cpuset.cpus</code> beállítás rootlessben
+gyakran nem működik, mert a cpuset partíciókat a rendszergazda kezeli;
+az <code>io.max</code>-hoz a megfelelő device hozzáférés kell. Az
+adminisztrátornak a <code>systemd</code> user service-ét és a
+<code>cgroup.subtree_control</code>-t kell delegálnia ahhoz, hogy a
+rootless konténer limitjei ténylegesen alkalmazhatóak legyenek. Ha a
+runtime nem tud cgroupot delegálni, a limitet a saját userspace szintjén
+próbálhatja érvényesíteni, de az nem kernel szintű accounting.</p>
+<h3 data-number="36.2.3" id="kidolgozott-példa"><span
+class="header-section-number">36.2.3</span> Kidolgozott példa</h3>
+<p>A példa egy konténer indítását és a cgroup v2 accounting kézi
+ellenőrzését mutatja. A labor önálló fixture-t épít: egy minimális
+<code>lab-cpp-demo:local</code> image-et, amelynek alapfolyamata egy
+CPU-bound shell-ciklus (a d176 csak <code>unshare</code>-rel dolgozott,
+image-et nem épített).</p>
+<p><strong>Target:</strong> <code>labhost</code>, felhasználó
+<code>labuser</code>, Podman rootless (a systemd user managerrel és
+delegált controllerekkel, lásd a Hibák 4. pontját). Előfeltétel: a
+cgroup v2 aktív (<code>/sys/fs/cgroup</code> unified), a Podman
+telepítve.</p>
+<p><strong>0. A fixture image építése.</strong>
+<code>Containerfile</code> egy üres munkakönyvtárban:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode dockerfile"><code class="sourceCode dockerfile"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> docker.io/library/ubuntu:24.04</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># CPU-bound fixture: végtelen ciklus egy szálon</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">CMD</span> [<span class="st">&quot;sh&quot;</span>, <span class="st">&quot;-c&quot;</span>, <span class="st">&quot;while :; do :; done&quot;</span>]</span></code></pre></div>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> build <span class="at">-t</span> lab-cpp-demo:local .</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> image inspect lab-cpp-demo:local <span class="at">--format</span> <span class="st">&#39;{{.Digest}}&#39;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="co"># a digestet a labnaplóba rögzítjük (az alapimage-é is: podman pull után)</span></span></code></pre></div>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. Konténer indítása CPU és memória limittel</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co"># A --cpus=0.5 -&gt; cpu.max 50000 100000</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co"># A --memory=256M --memory-swap=256M -&gt; memory.max 268435456 és swap 0</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co"># A --pids-limit=64 -&gt; pids.max 64</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> run <span class="at">-d</span> <span class="at">--name</span> lab-cgroup-demo <span class="dt">\</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--cpus</span><span class="op">=</span>0.5 <span class="dt">\</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--memory</span><span class="op">=</span>256M <span class="dt">\</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--memory-swap</span><span class="op">=</span>256M <span class="dt">\</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--pids-limit</span><span class="op">=</span>64 <span class="dt">\</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>  lab-cpp-demo:local</span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. Azonosítsuk a cgroup elérési útját</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> inspect lab-cgroup-demo <span class="at">--format</span> <span class="st">&#39;{{.State.CgroupPath}}&#39;</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="co"># Várható kimenet (rootless): /user.slice/user-1000.slice/user@1000.service/\</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="co">#   app.slice/libpod-&lt;id&gt;.scope</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="co"># Vagy rövid: /user.slice/user-1000.slice/user@1000.service/...</span></span></code></pre></div>
+<p>Most a kapott <code>CG_PATH</code> változóval olvassuk le a limiteket
+és a számlálókat. A példa egy lehetséges kimenettel:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="va">CG_PATH</span><span class="op">=</span><span class="va">$(</span><span class="ex">podman</span> inspect lab-cgroup-demo <span class="at">--format</span> <span class="st">&#39;{{.State.CgroupPath}}&#39;</span><span class="va">)</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="va">CG_BASE</span><span class="op">=</span><span class="st">&quot;/sys/fs/cgroup</span><span class="va">${CG_PATH}</span><span class="st">&quot;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;=== cpu.max ===&quot;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="st">&quot;</span><span class="va">$CG_BASE</span><span class="st">/cpu.max&quot;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Várható: 50000 100000</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;=== memory.max / memory.swap.max ===&quot;</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="st">&quot;</span><span class="va">$CG_BASE</span><span class="st">/memory.max&quot;</span> <span class="st">&quot;</span><span class="va">$CG_BASE</span><span class="st">/memory.swap.max&quot;</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="co"># Várható: 268435456 / 0</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;=== pids.max ===&quot;</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="st">&quot;</span><span class="va">$CG_BASE</span><span class="st">/pids.max&quot;</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="co"># Várható: 64</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. Figyeljük a CPU-throttlingot, miközben a konténer CPU-bound loopot futtat</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 2</span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;=== cpu.stat (részlet) ===&quot;</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;nr_periods|nr_throttled|throttled_usec|usage_usec&#39;</span> <span class="st">&quot;</span><span class="va">$CG_BASE</span><span class="st">/cpu.stat&quot;</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a><span class="co"># Példa várt/illusztratív kimenet (nem mért, hanem a modell alapján várható):</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a><span class="co"># usage_usec 123000000</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a><span class="co"># nr_periods 180</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a><span class="co"># nr_throttled 173</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a><span class="co"># throttled_usec 82345678</span></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a><span class="co"># 4. Ellenőrizzük a memóriaeseményeket</span></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;=== memory.events ===&quot;</span></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="st">&quot;</span><span class="va">$CG_BASE</span><span class="st">/memory.events&quot;</span></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a><span class="co"># Illusztratív kimenet:</span></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a><span class="co"># low 0</span></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a><span class="co"># high 0</span></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a><span class="co"># max 0</span></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a><span class="co"># oom 0</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a><span class="co"># oom_kill 0</span></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a><span class="co"># 5. Takarítás</span></span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> rm <span class="at">-f</span> lab-cgroup-demo</span></code></pre></div>
+<p><strong>Ellenőrzési feltétel:</strong> a <code>cpu.max</code>
+pontosan <code>50000 100000</code>; a <code>memory.max</code> bájtban
+<code>268435456</code>; a <code>pids.max</code> <code>64</code>. A
+<code>cpu.stat</code> <code>nr_throttled</code> értéke másodpercek alatt
+növekszik, mert a konténer CPU-bound, és a quota miatt folyamatosan
+throttlingot kap. A <code>memory.events</code> <code>oom_kill</code>
+értéke 0, ha a memória nem fog elérni a limitre.</p>
+<p><strong>Hibajelenség:</strong> ha a <code>--cpus=0.5</code> helyett
+valaki <code>--cpus=0.05</code>-öt ad (<code>cpu.max</code> =
+<code>5000 100000</code>), a CPU-bound szolgáltatás drasztikusan
+lelassul, a <code>nr_throttled</code> minden periódusban nő. A
+<code>--cpu-quota=0</code> ezzel szemben nem „nulla CPU”: a quota
+hiányát jelenti, a <code>cpu.max</code> <code>max 100000</code> lesz, a
+konténer korlátlan CPU-t kap. Ha a memória limit túl alacsony, a
+<code>memory.events</code> <code>oom_kill</code> 1-re vált, és a
+konténer egyik processze megszakad.</p>
+<h3 data-number="36.2.4" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">36.2.4</span> Tipikus hibák és
+ellenpróbák</h3>
+<ol type="1">
+<li><p><strong>A quota és a weight keverése.</strong> Tünet: a
+szolgáltatás lassú, bár a <code>cpu.weight</code> értékét növelték.
+Hipotézis: a <code>cpu.max</code> abszolút plafonja független a
+<code>cpu.weight</code>-től. Adatgyűjtés: <code>cat cpu.max</code> és
+<code>cat cpu.weight</code>;
+<code>cat cpu.stat | grep nr_throttled</code>. Ha
+<code>nr_throttled</code> nő, a quota a hibás. Egy változtatás: emeld a
+<code>cpu.max</code> értékét
+(<code>podman update --cpus=1.0 lab-cgroup-demo</code>). Verifikáció: a
+<code>nr_throttled</code> nem nő tovább, bár a <code>cpu.weight</code>
+változatlan.</p></li>
+<li><p><strong>A <code>memory.max</code> OOM, nem a host OOM.</strong>
+Tünet: a konténer processze SIGKILL-jel hal meg, de a host memória
+kihasználtsága alacsony. Hipotézis: a cgroup saját
+<code>memory.max</code>-a lépett érvénybe. Adatgyűjtés:
+<code>grep oom_kill memory.events</code>; ha
+<code>oom_kill &gt; 0</code>, akkor cgroup OOM. Ellenpróba: növeld a
+<code>memory.max</code>-ot, vagy csökkentsd a memóriafoglalást. A
+<code>memory.high</code> korábbi beállítása reclaim-throttle-t okoz, de
+nem OOM killt; ezt a logokban a hirtelen megjelenő lassulás
+jelzi.</p></li>
+<li><p><strong>A page cache túlbeszámítása.</strong> Tünet: a
+<code>memory.current</code> közel van a <code>memory.max</code>-hoz, és
+a szolgáltatás lelassul, de a tényleges heap nem nőtt. Hipotézis: a page
+cache (file-backed lapok) tölti ki a limitet. Adatgyűjtés:
+<code>grep -E 'file|anon' memory.stat</code>. Ha a <code>file</code>
+nagyobb, mint az <code>anon</code>, a fájl I/O a felelős. Egy
+változtatás: a <code>memory.high</code> csökkentése mellett a
+<code>memory.stat</code>-ból megállapítható, hogy a reclaim a cache-t
+szabadítja fel, nem kell OOM-t okozni. Verifikáció:
+<code>memory.current</code> csökken, <code>oom_kill</code> marad
+0.</p></li>
+<li><p><strong>A rootless limit nem fogan.</strong> Tünet: a rootless
+Podman konténer nem kapja meg a <code>--cpus=0.5</code> limitet, a
+<code>cpu.max</code> továbbra is <code>max</code>. Hipotézis: a user
+manager <code>Delegate=yes</code> hiánya vagy a
+<code>cgroup.subtree_control</code> delegálás hiánya. Adatgyűjtés: a
+delegált controllerek közvetlenül:
+<code>cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers</code>
+(ha a <code>cpu</code> hiányzik, a CPU-limit nem alkalmazható), valamint
+<code>systemctl show user@$(id -u).service -P Delegate</code>. Egy
+változtatás: drop-in fájl
+<code>/etc/systemd/system/user@.service.d/delegate.conf</code>
+tartalommal <code>[Service]</code> /
+<code>Delegate=cpu cpuset io memory pids</code>, majd
+<code>sudo systemctl daemon-reload</code> és újra bejelentkezés (a user
+manager újraindul). Verifikáció: a <code>cgroup.controllers</code>
+tartalmazza a <code>cpu</code>-t, és új konténernél a
+<code>podman inspect</code> <code>CgroupPath</code> alatt a
+<code>cpu.max</code> a beállított értéket mutatja.</p></li>
+<li><p><strong>A <code>pids.max</code> túllépése nem OOM.</strong>
+Tünet: a C++ szolgáltatás <code>std::thread</code> konstruktorai
+<code>std::system_error</code>-t dobnak
+(<code>Resource temporarily unavailable</code>), de a memória nem magas.
+Hipotézis: a <code>pids.max</code> limit elérése. Adatgyűjtés:
+<code>cat pids.current</code> és <code>cat pids.max</code>; ha egyenlő,
+akkor a PID/szál limit a hibás. Egy változtatás: növeld a
+<code>--pids-limit</code>-et. Verifikáció: a szálak létrejönnek, a
+<code>pids.events</code> nem nő.</p></li>
+</ol>
+<h3 data-number="36.2.5" id="feladatok"><span
+class="header-section-number">36.2.5</span> Feladatok</h3>
+<h4 data-number="36.2.5.1" id="f1-magyarázó-feladat"><span
+class="header-section-number">36.2.5.1</span> F1 – Magyarázó
+feladat</h4>
+<p>Egy futó konténer <code>lab-cgroup-demo</code> cgroupjában az alábbi
+értékek vannak:</p>
+<ul>
+<li><code>cpu.max</code>: <code>30000 100000</code></li>
+<li><code>cpu.weight</code>: <code>100</code></li>
+<li><code>cpu.stat</code>: <code>nr_throttled</code> növekszik</li>
+<li><code>memory.max</code>: <code>536870912</code></li>
+<li><code>memory.events</code>: <code>oom_kill 0</code></li>
+</ul>
+<p>Magyarázd el, miért lehet a szolgáltatás lassú, és hogyan döntenéd
+el, hogy a CPU quota vagy a host terhelés okozza-e. Milyen parancsot
+futtatnál a host PSI ellenőrzéséhez?</p>
+<h4 data-number="36.2.5.2"
+id="f2-adminisztrációskonfigurációs-feladat"><span
+class="header-section-number">36.2.5.2</span> F2 –
+Adminisztrációs/konfigurációs feladat</h4>
+<p>Indíts egy <code>lab-cgroup-cfg</code> nevű konténert a
+<code>lab-cpp-demo:local</code> image-ből, a következő limitekkel:</p>
+<ul>
+<li>CPU: 0,75 vCPU</li>
+<li>Memória: 512 MiB, swap nélkül</li>
+<li>PIDs limit: 128</li>
+</ul>
+<p>Állítsd be úgy, hogy a memórianyomásra a <code>memory.high</code>
+(384 MiB) előbb fékezzen, mint a <code>memory.max</code>. Figyelem: a
+<code>--memory-reservation</code> cgroup v2-n <code>memory.low</code>-ra
+(védett minimum) képeződik, nem <code>memory.high</code>-ra; a
+<code>memory.high</code>-ot közvetlenül kell beállítani (például
+<code>--cgroup-conf=memory.high=...</code>). Ellenőrizd a cgroupban a
+<code>cpu.max</code>, <code>memory.max</code>, <code>memory.high</code>,
+<code>memory.swap.max</code> és <code>pids.max</code> értékét, majd
+távolítsd el a konténert.</p>
+<h4 data-number="36.2.5.3"
+id="f3-diagnosztikaifailurerecovery-feladat"><span
+class="header-section-number">36.2.5.3</span> F3 –
+Diagnosztikai/failure/recovery feladat</h4>
+<p>A <code>lab-cgroup-fail</code> konténer OOM-kill áldozata lett: a
+<code>memory.events</code> <code>oom_kill</code> értéke 2, a konténerben
+futó C++ szolgáltatás meghalt. A memória limit <code>256M</code>, a swap
+limit <code>0</code>. Feladat: derítsd ki a
+<code>memory.stat</code>-ból, hogy anon vagy file memória okozta-e a
+túlfutást; ha anon, akkor növeld a limitet 512 MiB-ra, és ha file, akkor
+állíts <code>memory.high</code>-ot 384 MiB-ra, hogy a reclaim korábban
+induljon. Indítsd újra a konténert, és igazold, hogy az
+<code>oom_kill</code> esemény nem nő tovább legalább 10 másodpercig.</p>
+<h3 data-number="36.2.6" id="megoldások"><span
+class="header-section-number">36.2.6</span> Megoldások</h3>
+<h4 data-number="36.2.6.1" id="m1"><span
+class="header-section-number">36.2.6.1</span> M1</h4>
+<p>A <code>cpu.max</code> <code>30000 100000</code> azt jelenti, hogy a
+konténer processzei minden 100 ms periódusból legfeljebb 30 ms CPU-időt
+kaphatnak. A <code>cpu.weight</code> 100 alapértelmezett, de mivel a
+quota abszolút, a host még üresjáratban sem enged többet. A növekvő
+<code>nr_throttled</code> azt mutatja, hogy a CPU-bound szolgáltatás
+eléri a plafont, és a kernel leállítja a futást. A host terhelés
+ellenőrzéséhez a <code>/proc/pressure/cpu</code>-t kell olvasni: ha a
+host <code>some</code> PSI alacsony, de a cgroup
+<code>nr_throttled</code> nő, akkor a konténer saját quota a szűk
+keresztmetszet. Postcondition: a tanuló meg tudja különböztetni a
+quota-throttlingot a host CPU-nyomástól.</p>
+<h4 data-number="36.2.6.2" id="m2"><span
+class="header-section-number">36.2.6.2</span> M2</h4>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: labhost, labuser, Podman rootless</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> run <span class="at">-d</span> <span class="at">--name</span> lab-cgroup-cfg <span class="dt">\</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--cpus</span><span class="op">=</span>0.75 <span class="dt">\</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--memory</span><span class="op">=</span>512M <span class="dt">\</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--memory-swap</span><span class="op">=</span>512M <span class="dt">\</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--cgroup-conf</span><span class="op">=</span>memory.high=402653184 <span class="dt">\</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--pids-limit</span><span class="op">=</span>128 <span class="dt">\</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>  lab-cpp-demo:local</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="co"># a --cgroup-conf elérhetőségét a telepített Podman ellenőrzi:</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="co">#   podman run --help | grep cgroup-conf</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="va">CG_PATH</span><span class="op">=</span><span class="va">$(</span><span class="ex">podman</span> inspect lab-cgroup-cfg <span class="at">--format</span> <span class="st">&#39;{{.State.CgroupPath}}&#39;</span><span class="va">)</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="va">CG_BASE</span><span class="op">=</span><span class="st">&quot;/sys/fs/cgroup</span><span class="va">${CG_PATH}</span><span class="st">&quot;</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;cpu.max: </span><span class="va">$(</span><span class="fu">cat</span> <span class="va">$CG_BASE</span>/cpu.max<span class="va">)</span><span class="st">&quot;</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;memory.max: </span><span class="va">$(</span><span class="fu">cat</span> <span class="va">$CG_BASE</span>/memory.max<span class="va">)</span><span class="st">&quot;</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;memory.high: </span><span class="va">$(</span><span class="fu">cat</span> <span class="va">$CG_BASE</span>/memory.high<span class="va">)</span><span class="st">&quot;</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;memory.swap.max: </span><span class="va">$(</span><span class="fu">cat</span> <span class="va">$CG_BASE</span>/memory.swap.max<span class="va">)</span><span class="st">&quot;</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;pids.max: </span><span class="va">$(</span><span class="fu">cat</span> <span class="va">$CG_BASE</span>/pids.max<span class="va">)</span><span class="st">&quot;</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a><span class="co"># Várható kimenetek:</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a><span class="co"># cpu.max: 75000 100000</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a><span class="co"># memory.max: 536870912</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a><span class="co"># memory.high: 402653184</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a><span class="co"># memory.swap.max: 0</span></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a><span class="co"># pids.max: 128</span></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a><span class="co"># Cleanup</span></span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> rm <span class="at">-f</span> lab-cgroup-cfg</span></code></pre></div>
+<p>Postcondition: a konténer elindult, a cgroupban a limitértékek a
+kértnek felelnek meg; a swap limit 0, a <code>memory.high</code>
+alacsonyabb, mint a <code>memory.max</code>. A cleanup után a konténer
+nem fut. (A <code>--memory-reservation=384M</code> ezzel szemben a
+<code>memory.low</code>-t állítaná 402653184-re, a
+<code>memory.high</code> <code>max</code> maradna.)</p>
+<h4 data-number="36.2.6.3" id="m3"><span
+class="header-section-number">36.2.6.3</span> M3</h4>
+<p>Először azonosítsuk a memóriaforrás típusát:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="va">CG_PATH</span><span class="op">=</span><span class="va">$(</span><span class="ex">podman</span> inspect lab-cgroup-fail <span class="at">--format</span> <span class="st">&#39;{{.State.CgroupPath}}&#39;</span><span class="va">)</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="va">CG_BASE</span><span class="op">=</span><span class="st">&quot;/sys/fs/cgroup</span><span class="va">${CG_PATH}</span><span class="st">&quot;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;^(anon|file|shmem|slab)&#39;</span> <span class="st">&quot;</span><span class="va">$CG_BASE</span><span class="st">/memory.stat&quot;</span></span></code></pre></div>
+<p>Ha az <code>anon</code> nagy (például 250 MiB a 256 MiB-ból), akkor a
+C++ heap túlfutás a valószínű ok. A recovery: álljunk le a konténerrel,
+indítsuk újra magasabb limittel.</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> rm <span class="at">-f</span> lab-cgroup-fail</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> run <span class="at">-d</span> <span class="at">--name</span> lab-cgroup-fail <span class="dt">\</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--memory</span><span class="op">=</span>512M <span class="at">--memory-swap</span><span class="op">=</span>512M <span class="dt">\</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>  lab-cpp-demo:local</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Várjunk 10 másodpercet, majd ellenőrizzük</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 10</span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="va">CG_PATH</span><span class="op">=</span><span class="va">$(</span><span class="ex">podman</span> inspect lab-cgroup-fail <span class="at">--format</span> <span class="st">&#39;{{.State.CgroupPath}}&#39;</span><span class="va">)</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="st">&#39;oom_kill&#39;</span> <span class="st">&quot;/sys/fs/cgroup</span><span class="va">${CG_PATH}</span><span class="st">/memory.events&quot;</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="co"># Várható: oom_kill 0</span></span></code></pre></div>
+<p>Ha viszont a <code>file</code> volt meghatározó (page cache), akkor
+nem a heap, hanem a fájl I/O a hibás. Ekkor a <code>memory.high</code>
+beállítás segít korábbi reclaimet kiváltani. A feladat 384 MiB-os
+<code>memory.high</code>-ot kér; hogy ez a <code>memory.max</code> alatt
+legyen, a hard limitet 512 MiB-ra emeljük (a
+<code>--memory-reservation</code> nem <code>memory.high</code>-ot, hanem
+<code>memory.low</code>-t állítana):</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> rm <span class="at">-f</span> lab-cgroup-fail</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> run <span class="at">-d</span> <span class="at">--name</span> lab-cgroup-fail <span class="dt">\</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--memory</span><span class="op">=</span>512M <span class="at">--memory-swap</span><span class="op">=</span>512M <span class="dt">\</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--cgroup-conf</span><span class="op">=</span>memory.high=402653184 <span class="dt">\</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>  lab-cpp-demo:local</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 10</span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="va">CG_PATH</span><span class="op">=</span><span class="va">$(</span><span class="ex">podman</span> inspect lab-cgroup-fail <span class="at">--format</span> <span class="st">&#39;{{.State.CgroupPath}}&#39;</span><span class="va">)</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="st">&#39;oom_kill&#39;</span> <span class="st">&quot;/sys/fs/cgroup</span><span class="va">${CG_PATH}</span><span class="st">/memory.events&quot;</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a><span class="co"># Várható: oom_kill 0, mert a reclaim a cache-t szabadítja fel</span></span></code></pre></div>
+<p>Postcondition: az <code>oom_kill</code> számláló nem nő tovább az
+újraindítás után, a konténer fut, és a memória típusa alapján megfelelő
+stratégiát választottunk (limit emelés vagy <code>memory.high</code>
+korai reclaim).</p>
+<h3 data-number="36.2.7" id="rövid-összefoglaló"><span
+class="header-section-number">36.2.7</span> Rövid összefoglaló</h3>
+<p>A konténer-erőforrások elszámolása a cgroup v2 hierarchiában
+történik, amelyet a systemd driver delegál a runtime-oknak. A CPU-nál a
+<code>cpu.max</code> abszolút plafon, a <code>cpu.weight</code> relatív
+súly; a throttle-t a <code>cpu.stat</code> mutatja. A memóriánál a
+<code>memory.max</code> hard OOM-kill, a <code>memory.high</code> soft
+reclaim-throttle; a <code>memory.events</code> <code>oom_kill</code>
+azonnali bizonyíték. A page cache a <code>memory.current</code> része,
+ezért a <code>memory.stat</code> anon/file bontása szükséges. A pids
+limit a szálakat is korlátozza, a PSI pedig elválasztja a saját limitet
+a host nyomástól. Rootlessben a systemd user manager
+<code>Delegate=yes</code> beállítása kell a korlátok
+érvényesítéséhez.</p>
+<p>Továbbhasznált definíciók:</p>
+<ul>
+<li><strong>Container cgroup accounting:</strong> a konténer runtime
+által delegált cgroup v2 csomópontba sorolt processzek kernel szintű
+erőforrás-számlálása és limitálása.</li>
+<li><strong>CPU throttling:</strong> a <code>cpu.max</code> quota által
+kiváltott futásidő-korlátozás, amely idle hoston is bekövetkezik.</li>
+<li><strong><code>memory.events.oom_kill</code>:</strong> a cgroup saját
+memória-limitjének túllépése miatt a kernel által megölt processzek
+száma.</li>
+</ul>
+<h3 data-number="36.2.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">36.2.8</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li><a href="https://docs.kernel.org/admin-guide/cgroup-v2.html">Linux
+kernel – Control Group v2</a>: <code>cpu.max</code>,
+<code>cpu.weight</code>, <code>cpu.stat</code>
+(<code>nr_throttled</code>, <code>throttled_usec</code>),
+<code>memory.max</code>/<code>high</code>/<code>low</code>/<code>swap.max</code>,
+<code>memory.events</code>, <code>pids.max</code>, PSI – Ubuntu 24.04 GA
+kernel (6.8) ágához.</li>
+<li><a
+href="https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html">systemd.resource-control(5)</a>:
+<code>Delegate=</code>; <a
+href="https://www.freedesktop.org/software/systemd/man/latest/user@.service.html">user@.service</a>:
+a user manager.</li>
+<li><a
+href="https://github.com/opencontainers/runtime-spec/blob/main/config-linux.md">OCI
+Runtime Specification – Linux</a>: <code>memory.reservation</code>,
+<code>cpu.quota</code>/<code>period</code>,
+<code>pids.limit</code>.</li>
+<li><a
+href="https://github.com/containers/crun/blob/main/crun.1.md">crun –
+cgroup v2 leképezés</a>: az OCI-mezők cgroup v2 megfelelői
+(<code>memory.reservation</code> → <code>memory.low</code>).</li>
+<li><a
+href="https://docs.podman.io/en/latest/markdown/podman-run.1.html">podman-run(1)</a>:
+<code>--cpus</code>, <code>--memory</code>, <code>--memory-swap</code>,
+<code>--memory-reservation</code>, <code>--cgroup-conf</code>,
+<code>--pids-limit</code>; <a
+href="https://docs.podman.io/en/latest/markdown/podman-update.1.html">podman-update(1)</a>.</li>
+<li><a
+href="https://github.com/containers/podman/blob/main/docs/tutorials/rootless_tutorial.md">Podman
+rootless tutorial</a>: cgroup v2 delegáció.</li>
+</ul>
+<p>Ellenőrzési hiányok: a konkrét Ubuntu 24.04 kernelverzió, a
+Podman/crun verzió (<code>podman version</code>,
+<code>crun --version</code>), a systemd cgroup driver pontos viselkedése
+és a rootless delegálás elérhető controller-köre a laborban futtatott
+parancsokkal ellenőrizendő. A példák laborban ellenőrizendők; ebben a
+munkamenetben nem történt laborfuttatás, dátumozott futtatási napló még
+nincs.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d176.html">← 36.1 Process, namespace és konténerizoláció</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d178.html">36.3 Image layer, overlayfs és persistens adat →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

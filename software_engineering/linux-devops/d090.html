@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>18.5 Storage bővítés, hiba és recovery labor – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch18">18 Block device, partition, LVM és titkosítás adminisztrációja</a></p>
+<div class="links"><a class="prev" rel="prev" href="d089.html">← 18.4 LUKS/dm-crypt és kulcs-életciklus</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d091.html">19.1 Mount, fstab és namespace →</a></div>
+</nav>
+<h2 data-number="18.5" id="d090"><span
+class="header-section-number">18.5</span> Storage bővítés, hiba és
+recovery labor</h2>
+<h3 data-number="18.5.1" id="motiváció-és-definíció"><span
+class="header-section-number">18.5.1</span> Motiváció és definíció</h3>
+<p>A block stack adminisztrációja akkor válik veszélyessé, ha a rétegek
+azonosságát és a target eszközt nem ellenőrizzük minden módosítás előtt.
+A d087-ben megismert LVM és a d089-ben tárgyalt LUKS/dm-crypt önmagában
+is sok állapotot hordoz; egy rossz <code>pvcreate</code> vagy
+<code>lvreduce</code> azonnal tönkreteheti a teljes stacket, ha éppen a
+root diszken hajtjuk végre. Ebben a laborban kizárólag névvel
+azonosított, eldobható virtuális diszkeken dolgozunk, és minden
+műveletet inventory-val, target asserttel, backup ponttal és
+ellenőrzéssel kötünk össze.</p>
+<p><strong>Block stack invariáns</strong>: olyan ellenőrzött állapot,
+amelyben a GPT partíció UUID/type, a LUKS header UUID, a PV/VG/LV
+UUID-k, a filesystem UUID és a mount path egymáshoz rögzítettek, és
+egyetlen réteg sem módosul anélkül, hogy a teljes függőségi láncot újra
+ne ellenőriztük volna. A lab célja, hogy az extend, a hiba és a recovery
+során ezt az invariánst fenntartsuk.</p>
+<p><strong>Inventory és target assert</strong>: a módosítás előtt
+automatikusan kiadott, parancsokból álló ellenőrzés, amely igazolja,
+hogy a cél diszk a laborhoz tartozó, nem a rendszer-root disk, és a várt
+LUKS/LVM/filesystem azonosítókat tartalmazza. A
+<code>target assert</code> a kiválasztott device path és a
+<code>by-id</code> serial egyezését is vizsgálja, így a
+<code>/dev/sdb</code>-hez hasonló unstable név nem elég.</p>
+<p>A műveleti jegyzőkönyv (change log) a preflight, a változtatás és a
+post-verification kimenetét rögzíti. Ez a jegyzőkönyv a későbbi recovery
+alapja is, mert a backup pontok (például <code>vgcfgbackup</code>) és a
+checksum listák a labkönyvtárban vannak.</p>
+<h3 data-number="18.5.2" id="működés-és-rétegek"><span
+class="header-section-number">18.5.2</span> Működés és rétegek</h3>
+<p>A gyakorlott stack így épül fel alulról felfelé:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Réteg</th>
+<th>Eszköz/objektum</th>
+<th>Ellenőrző parancs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPT</td>
+<td>partíció <code>p1</code></td>
+<td><code>sgdisk -p</code>, <code>blkid -p</code></td>
+</tr>
+<tr>
+<td>LUKS</td>
+<td><code>labcryptN</code> mapping</td>
+<td><code>cryptsetup luksDump</code>,
+<code>cryptsetup status</code></td>
+</tr>
+<tr>
+<td>LVM PV</td>
+<td><code>/dev/mapper/labcryptN</code></td>
+<td><code>pvs</code>, <code>pvdisplay</code></td>
+</tr>
+<tr>
+<td>LVM VG</td>
+<td><code>labvg</code></td>
+<td><code>vgs</code>, <code>vgdisplay</code>,
+<code>vgcfgbackup</code></td>
+</tr>
+<tr>
+<td>LVM LV</td>
+<td><code>labvg/lablv</code></td>
+<td><code>lvs</code>, <code>lvdisplay</code></td>
+</tr>
+<tr>
+<td>Filesystem</td>
+<td><code>LABEL=labfs</code></td>
+<td><code>lsblk -f</code>, <code>findmnt</code>,
+<code>dumpe2fs</code></td>
+</tr>
+<tr>
+<td>Mount</td>
+<td><code>/mnt/labfs</code></td>
+<td><code>findmnt</code>, adat-ellenőrzés</td>
+</tr>
+</tbody>
+</table>
+<p>A <strong>GPT -&gt; LUKS -&gt; LVM -&gt; filesystem
+variánsok</strong> itt azért fontos, mert a sorrend kötött: a LUKS a
+block device-on (vagy partíción) él, a LVM a feloldott mappingok felett,
+a filesystem pedig az LV felett. A stack minden rétegének megvan a maga
+HEADER és metadata tartománya; ha egy alsóbb réteg sérül, a felső réteg
+már nem találja a saját metaadatát. Ez a függőségi lánc a
+hibadiagnosztika magja. Az alábbi ábra a labor három lemezén mutatja a
+rétegeket, az LV-szegmensek PV-elhelyezését és a <code>labdisk2</code>
+kiesésének hatását.</p>
+<figure id="fig-d090-block-stack">
+<div class="fig-interactive"><iframe src="figures/html/d090-block-stack.html" title="Három lemezoszlop alulról felfelé: virtio-labdisk1–3, GPT part1, LUKS2 labcrypt1–3, PV 507 PE, VG labvg, LV lablv a labcrypt2 és labcrypt3 PV-n, ext4 LABEL=labfs, mount /mnt/labfs; a labdisk2 kiesése a labcrypt2-re eső LV-szegmenst teszi elérhetetlenné." loading="lazy" style="width:100%;border:0;height:640px"></iframe><noscript><img src="figures/img/d090-block-stack.png" style="width:90.0%"
+alt="Három lemezoszlop alulról felfelé: virtio-labdisk1–3, GPT part1, LUKS2 labcrypt1–3, PV 507 PE, VG labvg, LV lablv a labcrypt2 és labcrypt3 PV-n, ext4 LABEL=labfs, mount /mnt/labfs; a labdisk2 kiesése a labcrypt2-re eső LV-szegmenst teszi elérhetetlenné." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d090-block-stack.png" style="width:90.0%"
+alt="Három lemezoszlop alulról felfelé: virtio-labdisk1–3, GPT part1, LUKS2 labcrypt1–3, PV 507 PE, VG labvg, LV lablv a labcrypt2 és labcrypt3 PV-n, ext4 LABEL=labfs, mount /mnt/labfs; a labdisk2 kiesése a labcrypt2-re eső LV-szegmenst teszi elérhetetlenné." /></details></div>
+<figcaption>A labor block stackje és a PV-kiesés hatása: (a) ép stack az
+extend után, a <code>lablv</code> rögzítetten a <code>labcrypt2</code>
+és a <code>labcrypt3</code> PV-n; (b) a <code>labdisk2</code> kiesésekor
+csak a <code>labcrypt2</code>-re eső 256 PE-s szegmens válik
+elérhetetlenné (a PE-számok számítottak, nem mért értékek)</figcaption>
+</figure>
+<p>Inventory script minden lépés előtt
+(<code>/root/lab-d090/inventory.sh</code>). Minden labdiskre ellenőrzi a
+link létezését, hogy a feloldott eszköz nem a root fájlrendszert hordozó
+lemez, és hogy a udev által látott serial egyezik a várt névvel; csak a
+ciklus után ír sikert:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/usr/bin/env bash</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="bu">set</span> <span class="at">-euo</span> pipefail</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost=vm-storage1, UID=root, disposable labdisks only</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="co"># a root fs-t hordozó lemez(ek); LVM/LUKS root esetén is (lsblk -s)</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="va">rootsrc</span><span class="op">=</span><span class="va">$(</span><span class="ex">findmnt</span> <span class="at">-no</span> SOURCE /<span class="va">)</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="va">rootdisks</span><span class="op">=</span><span class="va">$(</span><span class="ex">lsblk</span> <span class="at">-nsl</span> <span class="at">-o</span> NAME,TYPE <span class="st">&quot;</span><span class="va">$rootsrc</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">|</span> <span class="fu">awk</span> <span class="st">&#39;$2 == &quot;disk&quot; {print &quot;/dev/&quot; $1}&#39;</span><span class="va">)</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> n <span class="kw">in</span> 1 2 3<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    <span class="va">d</span><span class="op">=</span>/dev/disk/by-id/virtio-labdisk<span class="va">$n</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    <span class="bu">test</span> <span class="at">-e</span> <span class="st">&quot;</span><span class="va">$d</span><span class="st">&quot;</span> <span class="kw">||</span> <span class="kw">{</span> <span class="bu">echo</span> <span class="st">&quot;HIBA: hiányzik </span><span class="va">$d</span><span class="st">&quot;</span><span class="kw">;</span> <span class="bu">exit</span> 1<span class="kw">;</span> <span class="kw">}</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    <span class="va">real</span><span class="op">=</span><span class="va">$(</span><span class="fu">readlink</span> <span class="at">-f</span> <span class="st">&quot;</span><span class="va">$d</span><span class="st">&quot;</span><span class="va">)</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> r <span class="kw">in</span> <span class="va">$rootdisks</span><span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>        <span class="bu">[</span> <span class="st">&quot;</span><span class="va">$real</span><span class="st">&quot;</span> <span class="ot">!=</span> <span class="st">&quot;</span><span class="va">$r</span><span class="st">&quot;</span> <span class="bu">]</span> <span class="kw">||</span> <span class="kw">{</span> <span class="bu">echo</span> <span class="st">&quot;HIBA: </span><span class="va">$d</span><span class="st"> a root disk&quot;</span><span class="kw">;</span> <span class="bu">exit</span> 1<span class="kw">;</span> <span class="kw">}</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">done</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>    <span class="co"># virtio-blk: a by-id link a virtio-$ID_SERIAL alakból jön</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>    <span class="va">s</span><span class="op">=</span><span class="va">$(</span><span class="ex">udevadm</span> info <span class="at">--query</span><span class="op">=</span>property <span class="at">--name</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$d</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>        <span class="kw">|</span> <span class="fu">sed</span> <span class="at">-n</span> <span class="st">&#39;s/^ID_SERIAL=//p&#39;</span><span class="va">)</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>    <span class="bu">[</span> <span class="st">&quot;</span><span class="va">$s</span><span class="st">&quot;</span> <span class="ot">=</span> <span class="st">&quot;labdisk</span><span class="va">$n</span><span class="st">&quot;</span> <span class="bu">]</span> <span class="kw">||</span> <span class="kw">{</span> <span class="bu">echo</span> <span class="st">&quot;HIBA: </span><span class="va">$d</span><span class="st"> serial: </span><span class="va">$s</span><span class="st">&quot;</span><span class="kw">;</span> <span class="bu">exit</span> 1<span class="kw">;</span> <span class="kw">}</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;OK: </span><span class="va">$d</span><span class="st"> -&gt; </span><span class="va">$real</span><span class="st"> (serial </span><span class="va">$s</span><span class="st">)&quot;</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;Target assert OK&quot;</span></span></code></pre></div>
+<p>A teljes lemezre futtatott <code>lsblk -no PKNAME</code> a lemez
+sorában üres értéket ad, ezért a root disk kizárását nem arra, hanem a
+root fájlrendszer forrásából inverz irányban (<code>lsblk -s</code>)
+bejárt lemezlistára építjük.</p>
+<p>A <strong>extend és támogatott rollback</strong> lényege: a bővítés
+nem destruktív, de csak akkor szabad elköteleződni, ha a művelet előtt
+készült LVM snapshot vagy backup, és a filesystem shrink képességét
+ismerjük. Az <code>ext4</code> offline shrinkelhető, az XFS nem; ezért a
+labban ext4-et használunk. A rollback nem automatikus: először meg kell
+állni, majd az állapotromlást adatokkal igazolni, és csak utána
+visszaállítani. A snapshot-merge (<code>lvconvert --merge</code>) jó
+eszköz, de csak akkor működik, ha a snapshot létrehozása sikeres volt és
+a COW terület nem telt meg.</p>
+<p>A <strong>degraded disk/áramkimaradás fixture</strong> a laborban a
+hypervisor oldaláról valósul meg: a VM futás közben lecsatoljuk a
+második labdiszket, ami a VG aktív PV-je (libvirt-hoston
+<code>virsh detach-disk vm-storage1 vdb --live</code>). A guestből a
+<code>/sys/block/&lt;dev&gt;/device/delete</code> csak SCSI-rétegű
+(<code>sdX</code>, virtio-scsi) lemezen létezik, a <code>vdX</code> nevű
+virtio-blk lemezen nincs ilyen attribútum. A lecsatolás a valós disk
+loss hatását szimulálja: a kernel elveszíti a block device-t, de a
+device-mapper táblák (<code>labcrypt2</code>, <code>labvg-lablv</code>)
+megmaradnak (<code>dmsetup ls</code> listázza őket), csak a hiányzó
+eszközre eső szegmensek I/O-ja ad hibát; az ext4 ilyenkor hibát naplóz
+és read-only módba válthat. Az adat nem feltétlenül vész el, de a stack
+nem használható. A recovery előtt a régi rétegeket felülről lefelé le
+kell bontani (<code>umount</code>, <code>vgchange -an labvg</code>,
+<code>cryptsetup close labcrypt2</code>), majd a diszk visszaadása, a
+rétegek újraaktiválása és a checksum ellenőrzés következik.</p>
+<h3 data-number="18.5.3" id="kidolgozott-példa"><span
+class="header-section-number">18.5.3</span> Kidolgozott példa</h3>
+<p>A laborhoz három 2 GiB-os virtuális diszket használunk:
+<code>labdisk1</code>, <code>labdisk2</code>, <code>labdisk3</code>. A
+root disk <code>vda</code>. A labhost <code>vm-storage1</code>, a
+parancsokat <code>root</code> futtatja. A LUKS-kulcs (dummy, csak
+demonstrációra), a checksum-lista és a metaadat-mentések a
+<code>/root/lab-d090/</code> (0700) könyvtárba kerülnek: a
+<code>/tmp</code> világolvasható lehet, és a rebootos recovery előtt a
+systemd-tmpfiles takaríthatja, a kulcs elvesztésével pedig a labor
+adatai visszafordíthatatlanul elvesznének.</p>
+<p><strong>1. Stack építése</strong></p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/usr/bin/env bash</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="bu">set</span> <span class="at">-euo</span> pipefail</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost=vm-storage1, UID=root</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="fu">install</span> <span class="at">-d</span> <span class="at">-m</span> 700 /root/lab-d090   <span class="co"># ide került az inventory.sh is</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="ex">/root/lab-d090/inventory.sh</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="va">KEY</span><span class="op">=</span>/root/lab-d090/labkey1</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="co"># Demó kulcs; a valóságban protected storage kell.</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="kw">(</span><span class="bu">umask</span> 077<span class="kw">;</span> <span class="fu">dd</span> if=/dev/urandom of=<span class="st">&quot;</span><span class="va">$KEY</span><span class="st">&quot;</span> bs=32 count=1 status=none<span class="kw">)</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="va">B</span><span class="op">=</span>/dev/disk/by-id/virtio-labdisk</span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 1) GPT előkészítés; 8309 = Linux LUKS partíciótípus</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> n <span class="kw">in</span> 1 2<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    <span class="ex">sgdisk</span> <span class="at">--zap-all</span> <span class="st">&quot;</span><span class="va">$B$n</span><span class="st">&quot;</span> <span class="op">&gt;</span>/dev/null</span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    <span class="ex">sgdisk</span> <span class="at">-n1:0:0</span> <span class="at">-t1:8309</span> <span class="at">-c1:labstorage</span> <span class="st">&quot;</span><span class="va">$B$n</span><span class="st">&quot;</span> <span class="op">&gt;</span>/dev/null</span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    <span class="ex">sgdisk</span> <span class="at">-p</span> <span class="st">&quot;</span><span class="va">$B$n</span><span class="st">&quot;</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="co"># 2) LUKS formázás és nyitás</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> n <span class="kw">in</span> 1 2<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>    <span class="ex">cryptsetup</span> luksFormat <span class="at">--type</span> luks2 <span class="at">--batch-mode</span> <span class="dt">\</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>        <span class="at">--key-file</span> <span class="st">&quot;</span><span class="va">$KEY</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$B$n</span><span class="st">-part1&quot;</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>    <span class="ex">cryptsetup</span> open <span class="at">--key-file</span> <span class="st">&quot;</span><span class="va">$KEY</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$B$n</span><span class="st">-part1&quot;</span> <span class="st">&quot;labcrypt</span><span class="va">$n</span><span class="st">&quot;</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a><span class="co"># 3) LVM; a lablv elhelyezése rögzített: a labcrypt2 PV-n</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a><span class="ex">pvcreate</span> /dev/mapper/labcrypt1 /dev/mapper/labcrypt2</span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a><span class="ex">vgcreate</span> labvg /dev/mapper/labcrypt1 /dev/mapper/labcrypt2</span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a><span class="ex">lvcreate</span> <span class="at">-L</span> 1G <span class="at">-n</span> lablv labvg /dev/mapper/labcrypt2</span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a><span class="co"># 4) Filesystem</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.ext4</span> <span class="at">-L</span> labfs /dev/labvg/lablv</span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> /mnt/labfs</span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> LABEL=labfs /mnt/labfs</span></code></pre></div>
+<p>A kulcsot a reboot előtt ellenőrizzük:
+<code>test -s /root/lab-d090/labkey1 &amp;&amp; stat -c '%a' /root/lab-d090/labkey1</code>
+→ <code>600</code>.</p>
+<p><strong>2. Baseline adat és checksum</strong></p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost=vm-storage1, UID=root</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;lab storage baseline&quot;</span> <span class="op">&gt;</span> /mnt/labfs/readme.txt</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="fu">dd</span> if=/dev/urandom of=/mnt/labfs/blob.bin bs=1M count=4 status=none</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sha256sum</span> /mnt/labfs/readme.txt /mnt/labfs/blob.bin <span class="dt">\</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>  <span class="kw">|</span> <span class="fu">tee</span> /root/lab-d090/labfs_baseline.sha256</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sync</span></span></code></pre></div>
+<p>Várható kimenet: a <code>mount</code> sikeres, a
+<code>df -h /mnt/labfs</code> mutatja a mountot, a
+<code>sha256sum</code> kiírja a hash-eket.</p>
+<p><strong>3. Extend a harmadik diszkkel</strong></p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost=vm-storage1, UID=root</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Preflight (target assert a labdisk3-ra is) és backup pont</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="ex">/root/lab-d090/inventory.sh</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="va">KEY</span><span class="op">=</span>/root/lab-d090/labkey1</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="va">D3</span><span class="op">=</span>/dev/disk/by-id/virtio-labdisk3</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="ex">sgdisk</span> <span class="at">--zap-all</span> <span class="st">&quot;</span><span class="va">$D3</span><span class="st">&quot;</span> <span class="op">&gt;</span>/dev/null</span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="ex">sgdisk</span> <span class="at">-n1:0:0</span> <span class="at">-t1:8309</span> <span class="at">-c1:labstorage</span> <span class="st">&quot;</span><span class="va">$D3</span><span class="st">&quot;</span> <span class="op">&gt;</span>/dev/null</span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="ex">cryptsetup</span> luksFormat <span class="at">--type</span> luks2 <span class="at">--batch-mode</span> <span class="at">--key-file</span> <span class="st">&quot;</span><span class="va">$KEY</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>  <span class="st">&quot;</span><span class="va">$D3</span><span class="st">-part1&quot;</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="ex">cryptsetup</span> open <span class="at">--key-file</span> <span class="st">&quot;</span><span class="va">$KEY</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$D3</span><span class="st">-part1&quot;</span> labcrypt3</span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="ex">vgcfgbackup</span> <span class="at">-f</span> /root/lab-d090/labvg_before_extend labvg</span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="co"># LVM snapshot rollback lehetőséghez, a labcrypt1 PV-n</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="ex">lvcreate</span> <span class="at">-s</span> <span class="at">-L</span> 512M <span class="at">-n</span> lablv_snap labvg/lablv /dev/mapper/labcrypt1</span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="co"># Extend: az új szegmens rögzítetten a labcrypt3 PV-re kerül</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="ex">pvcreate</span> /dev/mapper/labcrypt3</span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="ex">vgextend</span> labvg /dev/mapper/labcrypt3</span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a><span class="ex">lvextend</span> <span class="at">-L</span> +500M <span class="at">-r</span> labvg/lablv /dev/mapper/labcrypt3</span></code></pre></div>
+<p>Várható: <code>lvextend</code> automatikusan futtatja az
+<code>resize2fs</code>-et, mert <code>-r</code> kapcsolót adtunk.
+Ellenőrzés:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost=vm-storage1, UID=root</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">lsblk</span> <span class="at">-o</span> NAME,SIZE,TYPE,MOUNTPOINT</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-h</span> /mnt/labfs</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="ex">lvs</span> <span class="at">-o</span> lv_name,lv_size,devices labvg</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="ex">dumpe2fs</span> <span class="at">-h</span> /dev/labvg/lablv <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;Filesystem features|Block count&#39;</span></span></code></pre></div>
+<p>A mount továbbra is aktív, a teljes méret ~1,5 GiB, az inode és block
+count frissült. Az <code>lvs -o …,devices</code> a <code>lablv</code>
+sorában <code>/dev/mapper/labcrypt2(0),/dev/mapper/labcrypt3(0)</code>
+szegmenseket mutat (illusztratív), így a <code>labdisk2</code> kiesése
+determinisztikusan az LV első 1 GiB-ját (256 PE) érinti.</p>
+<p><strong>4. Degraded disk fixture és recovery</strong></p>
+<p>Szimuláljuk a <code>labdisk2</code> hirtelen kiesését. A guestben
+előbb rögzítjük a kernelnevet (a
+<code>/dev/disk/by-id/virtio-labdisk2</code> például
+<code>vdb</code>-ként látszik), majd a lecsatolás a hypervisor-hoston
+történik (a libvirt domain neve itt <code>vm-storage1</code>, a célnév a
+domain XML-jéből: <code>virsh domblklist vm-storage1</code>):</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost=vm-storage1 (guest), UID=root</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="fu">readlink</span> <span class="at">-f</span> /dev/disk/by-id/virtio-labdisk2   <span class="co"># például /dev/vdb</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="co"># hypervisor-host, libvirt-admin: virsh detach-disk vm-storage1 vdb --live</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="co"># guest, a lecsatolás után:</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="fu">dmesg</span> <span class="kw">|</span> <span class="fu">tail</span> <span class="at">-n</span> 5</span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="ex">dmsetup</span> ls</span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="ex">pvs</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="ex">lvs</span> <span class="at">-a</span> <span class="at">-o</span> lv_name,lv_attr,devices labvg</span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /mnt/labfs/readme.txt <span class="kw">||</span> <span class="fu">true</span></span></code></pre></div>
+<p>Várható: a <code>pvs</code> a <code>labcrypt2</code> mögötti PV-t
+hiányzónak (<code>[unknown]</code>, missing) jelzi; a
+<code>dmsetup ls</code> továbbra is listázza a <code>labcrypt2</code> és
+a <code>labvg-lablv</code> mappinget; az LV első szegmensére eső olvasás
+I/O hibát ad, a dmesg-ben I/O error jelenik meg, és az ext4 read-only
+módba válthat. A mappingek nem tűnnek el maguktól.</p>
+<p>A recovery lépései:</p>
+<ol type="1">
+<li><strong>Adatgyűjtés, nem módosítunk semmit</strong>: a fenti
+kimeneteket elmentjük a jegyzőkönyvbe.</li>
+<li><strong>A régi rétegek lebontása felülről lefelé</strong>:
+<code>umount /mnt/labfs</code> (szükség esetén <code>umount -l</code>),
+<code>vgchange -an labvg</code>,
+<code>cryptsetup close labcrypt2</code>.</li>
+<li><strong>A diszk visszacsatolása</strong>: a hypervisor-hoston
+<code>virsh attach-disk … --live</code> (a lecsatolt lemez
+forrásfájljával), vagy a VM újraindítása. A reboot a labban egyszerűbb
+és reprodukálható; reboot után mindhárom mappinget újra kell
+nyitni.</li>
+<li><strong>LUKS újranyitás</strong>: mindhárom labdisk a
+<code>/root/lab-d090/labkey1</code> kulccsal (reboot után; hot-attach
+esetén csak a <code>labcrypt2</code>).</li>
+<li><strong>LVM újraaktiválás</strong>: <code>pvscan</code>,
+<code>vgscan</code>, <code>vgchange -ay labvg</code></li>
+<li><strong>Mount és fsck</strong>:
+<code>fsck -f /dev/labvg/lablv</code> ;
+<code>mount LABEL=labfs /mnt/labfs</code></li>
+<li><strong>Checksum ellenőrzés</strong>: a
+<code>/root/lab-d090/labfs_baseline.sha256</code> fájlban szereplő
+hash-eket újraszámoljuk.</li>
+<li><strong>Jegyzőkönyv</strong>: rögzítjük a recovery időpontját, az
+adatellenőrzés eredményét és a root cause-t.</li>
+</ol>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost=vm-storage1, UID=root, recovery folytatás (reboot után)</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="va">KEY</span><span class="op">=</span>/root/lab-d090/labkey1</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> n <span class="kw">in</span> 1 2 3<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    <span class="ex">cryptsetup</span> open <span class="at">--key-file</span> <span class="st">&quot;</span><span class="va">$KEY</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;/dev/disk/by-id/virtio-labdisk</span><span class="va">$n</span><span class="st">-part1&quot;</span> <span class="st">&quot;labcrypt</span><span class="va">$n</span><span class="st">&quot;</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="ex">pvscan</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="ex">vgscan</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="ex">vgchange</span> <span class="at">-ay</span> labvg</span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="ex">lvs</span> <span class="at">-o</span> lv_name,lv_attr,devices labvg</span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="ex">fsck</span> <span class="at">-f</span> /dev/labvg/lablv</span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> LABEL=labfs /mnt/labfs</span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="fu">sha256sum</span> <span class="at">-c</span> /root/lab-d090/labfs_baseline.sha256</span></code></pre></div>
+<p>Várható: az <code>lvs</code> aktív LV-t mutat a
+<code>labcrypt2</code> és <code>labcrypt3</code> szegmensekkel, az
+<code>sha256sum -c</code> OK értékeket ad, a mount sikeres. Ha a FS
+dirty volt, az <code>fsck</code> journal replay-t hajt végre; ez a
+d050-ben tanult tartóssági szerződés miatt elvárt.</p>
+<h3 data-number="18.5.4" id="hibák-és-ellenpróbák"><span
+class="header-section-number">18.5.4</span> Hibák és ellenpróbák</h3>
+<p><strong>Rossz diszket formázunk.</strong> Ha az inventory kimarad, és
+a <code>/dev/sdb</code>-t használjuk, az lehet a root disk. Tünet: a
+rendszer azonnal leáll vagy a root partition sérül. Megelőzés: mindig
+<code>by-id</code> útvonal, serial ellenőrzés, és a
+<code>sgdisk --zap-all</code> előtt a <code>lsblk -o NAME,SERIAL</code>
+kimenetén target assert. A laborban csak a <code>virtio-labdiskN</code>
+azonosítók fordulhatnak elő.</p>
+<p><strong>Extend után a filesystem nem nő.</strong> Ha elmarad az
+<code>-r</code> vagy a <code>resize2fs</code>, a <code>df</code>
+továbbra is a régi méretet mutatja, de az <code>lvs</code> már nagyobb.
+Ez egyszerű javítás: <code>resize2fs /dev/labvg/lablv</code>.
+Ellenpróba: <code>df -h</code> előtt és után. Az ext4 mountolt
+állapotban is növelhető (online resize), ezért a <code>resize2fs</code>
+utólag, mount mellett is futtatható.</p>
+<p><strong>Rollback kísérlet XFS-en.</strong> Az XFS nem shrinkelhető;
+ha valaki <code>lvreduce --resizefs</code>-et próbál, hibát kap. A lab
+ezért használ ext4-et. Ha mégis XFS-t használunk, a rollback csak a
+snapshot-ból vagy a backupból lehetséges, és a shrink elveszti az
+adatot.</p>
+<p><strong>Degraded PV kiesés után a <code>vgchange -ay</code> hibát
+ad.</strong> Ennek oka, hogy valamelyik LUKS mapping (reboot után akár a
+<code>labcrypt3</code> is) még nem jött létre, vagy a diszk nem tért
+vissza. Ilyenkor a <code>pvs</code> hiányzó PV-t mutat; a
+rétegellenőrzés a LUKS mappingra és a device path-ra irányul. A
+<code>dmsetup ls</code> és <code>cryptsetup status labcryptN</code>
+segít.</p>
+<p><strong>Áramkimaradás szimulációjakor a mount írható állapotban
+maradhat?</strong> Ha a diszk hirtelen lecsatlakozik, a mount I/O
+hibákat ad, és a kernel read-only remountba fordulhat. A recovery után a
+<code>fsck</code> kötelező. A labban ne próbáljunk írni a hibás mountra;
+az <code>fsck</code> előtt csak read-only.</p>
+<h3 data-number="18.5.5" id="műveleti-jegyzőkönyv-és-backup-pont"><span
+class="header-section-number">18.5.5</span> Műveleti jegyzőkönyv és
+backup pont</h3>
+<p>A labor során minden változtatás előtt készítsünk jegyzőkönyvet.
+Példa a minimális jegyzőkönyv:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost: vm-storage1</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="fu">operation</span><span class="kw">:</span><span class="at"> extend_labvg</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="fu">preflight</span><span class="kw">:</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">targets</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="at">virtio-labdisk1</span><span class="kw">,</span><span class="at"> virtio-labdisk2</span><span class="kw">,</span><span class="at"> virtio-labdisk3</span><span class="kw">]</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">assert_success</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="fu">backup</span><span class="kw">:</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">vgcfgbackup</span><span class="kw">:</span><span class="at"> /root/lab-d090/labvg_before_extend</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">snapshot</span><span class="kw">:</span><span class="at"> labvg/lablv_snap</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a><span class="fu">change</span><span class="kw">:</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">commands</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="at">pvcreate</span><span class="kw">,</span><span class="at"> vgextend</span><span class="kw">,</span><span class="at"> lvextend -L +500M -r</span><span class="kw">]</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="fu">verification</span><span class="kw">:</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">df</span><span class="kw">:</span><span class="at"> /mnt/labfs 1.5G</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">sha256sum</span><span class="kw">:</span><span class="at"> OK</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a><span class="fu">rollback_plan</span><span class="kw">:</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">merge_snapshot</span><span class="kw">:</span><span class="at"> lvconvert --merge labvg/lablv_snap</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">lvreduce</span><span class="kw">:</span><span class="at"> lvreduce --resizefs -L -500M labvg/lablv</span><span class="co">  # ext4 only</span></span></code></pre></div>
+<p>A vgcfgbackup a VG metaadatot menti; a snapshot a rollbackhez kell. A
+jegyzőkönyv file <code>lab_change_log.md</code> néven a
+<code>/root/lab-d090/</code> alatt tárolandó; a lab végén a könyvtár (a
+kulccsal együtt) archiválandó vagy megsemmisítendő.</p>
+<h3 data-number="18.5.6" id="feladatok"><span
+class="header-section-number">18.5.6</span> Feladatok</h3>
+<h4 data-number="18.5.6.1" id="feladat-magyarázó"><span
+class="header-section-number">18.5.6.1</span> 1. feladat
+(magyarázó)</h4>
+<p>Magyarázd el, miért nem elég a <code>mount</code> sikerét ellenőrizni
+a block stack művelet után, és add meg legalább négy rétegellenőrző
+parancsot. Milyen invariáns sérül, ha a LUKS UUID megváltozik?</p>
+<h4 data-number="18.5.6.2"
+id="feladat-adminisztrációskonfigurációs"><span
+class="header-section-number">18.5.6.2</span> 2. feladat
+(adminisztrációs/konfigurációs)</h4>
+<p>Építsd fel a fenti stacket a <code>labdisk1</code> és
+<code>labdisk2</code> diszkeken, készíts baseline checksumot, majd add
+hozzá a <code>labdisk3</code>-at és bővítsd az <code>lablv</code>-t 500
+MiB-vel. Írd meg és futtasd az inventory/target assert scriptet. Az
+<code>lvextend</code> előtt hozd létre a snapshotot és a vgcfgbackupot.
+Igazold a bővítést <code>lvdisplay</code> és <code>df</code>
+kimenettel.</p>
+<h4 data-number="18.5.6.3"
+id="feladat-diagnosztikaifailurerecovery"><span
+class="header-section-number">18.5.6.3</span> 3. feladat
+(diagnosztikai/failure/recovery)</h4>
+<p>Szimulálj PV kiesést a <code>labdisk2</code> hypervisor-oldali
+lecsatolásával (<code>virsh detach-disk … --live</code>; SCSI-lemeznél a
+guestben <code>device/delete</code>). A hibás állapotban gyűjts
+adatokat, majd hajtsd végre a recovery tervet: diszk visszaadás, LUKS
+nyitás, VG aktiválás, mount, fsck, checksum. Dokumentáld a parancsokat
+és a posztfeltételeket.</p>
+<h3 data-number="18.5.7" id="megoldások"><span
+class="header-section-number">18.5.7</span> Megoldások</h3>
+<h4 data-number="18.5.7.1" id="feladat-megoldása"><span
+class="header-section-number">18.5.7.1</span> 1. feladat megoldása</h4>
+<p>A <code>mount</code> sikere csak a filesystem és a mount szintjét
+ellenőrzi, de nem igazolja, hogy a GPT partíció, a LUKS header, a
+PV/VG/LV metaadatok és az eszköz-azonosítók mind egyeznek a várt
+labstackkel. Ha a LUKS UUID megváltozik, a crypttab <code>UUID=</code>
+hivatkozása és a <code>/dev/disk/by-uuid/</code> link nem találja az
+eszközt, így boot után nincs mapping, és a fölötte lévő PV/VG/LV/FS
+elérhetetlen; a korábban mountolt FS-t a kernel közben még a page
+cache-ből kiszolgálhatja, ami hamis biztonságérzetet ad.</p>
+<p>Legalább négy ellenőrző parancs: -
+<code>sgdisk -p /dev/disk/by-id/virtio-labdisk1</code> -
+<code>cryptsetup luksDump /dev/disk/by-id/virtio-labdisk1-part1 | head -n 20</code>
+- <code>pvs</code> / <code>vgs</code> / <code>lvs labvg</code> -
+<code>lsblk -f</code> / <code>findmnt -o TARGET,SOURCE,FSTYPE</code></p>
+<p>Az invariáns sérülése: a rögzített inventory (LUKS UUID ↔︎ crypttab ↔︎
+by-id) nem egyezik, ezért az automatikus nyitás elmarad, és a stack nem
+épül fel. Kézi <code>cryptsetup open &lt;by-id-path&gt;</code> után az
+LVM a PV-címke UUID-ja alapján változatlanul megtalálja a PV-t: a LUKS
+UUID az LVM azonosítását nem érinti, és a GPT PARTUUID-tól is
+független.</p>
+<h4 data-number="18.5.7.2" id="feladat-megoldása-1"><span
+class="header-section-number">18.5.7.2</span> 2. feladat megoldása</h4>
+<p>A stack létrehozásának lépéseit a kidolgozott példa mutatja. A
+bővítés előtti target assert a 18.5.2 <code>inventory.sh</code>
+scriptje: minden labdiskre ellenőrzi a link létezését, a root disk
+kizárását és a serial egyezését, és csak hibátlan ciklus után írja ki a
+<code>Target assert OK</code> sort; bármely eltérésnél nem nulla kóddal
+kilép.</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost=vm-storage1, UID=root</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="ex">/root/lab-d090/inventory.sh</span> <span class="kw">&amp;&amp;</span> <span class="bu">echo</span> <span class="st">&quot;folytatható&quot;</span></span></code></pre></div>
+<p>Előfeltételek: a <code>labdisk1</code> és <code>labdisk2</code> már
+LUKS-nyitott, a <code>labvg</code> aktív, az <code>lablv</code>
+mountolt, <code>/root/lab-d090/labkey1</code> létezik (0600). A bővítés
+parancsai a kidolgozott példa 3. lépésével egyeznek, a
+<code>labdisk3</code> <code>luksFormat</code>-jával együtt. A
+posztfeltétel: <code>lvdisplay labvg/lablv</code> mutatja a nagyobb
+méretet, <code>df -h /mnt/labfs</code> szintén, a
+<code>lvs -o lv_name,devices labvg</code> a <code>labcrypt3</code>
+szegmenst is listázza, a <code>vgcfgbackup</code> és a snapshot létezik,
+és a <code>sha256sum -c</code> továbbra is OK.</p>
+<h4 data-number="18.5.7.3" id="feladat-megoldása-2"><span
+class="header-section-number">18.5.7.3</span> 3. feladat megoldása</h4>
+<p>Hibaszimuláció:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost=vm-storage1 (guest), UID=root</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="fu">readlink</span> <span class="at">-f</span> /dev/disk/by-id/virtio-labdisk2   <span class="co"># tételezzük fel: /dev/vdb</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="co"># hypervisor-host: virsh detach-disk vm-storage1 vdb --live</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="ex">dmsetup</span> ls</span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="ex">pvs</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="ex">lvs</span> <span class="at">-a</span> <span class="at">-o</span> lv_name,lv_attr,devices labvg</span></code></pre></div>
+<p>Recovery lépések:</p>
+<ol type="1">
+<li>Lebontás: <code>umount /mnt/labfs</code>,
+<code>vgchange -an labvg</code>,
+<code>cryptsetup close labcrypt2</code>.</li>
+<li>Reboot vagy hot-attach (<code>virsh attach-disk … --live</code>); a
+labban a reboot elegendő. A <code>/dev/disk/by-id/virtio-labdisk2</code>
+újra megjelenik.</li>
+<li>LUKS megnyitása mindhárom lemezre (reboot után):
+<code>cryptsetup open --key-file /root/lab-d090/labkey1 /dev/disk/by-id/virtio-labdiskN-part1 labcryptN</code>,
+N = 1, 2, 3.</li>
+<li>LVM aktiválás: <code>pvscan</code>, <code>vgscan</code>,
+<code>vgchange -ay labvg</code></li>
+<li>Fájlrendszer ellenőrzés és mount:
+<code>fsck -f /dev/labvg/lablv</code>,
+<code>mount LABEL=labfs /mnt/labfs</code></li>
+<li>Checksum:
+<code>sha256sum -c /root/lab-d090/labfs_baseline.sha256</code></li>
+</ol>
+<p>Posztfeltétel: a mount aktív, a baseline checksum ellenőrzése
+<code>OK</code> minden fájlra, a
+<code>lvs -o lv_name,lv_attr,devices labvg</code> aktív LV-t mutat a
+<code>labcrypt2</code> és <code>labcrypt3</code> szegmensekkel, és a
+jegyzőkönyvben a recovery lépései és időpontjai rögzítettek. Ha az
+<code>fsck</code> hibát jelez, további vizsgálat szükséges, de a labban
+a journal replay után tiszta állapot várható.</p>
+<h3 data-number="18.5.8" id="rövid-összefoglaló"><span
+class="header-section-number">18.5.8</span> Rövid összefoglaló</h3>
+<p>A d090 labor a block stack műveleti sorrendjét ellenőrizhető
+invariánsokkal kötötte össze. A GPT -&gt; LUKS -&gt; LVM -&gt;
+filesystem rétegek minden módosítás előtt inventory és target assert
+ellenőrzésen esnek át, a bővítés előtt backup pont készül, és a rollback
+csak ext4 shrink/snapshot merge esetén támogatott. A degraded disk
+fixture a hirtelen PV kiesést modellezte, a recovery pedig a
+rétegenkénti újraaktiválást, mount- és checksum-ellenőrzést mutatta be.
+A jegyzőkönyv biztosítja a reprodukálhatóságot és az
+auditálhatóságot.</p>
+<p>Továbbhasznált definíciók:</p>
+<ul>
+<li><strong>Block stack invariáns</strong>: rétegek azonosságát és
+függőségi láncát rögzítő ellenőrzött állapot; minden módosítás előtt
+igazolni kell.</li>
+<li><strong>Inventory és target assert</strong>: a módosítás előtti
+parancsok, amelyek a cél diszk azonosítóját és a várt rétegek meglétét
+ellenőrzik.</li>
+<li><strong>Degraded disk fixture</strong>: futás közben lecsatolt
+virtuális disk, amely a VG PV kiesését szimulálja, és a recovery tervet
+teszteli.</li>
+</ul>
+<h3 data-number="18.5.9" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">18.5.9</span> Források és ellenőrzési
+hiányok</h3>
+<p>Állításonkénti forrásindex (hivatkozott verzió: Ubuntu Server 24.04
+LTS – kernel 6.8, <code>lvm2</code>, <code>cryptsetup</code> 2.7-es
+sorozat, <code>gdisk</code>, <code>e2fsprogs</code>, libvirt a
+hypervisor-hoston; a pontos verziókat a labhoston <code>uname -r</code>,
+<code>lvm version</code>, <code>cryptsetup --version</code>,
+<code>sgdisk --version</code>, a hoston <code>virsh --version</code>
+rögzíti):</p>
+<ul>
+<li><a
+href="https://man7.org/linux/man-pages/man8/sgdisk.8.html">sgdisk(8)</a>
+– <code>--zap-all</code>, <code>-n</code>, <code>-t</code> (8309 = Linux
+LUKS), <code>-p</code>.</li>
+<li><a
+href="https://man7.org/linux/man-pages/man8/cryptsetup.8.html">cryptsetup(8)</a>
+– <code>luksFormat --key-file</code>, <code>open</code>,
+<code>close</code>, <code>luksUUID</code>.</li>
+<li><a
+href="https://man7.org/linux/man-pages/man8/lvcreate.8.html">lvcreate(8)</a>,
+<a
+href="https://man7.org/linux/man-pages/man8/lvextend.8.html">lvextend(8)</a>,
+<a href="https://man7.org/linux/man-pages/man8/lvs.8.html">lvs(8)</a>,
+<a
+href="https://man7.org/linux/man-pages/man8/vgcfgbackup.8.html">vgcfgbackup(8)</a>,
+<a
+href="https://man7.org/linux/man-pages/man8/lvconvert.8.html">lvconvert(8)</a>
+– PV-lista megadása, <code>-r</code>, <code>devices</code> mező,
+snapshot és <code>--merge</code>.</li>
+<li><a
+href="https://man7.org/linux/man-pages/man8/dmsetup.8.html">dmsetup(8)</a>
+– <code>ls</code>, a mappingek a hiányzó eszköz után is
+megmaradnak.</li>
+<li><a
+href="https://man7.org/linux/man-pages/man8/resize2fs.8.html">resize2fs(8)</a>,
+<a
+href="https://man7.org/linux/man-pages/man8/dumpe2fs.8.html">dumpe2fs(8)</a>
+– online növelés, offline shrink.</li>
+<li><a
+href="https://man7.org/linux/man-pages/man8/lsblk.8.html">lsblk(8)</a> –
+<code>-s</code> inverz függőség, <code>PKNAME</code>.</li>
+<li><a href="https://libvirt.org/manpages/virsh.html">libvirt virsh</a>
+– <code>detach-disk</code>, <code>attach-disk</code>,
+<code>domblklist</code>.</li>
+<li><a
+href="https://www.freedesktop.org/software/systemd/man/latest/systemd-tmpfiles.html">systemd-tmpfiles(8)</a>
+– a <code>/tmp</code> takarítása (ezért nem tárolunk ott kulcsot).</li>
+</ul>
+<p>Ellenőrzési hiány: a példák laborban ellenőrizendők; dátumozott
+reprodukciós napló (tool <code>--version</code>, sikeres és hibás ág
+kimenete) még nem készült. A <code>sgdisk</code> pontos kimenetei, a
+snapshot/merge pontos CLI opciói és az, hogy a használt
+<code>lvm2</code> engedi-e aktív snapshottal rendelkező origin
+bővítését, a labor futtatása előtt ellenőrizendők. A
+<code>virtio-labdiskN</code> nevek a virtuális környezetben eltérhetnek;
+a labhost inventory alapján kell rögzíteni. A fenti példa illusztratív,
+a tényleges parancskimenet a laborban mért érték.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d089.html">← 18.4 LUKS/dm-crypt és kulcs-életciklus</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d091.html">19.1 Mount, fstab és namespace →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

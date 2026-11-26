@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>6.2 NIC queue, offload és packet adatút – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch06">6 Hálózati hardver és átviteli technológiák</a></p>
+<div class="links"><a class="prev" rel="prev" href="d026.html">← 6.1 Ethernet, réz, optika és transceiverek</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d028.html">6.3 Switch, router és hardveres adatút →</a></div>
+</nav>
+<h2 data-number="6.2" id="d027"><span
+class="header-section-number">6.2</span> NIC queue, offload és packet
+adatút</h2>
+<h3 data-number="6.2.1" id="motiváció-és-mérési-cél"><span
+class="header-section-number">6.2.1</span> Motiváció és mérési cél</h3>
+<p>Egy szenior C++ fejlesztő hálózati teljesítményproblémája ritkán az
+alkalmazás szintjén kezdődik: a 99. percentilis latency megugrása, a
+CPU-magok aszimmetrikus terhelése vagy a packet capture-ben megjelenő
+„sérült” checksum gyakran a hálózati kártya (NIC, <em>network interface
+controller</em>) queue, interrupt és offload beállításaira vezethető
+vissza. Az operatív cél nem az összes offload bekapcsolása, hanem az,
+hogy egy adott szolgáltatás latency- vagy throughput-profiljához mérten
+tudjunk választani, és a mérési torzító hatásokat felismerjük.</p>
+<h3 data-number="6.2.2" id="alapdefiníciók-és-scope"><span
+class="header-section-number">6.2.2</span> Alapdefiníciók és scope</h3>
+<ul>
+<li><strong>RX/TX ring</strong> – A NIC driver és a hardware között
+megosztott gyűrűpuffer. Az RX ring a bejövő, a TX ring a kimenő packetek
+descriptorait tárolja. A gyűrű mérete korlátozza a CPU által még nem
+olvasott, illetve a NIC által még nem elküldött packetek számát.</li>
+<li><strong>Descriptor</strong> – A ring egy eleme; tartalmazza a
+memóriapuffer fizikai címét, hosszát és státuszbitjeit, valamint
+offload-válaszmezőket. A Descriptor nem a packet teljes másolata, hanem
+a NIC és a driver közötti munkalap.</li>
+<li><strong>Offload</strong> – A protokollfeldolgozás egy részének
+áthelyezése a NIC hardware-be, például checksum kiszámítása, TCP
+szegmentálás vagy vett csomagok aggregálása.</li>
+<li><strong>Interrupt coalescing</strong> – A NIC az interruptokat
+időben vagy darabszámban összevonja, hogy csökkentse a CPU
+interruptterhelést, cserébe növeli az átlagos és tail latencyt.</li>
+<li><strong>RSS/RPS/XPS</strong> – <em>Receive Side Scaling</em>
+(NIC-hardveres flow-alapú szétosztás), <em>Receive Packet Steering</em>
+(kernel szoftveres szétosztás) és <em>Transmit Packet Steering</em>
+(kimenő CPU-hoz rendelt TX queue).</li>
+</ul>
+<p>Ebben az alfejezetben a Linux host oldali NIC adatutat vizsgáljuk; a
+switch, router és optikai átviteli út a d026, a DMA/MSI-X alapok pedig a
+d017 fejezetben találhatók.</p>
+<h3 data-number="6.2.3" id="packet-adatút-rx-és-tx-irányban"><span
+class="header-section-number">6.2.3</span> Packet adatút RX és TX
+irányban</h3>
+<p>A packet nem úgy lesz memóriában, hogy a CPU bájtonként másolja a
+Ethernet frame-et; a DMA-motort használó NIC közvetlenül ír a ring
+descriptor által megcímzett pufferbe.</p>
+<h4 data-number="6.2.3.1" id="rx-adatút"><span
+class="header-section-number">6.2.3.1</span> RX adatút</h4>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Lépés</th>
+<th>Komponens</th>
+<th>Művelet</th>
+<th>Megfigyelhető állapot</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>PHY/MAC</td>
+<td>Ethernet frame vétele, CRC ellenőrzés</td>
+<td>link state, FCS error counter</td>
+</tr>
+<tr>
+<td>2</td>
+<td>NIC DMA</td>
+<td>Packet bájtok írása a host memóriába az RX descriptor pufferébe</td>
+<td>DMA mapping aktív</td>
+</tr>
+<tr>
+<td>3</td>
+<td>NIC</td>
+<td>Descriptor lezárása: length, hash, checksum status</td>
+<td>descriptor writeback</td>
+</tr>
+<tr>
+<td>4</td>
+<td>NIC MSI-X</td>
+<td>Interrupt kérése az adott RX queue-hoz kötött vektoron</td>
+<td><code>/proc/interrupts</code> számláló</td>
+</tr>
+<tr>
+<td>5</td>
+<td>driver NAPI poll</td>
+<td>Interrupt letiltása, descriptorok begyűjtése poll módban</td>
+<td><code>ethtool -S</code> <code>rx_packets</code>,
+<code>rx_bytes</code></td>
+</tr>
+<tr>
+<td>6</td>
+<td>kernel stack</td>
+<td>GRO, RPS, protokollfeldolgozás, socket queue</td>
+<td><code>netstat</code>, softirq stats</td>
+</tr>
+<tr>
+<td>7</td>
+<td>userspace</td>
+<td><code>recv</code>/<code>read</code> syscall, alkalmazás logika</td>
+<td>C++ alkalmazás latency</td>
+</tr>
+</tbody>
+</table>
+<p>A NAPI fontos eleme, hogy egyetlen interrupt után a driver nem
+feltétlenül dolgoz fel mindent azonnal: rövid poll ciklusban több
+descriptor kiszolgálásával csökkenti az interruptterhelést. Ez már
+önmagában latency-variabilitást visz a képbe.</p>
+<figure id="fig-d027-rx-path">
+<div class="fig-interactive"><iframe src="figures/html/d027-rx-path.html" title="Adatútábra hét számozott lépéssel: 1 PHY/MAC és FCS, 2 NIC DMA a ring 0 descriptorába, 3 descriptor writeback, 4 MSI-X interrupt a virtio0-input.0 vektoron, 5 CPU0 hardirq és NAPI poll letiltott interrupttal, budget 64, 6 GRO, RPS, TCP és socket queue, 7 recv a userspace-ben." loading="lazy" style="width:100%;border:0;height:620px"></iframe><noscript><img src="figures/img/d027-rx-path.png" style="width:95.0%"
+alt="Adatútábra hét számozott lépéssel: 1 PHY/MAC és FCS, 2 NIC DMA a ring 0 descriptorába, 3 descriptor writeback, 4 MSI-X interrupt a virtio0-input.0 vektoron, 5 CPU0 hardirq és NAPI poll letiltott interrupttal, budget 64, 6 GRO, RPS, TCP és socket queue, 7 recv a userspace-ben." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d027-rx-path.png" style="width:95.0%"
+alt="Adatútábra hét számozott lépéssel: 1 PHY/MAC és FCS, 2 NIC DMA a ring 0 descriptorába, 3 descriptor writeback, 4 MSI-X interrupt a virtio0-input.0 vektoron, 5 CPU0 hardirq és NAPI poll letiltott interrupttal, budget 64, 6 GRO, RPS, TCP és socket queue, 7 recv a userspace-ben." /></details></div>
+<figcaption>RX adatút a wire-től a socketig, a fenti táblázat 1–7.
+lépésével: DMA az RX ring descriptorába, writeback, MSI-X interrupt,
+NAPI poll letiltott interrupttal, GRO/RPS/TCP, socket queue és
+<code>recv()</code> (modell, nem mérés).</figcaption>
+</figure>
+<h4 data-number="6.2.3.2" id="tx-adatút"><span
+class="header-section-number">6.2.3.2</span> TX adatút</h4>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Lépés</th>
+<th>Komponens</th>
+<th>Művelet</th>
+<th>Megfigyelhető állapot</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>userspace</td>
+<td><code>send</code>/<code>write</code> syscall, userspace puffer</td>
+<td>CPU idő, syscall latency</td>
+</tr>
+<tr>
+<td>2</td>
+<td>kernel socket</td>
+<td><code>sk_buff</code> létrehozása, TCP state</td>
+<td>socket buffer, retransmission</td>
+</tr>
+<tr>
+<td>3</td>
+<td>qdisc</td>
+<td>ütemezés, esetleg shaping</td>
+<td><code>tc -s qdisc show</code></td>
+</tr>
+<tr>
+<td>4</td>
+<td>driver</td>
+<td><code>ndo_start_xmit</code>, sk_buff leképezése TX descriptorra</td>
+<td><code>ethtool -S</code> <code>tx_packets</code></td>
+</tr>
+<tr>
+<td>5</td>
+<td>NIC DMA</td>
+<td>descriptorból packet olvasása host memóriából</td>
+<td>DMA read</td>
+</tr>
+<tr>
+<td>6</td>
+<td>NIC</td>
+<td>checksum/TSO kiszámítása hardware-ben, Ethernet frame kiadása</td>
+<td>line rate, collision/error counter</td>
+</tr>
+<tr>
+<td>7</td>
+<td>környezet</td>
+<td>fogadó fél ACK-ja, visszaigazolás</td>
+<td>TCP RTT, tail latency</td>
+</tr>
+</tbody>
+</table>
+<p>A kimenő oldalon a <code>sk_buff</code> addig él, amíg a DMA be nem
+fejezte az olvasást; a driver felszabadítási callbackje tipikusan a TX
+completion interruptból vagy NAPI pollból fut.</p>
+<h3 data-number="6.2.4" id="rss-rps-xps-és-cpunuma-affinity"><span
+class="header-section-number">6.2.4</span> RSS, RPS, XPS és CPU/NUMA
+affinity</h3>
+<p>A modern NIC több RX/TX queue-t tud egyszerre kezelni. Az RSS a
+NIC-ben lefuttatott hash alapján választ RX queue-t: a cél, hogy ugyanaz
+a TCP- vagy UDP-flow mindig ugyanahhoz a queue-hoz, ezáltal remélhetőleg
+ugyanahhoz a CPU-maghoz kerüljön. A hash bemenete általában a forrás- és
+cél-IP, valamint a forrás- és célport; a kulcs és az indirekciós tábla
+platformonként eltérhet.</p>
+<p>A Linux kernel oldalán az
+<code>/proc/irq/IRQ_NUMBER/smp_affinity</code> mask adja meg, mely
+CPU-magok engedélyezettek az adott interruptvektor kiszolgálására. Ha a
+NIC MSI-X vektora csak egy bizonyos NUMA-node magjaira van korlátozva, a
+beérkező packetet feldolgozó CPU távoli node memóriájába is kerülhet,
+ami a d013 fejezetben tárgyalt memóriasávszélesség- és
+latency-következményekkel jár.</p>
+<ul>
+<li><strong>RSS</strong>: hardware-választás, a driver és a NIC
+határozza meg a queue-t. Akkor jó, ha a flow-hash egyenletesen oszlat
+el, és a queue-ok CPU-affinityje szándékos.</li>
+<li><strong>RPS</strong>: software-értelmezés, a kernel a packetet a
+kiválasztott CPU backlogjára teszi. Akkor hasznos, ha a NIC kevés
+queue-val rendelkezik, vagy a hardveres hash nem elég finom.</li>
+<li><strong>XPS</strong>: a kimenő oldalon a CPU-tól induló forgalomhoz
+jelöl ki TX queue-t, ezzel csökkenti a közös qdisc zárolási és
+cache-bounce hatását.</li>
+</ul>
+<p>A számított döntés mindig a flow-affinitás és az egyenletes
+CPU-elosztás közötti kompromisszum; a rosszul beállított affinitás egy
+CPU-mag „forró” 100%-át és a többi mag kihasználatlanságát
+eredményezheti, miközben az alkalmazások hálózati latencyje
+ingadozik.</p>
+<h3 data-number="6.2.5"
+id="offload-típusok-és-hatásuk-a-packet-capture-re"><span
+class="header-section-number">6.2.5</span> Offload típusok és hatásuk a
+packet capture-re</h3>
+<p>A Linux kernel a NIC képességeit feature-flagként kezeli; ezek élesen
+befolyásolják azt, amit a packet capture eszköz lát.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Offload</th>
+<th>Működés</th>
+<th>Capture-ben látható eltérés</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>IP/TCP/UDP checksum offload</td>
+<td>A NIC számolja az ellenőrzőösszeget kimenő oldalon; bejövő oldalon
+ellenőrzi.</td>
+<td>Kimenő capture-ben a checksum gyakran rossz vagy nulla, mert a
+kernel még nem számolta ki; a wire-en már jó lesz.</td>
+</tr>
+<tr>
+<td>TSO (TCP Segmentation Offload)</td>
+<td>A kernel nagy <code>sk_buff</code>-öt ad a NIC-nek, a NIC bontja MSS
+méretű Ethernet frame-ekre.</td>
+<td>A kimenő capture a hoston MTU-nál nagyobb, pl. 64 KiB
+„szupercsomagot” mutathat; a fizikai wire-en ez soha nem ilyen.</td>
+</tr>
+<tr>
+<td>GSO (Generic Segmentation Offload)</td>
+<td>Ugyanez a modell, de szoftveres fallback a driver előtt.</td>
+<td>Hasonló, de a szegmentálás már a kernelben történik bizonyos stack
+réteg előtt.</td>
+</tr>
+<tr>
+<td>GRO (Generic Receive Offload)</td>
+<td>A kernel aggregálja a vett szegmenseket protokollfeldolgozás
+előtt.</td>
+<td>A capture az aggregált, akár MTU-nál nagyobb skb-t láthatja.</td>
+</tr>
+<tr>
+<td>LRO (Large Receive Offload)</td>
+<td>Régebbi, hardware-ben aggregáló RX feature; TCP szemantikailag
+agresszívabb.</td>
+<td>Capture-ben szupercsomagok; tunneling/bridge esetén torzíthat.</td>
+</tr>
+</tbody>
+</table>
+<p>A tcpdump a Linux packet socketjéből másol, ezért a capture nem
+feltétlenül a wire-en lévő Ethernet frame pontos tükre. Kiemelten igaz
+ez a kimenő TSO és a bejövő GRO/LRO esetén. A diagnosztikai szabály: ha
+a capture checksum hibát mutat, először az offload állapotot kell
+ellenőrizni, nem a hálózati hibát keresni.</p>
+<p>A tcpdump <code>-K</code> (<code>--dont-verify-checksums</code>)
+kapcsolóval nem ellenőrzi az IP/TCP/UDP checksumot; offloados küldő
+hoston így eltűnnek az <code>incorrect</code> jelzések. <code>-K</code>
+nélkül a tcpdump a rögzített bájtokból maga számolja újra a checksumot,
+ezért a még ki nem töltött (offloadolt) mezőt hibásnak mutatja. A
+<code>-K</code> tehát csak a megjelenítést változtatja; a diagnózishoz a
+fenti offload-jellemzők ismerete kell.</p>
+<h3 data-number="6.2.6"
+id="ethtool-capabilities-counterek-és-interrupt-coalescing"><span
+class="header-section-number">6.2.6</span> ethtool capabilities,
+counterek és interrupt coalescing</h3>
+<p>A Linuxon az <code>ethtool</code> a standard felület a NIC
+hardware-jellemzőinek lekérdezésére és beállítására. A <code>-k</code> a
+feature state-et, a <code>-S</code> a hardware-counteket, a
+<code>-g</code>/<code>-G</code> a ring méretét, a
+<code>-l</code>/<code>-L</code> a channel számát, a
+<code>-c</code>/<code>-C</code> a coalescing paramétereket mutatja,
+illetve állítja.</p>
+<p>A legfontosabb counterk:</p>
+<ul>
+<li><code>rx_packets</code>, <code>tx_packets</code>: forgalom
+mennyisége.</li>
+<li><code>rx_dropped</code>, <code>tx_dropped</code>: driver vagy queue
+szinten eldobott csomagok.</li>
+<li><code>rx_missed_errors</code>, <code>rx_no_dma_resources</code>,
+<code>rx_crc_errors</code>: kevés leíró, fizikai hiba vagy DMA-erőforrás
+hiány.</li>
+<li><code>tx_timeouts</code>: a TX DMA nem fejeződött be időben; gyakran
+driver vagy hardware-állapot hiba.</li>
+</ul>
+<p>Az interrupt coalescing beállításai az <code>ethtool -c</code>
+kimenetben például <code>rx-usecs</code>, <code>tx-usecs</code>,
+<code>rx-frames</code>, <code>tx-frames</code>. A hardver az RX
+interruptot legfeljebb a megadott idő- vagy darabszám-korlátig váratja;
+az interrupt az elsőként teljesülő korlátnál keletkezik, ezért a
+tényleges késleltetés hozzávetőlegesen</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mtext mathvariant="normal">coalesce</mtext></msub><mo>≈</mo><mrow><mi>min</mi><mo>&#8289;</mo></mrow><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>t</mi><mtext mathvariant="normal">rx-usecs</mtext></msub><mo>,</mo><mspace width="0.222em"></mspace><mfrac><msub><mi>N</mi><mtext mathvariant="normal">rx-frames</mtext></msub><msub><mi>R</mi><mtext mathvariant="normal">frame</mtext></msub></mfrac><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">T_{\text{coalesce}} \approx \min\left(t_{\text{rx-usecs}},\ \frac{N_{\text{rx-frames}}}{R_{\text{frame}}}\right)</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>t</mi><mtext mathvariant="normal">rx-usecs</mtext></msub><annotation encoding="application/x-tex">t_{\text{rx-usecs}}</annotation></semantics></math>
+[µs] az időkorlát,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>N</mi><mtext mathvariant="normal">rx-frames</mtext></msub><annotation encoding="application/x-tex">N_{\text{rx-frames}}</annotation></semantics></math>
+[packet] a darabkorlát,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>R</mi><mtext mathvariant="normal">frame</mtext></msub><annotation encoding="application/x-tex">R_{\text{frame}}</annotation></semantics></math>
+[packet/µs] a beérkezési ráta. Alacsony forgalomnál az időkorlát, nagy
+forgalomnál a darabkorlát dominál. Példa: <code>rx-usecs</code> = 40 µs,
+<code>rx-frames</code> = 128,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>R</mi><annotation encoding="application/x-tex">R</annotation></semantics></math>
+= 1 packet/µs (1 Mpps) mellett a darabkorlát 128 µs lenne, a tényleges
+késleltetés tehát 40 µs. Nagyobb <code>rx-usecs</code> csökkenti a CPU
+interruptterhelést, de növeli a latency floor-t; kisebb érték fordított.
+A tail latency szempontjából ezért a coalescing beállítás mérési
+jegyzőkönyvbe való.</p>
+<h3 data-number="6.2.7" id="sr-iov-és-vf-előkép"><span
+class="header-section-number">6.2.7</span> SR-IOV és VF előkép</h3>
+<p>Az <em>SR-IOV</em> (Single Root I/O Virtualization) a NIC egy fizikai
+funkcióját (PF, <em>Physical Function</em>) több virtuális funkcióra
+(VF, <em>Virtual Function</em>) bonthatja. A hypervisor a VF-et szinte
+önálló PCI-eszközként tudja passthrough módban egy VM-hez rendelni, így
+a VM közvetlen DMA-t és MSI-X interruptot használhat, elkerülve a
+software bridge és a hypervisor adatmozgatás egy részét. Ez alacsony
+overheadet és jobb izolációt ígér, de a VF-hez rendelt queue-k,
+offload-képességek és fogyasztási korlátok, valamint a live migration és
+a szoftveres switch policy lehetőségei NIC- és firmware-függőek. A
+VM-eszköz-hozzárendelést a <a href="d169.html">Virtio, passthrough,
+SR-IOV és IOMMU</a>, a DMA/IOMMU alapokat a <a href="d017.html">DMA,
+interrupt, IOMMU és eszköz-hozzárendelés</a> tárgyalja.</p>
+<h3 data-number="6.2.8"
+id="kidolgozott-példa-labvm-nic-queueoffload-felmérése"><span
+class="header-section-number">6.2.8</span> Kidolgozott példa: labVM NIC
+queue/offload felmérése</h3>
+<p>A következő példa a <code>lab-vm1</code> nevű, izolált labVM-en futó
+<code>ens3</code> virtuális interfészt vizsgálja. A parancsok csak a
+labor saját hostjára és interface-ére vonatkoznak; a beállítás
+ideiglenes, visszaállítással együtt.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm1, root jogosultság (sudo), ellenőrző parancsok</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> root ethtool <span class="at">-i</span> ens3</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> root ethtool <span class="at">-l</span> ens3</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> root ethtool <span class="at">-g</span> ens3</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> root ethtool <span class="at">-k</span> ens3</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> root ethtool <span class="at">-c</span> ens3</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="co"># virtio_net: queue-nkénti számlálók</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> root ethtool <span class="at">-S</span> ens3 <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;queue_0_(packets|drops)&#39;</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> root grep <span class="at">-E</span> <span class="st">&#39;ens3|virtio&#39;</span> /proc/interrupts</span></code></pre></div>
+<p>Várt/illusztratív kimenet a <code>virtio_net</code> driverrel
+(tényleges futtatás nélkül, rövidítve; a mezők driverfüggők, a labVM
+kernel- és QEMU-verziója szerint eltérhetnek):</p>
+<pre class="text"><code>driver: virtio_net
+version: 1.0.0
+Channel parameters for ens3:
+Pre-set maximums:
+Combined:       4
+Current hardware settings:
+Combined:       4
+Ring parameters for ens3:
+Current hardware settings:
+RX:             256
+TX:             256
+rx-checksumming: on [fixed]
+tx-checksumming: on
+tcp-segmentation-offload: on
+generic-segmentation-offload: on
+generic-receive-offload: on
+large-receive-offload: off [fixed]
+netlink error: Operation not supported
+     rx_queue_0_packets: 120034
+     rx_queue_0_drops: 0
+     tx_queue_0_packets: 145210
+ 25:  120034     0     0     0  PCI-MSI 49153-edge  virtio0-input.0
+ 26:       0 145210     0     0  PCI-MSI 49154-edge  virtio0-output.0</code></pre>
+<p>A kimenet szerint 4 combined csatorna (RX/TX queue-pár) van. Az
+<code>ethtool -c</code> itt <code>Operation not supported</code>-et ad:
+a virtio_net coalescingje csak akkor állítható, ha a hypervisor a
+megfelelő feature-t (VIRTIO_NET_F_NOTF_COAL) kínálja és a kernel
+támogatja; ezt a jegyzőkönyvben rögzíteni kell. Az RX-interruptok a
+pillanatfelvétel szerint mind a CPU0-n jelentkeznek, ami egyoldalú
+terhelésre utalhat. A következő mérő parancs a packet capture és az
+offload kapcsolatát mutatja:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm1, root (sudo), illusztratív kimenő TCP-forgalom megfigyelése</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> root tcpdump <span class="at">-i</span> ens3 <span class="at">-n</span> <span class="at">-v</span> <span class="at">-c</span> 1 <span class="st">&#39;tcp&#39;</span></span></code></pre></div>
+<p>Várt illusztratív kimenet kimenő irányban TSO esetén (a
+<code>lab-vm1</code> címe 192.0.2.20; a kimenet olvashatóság miatt több
+sorra tördelve):</p>
+<pre class="text"><code>12:00:00.123456 IP (tos 0x0, ttl 64, id 12345, offset 0, flags [DF],
+    proto TCP (6), length 4452)
+    192.0.2.20.45678 &gt; 192.0.2.10.443: Flags [.],
+    cksum 0x0000 (incorrect -&gt; 0xabcd), seq 1000:5400, ack 1, win 512,
+    options [nop,nop,TS val 1000 ecr 2000], length 4400</code></pre>
+<p>Az IP-hossz 4452 bájt = 20 bájt IP-fejléc + 32 bájt TCP-fejléc
+(timestamp opcióval) + 4400 bájt payload (<code>seq 1000:5400</code>). A
+<code>length 4452</code> és a nagy TCP adathossz az MTU-t meghaladó
+GSO/TSO műtermék; a <code>cksum 0x0000 (incorrect -&gt; 0xabcd)</code>
+jelzi, hogy a kernel az offload miatt nem számolta ki a checksumot a
+capture pillanatában. Az ellenőrző mérés itt nem a wire-en történt,
+hanem a host packet socketjén, ezért a kimenetet torzítja az offload. A
+külső fogadó oldalon viszont a wire-en érvényes checksum és MSS-méretű
+szegmensek jelennek meg, ha a NIC működik. Az ideiglenes
+kikapcsolás:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm1, root (sudo), offload-kikapcsolás mérési céllal; rollback alább</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co"># baseline mentése a rollbackhez</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> root ethtool <span class="at">-k</span> ens3 <span class="kw">|</span> <span class="fu">sudo</span> tee /root/lab-ens3-features.before</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> root ethtool <span class="at">-K</span> ens3 tx off rx off tso off gso off</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="co"># mérő parancsok, például a szolgáltatás forgalmának újraindítása,</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="co"># latency megfigyelés</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="co"># rollback: a mentett baseline értékei (itt: mind on volt)</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> root ethtool <span class="at">-K</span> ens3 tx on rx on tso on gso on</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> diff <span class="op">&lt;(</span><span class="fu">sudo</span> <span class="at">-u</span> root ethtool <span class="at">-k</span> ens3<span class="op">)</span> /root/lab-ens3-features.before</span></code></pre></div>
+<p>A rollback akkor kész, ha a <code>diff</code> kimenete üres; ha a
+baseline-ban valamelyik funkció <code>off</code> volt, a
+rollback-parancsban is azt az értéket kell visszaállítani.</p>
+<p>A várt mérési eredmény hipotetikus: a CPU felhasználás növekedhet,
+mert a kernelre hárul a szegmentálás és checksumszámítás; a latency
+pedig javulhat, ha a korábbi nagy TSO-burstök miatt head-of-line
+torlódás volt. A tényleges mérés csak a labban, rögzített terheléssel és
+verzióval tekinthető bizonyítéknak.</p>
+<h3 data-number="6.2.9" id="hibák-és-ellenpróbák"><span
+class="header-section-number">6.2.9</span> Hibák és ellenpróbák</h3>
+<h4 data-number="6.2.9.1" id="bad-checksum-a-tcpdumpban"><span
+class="header-section-number">6.2.9.1</span> „Bad checksum a
+tcpdumpban”</h4>
+<p>Tünet: a capture-ben minden kimenő csomag ellenőrzőösszege hibás.
+Hipotézis: a hálózat valóban sérült. Első ellenőrzés:
+<code>ethtool -k ens3 | grep checksum</code>; ha
+<code>tx-checksumming</code> on, a hiba capture-műtermék. A verifikáció:
+indítsunk fogadó oldali capture-t egy másik labhoston, és ott a wire-ről
+érkező checksum jó. Javítás: semmilyen valós hálózati hiba nincs; a
+diagnosztikai policy szerint a host capture-ben ne tekintsük hibának az
+offload miatti checksumot.</p>
+<h4 data-number="6.2.9.2"
+id="a-latency-átlaga-jó-de-a-99.-percentilis-kiugrik"><span
+class="header-section-number">6.2.9.2</span> „A latency átlaga jó, de a
+99. percentilis kiugrik”</h4>
+<p>Tünet: alacsony terhelésnél időnként több tíz ms-os kiugrás.
+Hipotézis: túl agresszív interrupt coalescing vagy NAPI poll.
+Adatgyűjtés: <code>ethtool -c ens3</code>,
+<code>cat /proc/interrupts</code>, <code>mpstat -P ALL 1</code>, CPU
+affinity. Egy változtatás:
+<code>sudo -u root ethtool -C ens3 rx-usecs 8 tx-usecs 8</code> (ha a
+driver támogatja; virtio_net-en az <code>ethtool -c</code> gyakran
+<code>Operation not supported</code>, ekkor a coalescing a vendégben nem
+állítható, és a hipotézist a hypervisor oldalán kell vizsgálni).
+Verifikáció: reprodukálható terhelés mellett mért p99 csökken-e; ha
+igen, a tradeoffot rögzítjük.</p>
+<h4 data-number="6.2.9.3"
+id="több-queue-van-de-egyetlen-cpu-dolgozik"><span
+class="header-section-number">6.2.9.3</span> „Több queue van, de
+egyetlen CPU dolgozik”</h4>
+<p>Tünet: a <code>mpstat</code> szerint az egyik mag folyamatosan
+100%-on, a többiek üresek, a NIC több queue-val rendelkezik. Hipotézis:
+a driver nem engedélyezi az RSS-t, vagy az interruptaffinity csak egy
+CPU-t enged. Ellenpróba: <code>ethtool -S</code> per-queue statisztika,
+<code>/proc/interrupts</code> vektorai,
+<code>ethtool -X ens3 equal 4</code> (ha a driver támogatja). Ha az RSS
+megegyező indirekciós táblát használ, vagy a DMA/interrupt csak egy
+vektort hoz létre, a szoftveres RPS szándékos beállítása lehet a
+kerülőút.</p>
+<h4 data-number="6.2.9.4"
+id="ring-méret-kicsi-dropokról-panaszkodunk"><span
+class="header-section-number">6.2.9.4</span> „Ring méret kicsi,
+dropokról panaszkodunk”</h4>
+<p>Tünet: <code>ethtool -S ens3</code> <code>rx_dropped</code> vagy
+<code>rx_no_dma_resources</code> növekszik nagy forgalomnál. Hipotézis:
+kevés RX descriptor. Ellenőrzés: <code>ethtool -g ens3</code>.
+Változtatás: <code>sudo -u root ethtool -G ens3 rx 1024 tx 1024</code>.
+Postcondition: a <code>rx_dropped</code> növekedés leáll a reprodukált
+terhelés alatt.</p>
+<h3 data-number="6.2.10" id="feladatok"><span
+class="header-section-number">6.2.10</span> Feladatok</h3>
+<h4 data-number="6.2.10.1"
+id="magyarázó-feladat-packet-adatút-leképezése"><span
+class="header-section-number">6.2.10.1</span> 1. Magyarázó feladat:
+packet adatút leképezése</h4>
+<p>Tegyük fel, hogy egy <code>lab-vm1</code> hoston a <code>ens3</code>
+interfész MSI-X vektort használ, és a kernelben NAPI fut. Írd le
+szövegesen, lépésről lépésre, hogyan jut el egy bejövő TCP SYN packet a
+wire-ről a user space socketig, és hol dől el, hogy melyik CPU-mag
+szolgálja ki. Nevezd meg azokat a pontokat, ahol a ring descriptor és a
+DMA szerepet kap.</p>
+<h4 data-number="6.2.10.2"
+id="adminisztrációs-feladat-ideiglenes-coalescing-és-offload-módosítás"><span
+class="header-section-number">6.2.10.2</span> 2. Adminisztrációs
+feladat: ideiglenes coalescing és offload-módosítás</h4>
+<p>A <code>lab-vm1</code> hoston a <code>ens3</code> interfészen állítsd
+be ideiglenesen az RX interrupt coalescing értékét <code>16</code>
+mikroszekundumra, a TX értéket <code>32</code> mikroszekundumra, majd
+ellenőrizd. Előtte ellenőrizd: <code>ethtool -c ens3</code>; ha a válasz
+<code>Operation not supported</code>, a coalescing ezen a driveren nem
+állítható – rögzítsd a jegyzőkönyvben, és csak a GRO-részt végezd el.
+Kapcsold ki és vissza a <code>generic-receive-offload</code> funkciót
+is. Minden módosításhoz adj rollback parancsot, és rögzítsd a
+postconditiont.</p>
+<h4 data-number="6.2.10.3"
+id="diagnosztikai-feladat-capture-műtermék-azonosítása"><span
+class="header-section-number">6.2.10.3</span> 3. Diagnosztikai feladat:
+capture-műtermék azonosítása</h4>
+<p>Adott a következő illusztratív tcpdump kimenet (kimenő forgalom):</p>
+<pre class="text"><code>IP (tos 0x0, ttl 64, id 12345, offset 0, flags [DF], proto TCP (6),
+    length 4452)
+    192.0.2.20.45678 &gt; 192.0.2.10.443: Flags [.],
+    cksum 0x0000 (incorrect -&gt; 0xabcd), seq 1000:5400, ack 1, win 512,
+    options [nop,nop,TS val 1000 ecr 2000], length 4400</code></pre>
+<p>Tünet: a riasztás szerint a hálózat sérült csomagokat küld. Fogalmazz
+meg két lehetséges hipotézist, és adj parancssorozatot annak
+eldöntésére, hogy hardware-hiba vagy offload-műtermék okozza-e a
+jelenséget. Indokold a célállomási oldal mérésének szerepét.</p>
+<h3 data-number="6.2.11" id="megoldások"><span
+class="header-section-number">6.2.11</span> Megoldások</h3>
+<h4 data-number="6.2.11.1" id="magyarázó-feladat-megoldása"><span
+class="header-section-number">6.2.11.1</span> 1. Magyarázó feladat
+megoldása</h4>
+<p>A bejövő SYN a PHY/MAC rétegből a NIC belső bufferébe kerül; a NIC
+DMA egysége az RX ring aktuális descriptorában lévő memory pufferbe
+másolja a frame-et, majd lezárja a descriptort, beírja a hosszt, hash-
+és checksumstátuszt. A NIC MSI-X interruptot küld a queue-hoz rendelt
+vectornak. A NAPI pollban a driver lefagyasztja az interruptot, és
+begyűjti a lezárt descriptorokat; a kernel a GRO/RPS és az
+IP-feldolgozás után a TCP-rétegnek adja a SYN-t. A TCP-réteg a listening
+socket SYN queue-jában request sockot hoz létre és SYN-ACK-ot küld; a
+kliens ACK-ja után a kapcsolat az accept queue-ba kerül, ahonnan a user
+space <code>accept()</code> hívása új socketet kap. Adatot ezután a
+<code>recv()</code> olvas; a SYN-t magát az alkalmazás nem látja. Az,
+hogy melyik CPU-mag szolgálja ki, az RSS queue-választásból, az MSI-X
+interrupt affinity maszkból és a NAPI poll softirq futtatási helyéből
+adódik. Postcondition: a tanuló szövege az összes szereplő réteget (DMA,
+ring descriptor, MSI-X, NAPI, socket) megnevezi, és nem keveri a wire és
+host capture nézetet.</p>
+<h4 data-number="6.2.11.2" id="adminisztrációs-feladat-megoldása"><span
+class="header-section-number">6.2.11.2</span> 2. Adminisztrációs feladat
+megoldása</h4>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm1, root (sudo), baseline mentése</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="co"># (ha az ethtool -c &quot;Operation not supported&quot;: csak a GRO-rész)</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> root ethtool <span class="at">-c</span> ens3 <span class="kw">|</span> <span class="fu">sudo</span> tee /root/lab-ens3-coal.before</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> root ethtool <span class="at">-k</span> ens3 <span class="kw">|</span> <span class="fu">sudo</span> tee /root/lab-ens3-features.before</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="co"># ideiglenes coalescing beállítás</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> root ethtool <span class="at">-C</span> ens3 rx-usecs 16 tx-usecs 32</span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="co"># ellenőrzés</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> root ethtool <span class="at">-c</span> ens3 <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;rx-usecs|tx-usecs&#39;</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="co"># GRO ideiglenes kikapcsolása</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> root ethtool <span class="at">-K</span> ens3 gro off</span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a><span class="co"># ellenőrzés</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> root ethtool <span class="at">-k</span> ens3 <span class="kw">|</span> <span class="fu">grep</span> generic-receive-offload</span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a><span class="co"># rollback a mentett baseline értékeire</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a><span class="va">RXU</span><span class="op">=</span><span class="va">$(</span><span class="fu">awk</span> <span class="st">&#39;/^rx-usecs:/ {print $2}&#39;</span> /root/lab-ens3-coal.before<span class="va">)</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a><span class="va">TXU</span><span class="op">=</span><span class="va">$(</span><span class="fu">awk</span> <span class="st">&#39;/^tx-usecs:/ {print $2}&#39;</span> /root/lab-ens3-coal.before<span class="va">)</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a><span class="va">GRO</span><span class="op">=</span><span class="va">$(</span><span class="fu">awk</span> <span class="st">&#39;/^generic-receive-offload:/ {print $2}&#39;</span> <span class="dt">\</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>  /root/lab-ens3-features.before<span class="va">)</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> root ethtool <span class="at">-C</span> ens3 rx-usecs <span class="st">&quot;</span><span class="va">$RXU</span><span class="st">&quot;</span> tx-usecs <span class="st">&quot;</span><span class="va">$TXU</span><span class="st">&quot;</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> root ethtool <span class="at">-K</span> ens3 gro <span class="st">&quot;</span><span class="va">$GRO</span><span class="st">&quot;</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a><span class="co"># postcondition ellenőrzés: üres diff</span></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> diff <span class="op">&lt;(</span><span class="fu">sudo</span> <span class="at">-u</span> root ethtool <span class="at">-c</span> ens3<span class="op">)</span> /root/lab-ens3-coal.before</span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> diff <span class="op">&lt;(</span><span class="fu">sudo</span> <span class="at">-u</span> root ethtool <span class="at">-k</span> ens3<span class="op">)</span> /root/lab-ens3-features.before</span></code></pre></div>
+<p>Postcondition: a <code>lab-vm1</code> <code>ens3</code> interfész a
+feladat előtti, fájlba mentett baseline coalescing és GRO értékkel
+rendelkezik; ezt a két <code>diff</code> üres kimenete igazolja.</p>
+<h4 data-number="6.2.11.3" id="diagnosztikai-feladat-megoldása"><span
+class="header-section-number">6.2.11.3</span> 3. Diagnosztikai feladat
+megoldása</h4>
+<p>Hipotézis A: a NIC offload miatt a host oldali capture a GSO/TSO
+szupercsomagot és a nem kiszámolt checksumot látja. Hipotézis B: a NIC
+vagy a wire ténylegesen sérült Ethernet frame-et ad le. Az
+<code>ethtool -k ens3</code> és <code>ethtool -S ens3</code> lekérésével
+ellenőrizzük a <code>tcp-segmentation-offload</code>,
+<code>generic-segmentation-offload</code> és a
+<code>rx_crc_errors</code>/<code>tx_errors</code> értékeit. A fogadó
+oldali capture (külön labhost, nem a küldő host packet socketje) a
+wire-re kikerült frame-et látja; ha ott a TCP checksum
+<code>(correct)</code> és a csomagok MSS méretűek, akkor a forrásoldali
+tünet capture-műtermék. Ha a fogadó oldalon <code>bad checksum</code>
+gyakoriság nő a hálózati úton, tovább kell szűkíteni a hibás szegmenst.
+Postcondition: a tanuló a forrás- és fogadó oldali méréssel különbséget
+tud tenni a capture-nézet és a wire-nézet között, és a változtatást nem
+globális offload-kikapcsolással, hanem a mérés tükrében hajtja
+végre.</p>
+<h3 data-number="6.2.12" id="rövid-összefoglaló"><span
+class="header-section-number">6.2.12</span> Rövid összefoglaló</h3>
+<p>A NIC nem egyszerű bájtmásoló: a packet a ring descriptorra és DMA-ra
+épülő, több queue-t használó adatútban mozog, amelyet interruptvektorok
+és offload-flagok befolyásolnak. Az RX irányban az RSS/MSI-X/NAPI, a TX
+irányban az XPS/TSO/GSO dönti el, hogy melyik CPU-mag dolgozik, milyen
+méretű <code>sk_buff</code> jön létre, és mit lát a tcpdump. Az offload
+miatt a host oldali capture nem wire-nézet; a „bad checksum” és az
+MTU-nál nagyobb packet gyakran műtermék. A méréshez az
+<code>ethtool -k</code>, <code>-S</code>, <code>-c</code>,
+<code>-g</code>, <code>-l</code> és a fogadó oldali mérés együttes
+használata szükséges.</p>
+<p>Definíciók: <strong>RX/TX ring</strong> – descriptor-alapú
+gyűrűpuffer a NIC és driver között. <strong>Interrupt
+coalescing</strong> – interruptok idő-/darabszám-összevonása a
+CPU-terhelés és latency tradeoffjával. <strong>Offload</strong> –
+protokollfeldolgozás áthelyezése a NIC hardware-be, ami a packet capture
+nézetét torzítja.</p>
+<h3 data-number="6.2.13" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">6.2.13</span> Források és ellenőrzési
+hiányok</h3>
+<p>A jelen alfejezet alap-generálási folyamatban készült, webes kereső
+használata nélkül; az alábbi hivatkozások kiindulópontok, nem
+tekinthetők olvasott vagy ellenőrzött bizonyítéknak:</p>
+<ul>
+<li><a href="https://www.ieee802.org/3/">IEEE 802.3 Ethernet Working
+Group</a></li>
+<li><a href="https://docs.kernel.org/networking/">Linux kernel
+networking documentation</a></li>
+<li><a
+href="https://man7.org/linux/man-pages/man8/ethtool.8.html">ethtool(8)
+man page</a></li>
+<li><a href="https://www.rfc-editor.org/">RFC Editor</a></li>
+</ul>
+<p>Ellenőrzési hiányok: a példában szereplő <code>virtio_net</code>
+driver, <code>ethtool</code> feature-készlet és interrupt-affinity
+kimenet a <code>lab-vm1</code> dedikált labVM tényleges verziójától, a
+kernelbackport szintjétől és a hypervisor által exponált virtuális
+eszköztől függ; ezeket a labVM-en rögzített verzióval ellenőrizni kell.
+Az SR-IOV-ra, a specifikus NIC-vendor firmware-re és a hardveres RSS
+hash pontosságára vonatkozó képességeket a fizikai eszköz nevével, PCI
+ID-jával és gyártói adatlapjával kell megerősíteni. A tcpdump kimenet
+illusztratív, nem tényleges mérés.</p>
+<p>Állításonként ellenőrzendő pontok (verzió: Ubuntu Server 24.04 LTS,
+6.8-as GA kernel, a noble <code>ethtool</code> és <code>tcpdump</code>
+csomag; a pontos verziót <code>ethtool --version</code>,
+<code>tcpdump --version</code> és <code>uname -r</code> adja):</p>
+<ul>
+<li>NAPI, GRO, RSS/RPS/XPS: <a
+href="https://docs.kernel.org/networking/napi.html"
+class="uri">https://docs.kernel.org/networking/napi.html</a>, <a
+href="https://docs.kernel.org/networking/scaling.html"
+class="uri">https://docs.kernel.org/networking/scaling.html</a>.</li>
+<li>Segmentation offload (TSO/GSO) és checksum offload: <a
+href="https://docs.kernel.org/networking/segmentation-offloads.html"
+class="uri">https://docs.kernel.org/networking/segmentation-offloads.html</a>,
+<a href="https://docs.kernel.org/networking/checksum-offloads.html"
+class="uri">https://docs.kernel.org/networking/checksum-offloads.html</a>.</li>
+<li><code>ethtool(8)</code> (<code>-l</code>, <code>-g</code>,
+<code>-k</code>, <code>-c/-C</code>, <code>-S</code>, <code>-X</code>):
+<a href="https://man7.org/linux/man-pages/man8/ethtool.8.html"
+class="uri">https://man7.org/linux/man-pages/man8/ethtool.8.html</a>.</li>
+<li><code>tcpdump(1)</code> (<code>-K</code>, <code>-n</code>,
+<code>-v</code>): <a
+href="https://www.tcpdump.org/manpages/tcpdump.1.html"
+class="uri">https://www.tcpdump.org/manpages/tcpdump.1.html</a>.</li>
+<li>virtio-net eszköz: OASIS VIRTIO 1.2 specifikáció, <a
+href="https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html"
+class="uri">https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html</a>;
+a notification coalescing feature-t (VIRTIO_NET_F_NOTF_COAL) tartalmazó
+kiadás ellenőrizendő.</li>
+</ul>
+<p>A példák laborban ellenőrizendők; dátumozott futtatási napló
+(reprodukciós trace) még nem készült.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d026.html">← 6.1 Ethernet, réz, optika és transceiverek</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d028.html">6.3 Switch, router és hardveres adatút →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

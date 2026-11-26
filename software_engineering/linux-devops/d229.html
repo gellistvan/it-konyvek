@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>46.4 IaC CI, test, policy és promotion – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch46">46 Infrastructure as Code: OpenTofu/Terraform és állapot</a></p>
+<div class="links"><a class="prev" rel="prev" href="d228.html">← 46.3 Module, environment és változási határ</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d230.html">46.5 Idempotens provision és interrupted change labor →</a></div>
+</nav>
+<h2 data-number="46.4" id="d229"><span
+class="header-section-number">46.4</span> IaC CI, test, policy és
+promotion</h2>
+<h3 data-number="46.4.1" id="motiváció"><span
+class="header-section-number">46.4.1</span> Motiváció</h3>
+<p>Amikor az infrastruktúra-kódot Gitben fejlesztjük, a
+<code>tofu plan</code> kimenete csak akkor értékes, ha a remote provider
+felé történő módosítást pontosan ahhoz a tervhez kötjük, amelyet ember
+és automatizált szabály is jóváhagyott. A cél nem az, hogy a CI-ben
+minél több lépés legyen, hanem hogy a változtatásnak legyen auditálható,
+reprodukálható, review-zott útja. Ebben az alfejezetben a plan
+létrehozásától az apply-ig vezető pipeline-t úgy tanítjuk meg, hogy az
+identify, artifact, approval, policy és state réteg egymástól
+elválasztható legyen.</p>
+<p>A szenior C++-fejlesztő számára a párhuzam a release artifact és a
+deploy pipeline: egy fordítási artifactból sem szabad bárkinek bármit
+éles környezetbe juttatni. Az IaC esetén a „build” a <code>plan</code>,
+az „artifact” a terv bináris és JSON-reprezentációja, a „deploy” pedig
+az <code>apply</code>. A különbség az, hogy itt a remote API oldalán
+lévő erőforrás maga a futó, stateful rendszer.</p>
+<h3 data-number="46.4.2" id="definíció-és-működési-modell"><span
+class="header-section-number">46.4.2</span> Definíció és működési
+modell</h3>
+<p><strong>Plan artifact</strong> – az IaC pipeline azon
+megváltoztathatatlan, hash-kötött kimenete, amelyet a plan lépésben
+hozunk létre, és kizárólag ezt adhatjuk oda az apply lépésnek. A terv
+tartalmazza a config address-eket, a resource változásokat, valamint a
+state-hez és a provider verzióhoz kötő metaadatot.</p>
+<p><strong>Preflight</strong> – olyan gyors, read-only ellenőrzések
+sorozata, amelyek még a teljes plan elkészítése előtt kiszűrik a
+formázási, séma- és acceptance hibákat. Része a <code>fmt</code>,
+<code>validate</code>, <code>test</code>, provider- és backendprobe.</p>
+<p><strong>Approval scope</strong> – az a kör, amelyre emberi jóváhagyás
+terjed ki. Nem elég a „valaki ránézett”, hanem rögzíteni kell, hogy
+melyik environment, module path vagy destruktív diff esetén hány review
+szükséges.</p>
+<p><strong>Policy-as-code</strong> – a plan JSON felett kiértékelt,
+verziókötött szabály. A policy nem megbecsüli, hogy „szerintem ez
+veszélyes”, hanem a plan <code>resource_changes</code> mezőit vizsgálja.
+A destruktív diff különösen fontos, mert a provider oldalon az
+adatvesztés nem állítható vissza az <code>apply</code> inverzével.</p>
+<p><strong>OIDC federation</strong> – a CI identity provider és a cloud
+identity közötti bizalmi kapcsolat. A CI-ben nincs hosszú életű access
+key; a workflow rövid lejáratú credentialt kap úgy, hogy a cloud role
+trust policy megköveteli a
+<code>token.actions.githubusercontent.com:aud</code> =
+<code>sts.amazonaws.com</code> feltételt és a <code>sub</code>
+feltételt: a repositoryra és a refre, environment-es jobnál az
+environment nevére (ilyenkor a <code>sub</code> értéke
+<code>repo:&lt;org&gt;/&lt;repo&gt;:environment:&lt;név&gt;</code>).</p>
+<p>A pipeline-t két jogosultsági szintre bontjuk. A plan role erőforrást
+nem módosíthat, és a state objektumot nem írhatja, de a
+<code>tofu plan</code> alapértelmezésben lockolja a state-et, ezért a
+lockhoz szükséges minimális írási jogot megkapja (DynamoDB lock-táblánál
+<code>dynamodb:PutItem</code>/<code>DeleteItem</code>, natív S3-locknál
+csak a <code>&lt;key&gt;.tflock</code> objektumra
+<code>s3:PutObject</code>/<code>DeleteObject</code>). A
+<code>-lock=false</code> kerülőút ellentmondana a lent tárgyalt
+concurrency-védelemnek. Az apply role írhat, azonban csak a védett
+environment jóváhagyása után léphet életbe. A kettő közé kerül a
+policy-ellenőrzés és az artifact digest-ellenőrzés.</p>
+<h3 data-number="46.4.3" id="preflight-és-provider-probe"><span
+class="header-section-number">46.4.3</span> Preflight és provider
+probe</h3>
+<p>A preflight nem az általános programozási tesztelés újratanulása,
+hanem az IaC-ra szabott static validation. A formázás, a séma és a
+provider binary hitelesítése már a plan előtt lezárja a leggyakoribb
+hibákat. A <code>validate</code> és a <code>test</code> inicializált
+providereket és modulokat igényel (<code>.terraform/</code>), ezért az
+<code>init</code> megelőzi őket; backend nélküli statikus ellenőrzéshez
+<code>tofu init -backend=false</code> is elég:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="bu">set</span> <span class="at">-euo</span> pipefail</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> fmt <span class="at">-check</span> <span class="at">-recursive</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> init <span class="at">-input</span><span class="op">=</span>false <span class="at">-backend-config</span><span class="op">=</span><span class="st">&quot;lab/backend.conf&quot;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> validate</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> test</span></code></pre></div>
+<p>A provider probe célja, hogy a teljes resource gráf kiterjesztése
+nélkül ellenőrizze: a rövid lejáratú credentialt a provider fel tudja
+használni, a backend state elérhető, és a provider séma betöltődik. Erre
+egy célzott, read-only data source-ot használó plan szolgál:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> plan <span class="dt">\</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-refresh</span><span class="op">=</span>false <span class="dt">\</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-target</span><span class="op">=</span><span class="st">&#39;data.aws_caller_identity.current&#39;</span> <span class="dt">\</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-out</span><span class="op">=</span><span class="st">&#39;/tmp/lab-provider-probe.tfplan&#39;</span></span></code></pre></div>
+<p>A kapcsolódó HCL:</p>
+<pre class="hcl"><code>data &quot;aws_caller_identity&quot; &quot;current&quot; {}</code></pre>
+<p>Itt nem az erőforrás-változás a tét, hanem az exit code. Ha a
+credential lejárt, a <code>tofu init</code> még sikerülhet, de a
+provider configure során a plan meghiúsul. A provider probe tehát a
+pipeline korai auth/backend integration tesztje, nem apply és nem teljes
+plan.</p>
+<h3 data-number="46.4.4" id="plan-artifact-és-version-binding"><span
+class="header-section-number">46.4.4</span> Plan artifact és version
+binding</h3>
+<p>A review nem a terminálban görgetett, ember által „látott” outputra
+épül, hanem egy immutable artifactra:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> plan <span class="at">-refresh</span><span class="op">=</span>true <span class="at">-out</span><span class="op">=</span><span class="st">&quot;lab.plan&quot;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> show <span class="at">-json</span> <span class="st">&quot;lab.plan&quot;</span> <span class="op">&gt;</span> <span class="st">&quot;lab.plan.json&quot;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sha256sum</span> <span class="st">&quot;lab.plan&quot;</span> <span class="st">&quot;lab.plan.json&quot;</span> <span class="op">&gt;</span> <span class="st">&quot;lab.plan.sha256&quot;</span></span></code></pre></div>
+<p>A CI ezeket a fájlokat artifact store-ba teszi, a változtatás commit
+hash-ét, a <code>tofu version</code> kimenetét és a
+<code>.terraform.lock.hcl</code> digestjét mellékelve. A plan bináris
+tartalmazza a state sorozatszámát (és lineage-ét), így ha az apply előtt
+valaki más megváltoztatja a state-et, az apply elavult tervként („stale
+plan”) elutasítja. Ez nem pótolja az alkalmazás-szintű rollout-zárat, de
+megakadályozza, hogy egy elavult tervet a megváltozott valóság felett
+alkalmazzunk.</p>
+<p>A version binding szempontjából a <code>.terraform.lock.hcl</code> a
+provider és az OpenTofu/Terraform közti szerződés. A CI plan job nem
+használhat más provider verziót, mint amit a lock file rögzít; a lock
+frissítése külön PR-ben, éles környezetre nem vonatkozó review-val
+történik.</p>
+<h3 data-number="46.4.5" id="policy-as-code-és-destruktív-diff"><span
+class="header-section-number">46.4.5</span> Policy-as-code és destruktív
+diff</h3>
+<p>A review számára a <code>plan.json</code> egyik legfontosabb mezője a
+<code>change.actions</code>. A <code>"create"</code> önmagában általában
+alacsony kockázatú, a <code>"update"</code> in-place módosítás lehet, a
+<code>"delete"</code> vagy a <code>"delete"+"create"</code> páros pedig
+replacement, amely destruktív is lehet. A policy ezt nem tippeli meg,
+hanem szabályszerűen tiltja, kivéve az eldobható, ideiglenes
+lab-erőforrások <code>lab-tmp-</code> prefixét (a tartós
+lab-erőforrások, például a lenti <code>lab-d229-existing</code> artifact
+bucket, ide nem tartoznak). A prefix az erőforrás valós nevére (itt a
+bucket nevére vagy a <code>Name</code> tagre) vonatkozik, nem a
+Terraform-címre: a plan JSON <code>address</code> mezője
+(<code>aws_s3_bucket.artifact</code>, <code>module.x.aws_…</code>) sosem
+kezdődik <code>lab-</code>-bel. A nevet a változás előtti
+attribútumokból (<code>change.before</code>) vesszük:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> resource_name(rc):</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>    before <span class="op">=</span> rc[<span class="st">&quot;change&quot;</span>].get(<span class="st">&quot;before&quot;</span>) <span class="kw">or</span> {}</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> before.get(<span class="st">&quot;bucket&quot;</span>) <span class="kw">or</span> (before.get(<span class="st">&quot;tags&quot;</span>) <span class="kw">or</span> {}).get(<span class="st">&quot;Name&quot;</span>, <span class="st">&quot;&quot;</span>)</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> destructive_deny(plan_json, allow_prefix<span class="op">=</span><span class="st">&quot;lab-tmp-&quot;</span>):</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> rc <span class="kw">in</span> plan_json.get(<span class="st">&quot;resource_changes&quot;</span>, []):</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>        actions <span class="op">=</span> rc[<span class="st">&quot;change&quot;</span>][<span class="st">&quot;actions&quot;</span>]</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="st">&quot;delete&quot;</span> <span class="kw">in</span> actions:</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="kw">not</span> resource_name(rc).startswith(allow_prefix):</span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>                <span class="cf">raise</span> <span class="pp">SystemExit</span>(</span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>                    <span class="ss">f&quot;destructive delete blocked: </span><span class="sc">{</span>rc[<span class="st">&#39;address&#39;</span>]<span class="sc">}</span><span class="ss">&quot;</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>                )</span></code></pre></div>
+<p>Ez a példa szándékosan tanulóbarát; productionben ugyanezt a logikát
+érdemes OPA/Rego vagy más verziókötött policy motorba tenni. A lényeg a
+döntési határ: a policy a plan JSON-t kapja, nem a forráskódot. Egy
+<code>force_destroy = true</code> a HCL-ben önmagában nem biztos, hogy a
+policy hiba nélkül átmegy, ezért a JSON oldalon kell tiltani vagy
+approvalhoz kötni.</p>
+<p>A destruktív diff tehát nem mindig tiltott. A lab erőforrások törlése
+esetén az engedélyező szabály kiterjeszthető, de akkor a hozzá tartozó
+approval scope is szigorúbb: productionben kézi, kétszemélyes jóváhagyás
+szükséges.</p>
+<h3 data-number="46.4.6" id="oidc-és-rövid-lejáratú-ci-role"><span
+class="header-section-number">46.4.6</span> OIDC és rövid lejáratú CI
+role</h3>
+<p>A statikus CI secret hosszú életű, nem auditálható per workflow, és
+könnyen kikerül a repository-ból. A pipeline ezért OIDC federationt
+használ. A GitHub Actions példában a workflow csak
+<code>id-token: write</code> jogot kér, a cloud role trust policy pedig
+a <code>sub</code> claim-re szűkíti a felvételt:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">permissions</span><span class="kw">:</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">id-token</span><span class="kw">:</span><span class="at"> write</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">contents</span><span class="kw">:</span><span class="at"> read</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="fu">jobs</span><span class="kw">:</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">plan</span><span class="kw">:</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">runs-on</span><span class="kw">:</span><span class="at"> ubuntu-24.04</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">environment</span><span class="kw">:</span><span class="at"> lab-plan</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">steps</span><span class="kw">:</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">uses</span><span class="kw">:</span><span class="at"> actions/checkout@v4</span><span class="co"> # lab fixture, verziót ellenőrizni kell</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="co">      # az OpenTofu nem része a runner-image-nek; a verzió rögzítendő</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">uses</span><span class="kw">:</span><span class="at"> opentofu/setup-opentofu@v1</span><span class="co"> # verziót ellenőrizni kell</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">with</span><span class="kw">:</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">tofu_version</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;1.8.x&quot;</span><span class="co"> # a labprofil rögzített verziója</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">uses</span><span class="kw">:</span><span class="at"> aws-actions/configure-aws-credentials@v4</span><span class="co"> # lab fixture</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">with</span><span class="kw">:</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">role-to-assume</span><span class="kw">:</span><span class="at"> arn:aws:iam::111122223333:role/lab-iac-plan</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">role-session-name</span><span class="kw">:</span><span class="at"> ci-plan-lab-d229</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">aws-region</span><span class="kw">:</span><span class="at"> eu-west-1</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a><span class="kw">      - </span><span class="fu">run</span><span class="kw">:</span><span class="at"> </span><span class="ch">|</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>          tofu init -input=false -backend-config=&quot;lab/backend.conf&quot;</span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>          tofu fmt -check -recursive</span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>          tofu validate</span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a>          tofu test</span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a><span class="kw">      - </span><span class="fu">run</span><span class="kw">:</span><span class="at"> </span><span class="ch">|</span></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a>          tofu plan -refresh=true -out=&quot;lab.plan&quot;</span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a>          tofu show -json &quot;lab.plan&quot; &gt; &quot;lab.plan.json&quot;</span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a>          sha256sum lab.plan lab.plan.json &gt; lab.plan.sha256</span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a>          tofu version &gt; lab.tofu-version.txt</span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">uses</span><span class="kw">:</span><span class="at"> actions/upload-artifact@v4</span><span class="co"> # verziót ellenőrizni kell</span></span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">with</span><span class="kw">:</span></span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-plan-${{ github.sha }}</span></span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a><span class="fu">          path</span><span class="kw">: </span><span class="ch">|</span></span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a>            lab.plan</span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a>            lab.plan.json</span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a>            lab.plan.sha256</span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a>            lab.tofu-version.txt</span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a>            .terraform.lock.hcl</span></code></pre></div>
+<p>Az apply job külön <code>lab-iac-apply</code> role-t használ, és ezt
+az artifactot tölti le (a <code>PLAN_SHA256</code> a
+<code>lab.plan.sha256</code>-ból jön). A plan role policy a state bucket
+olvasását, a KMS kulcs használatát, a provider read-only hívásait és a
+state lockhoz szükséges minimális írást engedi; az apply role a
+szükséges write jogokat kapja, de nem örökölheti a plan role-tól a
+teljes adminisztrátori jogot.</p>
+<h3 data-number="46.4.7" id="apply-concurrency-és-approval-scope"><span
+class="header-section-number">46.4.7</span> Apply concurrency és
+approval scope</h3>
+<p>A remote state backend lock már concurrency-szinten védi a state-t. A
+Terraform S3 backend DynamoDB lockkal dolgozik, és a plan state serial
+mismatch esetén az apply megtagadja a futást. A pipeline szintjén
+azonban ennél többre van szükség: két apply job ne versenyezzen
+ugyanarra az environmentre, és a jóváhagyás előtti concurrency ne
+juthasson tovább.</p>
+<p>A GitHub Actions <code>environment</code> védelme két dolgot ad: az
+OIDC credential a védett environment kontextusában kérhető le, és a
+production környezetre manuális approvert lehet előírni. Az approval
+scope például:</p>
+<ul>
+<li><code>lab</code> environment: CI auto-apply, destruktív diff csak az
+ideiglenes, <code>lab-tmp-</code> nevű erőforrásokra engedett;</li>
+<li><code>staging</code>: auto-apply, destructive delete tiltott;</li>
+<li><code>prod</code>: legalább két reviewer, destructive diffhez külön
+karbantartási engedély.</li>
+</ul>
+<p>Ez a scope a module path szerint is finomítható: a közös networking
+modulra szélesebb hatású jóváhagyás kell, mint egy egyedi bucket
+resource-ra.</p>
+<h3 data-number="46.4.8"
+id="postcondition-drift-monitor-és-rollback-korlát"><span
+class="header-section-number">46.4.8</span> Postcondition, drift monitor
+és rollback korlát</h3>
+<p>Az apply utáni elfogadás nem ér véget az <code>Apply complete!</code>
+kiírással. A postcondition a resource szintjén ellenőrzi, hogy az
+alkalmazott állapot tényleg megfelel-e a minimális biztonsági
+követelménynek:</p>
+<pre class="hcl"><code>resource &quot;aws_s3_bucket_versioning&quot; &quot;artifact_versioning&quot; {
+  bucket = aws_s3_bucket.artifact.id
+
+  versioning_configuration {
+    status = &quot;Enabled&quot;
+  }
+
+  lifecycle {
+    postcondition {
+      condition     = self.versioning_configuration[0].status == &quot;Enabled&quot;
+      error_message = &quot;artifact bucket versioning must be enabled&quot;
+    }
+  }
+}</code></pre>
+<p>Resource-szintű <code>postcondition</code>-ben a saját attribútumokra
+a <code>self</code> objektummal hivatkozunk; a csupasz
+<code>versioning_configuration</code> érvénytelen referencia lenne. A
+postcondition megsértése esetén az apply hibára fut, és a pipeline nem
+jelenthet sikeres kiadást.</p>
+<p>A drift monitor egy scheduled, read-only plan:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> plan <span class="at">-refresh</span><span class="op">=</span>true <span class="at">-detailed-exitcode</span> <span class="at">-out</span><span class="op">=</span><span class="st">&quot;/tmp/drift.tfplan&quot;</span></span></code></pre></div>
+<p>Ha a <code>detailed-exitcode</code> <code>2</code>, akkor a provider
+oldali valós állapot eltér a desired state-től. Ilyenkor nem szabad
+automatikusan apply-zni; először a drift okát kell diagnosztizálni. A
+kézi konzolban végzett módosítás, az untracked erőforrás vagy egy krízis
+alatt hozott provider change mind külön ok lehet. A drift monitor nem az
+apply alá tartozó rollout lépés, hanem a desired state folyamatos
+megfigyelése.</p>
+<p>A rollback legfontosabb korlátja: az IaC apply nem általános inverz
+művelet. Ha egy database resource-ot replacement vált ki, a régi példány
+törlése után a verziókezelt konfiguráció visszatekerése nem hozza vissza
+az adatokat. A korábbi commit <code>tofu apply</code>-ja akkor működik,
+ha az erőforrás in-place módosítás volt, és a provider támogatja a
+visszamenőleges update-et. A state-t külön backupba kell tenni, a data
+recovery pedig snapshot vagy point-in-time restore kérdése. A rollback
+tehát általában forward fix, nem pedig a korábbi config beadása.</p>
+<h3 data-number="46.4.9"
+id="kidolgozott-példa-lab-bucket-plan-policy-és-approval"><span
+class="header-section-number">46.4.9</span> Kidolgozott példa: lab
+bucket plan, policy és approval</h3>
+<p>A lab target: repository <code>lab-iac-cicd</code>, environment
+<code>lab</code>, dummy AWS account <code>111122223333</code>, state
+bucket <code>lab-terraform-state</code>, region <code>eu-west-1</code>.
+A jelenlegi bucket neve <code>lab-d229-existing</code>, és a fejlesztő
+átnevezi <code>lab-d229-new</code>-ra. A HCL:</p>
+<pre class="hcl"><code>resource &quot;aws_s3_bucket&quot; &quot;artifact&quot; {
+  bucket = &quot;lab-d229-new&quot;
+}</code></pre>
+<p>Az alábbi ábra a példa két plan-futását mutatja a pipeline oszlopain:
+melyik lépés melyik identityvel fut, mi kerül az artifact store-ba, és
+hol dől el a továbbengedés.</p>
+<figure id="fig-d229-plan-pipeline">
+<div class="fig-interactive"><iframe src="figures/html/d229-plan-pipeline.html" title="Két sor azonos oszlopokkal: Git, CI plan job lab-iac-plan role-lal (read + lock), artifact store a lab.plan, lab.plan.json és lab.plan.sha256 fájlokkal, destructive_deny policy, lab environment approval, CI apply job lab-iac-apply role-lal, state backend. Első futás: aws_s3_bucket.artifact delete és create, a policy megállítja: destructive delete blocked. Második futás: aws_s3_bucket_versioning.artifact_versioning create, a policy átengedi, approval, hash-ellenőrzés, apply, a state serial n-ről n+1-re nő, a postcondition Enabled." loading="lazy" style="width:100%;border:0;height:520px"></iframe><noscript><img src="figures/img/d229-plan-pipeline.png" style="width:100.0%"
+alt="Két sor azonos oszlopokkal: Git, CI plan job lab-iac-plan role-lal (read + lock), artifact store a lab.plan, lab.plan.json és lab.plan.sha256 fájlokkal, destructive_deny policy, lab environment approval, CI apply job lab-iac-apply role-lal, state backend. Első futás: aws_s3_bucket.artifact delete és create, a policy megállítja: destructive delete blocked. Második futás: aws_s3_bucket_versioning.artifact_versioning create, a policy átengedi, approval, hash-ellenőrzés, apply, a state serial n-ről n+1-re nő, a postcondition Enabled." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d229-plan-pipeline.png" style="width:100.0%"
+alt="Két sor azonos oszlopokkal: Git, CI plan job lab-iac-plan role-lal (read + lock), artifact store a lab.plan, lab.plan.json és lab.plan.sha256 fájlokkal, destructive_deny policy, lab environment approval, CI apply job lab-iac-apply role-lal, state backend. Első futás: aws_s3_bucket.artifact delete és create, a policy megállítja: destructive delete blocked. Második futás: aws_s3_bucket_versioning.artifact_versioning create, a policy átengedi, approval, hash-ellenőrzés, apply, a state serial n-ről n+1-re nő, a postcondition Enabled." /></details></div>
+<figcaption>Plan artifact, policy és approval a lab bucket példán: az 1.
+futás (bucket-átnevezés, „delete”+„create”) a policynél megáll, a 2.
+futás (versioning, „create”) jóváhagyás és hash-ellenőrzés után a
+lab-iac-apply role-lal alkalmazódik, a postcondition „Enabled”
+(illusztratív, nem futtatott pipeline)</figcaption>
+</figure>
+<p>A CI preflight lefut, a plan artifact elkészül, a policy azonban ezt
+adja:</p>
+<pre class="text"><code>destructive delete blocked: aws_s3_bucket.artifact</code></pre>
+<p>A plan JSON:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;resource_changes&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;address&quot;</span><span class="fu">:</span> <span class="st">&quot;aws_s3_bucket.artifact&quot;</span><span class="fu">,</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;change&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;actions&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;delete&quot;</span><span class="ot">,</span> <span class="st">&quot;create&quot;</span><span class="ot">]</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>      <span class="fu">}</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>  <span class="ot">]</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>A bucket név megváltoztatása replacement, ezért a policy tilt. A
+reviewer visszadobja a PR-t; a fejlesztő megtartja a bucket nevét,
+helyette csak a versioning beállítást módosítja. Az új plan:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;resource_changes&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;address&quot;</span><span class="fu">:</span> <span class="st">&quot;aws_s3_bucket_versioning.artifact_versioning&quot;</span><span class="fu">,</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;change&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;actions&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;create&quot;</span><span class="ot">]</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a>      <span class="fu">}</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a>  <span class="ot">]</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>A policy átengedi, mert nincs delete. Az approval megtörténik, az
+apply job lefuttatja:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="bu">test</span> <span class="st">&quot;</span><span class="va">$(</span><span class="fu">sha256sum</span> lab.plan <span class="kw">|</span> <span class="fu">cut</span> <span class="at">-d</span><span class="st">&#39; &#39;</span> <span class="at">-f1</span><span class="va">)</span><span class="st">&quot;</span> = <span class="st">&quot;</span><span class="va">$PLAN_SHA256</span><span class="st">&quot;</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> apply <span class="at">-input</span><span class="op">=</span>false <span class="at">-auto-approve</span> <span class="st">&quot;lab.plan&quot;</span></span></code></pre></div>
+<p>Az apply után a postcondition ellenőrzi a versioninget, a drift
+monitor pedig egy külön ütemezett planban megerősíti, hogy nincs külső
+eltérés.</p>
+<h3 data-number="46.4.10" id="hibák-és-ellenpróbák"><span
+class="header-section-number">46.4.10</span> Hibák és ellenpróbák</h3>
+<p>Az alábbi hibák tünetből, hipotézisből és egy változtatásból indulnak
+ki.</p>
+<p><strong>Stale plan apply</strong> – tünet: az apply job elavult
+tervre utaló hibával leáll (várhatóan
+<code>Error: Saved plan is stale</code>; illusztratív hibaüzenet, a
+pontos szöveget a labor futtatásakor kell rögzíteni). Hipotézis: a plan
+elkészülte után kézi apply vagy másik pipeline futtatott a state-re.
+Gyűjtsünk bizonyítékot: a plan artifact metaadatában lévő state serial
+nem egyezik a remote state aktuális serial-jával. Egy változtatás: ne
+replan nélkül erőltessük az apply-t; futtassunk friss plan-t, végezzük
+el újra a policy- és approval-scope ellenőrzést, majd az új artifacttal
+apply-zunk.</p>
+<p><strong>Policy nem látja a destruktív diffet</strong> – tünet: a
+policy átment, de az apply replacementet hajtott végre. Hipotézis: a
+policy a forráskódot nézte, nem a plan JSON-t. Gyűjtsünk bizonyítékot: a
+<code>resource_changes[].change.actions</code> tartalmazza a
+<code>delete</code> értéket. Egy változtatás: a policy inputja kizárólag
+a <code>plan.json</code> legyen, és a CI a <code>tofu show -json</code>
+kimenetét etesse a policy engine-nek.</p>
+<p><strong>OIDC role nem felvehető</strong> – tünet: az apply job
+<code>AccessDenied</code> hibával meghal, a plan job mégis lefutott.
+Hipotézis: a production environment OIDC role trust feltétele eltér a
+plan role-tól. Gyűjtsünk bizonyítékot: a CloudTrail
+<code>AssumeRoleWithWebIdentity</code> eseménye vagy a CI OIDC token
+<code>sub</code> claimje. Environment-es jobnál a <code>sub</code>
+értéke
+<code>repo:&lt;org&gt;/&lt;repo&gt;:environment:&lt;név&gt;</code>, nem
+<code>…:ref:refs/heads/main</code>; egy ref-re szűkített trust ezért nem
+illeszkedik. Egy változtatás: a role trust policy
+<code>token.actions.githubusercontent.com:sub</code> feltétele az apply
+jobnál a pontos
+<code>repo:&lt;org&gt;/lab-iac-cicd:environment:prod</code> érték (nem
+wildcard), a <code>token.actions.githubusercontent.com:aud</code>
+feltétel pedig <code>sts.amazonaws.com</code>; szűkítés, nem
+szélesítés.</p>
+<h3 data-number="46.4.11" id="feladatok"><span
+class="header-section-number">46.4.11</span> Feladatok</h3>
+<h4 data-number="46.4.11.1" id="értelmező-feladat"><span
+class="header-section-number">46.4.11.1</span> 1. Értelmező feladat</h4>
+<p>Adott a <code>plan.json</code> részlet:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;resource_changes&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;address&quot;</span><span class="fu">:</span> <span class="st">&quot;aws_db_instance.lab&quot;</span><span class="fu">,</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;change&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;actions&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;delete&quot;</span><span class="ot">,</span> <span class="st">&quot;create&quot;</span><span class="ot">]</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a>      <span class="fu">}</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;address&quot;</span><span class="fu">:</span> <span class="st">&quot;aws_security_group.lab&quot;</span><span class="fu">,</span></span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;change&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;actions&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;update&quot;</span><span class="ot">]</span></span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a>      <span class="fu">}</span></span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span></span>
+<span id="cb14-15"><a href="#cb14-15" aria-hidden="true" tabindex="-1"></a>  <span class="ot">]</span></span>
+<span id="cb14-16"><a href="#cb14-16" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>Miért kockázatosabb a <code>["delete", "create"]</code> mint a
+<code>["update"]</code>? Melyik resource-nál kell extra approval?
+Válaszodban ne használj konkrét AWS DB-t, ha nem ismered; a logikai
+különbség a lényeg.</p>
+<h4 data-number="46.4.11.2" id="adminisztrációs-feladat"><span
+class="header-section-number">46.4.11.2</span> 2. Adminisztrációs
+feladat</h4>
+<p>Készíts egy preflight scriptet, amely <code>set -euo pipefail</code>
+mellett lefuttatja a formázást, a validate-et, a testet és a provider
+probe-ot. A provider probe egy célzott
+<code>data "aws_caller_identity" "current" {}</code> plan legyen. A
+script outputja egy <code>preflight.json</code> fájl legyen, amely
+tartalmazza a <code>fmt_ok</code>, <code>validate_ok</code>,
+<code>test_ok</code> és <code>probe_ok</code> bool mezőket. A
+célállapot: minden mező <code>true</code>, ha a provider hitelesítés és
+a backend elérhető.</p>
+<h4 data-number="46.4.11.3" id="diagnosztikai-feladat"><span
+class="header-section-number">46.4.11.3</span> 3. Diagnosztikai
+feladat</h4>
+<p>Az apply job hibával áll le:</p>
+<pre class="text"><code>Error: Saved plan is stale</code></pre>
+<p>(Illusztratív hibaüzenet; a pontos szöveget a labor futtatásakor kell
+rögzíteni.)</p>
+<p>A plan artifact SHA256 rendben van, a policy átment. Milyen
+hipotézist állítasz fel? Milyen adatot gyűjtesz a state serial és a CI
+artifact metaadataiból? Mi az a helyreállítási lépés, amely nem kerüli
+meg a policy-t? Adj postconditiont.</p>
+<h3 data-number="46.4.12" id="megoldások"><span
+class="header-section-number">46.4.12</span> Megoldások</h3>
+<h4 data-number="46.4.12.1" id="megoldás"><span
+class="header-section-number">46.4.12.1</span> 1. megoldás</h4>
+<p>A <code>["delete", "create"]</code> replacementet jelez: a régi
+resource-t törli, majd újat hoz létre. A névváltás vagy más immutable
+attribútum változása ilyen. A <code>["update"]</code> in-place módosítás
+is lehet, ezért a policy az előbbinél destruktív diffre gyanakszik. A DB
+resource esetén a delete potenciálisan adatvesztést okoz, tehát ott
+extra approval szükséges. Postcondition: a policy a DB resource
+delete-jére <code>deny</code>-t ad, kivéve az ideiglenes
+<code>lab-tmp-</code> nevű erőforrást és az explicit jóváhagyást.</p>
+<h4 data-number="46.4.12.2" id="megoldás-1"><span
+class="header-section-number">46.4.12.2</span> 2. megoldás</h4>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/usr/bin/env bash</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="bu">set</span> <span class="at">-euo</span> pipefail</span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a><span class="va">fmt_ok</span><span class="op">=</span>false <span class="va">init_ok</span><span class="op">=</span>false <span class="va">validate_ok</span><span class="op">=</span>false <span class="va">test_ok</span><span class="op">=</span>false <span class="va">probe_ok</span><span class="op">=</span>false</span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="ex">tofu</span> fmt <span class="at">-check</span> <span class="at">-recursive</span><span class="kw">;</span> <span class="cf">then</span> <span class="va">fmt_ok</span><span class="op">=</span>true<span class="kw">;</span> <span class="cf">fi</span></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a><span class="co"># az init megelőzi a validate-et és a testet (inicializált provider kell)</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="ex">tofu</span> init <span class="at">-input</span><span class="op">=</span>false <span class="at">-backend-config</span><span class="op">=</span><span class="st">&quot;lab/backend.conf&quot;</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a>  <span class="va">init_ok</span><span class="op">=</span>true</span>
+<span id="cb16-11"><a href="#cb16-11" aria-hidden="true" tabindex="-1"></a><span class="cf">fi</span></span>
+<span id="cb16-12"><a href="#cb16-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-13"><a href="#cb16-13" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="bu">[</span> <span class="st">&quot;</span><span class="va">$init_ok</span><span class="st">&quot;</span> <span class="ot">=</span> true <span class="bu">]</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb16-14"><a href="#cb16-14" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="ex">tofu</span> validate<span class="kw">;</span> <span class="cf">then</span> <span class="va">validate_ok</span><span class="op">=</span>true<span class="kw">;</span> <span class="cf">fi</span></span>
+<span id="cb16-15"><a href="#cb16-15" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="ex">tofu</span> test<span class="kw">;</span> <span class="cf">then</span> <span class="va">test_ok</span><span class="op">=</span>true<span class="kw">;</span> <span class="cf">fi</span></span>
+<span id="cb16-16"><a href="#cb16-16" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="ex">tofu</span> plan <span class="dt">\</span></span>
+<span id="cb16-17"><a href="#cb16-17" aria-hidden="true" tabindex="-1"></a>        <span class="at">-refresh</span><span class="op">=</span>false <span class="dt">\</span></span>
+<span id="cb16-18"><a href="#cb16-18" aria-hidden="true" tabindex="-1"></a>        <span class="at">-target</span><span class="op">=</span><span class="st">&#39;data.aws_caller_identity.current&#39;</span> <span class="dt">\</span></span>
+<span id="cb16-19"><a href="#cb16-19" aria-hidden="true" tabindex="-1"></a>        <span class="at">-out</span><span class="op">=</span><span class="st">&#39;/tmp/lab-provider-probe.tfplan&#39;</span> <span class="op">&gt;</span>/dev/null<span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb16-20"><a href="#cb16-20" aria-hidden="true" tabindex="-1"></a>    <span class="va">probe_ok</span><span class="op">=</span>true</span>
+<span id="cb16-21"><a href="#cb16-21" aria-hidden="true" tabindex="-1"></a>  <span class="cf">fi</span></span>
+<span id="cb16-22"><a href="#cb16-22" aria-hidden="true" tabindex="-1"></a><span class="cf">fi</span></span>
+<span id="cb16-23"><a href="#cb16-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-24"><a href="#cb16-24" aria-hidden="true" tabindex="-1"></a><span class="co"># a JSON-t jq állítja elő (nem string-cserével); init-hibánál is létrejön</span></span>
+<span id="cb16-25"><a href="#cb16-25" aria-hidden="true" tabindex="-1"></a><span class="ex">jq</span> <span class="at">-n</span> <span class="at">--argjson</span> fmt <span class="st">&quot;</span><span class="va">$fmt_ok</span><span class="st">&quot;</span> <span class="at">--argjson</span> validate <span class="st">&quot;</span><span class="va">$validate_ok</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb16-26"><a href="#cb16-26" aria-hidden="true" tabindex="-1"></a>      <span class="at">--argjson</span> test <span class="st">&quot;</span><span class="va">$test_ok</span><span class="st">&quot;</span> <span class="at">--argjson</span> probe <span class="st">&quot;</span><span class="va">$probe_ok</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb16-27"><a href="#cb16-27" aria-hidden="true" tabindex="-1"></a>      <span class="st">&#39;{fmt_ok: $fmt, validate_ok: $validate, test_ok: $test,</span></span>
+<span id="cb16-28"><a href="#cb16-28" aria-hidden="true" tabindex="-1"></a><span class="st">        probe_ok: $probe}&#39;</span> <span class="op">&gt;</span> preflight.json</span>
+<span id="cb16-29"><a href="#cb16-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-30"><a href="#cb16-30" aria-hidden="true" tabindex="-1"></a><span class="co"># nem-nulla exit, ha bármely mező false: a CI itt megáll</span></span>
+<span id="cb16-31"><a href="#cb16-31" aria-hidden="true" tabindex="-1"></a><span class="ex">jq</span> <span class="at">-e</span> <span class="st">&#39;all(.[]; . == true)&#39;</span> preflight.json <span class="op">&gt;</span>/dev/null</span></code></pre></div>
+<p>A script célja a gyors, gépi visszajelzés, nem az emberi parse-olás.
+Az init sikertelensége nem szakítja meg a scriptet (az <code>if</code>
+alatt a <code>set -e</code> nem érvényesül), így a
+<code>preflight.json</code> ilyenkor is létrejön,
+<code>validate_ok</code>, <code>test_ok</code> és <code>probe_ok</code>
+értéke <code>false</code>. A postcondition: ha bármely mező false, a
+script nem-nulla exit kóddal tér vissza, és a CI nem megy tovább a
+teljes planra.</p>
+<h4 data-number="46.4.12.3" id="megoldás-2"><span
+class="header-section-number">46.4.12.3</span> 3. megoldás</h4>
+<p>Hipotézis: a plan létrehozása után egy másik apply, refresh-only vagy
+kézi beavatkozás megváltoztatta a remote state-et. Bizonyíték: a plan
+artifact metaadatában tárolt state serial nem egyezik a remote state
+serial-jával. Helyreállítás: a commitból új <code>tofu plan</code>
+készül, a plan JSON-t ismét policy ellenőrzi, az ember újra review-zik,
+majd az új plan artifacttal az apply lefut. A postcondition: az új plan
+artifact serialja az apply előtt egyezik a remote state serialjával; az
+apply után a remote serial nagyobb a plan serialnál (a sikeres apply
+növeli), és egy friss <code>tofu plan -detailed-exitcode</code> 0-s exit
+kóddal tér vissza; az elavult tervre utaló hiba nem jelenik meg, és a
+policy az új planra is <code>pass</code> eredményt ad.</p>
+<h3 data-number="46.4.13" id="rövid-összefoglaló"><span
+class="header-section-number">46.4.13</span> Rövid összefoglaló</h3>
+<p>Az IaC CI nem helyettesíti a lokális <code>tofu plan</code> gyors
+futtatását, hanem azt emeli szabályozott, auditálható pipeline-ba. A
+preflight már a plan előtt lezárja a formai, séma- és providerprobe
+hibákat. A plan bináris artifact hash-hez, state serialhez és lock
+fájlhoz kötött; kizárólag ezt adhatjuk apply-nak. A policy-as-code a
+plan JSON mezőit vizsgálja, és a destruktív diffet approval scope-hoz
+köti. Az OIDC rövid lejáratú CI role-jai külön plan és apply
+jogosultságot adnak. A postcondition az apply sikerét, a drift monitor a
+folyamatos egyezést ellenőrzi; a rollback nem univerzális inverz, hanem
+konfigurációs forward fix.</p>
+<p><strong>Továbbhasznált definíciók</strong>: <strong>Plan
+artifact</strong> – hash-kötött, immutable terv; <strong>Approval
+scope</strong> – jóváhagyás alá eső változtatási kör;
+<strong>Drift</strong> – a desired és az observed state eltérése.</p>
+<h3 data-number="46.4.14" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">46.4.14</span> Források és ellenőrzési
+hiányok</h3>
+<p>Ebben a kérésben nem volt webes keresőeszköz, ezért a megadott
+linkeket nem olvastam és nem ellenőriztem. A technológiai állítások
+fogalmi modelleket írnak le, de a pontos CLI-szintaxis, a GitHub Actions
+action-verziók, a provider lock, a <code>tofu test</code> és a plan
+JSON-séma a labban ellenőrizendő. A bucket, account ID és environment
+nevek hipotetikus labfixture-ök, nem valós erőforrások. Az AWS a
+referencia provider, de a GCP/Azure mapping csak fogalmi szintű. A
+verziókat a <code>.terraform.lock.hcl</code> és a lab release jegyzék
+alapján kell pontosítani.</p>
+<p>Állításonként (hivatkozott verzió: OpenTofu 1.8.x labprofil; GitHub
+Actions és AWS IAM a generáláskor aktuális dokumentáció szerint):</p>
+<ul>
+<li><a href="https://opentofu.org/docs/">OpenTofu documentation</a> –
+„Command: init” (<code>-backend=false</code>), „Command: validate”,
+„Command: test”, „Command: plan” (<code>-out</code>,
+<code>-detailed-exitcode</code>, <code>-lock</code>), „JSON output
+format” (<code>resource_changes</code>, <code>change.before</code>),
+„Custom conditions” (<code>postcondition</code>, <code>self</code>),
+„Backend Type: s3” (lock-jogok).</li>
+<li><a href="https://developer.hashicorp.com/terraform/docs">Terraform
+documentation</a> – ugyanezek; a mentett, elavult plan hibaüzenete a
+labor futtatásakor rögzítendő.</li>
+<li>GitHub Actions OIDC (<code>sub</code> formátumok,
+environment-claim): a <a
+href="https://docs.github.com/en/actions">GitHub Docs</a> „Security
+hardening with OpenID Connect” és „Configuring OpenID Connect in Amazon
+Web Services” oldala; az <code>opentofu/setup-opentofu</code> és az
+<code>actions/upload-artifact</code> action verziója a saját
+repository-jukban ellenőrizendő.</li>
+<li><a href="https://docs.aws.amazon.com/">AWS documentation</a> – IAM
+User Guide „Creating a role for OpenID Connect federation”
+(<code>aud</code> = <code>sts.amazonaws.com</code>), CloudTrail
+<code>AssumeRoleWithWebIdentity</code> esemény.</li>
+</ul>
+<p><strong>Ellenőrzési státusz:</strong> a preflight script
+<code>bash -n</code>-nel ellenőrizve, a policy-függvény Python
+mintaadaton tesztelve; a teljes CI-pipeline sikeres és hibás ága (stale
+plan, OIDC-trust) laborban ellenőrizendő, dátumozott futtatási napló még
+nem készült.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d228.html">← 46.3 Module, environment és változási határ</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d230.html">46.5 Idempotens provision és interrupted change labor →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

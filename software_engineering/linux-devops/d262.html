@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>53.2 Replication, failover, backup és PITR – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch53">53 Database, cache és messaging működtetése</a></p>
+<div class="links"><a class="prev" rel="prev" href="d261.html">← 53.1 Database kapcsolatok, resource és health</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d263.html">53.3 Redis/cache: eviction, persistence és failure →</a></div>
+</nav>
+<h2 data-number="53.2" id="d262"><span
+class="header-section-number">53.2</span> Replication, failover, backup
+és PITR</h2>
+<h3 data-number="53.2.1" id="motiváció-definíció-és-scope"><span
+class="header-section-number">53.2.1</span> Motiváció, definíció és
+scope</h3>
+<p>Az állapotmentes (stateless) szolgáltatás újraindításakor csak a
+processznek kell elindulnia. Egy adatbázist (database, DB) tartalmazó
+szolgáltatásnál a tartós állapotot a hibás lemez, a hibás host vagy a
+rosszul sikerült sémaváltozás után is garantálni kell. A replikáció
+(replication) és a helyreállítási terv (recovery plan) nem
+backend-részlet, hanem a szolgáltatás rendelkezésre állási és
+adatvesztési szerződésének alapja. Ez az alfejezet a primary/replica
+modellt, a WAL-archiválást, a failovert, a PITR-t és ezek RPO/RTO
+hatásait mutatja be PostgreSQL fogalmi példán, de nem állít aktuális
+verziókövetést. A parancsok izolált labVM-eken futnak; éles környezethez
+a support szintaxist ellenőrizni kell.</p>
+<p><strong>Definíció (primary/replica és lag):</strong> A primary (más
+néven master) fogad írási tranzakciókat, a replica (standby) másolja
+azokat, és olvasási lekérdezéseket szolgálhat ki. A PostgreSQL a
+módosításokat write-ahead logba (WAL) írja, majd a replica folyamatosan
+streameli ezt a logfolyamot, és visszajátssza. A <em>replication
+lag</em> az az idő, amennyivel a replica lemarad a primary mögött;
+mérhető bájtban
+(<code>pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)</code>; az LSN,
+Log Sequence Number a WAL-folyam bájtpozíciója, nem tranzakciószám) vagy
+időben (<code>replay_lag</code>). Ugyanezt a logfolyamot lehet
+archiválni is, így a régebbi állapotok helyreállíthatók.</p>
+<p>A synchronous (szinkron) és asynchronous (aszinkron) commit döntése
+közvetlen RPO-tradeoff. Szinkron módban
+(<code>synchronous_commit = on</code>) a primary csak akkor jelez
+sikeres COMMIT-ot, ha a kijelölt replica megerősítette a WAL tartós
+írását (flush). Ekkor a committed adatra RPO = 0, de a commit latency
+megnő, és ha a szinkron replica elérhetetlen, a commitok időkorlát
+nélkül várnak (nem váltanak hibára). Aszinkron módban azonnali commit,
+de a lag alatti adatvesztés lehetséges. A kettő közötti megoldás a
+<em>quorum commit</em>:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>
+szinkron jelölt közül bármely
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>k</mi><annotation encoding="application/x-tex">k</annotation></semantics></math>
+visszaigazolása elég
+(<code>synchronous_standby_names = 'ANY 1 (lab_replica1, lab_replica2)'</code>).
+A commit latencyt a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>k</mi><annotation encoding="application/x-tex">k</annotation></semantics></math>-adik
+leggyorsabb standby határozza meg; az RPO 0 marad, amíg a primary és a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>k</mi><annotation encoding="application/x-tex">k</annotation></semantics></math>
+visszaigazoló közül legalább egy tárolója túléli a hibát, a write
+availability pedig addig, amíg legalább
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>k</mi><annotation encoding="application/x-tex">k</annotation></semantics></math>
+standby elérhető.</p>
+<p>A failover (átállás) során a replica primaryvá válik, a régi primert
+le kell állítani vagy el kell szigetelni. A <em>fencing</em> (izolálás)
+kritikus: ha a régi primary tovább fut, a kliens két írási pontot
+láthat, és <em>split brain</em> (kettős főnök) alakul ki, amely
+adatdivergenciához vezet. A fencing megvalósítható storage szinten (a
+régi primary lemezhozzáférésének elvesztése), hálózati szinten (a régi
+primary elérése letiltva), vagy cluster manageren keresztül (pl. node
+leválasztás). A failover után az alkalmazás kapcsolatának is át kell
+állnia: a client state nem követi automatikusan a DB state-et.</p>
+<p>A backup (mentés) lehet <em>logical backup</em> (pl.
+<code>pg_dump</code>), amely SQL/dump formátumú, táblánként
+visszaállítható, de nagy adatbázisnál lassú. A <em>physical backup</em>
+a DB fájlrendszer konzisztens másolata (pl. <code>pg_basebackup</code>),
+amelyet WAL-archívummal kombinálva pont az időre visszaállítás
+(point-in-time recovery, PITR) érhető el. A PITR feltétele: a base
+backup készítésének időpontja, a lezárt WAL-szegmensek tartós archívumba
+másolása, és a kívánt visszaállítási pont (például
+<code>recovery_target_time</code>). A PITR után a rendszer nem
+feltétlenül tartalmazza a későbbi tranzakciókat; ezért a targetet és a
+kizárási politikát expliciten kell rögzíteni.</p>
+<p>A séma migráció (schema migration) replikált környezetben akkor
+biztonságos, ha a változtatás két fázisban bővíthető: először a
+kompatibilis bővítést (add nullable column, új tábla, új index) vezetjük
+be, az összes régi verzió tovább fut, majd egy későbbi deploy során
+távolítjuk el a nem használt régi sémaelemet. A fizikai (streaming)
+replikáció és a logikai replikáció itt élesen eltér. Fizikai replikánál
+a WAL a blokkszintű adat- és katalógusváltozást együtt viszi: a primaryn
+futtatott <code>ALTER TABLE</code> vagy <code>CREATE INDEX</code> külön
+standby-DDL nélkül megjelenik a replikán, a standbynek nincs saját „régi
+sémája” vagy külön karbantartandó indexkészlete. A kockázat itt a
+<em>hot standby query conflict</em>: a primaryn futó
+<code>ACCESS EXCLUSIVE</code> zárat igénylő DDL (vagy a VACUUM által
+eltávolított sorverzió) visszajátszása ütközhet a replikán futó olvasó
+lekérdezéssel, amelyet a standby
+<code>max_standby_streaming_delay</code> után megszakít, vagy a replay
+lemarad. A régi és új alkalmazásverzió közti kompatibilitás tehát a
+kliensek oldaláról számít. Logikai replikációnál
+(<code>CREATE PUBLICATION</code>/<code>SUBSCRIPTION</code>) viszont a
+DDL nem replikálódik: az előfizetőn a sémát külön kell migrálni, és ha a
+séma eltér (pl. új <code>NOT NULL</code> oszlop csak az előfizetőn), az
+apply hibával megáll. A <code>CREATE INDEX CONCURRENTLY</code> a
+primaryn elkerüli a hosszú write lockot; fizikai replikára WAL-lal kerül
+át, logikai előfizetőn külön kell létrehozni.</p>
+<hr />
+<h3 data-number="53.2.2"
+id="kidolgozott-példa-primaryreplica-szinkron-commit-majd-pitr"><span
+class="header-section-number">53.2.2</span> Kidolgozott példa:
+primary–replica, szinkron commit, majd PITR</h3>
+<p><strong>Labtopológia:</strong></p>
+<table>
+<colgroup>
+<col style="width: 37%" />
+<col style="width: 25%" />
+<col style="width: 37%" />
+</colgroup>
+<thead>
+<tr>
+<th>Host</th>
+<th>IP</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>lab-pg-primary</td>
+<td>10.13.0.10</td>
+<td>primary</td>
+</tr>
+<tr>
+<td>lab-pg-replica</td>
+<td>10.13.0.11</td>
+<td>standby</td>
+</tr>
+<tr>
+<td>lab-backup</td>
+<td>10.13.0.20</td>
+<td>WAL-archívum és base backup tár (NFS-export:
+<code>/srv/pg-archive</code>)</td>
+</tr>
+<tr>
+<td>lab-recovery</td>
+<td>10.13.0.12</td>
+<td>PITR-teszt (eldobható)</td>
+</tr>
+</tbody>
+</table>
+<p>Minden PostgreSQL-parancs <code>postgres</code> OS felhasználóval
+vagy <code>sudo -u postgres</code> módon fut; a verzió mindenhol
+PostgreSQL 16 (Ubuntu 24.04 <code>postgresql-16</code> csomag, cluster:
+<code>16/main</code>). A labhost nevek explicit; a parancsok nem
+futtathatók éles környezetben verzióellenőrzés nélkül. A hálózati vagy
+VM-szintű fencinghez a labkonzol (hypervisor-hozzáférés) legyen
+nyitva.</p>
+<p><strong>0. Előkészítés (mindhárom DB-hoston):</strong> a
+<code>lab-backup</code> <code>/srv/pg-archive</code> exportját mindhárom
+PostgreSQL-host ugyanazon az úton csatolja
+(<code>/mnt/pg-archive</code>, benne <code>wal/</code> és
+<code>base/</code> alkönyvtár, tulajdonos a <code>postgres</code> UID),
+így a primary, a később promotált replica és a <code>lab-recovery</code>
+is ugyanazt az archívumot látja. Ellenőrzés:
+<code>sudo -u postgres touch /mnt/pg-archive/wal/.probe</code> mindhárom
+hoston sikeres. Kezdés előtt minden VM-ről snapshot készül.</p>
+<p><strong>1. Primary konfiguráció (<code>10.13.0.10</code>), először
+aszinkron módban:</strong></p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="dt">\</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-c</span> <span class="st">&quot;CREATE ROLE rep WITH REPLICATION LOGIN PASSWORD &#39;labsecret&#39;;&quot;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="at">-c</span> <span class="st">&quot;ALTER SYSTEM SET wal_level = replica;&quot;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="at">-c</span> <span class="st">&quot;ALTER SYSTEM SET max_wal_senders = 5;&quot;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="at">-c</span> <span class="st">&quot;ALTER SYSTEM SET listen_addresses = &#39;*&#39;;&quot;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="at">-c</span> <span class="st">&quot;ALTER SYSTEM SET archive_mode = on;&quot;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="at">-c</span> <span class="st">&quot;ALTER SYSTEM SET archive_timeout = &#39;60s&#39;;&quot;</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="at">-c</span> <span class="st">&quot;ALTER SYSTEM SET archive_command = </span><span class="dt">\</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="st">  &#39;test ! -f /mnt/pg-archive/wal/%f &amp;&amp; cp %p /mnt/pg-archive/wal/%f&#39;;&quot;</span></span></code></pre></div>
+<p>A <code>pg_hba.conf</code>
+(<code>/etc/postgresql/16/main/pg_hba.conf</code>) végére a replikációs
+és a backup-kapcsolat engedélye kerül, majd újraindítás (a
+<code>wal_level</code>, <code>archive_mode</code> és
+<code>listen_addresses</code> csak restarttal érvényes):</p>
+<pre class="text"><code>host  replication  rep  10.13.0.11/32  scram-sha-256
+host  replication  rep  10.13.0.20/32  scram-sha-256</code></pre>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart postgresql@16-main</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="dt">\</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-c</span> <span class="st">&quot;SELECT archived_count, failed_count FROM pg_stat_archiver;&quot;</span></span></code></pre></div>
+<p>Az archiválást a replica felépítése <em>előtt</em> kapcsoljuk be, így
+a <code>pg_basebackup</code>-pal klónozott replica a
+<code>postgresql.auto.conf</code>-ban ugyanazt az
+<code>archive_mode</code>/<code>archive_command</code> beállítást
+örökli. A standby <code>archive_mode = on</code> mellett a promócióig
+nem archivál, a promóció után viszont igen (<code>always</code> esetén
+standbyként is). Az <code>archive_command</code> nem nulla exit code
+esetén a PostgreSQL újrapróbálja a szegmenst, és a
+<code>pg_stat_archiver.failed_count</code> nő; ezt kell figyelni. A
+<code>synchronous_standby_names</code> ebben a lépésben még üres: amíg
+nincs streamelő standby, a szinkron beállítás minden commitot
+megakasztana.</p>
+<p><strong>2. Replica konfiguráció
+(<code>10.13.0.11</code>):</strong></p>
+<p>A <code>pg_basebackup</code> üres céladatkönyvtárat vár, ezért előbb
+leállítjuk a csomag által létrehozott clustert, és a régi adatkönyvtárat
+félretesszük (nem töröljük). A jelszót <code>~postgres/.pgpass</code>
+fájlból adjuk (<code>chmod 600</code>), nem a parancssorból:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_lsclusters</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl stop postgresql@16-main</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mv /var/lib/postgresql/16/main /var/lib/postgresql/16/main.orig</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&#39;10.13.0.10:5432:replication:rep:labsecret&#39;</span> <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>  <span class="fu">sudo</span> <span class="at">-u</span> postgres tee /var/lib/postgresql/.pgpass <span class="op">&gt;</span>/dev/null</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> chmod 600 /var/lib/postgresql/.pgpass</span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres pg_basebackup <span class="dt">\</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;host=10.13.0.10 port=5432 user=rep application_name=lab_replica&#39;</span> <span class="dt">\</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">-D</span> /var/lib/postgresql/16/main <span class="at">-R</span> <span class="at">-X</span> stream <span class="at">-P</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl start postgresql@16-main</span></code></pre></div>
+<p>A <code>-R</code> létrehozza a <code>standby.signal</code> fájlt az
+adatkönyvtárban, és a <code>postgresql.auto.conf</code>-ba írja a
+<code>primary_conninfo</code>-t (a <code>-d</code> conninfóból, benne az
+<code>application_name</code>-mel). PostgreSQL 12 óta nincs
+<code>recovery.conf</code> és <code>standby_mode</code>: ha ilyen fájl
+van az adatkönyvtárban, a szerver nem indul. Az eredmény a replica
+<code>postgresql.auto.conf</code>-jában (a jelszó a
+<code>.pgpass</code>-ból jön, a conninfo-ba nem kerül be):</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode ini"><code class="sourceCode ini"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># kivonat: a -R a többi kapcsolati paramétert (port, sslmode stb.) is kiírja</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="dt">primary_conninfo </span><span class="ot">=</span><span class="st"> &#39;user=rep host=10.13.0.10 application_name=lab_replica …&#39;</span></span></code></pre></div>
+<p>Ellenőrzés primary oldalon:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="at">-c</span> <span class="st">&quot;SELECT application_name, state, sync_state, </span><span class="dt">\</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="st">  sent_lsn, replay_lsn, replay_lag FROM pg_stat_replication;&quot;</span></span></code></pre></div>
+<p>Várt kimenet: egy sor, <code>application_name = lab_replica</code>,
+<code>state=streaming</code>, <code>sync_state=async</code>,
+<code>replay_lag</code> közel nulla. Ha a lag nő, nézd meg a
+<code>sync_state</code> oszlopot
+(<code>sync</code>/<code>async</code>/<code>quorum</code>), majd a
+hálózat és a standby I/O szűkületét; szinkron <code>on</code> módban is
+lehet replay lag, mert az <code>on</code> csak a standby-flushre vár, a
+visszajátszásra nem.</p>
+<p><strong>3. Szinkron mód bekapcsolása, majd a commit latency
+tradeoff:</strong></p>
+<p>Csak a streamelő standby ellenőrzése után kapcsoljuk be a szinkron
+módot a primaryn (reload elég, restart nem kell):</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="dt">\</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-c</span> <span class="st">&quot;ALTER SYSTEM SET synchronous_standby_names = &#39;lab_replica&#39;;&quot;</span> <span class="dt">\</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-c</span> <span class="st">&quot;SELECT pg_reload_conf();&quot;</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="dt">\</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">-c</span> <span class="st">&quot;SELECT application_name, sync_state FROM pg_stat_replication;&quot;</span></span></code></pre></div>
+<p>Várt kimenet: <code>sync_state = sync</code>. A
+<code>synchronous_standby_names</code> a replica
+<code>primary_conninfo</code>-beli <code>application_name</code>-ét
+azonosítja; a <code>synchronous_commit = on</code> (alapérték) minden
+tranzakciónál a szinkron standby flush-visszaigazolására vár. Ez
+garantálja, hogy a committed adat a szinkron replikán is megvan; az RPO
+committed adatra nulla, ha a primary és a szinkron replica tárolója nem
+egyszerre vész el. Visszaút (cancel/failback), ha a standby kiesik vagy
+a commitok megakadnak:
+<code>ALTER SYSTEM RESET synchronous_standby_names;</code> +
+<code>SELECT pg_reload_conf();</code> — ez tudatos RPO-feladás, amelyet
+incidensjegyben rögzítünk.</p>
+<p>Vizsgáljuk meg a commit latencyt szinkron és aszinkron módban egy
+egyszerű, terheléstől független modellel (telítés alatt). A
+<code>synchronous_commit = local</code> csak a helyi WAL-flushre vár, a
+standby visszaigazolására nem (replikációs szempontból aszinkron). A
+mérés <code>pgbench</code>-et használhat; itt illusztratív számítást
+adunk, nem mért adatot.</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>L</mi><mtext mathvariant="normal">async</mtext></msub><mo>=</mo><msub><mi>t</mi><mtext mathvariant="normal">flush,primary</mtext></msub><mo>=</mo><mn>1</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">ms</mtext><mo>,</mo><mspace width="2.0em"></mspace><msub><mi>L</mi><mtext mathvariant="normal">sync</mtext></msub><mo>=</mo><msub><mi>t</mi><mtext mathvariant="normal">flush,primary</mtext></msub><mo>+</mo><mi>R</mi><mi>T</mi><mi>T</mi><mo>+</mo><msub><mi>t</mi><mtext mathvariant="normal">flush,standby</mtext></msub><mo>=</mo><mn>1</mn><mo>+</mo><mn>3</mn><mo>+</mo><mn>1</mn><mo>=</mo><mn>5</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">ms</mtext></mrow><annotation encoding="application/x-tex">L_{\text{async}} = t_{\text{flush,primary}} = 1\ \text{ms}, \qquad L_{\text{sync}} = t_{\text{flush,primary}} + RTT + t_{\text{flush,standby}} = 1 + 3 + 1 = 5\ \text{ms}</annotation></semantics></math></p>
+<figure>
+<img src="assets/d262-plot-1.png"
+alt="Hipotetikus átlagos commit latency aszinkron és szinkron módban - Modell: helyi WAL-flush 1 ms, standby RTT 3 ms, standby flush 1 ms; telítés alatt terheléstől független; nem mért adat." />
+<figcaption aria-hidden="true">Hipotetikus átlagos commit latency
+aszinkron és szinkron módban - Modell: helyi WAL-flush 1 ms, standby RTT
+3 ms, standby flush 1 ms; telítés alatt terheléstől független; nem mért
+adat.</figcaption>
+</figure>
+<table>
+<thead>
+<tr>
+<th>Tranzakció/s</th>
+<th style="text-align: right;">Async latency</th>
+<th style="text-align: right;">Sync latency (hipotetikus)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>5</td>
+<td style="text-align: right;">1 ms</td>
+<td style="text-align: right;">5 ms</td>
+</tr>
+<tr>
+<td>10</td>
+<td style="text-align: right;">1 ms</td>
+<td style="text-align: right;">5 ms</td>
+</tr>
+<tr>
+<td>50</td>
+<td style="text-align: right;">1 ms</td>
+<td style="text-align: right;">5 ms</td>
+</tr>
+<tr>
+<td>100</td>
+<td style="text-align: right;">1 ms</td>
+<td style="text-align: right;">5 ms</td>
+</tr>
+</tbody>
+</table>
+<p>A modell nem tartalmaz telítést: ha a WAL-eszköz vagy a hálózat közel
+kerül a kapacitásához, mindkét oszlop nő (sorbanállási modellel, pl.
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>W</mi><mo>=</mo><mi>S</mi><mi>/</mi><mo stretchy="false" form="prefix">(</mo><mn>1</mn><mo>−</mo><mi>ρ</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">W = S/(1-\rho)</annotation></semantics></math>,
+külön kellene számolni). A tanulság: a szinkron commit a committed adat
+RPO-ját nullára csökkenti, de az átlagos commit latencyt legalább egy
+standby-körúttal növeli, és a write path függővé válik a standbytől.</p>
+<p><strong>4. Backup és PITR:</strong></p>
+<p>A WAL-archiválás az 1. lépésben már fut (<code>%p</code> a lezárt WAL
+fájl útja, <code>%f</code> a fájlneve). Ellenőrzés a primaryn: a
+<code>pg_stat_archiver</code> <code>archived_count</code> értéke nő, a
+<code>failed_count</code> nem; a <code>/mnt/pg-archive/wal/</code> alatt
+megjelennek a szegmensek.</p>
+<p>Base backup készítése a <code>lab-backup</code> hostról (tar
+formátum, a <code>-X stream</code> a backup alatti WAL-t is
+mellékeli):</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres pg_basebackup <span class="at">-h</span> 10.13.0.10 <span class="at">-U</span> rep <span class="dt">\</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-D</span> /srv/pg-archive/base/2025-03-15 <span class="at">-F</span> tar <span class="at">-z</span> <span class="at">-X</span> stream <span class="at">-P</span></span></code></pre></div>
+<p>A <code>lab-backup</code> hoston is <code>~postgres/.pgpass</code>
+adja a <code>rep</code> jelszavát. Az eredmény a
+<code>base.tar.gz</code> és a <code>pg_wal.tar.gz</code>. A PITR-t egy
+külön labhoston, a <code>lab-recovery</code>-n (10.13.0.12) teszteljük,
+hogy a primaryt ne érintsük. Teljes műveletsor a
+<code>lab-recovery</code>-n:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl stop postgresql@16-main</span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mv /var/lib/postgresql/16/main /var/lib/postgresql/16/main.pre-pitr</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres mkdir <span class="at">-m</span> 700 /var/lib/postgresql/16/main</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres tar <span class="at">-xzf</span> /mnt/pg-archive/base/2025-03-15/base.tar.gz <span class="dt">\</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">-C</span> /var/lib/postgresql/16/main</span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres touch /var/lib/postgresql/16/main/recovery.signal</span></code></pre></div>
+<p>A recovery-beállítások a
+<code>/etc/postgresql/16/main/conf.d/recovery.conf</code> include-fájlba
+kerülnek (a név tetszőleges; ez normál konfigurációs fájl, nem a régi
+<code>recovery.conf</code> mechanizmus). Ezen a hoston az
+<code>archive_mode = off</code> maradjon, hogy a teszt ne írjon a közös
+archívumba:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode ini"><code class="sourceCode ini"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="dt">restore_command </span><span class="ot">=</span><span class="st"> &#39;cp /mnt/pg-archive/wal/%f %p&#39;</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="dt">recovery_target_time </span><span class="ot">=</span><span class="st"> &#39;2025-03-15 14:30:00+00&#39;</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="dt">recovery_target_action </span><span class="ot">=</span><span class="st"> &#39;pause&#39;</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="dt">archive_mode </span><span class="ot">=</span><span class="st"> </span><span class="kw">off</span></span></code></pre></div>
+<p>A célidőt UTC-ben, a commit-időbélyegekkel (<code>now()</code> az
+eseménysorban) azonos időzónában add meg; időzóna nélkül a
+recovery-szerver <code>timezone</code> beállítása szerint értelmeződik,
+és más zónájú VM-en egy órával más pontra állhat meg.</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl start postgresql@16-main</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="dt">\</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-c</span> <span class="st">&quot;SELECT pg_is_in_recovery(), pg_get_wal_replay_pause_state();&quot;</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="at">-d</span> labdb <span class="at">-c</span> <span class="st">&quot;SELECT max(created_at) FROM events;&quot;</span></span></code></pre></div>
+<p>A <code>pause</code> megállítja a visszajátszást a célidőnél, így
+ellenőrizhető az adat. Várt kimenet: <code>pg_is_in_recovery = t</code>,
+<code>pg_get_wal_replay_pause_state = paused</code>, a naplóban
+<code>recovery stopping before commit ...</code> és
+<code>pausing at the end of recovery</code>; az <code>events</code>
+legutolsó sora 14:30 előtti, a hibás 14:42-es <code>DELETE</code> hatása
+nincs jelen. Ez bizonyítja, hogy a PITR működik; a rendszer ilyenkor
+csak olvasható. Ha az adat jó,
+<code>SELECT pg_wal_replay_resume();</code> lezárja a recoveryt, és a
+node új timeline-on írhatóvá válik. (A
+<code>labdb</code>/<code>events</code> a laborban előre létrehozott
+tesztadat; a kimenet szemléltető, nem futtatott.)</p>
+<p>Az alábbi ábra a PITR elérhető tartományát és a failover hatását
+mutatja: a célidőnek a base backup konzisztens pontja és az utolsó
+archivált WAL-szegmens közé kell esnie, a promóció pedig új timeline-t
+nyit.</p>
+<figure id="fig-d262-wal-timeline">
+<div class="fig-interactive"><iframe src="figures/html/d262-wal-timeline.html" title="Idővonal 14:00–15:00 között; a base backup 14:08-kor konzisztens, a WAL 14:45-ig archivált, a 14:30-as célidő ezen belül van; a promóció után új timeline indul." loading="lazy" style="width:100%;border:0;height:520px"></iframe><noscript><img src="figures/img/d262-wal-timeline.png" style="width:95.0%"
+alt="Idővonal 14:00–15:00 között; a base backup 14:08-kor konzisztens, a WAL 14:45-ig archivált, a 14:30-as célidő ezen belül van; a promóció után új timeline indul." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d262-wal-timeline.png" style="width:95.0%"
+alt="Idővonal 14:00–15:00 között; a base backup 14:08-kor konzisztens, a WAL 14:45-ig archivált, a 14:30-as célidő ezen belül van; a promóció után új timeline indul." /></details></div>
+<figcaption>PITR-tartomány és timeline-váltás a lab-pg-primary
+WAL-folyamán (illusztratív időpontok): a 14:30-as célidő a 14:08–14:45
+közötti archivált tartományon belül, a 14:42-es hibás DELETE előtt van;
+a 14:45-ös promóció után a timeline 2 szegmensei csak akkor archiváltak,
+ha a promotált node is archivál</figcaption>
+</figure>
+<p><strong>5. Failover és fencing:</strong></p>
+<p>Tegyük fel, hogy a primary <code>10.13.0.10</code> leállt vagy nem
+válaszol. A sorrend kötelező: előbb fencing, csak utána promóció,
+különben a két lépés között két írható primary létezhet.</p>
+<ol type="1">
+<li>Fencing a hypervisorról (nem a guestbe ssh-zva: egy elérhetetlen
+hoston az ssh nem fut le, egy elérhetőn pedig a saját
+management-útvonalát vágná el):</li>
+</ol>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system destroy lab-pg-primary</span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system domstate lab-pg-primary</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="fu">ping</span> <span class="at">-c</span> 3 10.13.0.10</span></code></pre></div>
+<p>Várt kimenet: <code>shut off</code>, a ping sikertelen. (Alternatíva
+a VM leállítása helyett:
+<code>virsh domif-setlink lab-pg-primary &lt;vnetX&gt; down</code>.)</p>
+<ol start="2" type="1">
+<li>Csak ezután a replica promóciója:</li>
+</ol>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="at">-c</span> <span class="st">&quot;SELECT pg_promote();&quot;</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> postgres psql <span class="at">-c</span> <span class="st">&quot;SELECT pg_is_in_recovery();&quot;</span></span></code></pre></div>
+<ol start="3" type="1">
+<li>Ellenőrzés: a <code>pg_is_in_recovery()</code> értéke <code>f</code>
+az új primaryn, egy írási teszt commitol, a régi primary nem érhető el,
+és a <code>pg_stat_replication</code> üres, amíg új standbyt nem
+építünk. A promóció új timeline-t nyit: a
+<code>/mnt/pg-archive/wal/</code> alatt megjelenik a
+<code>00000002.history</code>, és az új primary
+<code>pg_stat_archiver.archived_count</code> értéke nő (az örökölt
+<code>archive_mode = on</code> miatt). A failover után azonnal új base
+backup készül, mert a PITR-lefedettség addig a régi timeline-ra és a
+<code>.history</code> fájl elérhetőségére épül. A régi primaryt nem
+indítjuk vissza: <code>pg_rewind</code>-dal vagy új
+<code>pg_basebackup</code>-pal standbyként építjük újra.</li>
+</ol>
+<p>Élesben ezt a cluster manager (pl. Patroni, repmgr) hajtja végre, de
+a LabVM-ben a cél a paradigmák gyakorlása.</p>
+<hr />
+<h3 data-number="53.2.3" id="hibák-és-ellenpróbák"><span
+class="header-section-number">53.2.3</span> Hibák és ellenpróbák</h3>
+<p><strong>Hiba 1: a replica nem streamel.</strong> Tünet: a
+<code>pg_stat_replication</code> üres, vagy a <code>pg_basebackup</code>
+után a replica nem indul el. Hipotézis: a <code>primary_conninfo</code>
+hibás jelszót vagy <code>application_name</code>-et tartalmaz; hálózati
+tűzfal blokkolja a 5432-t. Adatgyűjtés:
+<code>journalctl -u postgresql@16-main</code> a replica hoston; a
+primaryn <code>ss -tln '( sport = :5432 )'</code> (hallgat-e a primary a
+hálózati címen), a replicáról <code>nc -vz 10.13.0.10 5432</code>
+(elérhetőség, tűzfal). Egy változtatás: ellenőrizni a primary
+<code>pg_hba.conf</code>-jában a <code>replication</code> sort a
+<code>rep</code> userre, és tesztelni a replikációs protokollal:
+<code>psql "host=10.13.0.10 port=5432 user=rep replication=true" -c "IDENTIFY_SYSTEM;"</code>
+— siker esetén egy sor <code>systemid</code>, <code>timeline</code>,
+<code>xlogpos</code> oszlopokkal. (A <code>dbname=replication</code>
+conninfo egy nem létező, „replication” nevű adatbázishoz nyitna
+közönséges kapcsolatot, ezért hamis negatívat adna.) Verification: a
+<code>pg_stat_replication</code> sor megjelenik,
+<code>state=streaming</code>.</p>
+<p><strong>Hiba 2: blokkolt commitok szinkron módban.</strong> Tünet: az
+írási tranzakciók commitja hosszú ideig vár, mert a
+<code>synchronous_standby_names</code> szerinti standby nem igazol
+vissza. Hipotézis: a szinkron replica kiesett, ezért minden commit vár
+(a PostgreSQL-ben nincs szinkron commit-timeout; a
+<code>statement_timeout</code> sem szakítja meg a várakozást, a
+megszakított commit helyileg már megtörtént). Adatgyűjtés:
+<code>watch -n 1 'sudo -u postgres psql -c "SELECT pid,state,wait_event_type,wait_event FROM pg_stat_activity;"'</code>
+— a várakozó sessionöknél <code>wait_event = 'SyncRep'</code>; a
+<code>pg_stat_replication</code> üres vagy nincs <code>sync</code> sor.
+Egy változtatás (tudatos RPO-feladás, incidensjegyben rögzítve):
+<code>sudo -u postgres psql -c "ALTER SYSTEM SET synchronous_standby_names = '';" -c "SELECT pg_reload_conf();"</code>.
+Verification: <code>SHOW synchronous_standby_names;</code> üres, a
+<code>SyncRep</code> várakozások eltűnnek, a commit latency visszaáll; a
+standby visszatéréséig az RPO már nem nulla. Megjegyzés: a
+<code>synchronous_commit = remote_apply</code> a standbyn való
+visszajátszásig vár (read-your-writes a standbyn), ezért az
+<code>on</code>-nál is nagyobb commit latencyt ad.</p>
+<p><strong>Hiba 3: split brain failover után.</strong> Tünet: két
+primary <code>pg_is_in_recovery() = false</code>. Hipotézis: a régi
+primary visszatért és továbbra is ír. Adatgyűjtés:
+<code>SELECT pg_current_wal_lsn()</code> mindkét node-on; a LSN-ek
+eltérnek. Egy változtatás: a régi primary azonnali leállítása, hálózati
+fencing. Verification: csak az új primary érhető el, a régi primary a
+régi LSN-en áll.</p>
+<p><strong>Hiba 4: PITR cél időpontja túl késői.</strong> Tünet: a
+visszaállítás nem éri el a kívánt időt, vagy hibával leáll. Hipotézis: a
+WAL-szegmens nem lett archiválva a meghibásodás pillanatában.
+Adatgyűjtés: <code>ls -l /var/lib/postgresql/wal_archive</code> alapján
+a legutóbbi fájl időbélyege. Egy változtatás: korábbi
+<code>recovery_target_time</code>, vagy <code>recovery_target_xid</code>
+az ismert jó tranzakció azonosítóval. Verification: a recovery sikeresen
+megáll <code>pause</code> állapotban, a hibás tranzakció nincs
+jelen.</p>
+<hr />
+<h3 data-number="53.2.4" id="feladatok"><span
+class="header-section-number">53.2.4</span> Feladatok</h3>
+<p><strong>1. (Magyarázó) RPO-számítás szinkron és aszinkron
+replikánál.</strong><br />
+Egy adatbázis írási terhelése 50 tranzakció/s. Aszinkron replikánál a
+lag átlagosan 2 másodperc, a mért maximum 5 másodperc. Szinkron
+(<code>synchronous_commit = on</code>) módban a commit a standby
+flush-visszaigazolására vár. Az alkalmazás 200 ms kliensoldali
+timeouttal adja fel a commitra való várakozást. Számítsd ki az RPO-t
+időben és committed tranzakciókban (a) aszinkron, (b) szinkron, (c)
+szinkron + replica kiesés esetén. Mit tud az alkalmazás a tranzakció
+sorsáról, ha a 200 ms-os kliensoldali timeout lejár? Melyik komponens
+növeli az availabilityt?</p>
+<p><strong>2. (Adminisztrációs) Primary–replica beállítása WAL
+streaminggel.</strong><br />
+A labhostok: <code>lab-pg-primary</code> és <code>lab-pg-replica</code>.
+Készítsd el a primary beállításokat (<code>wal_level</code>,
+<code>max_wal_senders</code>, <code>synchronous_standby_names</code>),
+majd a replicán futtasd a <code>pg_basebackup</code>-ot <code>-R</code>
+kapcsolóval. Ellenőrizd a <code>pg_stat_replication</code>-et. Mi a
+desired state? Írd le a rollback lépéseket, ha a replica nem indul.</p>
+<p><strong>3. (Diagnosztikai/failure recovery) Failover és PITR
+gyakorlat.</strong><br />
+A primary <code>lab-pg-primary</code> leállt; a replica
+<code>lab-pg-replica</code> még streaming állapotban van. Promotáld a
+replicát primaryvá, majd végezz PITR-t egy korábbi időpontra a
+<code>lab-recovery</code> hoston a base backup és a WAL-archívum
+felhasználásával. Ellenőrizd, hogy a
+<code>recovery_target_action = 'pause'</code> megállította-e a
+processzt. Dokumentáld a client state-et: az alkalmazás kapcsolati
+stringjét miért kell megváltoztatni?</p>
+<hr />
+<h3 data-number="53.2.5" id="megoldások"><span
+class="header-section-number">53.2.5</span> Megoldások</h3>
+<p><strong>1. RPO-számítás</strong><br />
+Az RPO a legrosszabb esetre vonatkozik, ezért a maximális laggal
+számolunk, nem az átlaggal. (a) Aszinkron:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>R</mi><mi>P</mi><msub><mi>O</mi><mtext mathvariant="normal">async</mtext></msub><mo>≤</mo><mn>5</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">s</mtext></mrow><annotation encoding="application/x-tex">RPO_{\text{async}} \le 5\ \text{s}</annotation></semantics></math>,
+worst-case
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>50</mn><mo>⋅</mo><mn>5</mn><mo>=</mo><mn>250</mn></mrow><annotation encoding="application/x-tex">50 \cdot 5 = 250</annotation></semantics></math>
+committed tranzakció; átlagos lagnál várhatóan
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>50</mn><mo>⋅</mo><mn>2</mn><mo>=</mo><mn>100</mn></mrow><annotation encoding="application/x-tex">50 \cdot 2 = 100</annotation></semantics></math>
+tranzakció vész el. (b) Szinkron (<code>synchronous_commit = on</code>):
+minden visszaigazolt commit WAL-ja a szinkron standby lemezén is tartós,
+így
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>R</mi><mi>P</mi><mi>O</mi><mo>=</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">RPO = 0</annotation></semantics></math>,
+ha nem vész el egyszerre a primary ÉS a standby tárolója (közös failure
+domain esetén a committed adat elveszhet). (c) A standby kiesésekor a
+commit időkorlát nélkül vár: az RPO 0 marad, de a write availability 0 a
+standby visszatéréséig vagy a <code>synchronous_standby_names</code>
+üresre állításáig (reload) — ez utóbbi tudatos RPO-feladás. A 200 ms-os
+kliensoldali timeout után az alkalmazás nem tudja, mi lett a
+tranzakcióval: a commit a primaryn helyileg már megtörténhetett, csak a
+standby-visszaigazolás hiányzik; ezért idempotens újrapróbálás vagy
+utólagos ellenőrzés kell. Az availabilityt az aszinkron mód vagy a több
+szinkron jelöltes quorum commit (<code>ANY 1 (...)</code>) növeli, az
+RPO-t a szinkron visszaigazolás védi; az elfogadható tradeoffot az SLO
+határozza meg.</p>
+<p><strong>2. Replica beállítása</strong><br />
+Desired state: a <code>pg_stat_replication</code> egy sor
+<code>application_name = lab_replica</code>,
+<code>state=streaming</code>, <code>replay_lag</code> &lt; 100 ms; a
+szinkron mód bekapcsolása után <code>sync_state = sync</code>. Lépések:
+a primaryn a <code>rep</code> role, a <code>pg_hba.conf</code>
+<code>replication</code> sora, a fenti <code>ALTER SYSTEM SET</code>
+parancsok és restart (a <code>synchronous_standby_names</code> még
+üres); a replicán a cluster leállítása, a régi adatkönyvtár félretétele,
+<code>.pgpass</code>, majd
+<code>pg_basebackup -d 'host=10.13.0.10 user=rep application_name=lab_replica' -D /var/lib/postgresql/16/main -R -X stream -P</code>
+és indítás. A <code>-R</code> létrehozza a <code>standby.signal</code>-t
+és a <code>primary_conninfo</code>-t. Ellenőrzés:
+<code>psql -c "SELECT * FROM pg_stat_replication;"</code> a primaryn;
+csak ezután a <code>synchronous_standby_names = 'lab_replica'</code> +
+<code>pg_reload_conf()</code>. A hibakereséshez a replica
+<code>journalctl -u postgresql@16-main</code> kimenete megmutatja a
+csatlakozási hibát (jelszó, <code>pg_hba.conf</code>,
+<code>application_name</code>-egyezés).</p>
+<p>Rollback, ha a replica nem indul: (1) a primaryn
+<code>ALTER SYSTEM RESET synchronous_standby_names; SELECT pg_reload_conf();</code>
+— postcondition: <code>SHOW synchronous_standby_names</code> üres, egy
+írási teszt commitol (ha a szinkron mód már be volt kapcsolva, enélkül a
+primary minden commitja blokkolna); (2) a replicán
+<code>sudo systemctl stop postgresql@16-main</code>, a hibás
+adatkönyvtár félreállítása
+(<code>sudo mv /var/lib/postgresql/16/main /var/lib/postgresql/16/main.failed-$(date +%s)</code>),
+majd a bootstrap előtti VM-snapshot visszaállítása vagy a
+<code>main.orig</code> visszamozgatása; (3) ha replikációs slot is
+készült, annak törlése a primaryn:
+<code>SELECT pg_drop_replication_slot('…');</code>. Postcondition: a
+primary önállóan, aszinkron módban ír, a
+<code>pg_stat_replication</code> üres, a replica az eredeti állapotában
+van.</p>
+<p><strong>3. Failover és PITR</strong><br />
+Failover: előbb a régi primary fencingje a hypervisorról
+(<code>virsh destroy</code> vagy <code>domif-setlink … down</code>,
+ellenőrzés: <code>domstate</code> = <code>shut off</code>, ping
+sikertelen), majd a replica promotálása
+(<code>SELECT pg_promote();</code>). Ellenőrzés:
+<code>psql -c "SELECT pg_is_in_recovery();"</code> hamis az új primaryn,
+a <code>pg_stat_archiver.archived_count</code> nő, és az archívumban
+megjelenik a <code>00000002.history</code>. PITR: a
+<code>lab-recovery</code> hoston a cluster leállítása, az adatkönyvtár
+félretétele, a <code>base.tar.gz</code> kicsomagolása,
+<code>recovery.signal</code>, a <code>restore_command</code>, az
+időzónás <code>recovery_target_time</code> és a
+<code>recovery_target_action = 'pause'</code> beállítása, majd indítás.
+A <code>restore_command</code> másolja a WAL-okat az archívumból, a
+<code>recovery_target_action</code> <code>pause</code> megállítja a
+folyamatot. Ellenőrzés: a <code>psql</code> kapcsolódik, és a kívánt
+időpont utáni tranzakció hiányzik. A client state: az alkalmazás
+connection string vagy a DNS a régi primary IP-t mutatja; frissíteni
+kell a primary floating IP-t vagy a service discoveryt. A postcondition:
+az új primary fogad írásokat, a PITR példa pause állapotban van, és
+egyetlen split brain sincs.</p>
+<hr />
+<h3 data-number="53.2.6" id="rövid-összefoglaló"><span
+class="header-section-number">53.2.6</span> Rövid összefoglaló</h3>
+<p>A replikáció a WAL streamelésével biztosítja, hogy a committed adat
+legalább egy másodlagos node-on is meglegyen. A szinkron commit RPO-t
+nullára csökkent, de a write availabilityt és latencyt rontja; az
+aszinkron lag növeli az RPO-t. A failover előtt fencinggel meg kell
+akadályozni a split brain-t. A PITR a physical base backup és a
+WAL-archívum kombinációjával tetszőleges, a backup készítése utáni
+időpontra visszaállít, de az archívum sértetlenségét és a séma migráció
+kompatibilitását külön kell tesztelni. A recovery rehearsal nem csak a
+DB state-et, hanem a client connection és a séma verziót is
+ellenőrzi.</p>
+<p><strong>Továbbhasznált definíciók:</strong></p>
+<ul>
+<li><strong>Replication lag</strong>: az az idő vagy WAL-távolság,
+amennyivel a replica lemarad a primary mögött.</li>
+<li><strong>Fencing</strong>: a régi primary elérhetetlenné tétele
+failover alatt, hogy csak egy írható node maradjon.</li>
+<li><strong>Point-in-time recovery (PITR)</strong>: base backupból és
+WAL-archívumból történő visszaállítás egy adott időpontra.</li>
+</ul>
+<hr />
+<h3 data-number="53.2.7" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">53.2.7</span> Források és ellenőrzési
+hiányok</h3>
+<p>Kiindulópontként megadott források:</p>
+<ul>
+<li><a href="https://www.postgresql.org/docs/">PostgreSQL
+documentation</a></li>
+<li><a href="https://redis.io/docs/latest/">Redis documentation</a></li>
+<li><a href="https://www.rabbitmq.com/docs">RabbitMQ
+documentation</a></li>
+<li><a href="https://sre.google/books/">SRE books</a></li>
+</ul>
+<p>Állításonkénti hivatalos források (hivatkozott verzió: PostgreSQL 16,
+Ubuntu 24.04 <code>postgresql-16</code> csomag):</p>
+<ul>
+<li>Streaming replikáció, <code>standby.signal</code>,
+<code>primary_conninfo</code>, szinkron és quorum commit: PostgreSQL 16
+dokumentáció, 27.2 „Log-Shipping Standby Servers” — <a
+href="https://www.postgresql.org/docs/16/warm-standby.html"
+class="uri">https://www.postgresql.org/docs/16/warm-standby.html</a></li>
+<li><code>synchronous_standby_names</code>
+(<code>FIRST</code>/<code>ANY</code> szintaxis),
+<code>max_wal_senders</code>: 20.6 „Replication” — <a
+href="https://www.postgresql.org/docs/16/runtime-config-replication.html"
+class="uri">https://www.postgresql.org/docs/16/runtime-config-replication.html</a></li>
+<li><code>wal_level</code>, <code>synchronous_commit</code> értékei
+(<code>local</code>, <code>on</code>, <code>remote_apply</code>),
+<code>archive_mode</code>, <code>archive_command</code>,
+<code>archive_timeout</code>, <code>restore_command</code>,
+<code>recovery_target_*</code>: 20.5 „Write Ahead Log” — <a
+href="https://www.postgresql.org/docs/16/runtime-config-wal.html"
+class="uri">https://www.postgresql.org/docs/16/runtime-config-wal.html</a></li>
+<li>Base backup, WAL-archiválás és PITR műveletsora
+(<code>recovery.signal</code>, timeline, <code>.history</code>): 26.3
+„Continuous Archiving and Point-in-Time Recovery (PITR)” — <a
+href="https://www.postgresql.org/docs/16/continuous-archiving.html"
+class="uri">https://www.postgresql.org/docs/16/continuous-archiving.html</a></li>
+<li><code>pg_basebackup</code> kapcsolói (<code>-R</code>,
+<code>-X stream</code>, <code>-F tar</code>, <code>-d</code>): <a
+href="https://www.postgresql.org/docs/16/app-pgbasebackup.html"
+class="uri">https://www.postgresql.org/docs/16/app-pgbasebackup.html</a></li>
+<li>A <code>recovery.conf</code> megszűnése (PostgreSQL 12): O.1
+„recovery.conf file merged into postgresql.conf” — <a
+href="https://www.postgresql.org/docs/16/recovery-config.html"
+class="uri">https://www.postgresql.org/docs/16/recovery-config.html</a></li>
+<li><code>pg_stat_replication</code>, <code>pg_stat_archiver</code>,
+<code>wait_event = SyncRep</code>: 28.2 „The Cumulative Statistics
+System” — <a
+href="https://www.postgresql.org/docs/16/monitoring-stats.html"
+class="uri">https://www.postgresql.org/docs/16/monitoring-stats.html</a></li>
+<li><code>pg_promote()</code>,
+<code>pg_get_wal_replay_pause_state()</code>,
+<code>pg_wal_replay_resume()</code>: 9.27 „System Administration
+Functions” — <a
+href="https://www.postgresql.org/docs/16/functions-admin.html"
+class="uri">https://www.postgresql.org/docs/16/functions-admin.html</a></li>
+<li>Hot standby query conflict: 27.4 „Hot Standby” — <a
+href="https://www.postgresql.org/docs/16/hot-standby.html"
+class="uri">https://www.postgresql.org/docs/16/hot-standby.html</a>;
+logikai replikáció korlátai (a DDL nem replikálódik): 31.6
+„Restrictions” — <a
+href="https://www.postgresql.org/docs/16/logical-replication-restrictions.html"
+class="uri">https://www.postgresql.org/docs/16/logical-replication-restrictions.html</a></li>
+<li>A Redis- és RabbitMQ-dokumentáció ebben az alfejezetben nem
+hivatkozott; a 53.3–53.4 használja.</li>
+</ul>
+<p>Reprodukciós státusz: a fenti példák laborban ellenőrizendők;
+dátumozott futtatási napló (<code>psql --version</code>,
+parancskimenetek, egy sikeres és egy hibás ág) még nem készült, a
+megadott kimenetek szemléltetők. A <code>recovery.conf</code>
+eltávolítása a PostgreSQL 12-ben megtörtént; a könyv példái csak a
+<code>standby.signal</code>/<code>recovery.signal</code> +
+<code>postgresql.auto.conf</code> mechanizmust használják. Az éles
+beállításhoz szükséges a hivatalos, verzióra lebontott dokumentáció. A
+lab környezetben a WAL archívum elérési útja
+(<code>/var/lib/postgresql/wal_archive</code>) és a replikációs user
+(<code>rep</code>) csak példa; a jelszó <code>labsecret</code> dummy
+adat. A cloud esetén a managed PostgreSQL replication és PITR
+beállításai szolgáltatóspecifikusak; jelen alfejezet nem terjed ki a
+managed service pontos API-jára. A tényleges failover/fencing eszköz
+(Patroni, repmgr) verziója és konfigurációja további ellenőrzést
+igényel.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d261.html">← 53.1 Database kapcsolatok, resource és health</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d263.html">53.3 Redis/cache: eviction, persistence és failure →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

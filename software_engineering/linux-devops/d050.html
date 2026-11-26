@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>10.5 Tartóssági és I/O rétegdiagnosztikai labor – Linux és
+DevOps rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch10">10 Linux blokk-I/O, VFS és tartósság</a></p>
+<div class="links"><a class="prev" rel="prev" href="d049.html">← 10.4 IOPS, queue és Linux I/O statisztikák</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d051.html">11.1 Path, inode, link és filesystem namespace →</a></div>
+</nav>
+<h2 data-number="10.5" id="d050"><span
+class="header-section-number">10.5</span> Tartóssági és I/O
+rétegdiagnosztikai labor</h2>
+<h3 data-number="10.5.1" id="motiváció-definíció-és-előfeltételek"><span
+class="header-section-number">10.5.1</span> Motiváció, definíció és
+előfeltételek</h3>
+<p>Az előző alfejezetekben (<a href="d046.html">Syscalltól az eszközig:
+I/O rétegek</a>, <a href="d049.html">IOPS, queue és Linux I/O
+statisztikák</a>) megismertük a Linux I/O rétegeket és az IOPS, queue,
+latency alapfogalmait, de egy éles incidensben a lassú
+<code>fsync</code> vagy a nem várt write latency még mindig „valahol a
+rendszerben” marad. A működtető feladata ilyenkor az, hogy a tünetet
+réteghatárok mentén szűkítse, ne egyetlen gyanúsítottra ugorjon. Ez a
+labor olyan kontrollált, megismételhető kísérletsorozatot ad, amelyben
+egy disposable virtuális lemezen modellezünk egy update-et és I/O
+nyomást, majd syscall trace, device counter és cache-beállítás
+segítségével azonosítjuk a tényleges átviteli út állapotát.</p>
+<p><strong>Definíció (tartóssági és I/O rétegdiagnosztikai
+labor).</strong> Olyan izolált labor, amelyben egy dedikált, kijelölt
+blokkeszközön (a) az alkalmazás syscall szintű kéréseit és a blokkeszköz
+device countereit egyidejűleg figyeljük, (b) buffered és direct I/O
+mérési tervvel elválasztjuk a page cache hatását a tényleges device
+hatástól, (c) egy kis C++ <code>fsync</code>/<code>rename</code>
+update-modellt futtatunk a tartóssági szerződés szemléltetésére, és (d)
+dokumentáljuk a crash-recovery előfeltételeit, majd a labdiszk
+reset/restore utáni adatellenőrzését elvégezzük. A labor outputja nem
+benchmark, hanem réteghelyes bizonyíték: measurement jegyzőkönyv,
+hipotézis, expected postcondition és rollback.</p>
+<p><strong>Scope és előfeltételek.</strong> A labor egyetlen Linux
+labhostot (<code>lab-vm-01</code>) és egy dedikált virtuális lemezt
+használ. Nem foglalkozunk fizikai meghibásodással, RAID-del,
+multipath-tal vagy hálózati tárolóval. Az előfeltételek: az <a
+href="d049.html">IOPS, queue és Linux I/O statisztikák</a> alfejezetben
+tanult <code>iostat</code>, <code>/proc/diskstats</code>, IOPS és queue
+depth értelmezés, valamint a <a href="d005.html">Működtetési szerződés,
+runbook és változtatás</a> alfejezet runbook, change record és
+postcondition szemlélete. A hallgatótól nem várunk kernel
+forráskód-szintű elemzést, de a mérési réteghatárokat pontosan kell
+tudnia.</p>
+<h3 data-number="10.5.2" id="rétegmodell-és-vizsgálati-stratégia"><span
+class="header-section-number">10.5.2</span> Rétegmodell és vizsgálati
+stratégia</h3>
+<p>Az adatút a C++ alkalmazástól a fizikai tároló felé így bontható:</p>
+<ol type="1">
+<li><strong>Alkalmazás syscall rétege</strong>: <code>write</code>,
+<code>fsync</code>, <code>rename</code>. A syscall belépés és
+visszatérés időtartamát a <code>strace -c</code> vagy
+<code>strace -T</code> mutatja. Ez a réteg tartalmazza a VFS és a page
+cache műveletek nagy részét is buffered módban.</li>
+<li><strong>Page cache és VFS réteg</strong>: <code>write</code>
+buffered módban a RAM-ban lévő oldalakba ír, és azonnal visszatérhet; a
+tényleges lemezre írás később, a writeback mechanizmuson keresztül
+történik. A <code>read</code> cache hit esetén szintén elkerüli a
+lemezt. Ha az alkalmazás <code>O_DIRECT</code> flaget használ, a page
+cache megkerülése közvetlenül a block layerhez irányítja az I/O-t.</li>
+<li><strong>Block layer és device driver</strong>: a bio réteg, IO
+scheduler, queue depth, majd a driver (itt <code>virtio-blk</code>)
+továbbítja a kérést a virtuális eszköznek.</li>
+<li><strong>Virtuális disk réteg</strong>: a VM-ben látszó blokkeszköz a
+hypervisorban egy backing file vagy volume. A VM-ből kiadott
+<code>fsync</code> a <code>virtio-blk</code> cache flush parancsát
+jelenti, ami a host kernel page cache-éből a backing storage-ra ír.</li>
+<li><strong>Fizikai vagy host-oldali tároló</strong>: a tényleges
+flash/HDD réteg, amelyet a VM-ből már nem látunk közvetlenül.</li>
+</ol>
+<p>A labor kulcsgondolata, hogy a syscall trace a userspace és a VFS
+felől mutatja a kéréseket, a device counter (például
+<code>/sys/block/vdb/stat</code>, <code>iostat -dx</code>) pedig a
+blokkeszköz tényleges aktivitását. Ha buffered <code>write</code> esetén
+a syscall latency alacsony, de a device counter nem változik, akkor a
+writeback még nem érte el a lemezt. Ha <code>fsync</code> után a device
+counter növekszik, akkor a flush valóban lement a blokkeszköz szintjéig.
+Direct I/O esetén a write syscall közvetlenül device I/O-t generál,
+ezért a syscall latency és a device counter aktivitás szorosabban együtt
+mozog.</p>
+<p>A mérési terv három üzemmódot hasonlít össze:</p>
+<ul>
+<li><strong>buffered read</strong>: page cache hit esetén a device
+counter alig mozdul, a latency 100 µs alatt lehet.</li>
+<li><strong>direct read</strong>: minden olvasás a lemezig megy, a
+latency nagyságrendileg a device IOPS-hez és queue-hoz igazodik.</li>
+<li><strong>buffered write + fsync</strong>: a write visszatérése gyors,
+de az fsync latency tartalmazza a writeback és a flush költségét.</li>
+</ul>
+<p>A rétegdiagnosztika eredményét mindig mérési jegyzőkönyvben
+rögzítjük, ahol a várt és a ténylegesen mért érték külön oszlopban
+szerepel.</p>
+<h3 data-number="10.5.3"
+id="kidolgozott-példa-update-modell-és-io-nyomás"><span
+class="header-section-number">10.5.3</span> Kidolgozott példa: update
+modell és I/O nyomás</h3>
+<p>A labor a <a href="d005.html">Működtetési szerződés, runbook és
+változtatás</a> alfejezet elve szerint a módosító parancsokat target,
+privilege, előfeltétel, ellenőrzés és rollback mellett mutatja. Az
+inventory:</p>
+<ul>
+<li><strong>Host</strong>: <code>lab-vm-01</code>, felhasználó
+<code>laboperator</code> UID 1000, <code>sudo</code> csoporttag.</li>
+<li><strong>Disposable disk</strong>: <code>LAB-DISK-0</code>, azonosító
+<code>/dev/disk/by-id/virtio-lab-data-0</code>, csatolva
+<code>vdb</code>-ként.</li>
+<li><strong>Mountpoint</strong>: <code>/mnt/lab-data</code>.</li>
+<li><strong>Állapot</strong>: a lemez formázatlan, semmilyen termelési
+adatot nem tartalmaz; cleanup csak erre a lemezre és a
+<code>/mnt/lab-data</code> alá terjed.</li>
+</ul>
+<p>Első lépésben a labdiszk előkészítése (target:
+<code>lab-vm-01</code>, privilege: sudo, előfeltétel: a lemez létezik és
+nincs rajta szükséges adat):</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm-01, laboperator UID 1000, sudo</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-l</span> /dev/disk/by-id/virtio-lab-data-0</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkfs.ext4 <span class="at">-F</span> /dev/disk/by-id/virtio-lab-data-0</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkdir <span class="at">-p</span> /mnt/lab-data</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mount /dev/disk/by-id/virtio-lab-data-0 /mnt/lab-data</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="co"># az új ext4 gyökere root:root 0755 – a laboperator írási joga:</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> chown laboperator:laboperator /mnt/lab-data</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="fu">stat</span> <span class="at">-c</span> <span class="st">&#39;%U:%G %a&#39;</span> /mnt/lab-data     <span class="co"># várt: laboperator:laboperator 755</span></span></code></pre></div>
+<p>Az update-modell C++ programja a következő. A cél nem új C++ ismeret,
+hanem annak bemutatása, hogy a <code>write</code>, <code>fsync</code>,
+<code>rename</code>, majd a directory <code>fsync</code> milyen
+tartóssági kapcsolatban áll egymással:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// lab_fsync_rename.cpp</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;unistd.h&gt;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstring&gt;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cerrno&gt;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">char</span><span class="op">*</span> dir <span class="op">=</span> <span class="st">&quot;/mnt/lab-data&quot;</span><span class="op">;</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">char</span><span class="op">*</span> tmp <span class="op">=</span> <span class="st">&quot;/mnt/lab-data/txn.dat&quot;</span><span class="op">;</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">char</span><span class="op">*</span> committed <span class="op">=</span> <span class="st">&quot;/mnt/lab-data/txn-committed.dat&quot;</span><span class="op">;</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span>tmp<span class="op">,</span> O_WRONLY <span class="op">|</span> O_CREAT <span class="op">|</span> O_TRUNC<span class="op">,</span> <span class="bn">0600</span><span class="op">);</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span> perror<span class="op">(</span><span class="st">&quot;open tmp&quot;</span><span class="op">);</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">char</span><span class="op">*</span> payload <span class="op">=</span> <span class="st">&quot;hello-durable-42</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> len <span class="op">=</span> strlen<span class="op">(</span>payload<span class="op">);</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ssize_t</span> n <span class="op">=</span> write<span class="op">(</span>fd<span class="op">,</span> payload<span class="op">,</span> len<span class="op">);</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>n <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span> perror<span class="op">(</span><span class="st">&quot;write&quot;</span><span class="op">);</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span><span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">size_t</span><span class="op">&gt;(</span>n<span class="op">)</span> <span class="op">!=</span> len<span class="op">)</span> <span class="op">{</span>  <span class="co">// rövid írás: itt hibaként</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>        fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;short write</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>    <span class="co">// write visszatérése még nem garantálja a stable storage-ot.</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fsync<span class="op">(</span>fd<span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span> perror<span class="op">(</span><span class="st">&quot;fsync tmp&quot;</span><span class="op">);</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>close<span class="op">(</span>fd<span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span> perror<span class="op">(</span><span class="st">&quot;close tmp&quot;</span><span class="op">);</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A rename a filesystem namespace-ben atomikus, de a név tartóssága</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>    <span class="co">// csak a directory fsync után garantált.</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>rename<span class="op">(</span>tmp<span class="op">,</span> committed<span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span> perror<span class="op">(</span><span class="st">&quot;rename&quot;</span><span class="op">);</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> dfd <span class="op">=</span> open<span class="op">(</span>dir<span class="op">,</span> O_RDONLY <span class="op">|</span> O_DIRECTORY<span class="op">);</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>dfd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span> perror<span class="op">(</span><span class="st">&quot;open dir&quot;</span><span class="op">);</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fsync<span class="op">(</span>dfd<span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span> perror<span class="op">(</span><span class="st">&quot;fsync dir&quot;</span><span class="op">);</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>    close<span class="op">(</span>dfd<span class="op">);</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Fordítás és futtatás syscall trace-szel, miközben a device countert
+is figyeljük:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm-01, laboperator UID 1000</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">g++</span> <span class="at">-Wall</span> <span class="at">-Wextra</span> <span class="at">-O2</span> <span class="at">-o</span> lab_fsync_rename lab_fsync_rename.cpp</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. terminál: device counter, 1 s-os mintavétel, 10 riport</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="ex">iostat</span> <span class="at">-dx</span> /dev/vdb 1 10</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. terminál: syscall trace (a close-t nem szűrjük: a dinamikus</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="co"># betöltő close-hívásai is megjelennének)</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="ex">strace</span> <span class="at">-e</span> trace=openat,write,fsync,rename ./lab_fsync_rename</span></code></pre></div>
+<p>Várható kimenet (illusztratív, tényleges futtatás nélkül):</p>
+<pre class="text"><code>openat(..., &quot;/mnt/lab-data/txn.dat&quot;, ...) = 3
+write(3, &quot;hello-durable-42\n&quot;, 17)       = 17
+fsync(3)                                = 0
+rename(&quot;/mnt/lab-data/txn.dat&quot;, &quot;/mnt/lab-data/txn-committed.dat&quot;) = 0
+openat(..., &quot;/mnt/lab-data&quot;, ...)       = 3
+fsync(3)                                = 0</code></pre>
+<p>(A betöltő <code>openat</code> sorai a kimenet elején szintén
+látszanak.) Az ellenőrzési feltétel: a program 0-val lép ki, a
+<code>/mnt/lab-data/txn-committed.dat</code> létezik, a
+<code>strace</code> kimenetben a <code>fsync</code> hívások megjelennek,
+és az <code>iostat</code> kimenetben a <code>vdb</code> sor
+<code>w/s</code> és <code>wkB/s</code> értéke (<code>-m</code>
+kapcsolóval <code>wMB/s</code>) a futtatás alatt nullánál nagyobb. Ha a
+device counter nem mozdul, akkor a mérési pont hibás (például másik
+disk, rossz device név, vagy a virtuális disk hiba).</p>
+<p>A cache-hit/miss és direct/buffered mérési terv egy lehetséges
+parancssora <code>fio</code>-val (a laborban a tényleges verzió és a
+használt ioengine ellenőrizendő, mert az <code>fio</code> support policy
+verziófüggő). A fio alapértelmezése <code>invalidate=1</code> (minden
+job előtt eldobja a cache-t), és egy <code>randread</code> menet a
+random map miatt minden blokkot pontosan egyszer olvas; ezért a buffered
+futás <code>--invalidate=0 --loops=2</code> beállítást kap: az első
+menet tölti a cache-t, a második talál. A
+<code>--output-format=json</code> nélkül a <code>--output</code> fájl
+szöveges lenne:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm-01, laboperator UID 1000, sudo a disk hozzáféréshez</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="va">DEV</span><span class="op">=</span>/dev/disk/by-id/virtio-lab-data-0</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="co"># Buffered random read: 1. menet tölt, 2. menet cache-találat</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> fio <span class="at">--name</span><span class="op">=</span>lab-buffered-read <span class="at">--rw</span><span class="op">=</span>randread <span class="at">--bs</span><span class="op">=</span>4k <span class="at">--size</span><span class="op">=</span>256M <span class="dt">\</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--iodepth</span><span class="op">=</span>1 <span class="at">--direct</span><span class="op">=</span>0 <span class="at">--invalidate</span><span class="op">=</span>0 <span class="at">--loops</span><span class="op">=</span>2 <span class="at">--filename</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$DEV</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--output-format</span><span class="op">=</span>json <span class="at">--output</span><span class="op">=</span>lab-buffered-read.json</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Direct random read</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> fio <span class="at">--name</span><span class="op">=</span>lab-direct-read <span class="at">--rw</span><span class="op">=</span>randread <span class="at">--bs</span><span class="op">=</span>4k <span class="at">--size</span><span class="op">=</span>256M <span class="dt">\</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--iodepth</span><span class="op">=</span>1 <span class="at">--direct</span><span class="op">=</span>1 <span class="at">--filename</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$DEV</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">--output-format</span><span class="op">=</span>json <span class="at">--output</span><span class="op">=</span>lab-direct-read.json</span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="co"># a jegyzőkönyv mezői</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="ex">jq</span> <span class="st">&#39;.jobs[0].read | {iops, lat_ns_mean: .lat_ns.mean}&#39;</span> <span class="dt">\</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>  lab-buffered-read.json lab-direct-read.json</span></code></pre></div>
+<p>A mérési jegyzőkönyvben külön oszlopban szerepel a
+<code>jobs[0].read.iops</code>, a <code>jobs[0].read.lat_ns.mean</code>
+és a <code>syscall</code> trace-ből nyert belépés/visszatérés idő. A
+várt eredmény: buffered módban a második menetben a page cache talál (az
+<code>iostat</code> <code>r/s</code> közel 0), a direct módban minden
+kérés lemezre megy; ezért a direct latency jellemzően nagyobb, de a
+pontos érték a virtuális disk típusától függ, így a laborban jelölt mért
+eredményt kell rögzíteni.</p>
+<p>A latency görbét a laborban az <code>fio</code> latency
+percentiliseiből vagy saját mérésből számítjuk. Az alábbi ábra egy
+hipotetikus, számított vonaldiagramot mutat a queue depth függvényében,
+4 KiB random write, direct, aszinkron (<code>io_uring</code>) esetben
+egy telítődő eszközön, ahol a latency = alapkésleltetés + sorolási
+overhead. (Szinkron ioengine-nél és buffered írásnál nincs érdemi queue
+depth.) Az értékek nem valós mérésből származnak, csak a mérési terv
+értelmezését segítik.</p>
+<figure>
+<img src="assets/d050-plot-1.png"
+alt="Illusztratív, számított latency queue depth függvényében - Hipotetikus modell: latency = 0.8 + 0.15qd + 0.005qd^2 ms; 4 KiB random write, direct, io_uring, telítődő virtuális SSD-szerű labdisk; nem mért eredmény." />
+<figcaption aria-hidden="true">Illusztratív, számított latency queue
+depth függvényében - Hipotetikus modell: latency = 0.8 + 0.15<em>qd +
+0.005</em>qd^2 ms; 4 KiB random write, direct, io_uring, telítődő
+virtuális SSD-szerű labdisk; nem mért eredmény.</figcaption>
+</figure>
+<p>Numerikus táblázat a fenti görbéhez:</p>
+<table>
+<thead>
+<tr>
+<th>Queue depth</th>
+<th>Számított latency [ms]</th>
+<th>Megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>0,96</td>
+<td>alapterhelés</td>
+</tr>
+<tr>
+<td>2</td>
+<td>1,12</td>
+<td>enyhe sorolás</td>
+</tr>
+<tr>
+<td>4</td>
+<td>1,48</td>
+<td>egyre nagyobb várakozás</td>
+</tr>
+<tr>
+<td>8</td>
+<td>2,32</td>
+<td>meredekebb emelkedés</td>
+</tr>
+<tr>
+<td>16</td>
+<td>4,48</td>
+<td>hipotetikus telítődési pont</td>
+</tr>
+</tbody>
+</table>
+<p>A virtuális disk és a fizikai persistence különbségét a laborban
+explicit módon dokumentáljuk. A VM-ből kiadott <code>fsync</code> a
+<code>virtio-blk</code> cache flush kérést jelenti. Ez a hypervisorban a
+backing file <code>fsync</code>-jéhez vezethet, de a VM-ből nézve a
+visszatérési kód csak azt jelzi, hogy a kérés eljutott a virtuális
+eszközig. Hogy a hypervisor valóban stable storage-ra írt-e, csak a host
+oldali méréssel vagy a hypervisor vendor dokumentációjával igazolható.
+Ezért a laborban a mérési jegyzőkönyvben külön sorban rögzítjük:
+„virtuális disk persistence: assumed based on virtio-blk flush, host
+side not verified”. Ez a korlát nem hiba, hanem a mérési határ pontos
+jelölése.</p>
+<h3 data-number="10.5.4" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">10.5.4</span> Tipikus hibák és
+ellenpróbák</h3>
+<p><strong>1. hiba:</strong> A <code>write</code> syscall visszatérése
+után a device counter nulla, ezért a writes „nem megy lemezre”.<br />
+<strong>Tünet:</strong> <code>strace</code> mutat <code>write</code>
+hívást, de <code>iostat</code> <code>/dev/vdb</code> sor nem
+növekszik.<br />
+<strong>Hipotézis:</strong> buffered write esetén a page cache
+késlelteti a tényleges lemezírást.<br />
+<strong>Adatgyűjtés:</strong> fusson <code>sync</code> vagy
+<code>fsync</code> a fájlra, ezután nézzük a device countert.<br />
+<strong>Egy változtatás:</strong> adjunk <code>fsync</code> hívást a
+programba, vagy futtassuk <code>sync</code> parancsot.<br />
+<strong>Verification:</strong> a device counter növekszik, a
+<code>fsync</code> megtörténte után. Ha nem, más device-ot nézünk, vagy
+a IO scheduler merge-elte a kéréseket.</p>
+<p><strong>2. hiba:</strong> „A fájl ott van a rename után, tehát kész a
+tartós commit.”<br />
+<strong>Tünet:</strong> a <code>rename</code> syscall sikeres, de a
+tesztrendszer power loss után a fájl üres vagy hiányzik.<br />
+<strong>Hipotézis:</strong> a rename csak a VFS namespace-ben történt
+meg, a directory entry nem volt fsyncelve.<br />
+<strong>Adatgyűjtés:</strong> <code>strace</code> kimenetben a
+<code>rename</code> után nincs <code>fsync</code> a directory file
+descriptoron.<br />
+<strong>Egy változtatás:</strong> a C++ program nyissa meg a directoryt
+és hívjon <code>fsync</code>-et a <code>rename</code> után.<br />
+<strong>Verification:</strong> a <code>strace</code> mutatja a directory
+<code>fsync</code>-et, és a dokumentált crash-recovery teszt (valós
+power loss nélkül, a háttérben
+<code>sync; echo 1 &gt; /proc/sys/vm/drop_caches</code> nem elegendő)
+legalább a fájl tartalmának és a név bejegyzésnek az együttes jelenlétét
+ellenőrzi.</p>
+<p><strong>3. hiba:</strong> A laborban a direct I/O mérés sokkal
+lassabb, ezért a lemez gyenge.<br />
+<strong>Tünet:</strong> direct read latency nagy, de a
+<code>iostat</code> util alacsony.<br />
+<strong>Hipotézis:</strong> a virtuális disk backing file a host oldalon
+erősen fragmentált, vagy a <code>virtio-blk</code> queue depth túl
+alacsony.<br />
+<strong>Adatgyűjtés:</strong> nézzük meg a <code>fio</code>
+<code>lat_ns</code> percentilis görbéjét, a host oldali
+<code>iostat</code>-ot (ha elérhető), és a lab storage pool
+jellemzőit.<br />
+<strong>Egy változtatás:</strong> a QD = 1-es mérés mellé futtassuk
+aszinkron motorral és nagyobb queue depth-szel is:
+<code>--ioengine=io_uring --direct=1 --iodepth=8</code> (vagy
+<code>libaio</code>). Szinkron motornál (alapértelmezés:
+<code>psync</code>) az <code>--iodepth</code> 1 fölé emelése
+hatástalan.<br />
+<strong>Verification:</strong> az IOPS-t és a latencyt együtt
+értékeljük. Ha az IOPS közel QD-arányosan nő, miközben a latency alig
+változik, a device párhuzamossága kihasználatlan volt. Ha az IOPS nem
+nő, de a latency a QD-vel arányosan nő (Little:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>W</mi><mo>=</mo><mi>L</mi><mi>/</mi><mi>λ</mi></mrow><annotation encoding="application/x-tex">W = L/\lambda</annotation></semantics></math>),
+az eszköz vagy a backing storage telített.</p>
+<h3 data-number="10.5.5" id="feladatok"><span
+class="header-section-number">10.5.5</span> Feladatok</h3>
+<h4 data-number="10.5.5.1"
+id="magyarázó-feladat-rétegtérkép-és-megfigyelési-pontok"><span
+class="header-section-number">10.5.5.1</span> 1. Magyarázó feladat:
+rétegtérkép és megfigyelési pontok</h4>
+<p>Készítsen Markdown-táblázatot az alkalmazás
+<code>write</code>/<code>fsync</code>/<code>rename</code> útjáról a
+VM-ben látható blokkeszközig. A táblázatban minden réteghez adja meg,
+hogy milyen megfigyelési eszközzel (pl. <code>strace</code>,
+<code>/sys/block/vdb/stat</code>, <code>iostat</code>) mit lehet mérni,
+és mi az a hiba, amit ott nem lehet észrevenni. A végén foglalja össze,
+miért nem elegendő csak a <code>strace</code> kimenet egy tartóssági
+hiba diagnózisához.</p>
+<h4 data-number="10.5.5.2"
+id="adminisztrációskonfigurációs-feladat-buffered-versus-direct-mérés"><span
+class="header-section-number">10.5.5.2</span> 2.
+Adminisztrációs/konfigurációs feladat: buffered versus direct mérés</h4>
+<p>A <code>lab-vm-01</code> gépen a rendelkezésre álló
+<code>LAB-DISK-0</code> lemezen végezzen el két mérést
+<code>fio</code>-val: 4 KiB random read sorozat 256 MiB terjedelemben,
+egyszer <code>--direct=0</code> (buffered), egyszer
+<code>--direct=1</code> (direct) beállítással. Mindkét futásról
+készítsen <code>iostat -dx 1</code> rögzítést. A mérési jegyzőkönyvben
+tüntesse fel a várt cache-hit/miss viselkedést, a mért IOPS és latency
+értékeket, valamint a device counter változását. Postcondition: a két
+<code>fio</code> kimenet és a két <code>iostat</code> log létezik, és a
+jegyzőkönyvben a várt/eltérés oszlop ki van töltve.</p>
+<h4 data-number="10.5.5.3"
+id="diagnosztikaifailurerecovery-feladat-magas-fsync-latency-alacsony-device-util"><span
+class="header-section-number">10.5.5.3</span> 3.
+Diagnosztikai/failure/recovery feladat: magas fsync latency, alacsony
+device util</h4>
+<p>Adott a következő jelenség: a C++ update program <code>fsync</code>
+hívása átlagosan 120 ms-ig tart, de az <code>iostat</code> alatt a
+device util alig 5%. Fogalmazzon meg legalább két hipotézist, válasszon
+ki egyet, és hajtson végre egyetlen változtatást a méréssel kapcsolatban
+(például <code>O_DIRECT</code> fájl megnyitása, queue depth növelése,
+vagy a backing file host oldali ellenőrzése, ha elérhető). Ezután hajtsa
+végre a labdiszk reset/restore műveletet: célellenőrzés,
+<code>umount</code>, a fájlrendszer-aláírás törlése és az első 100 MiB
+nullázása <code>dd</code>-vel, újraformázás <code>mkfs.ext4</code>, majd
+remount. Ellenőrizze, hogy a korábbi tesztfájlok nem léteznek.
+Postcondition: a labdiszk üres és újraformázott, a tesztfájlok
+hiányoznak, a hipotézis tesztelve és a jegyzőkönyvben rögzítve.</p>
+<h3 data-number="10.5.6" id="megoldások"><span
+class="header-section-number">10.5.6</span> Megoldások</h3>
+<h4 data-number="10.5.6.1" id="megoldás"><span
+class="header-section-number">10.5.6.1</span> 1. Megoldás</h4>
+<p>A táblázat minimálisan a következő sorokat tartalmazza:</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Réteg</th>
+<th>Megfigyelési pont</th>
+<th>Mit mutat?</th>
+<th>Mi nem látható?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Syscall / VFS</td>
+<td><code>strace -T -e trace=write,fsync,rename</code></td>
+<td>hívás, visszatérési idő, return code</td>
+<td>page cache state, device queue</td>
+</tr>
+<tr>
+<td>Page cache / writeback</td>
+<td><code>/proc/meminfo</code>, <code>free</code>,
+<code>vm.dirty_*</code></td>
+<td>dirty oldalak mennyisége</td>
+<td>a writeback tényleges lemezig jutása</td>
+</tr>
+<tr>
+<td>Block layer / device</td>
+<td><code>/sys/block/vdb/stat</code>,
+<code>iostat -dx /dev/vdb 1</code></td>
+<td>aktivitás, queue, latency az eszköz szintjén</td>
+<td>a userbeli fájl és fájlrendszer logikai állapota</td>
+</tr>
+<tr>
+<td>Virtuális disk</td>
+<td>hypervisor oldali <code>ftrace</code> vagy host <code>iostat</code>
+(ha hozzáférhető)</td>
+<td>backing file aktivitás</td>
+<td>a VM-ből nézve a flush tényleges fizikai tartóssága</td>
+</tr>
+</tbody>
+</table>
+<p>A <code>strace</code> nem elég, mert a page cache találat, a
+writeback flush és a device szintű queue nem látszik benne; a lassú
+<code>fsync</code> oka lehet a writeback, a device driver vagy a
+hypervisor flush.</p>
+<h4 data-number="10.5.6.2" id="megoldás-1"><span
+class="header-section-number">10.5.6.2</span> 2. Megoldás</h4>
+<p>A mérési parancsok:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm-01, laboperator UID 1000, sudo</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="va">DEV</span><span class="op">=</span>/dev/disk/by-id/virtio-lab-data-0</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="ex">iostat</span> <span class="at">-dx</span> /dev/vdb 1 <span class="op">&gt;</span> lab-iostat-buffered.log <span class="kw">&amp;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="va">ios</span><span class="op">=</span><span class="va">$!</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> fio <span class="at">--name</span><span class="op">=</span>buffered-read <span class="at">--rw</span><span class="op">=</span>randread <span class="at">--bs</span><span class="op">=</span>4k <span class="at">--size</span><span class="op">=</span>256M <span class="dt">\</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--iodepth</span><span class="op">=</span>1 <span class="at">--direct</span><span class="op">=</span>0 <span class="at">--invalidate</span><span class="op">=</span>0 <span class="at">--loops</span><span class="op">=</span>2 <span class="at">--filename</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$DEV</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--output-format</span><span class="op">=</span>json <span class="at">--output</span><span class="op">=</span>lab-buffered-read.json</span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="bu">kill</span> <span class="st">&quot;</span><span class="va">$ios</span><span class="st">&quot;</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="ex">iostat</span> <span class="at">-dx</span> /dev/vdb 1 <span class="op">&gt;</span> lab-iostat-direct.log <span class="kw">&amp;</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="va">ios</span><span class="op">=</span><span class="va">$!</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> fio <span class="at">--name</span><span class="op">=</span>direct-read <span class="at">--rw</span><span class="op">=</span>randread <span class="at">--bs</span><span class="op">=</span>4k <span class="at">--size</span><span class="op">=</span>256M <span class="dt">\</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>  <span class="at">--iodepth</span><span class="op">=</span>1 <span class="at">--direct</span><span class="op">=</span>1 <span class="at">--filename</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$DEV</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>  <span class="at">--output-format</span><span class="op">=</span>json <span class="at">--output</span><span class="op">=</span>lab-direct-read.json</span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a><span class="bu">kill</span> <span class="st">&quot;</span><span class="va">$ios</span><span class="st">&quot;</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> <span class="at">-c</span> <span class="st">&quot;import json; json.load(open(&#39;lab-buffered-read.json&#39;))&quot;</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a><span class="ex">jq</span> <span class="st">&#39;.jobs[0].read | {iops, lat_ns_mean: .lat_ns.mean}&#39;</span> lab-<span class="pp">*</span>-read.json</span></code></pre></div>
+<p>Indoklás: a <code>--direct=0 --invalidate=0 --loops=2</code> esetben
+az első menet tölti a page cache-t, a második menetet a cache szolgálja
+ki (alapértelmezett <code>invalidate=1</code> mellett minden job hideg
+cache-sel indulna, és egy <code>randread</code> menet minden blokkot
+csak egyszer olvas), ezért az IOPS magas és a latency alacsony lehet, a
+device counter alig változik. A <code>--direct=1</code> esetben minden
+olvasás a blokkeszközig megy, ezért a device counter növekszik, és a
+latency a device valódi tulajdonságait tükrözi. A mérési jegyzőkönyv
+postconditionje: a JSON outputok megtalálhatók a munkakönyvtárban, az
+<code>iostat</code> logok külön fájlban, és a várt/eltérés táblázat
+kitöltve.</p>
+<h4 data-number="10.5.6.3" id="megoldás-2"><span
+class="header-section-number">10.5.6.3</span> 3. Megoldás</h4>
+<p>A magas <code>fsync</code> latency és alacsony device util egyik
+hipotézise: a virtuális disk backing file flush a host oldalon lassú, de
+a host device util nincs a VM <code>iostat</code>-jában mérve. Másik
+hipotézis: a C++ program <code>fsync</code>-je előtt a dirty page cache
+nagy, és a tényleges flush a host felé több tíz ms-t vesz igénybe, de a
+VM device util mérés korlátozott. Egyetlen változtatás: egy
+összehasonlító <code>fio --direct=1 --fsync=1</code> írási futás
+ugyanazon a lemezen; ha a direct írás + fsync lényegesen gyorsabb, akkor
+a buffered writeback path a gyanús, ha ugyanolyan lassú, a flush útja
+(virtio-blk, hypervisor) a szűk keresztmetszet. A reset/restore
+parancsok – a destruktív lépés előtt célellenőrzéssel:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-vm-01, laboperator UID 1000, sudo; DESTRUKTÍV, csak a LAB-DISK-0-n</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="va">DEV</span><span class="op">=</span>/dev/disk/by-id/virtio-lab-data-0</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="fu">readlink</span> <span class="at">-f</span> <span class="st">&quot;</span><span class="va">$DEV</span><span class="st">&quot;</span>                 <span class="co"># várt: /dev/vdb</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="ex">lsblk</span> <span class="at">-no</span> NAME,SERIAL,MOUNTPOINTS /dev/vdb</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> umount /mnt/lab-data</span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="ex">findmnt</span> /mnt/lab-data <span class="kw">||</span> <span class="bu">echo</span> <span class="st">&quot;nincs mountolva&quot;</span>   <span class="co"># várt: nincs mountolva</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> wipefs <span class="at">-a</span> <span class="st">&quot;</span><span class="va">$DEV</span><span class="st">&quot;</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> dd if=/dev/zero of=<span class="st">&quot;</span><span class="va">$DEV</span><span class="st">&quot;</span> bs=1M count=100 oflag=direct</span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkfs.ext4 <span class="at">-F</span> <span class="st">&quot;</span><span class="va">$DEV</span><span class="st">&quot;</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mount <span class="st">&quot;</span><span class="va">$DEV</span><span class="st">&quot;</span> /mnt/lab-data</span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> chown laboperator:laboperator /mnt/lab-data</span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="bu">test</span> ! <span class="at">-e</span> /mnt/lab-data/txn-committed.dat <span class="kw">&amp;&amp;</span> <span class="bu">echo</span> <span class="st">&quot;data cleared&quot;</span></span></code></pre></div>
+<p>A törlés terjedelme a fájlrendszer-aláírás és az első 100 MiB; ha a
+teljes lemez törlése a cél, a <code>dd</code> <code>count</code> nélkül
+(<code>status=progress</code>) vagy <code>sudo blkdiscard "$DEV"</code>
+használható, a lemez méretével arányos idővel. Postcondition: a labdiszk
+újraformázott, a mount sikeres, a gyökér a <code>laboperator</code>
+tulajdona, a korábbi update fájl nem létezik, és a jegyzőkönyvben a
+hipotézis tesztjének eredménye szerepel.</p>
+<h3 data-number="10.5.7" id="rövid-összefoglaló"><span
+class="header-section-number">10.5.7</span> Rövid összefoglaló</h3>
+<p>A tartóssági és I/O rétegdiagnosztikai labor egy disposable virtuális
+lemezen tanítja meg a rétegenkénti szűkítést. A syscall trace és a
+device counter összevetése elválasztja a page cache hatást a tényleges
+blokkeszköz aktivitástól. A buffered és direct mérési terv
+cache-hit/miss bizonyítékot ad. A kis C++
+<code>fsync</code>/<code>rename</code> példa rámutat, hogy a
+<code>write</code> visszatérése nem tartóssági garancia, és a
+<code>rename</code> utáni directory <code>fsync</code> is szükséges a
+crash-recovery előfeltételhez. A virtuális disk flush a hypervisor
+backing storage-ig vezet; a VM-ből nézve a fizikai tartósság csak
+korlátozottan igazolható. A reset/restore és adatellenőrzés biztosítja,
+hogy a labdiszk a kísérlet után tiszta állapotba kerül.</p>
+<p>Továbbhasznált definíciók:</p>
+<ul>
+<li><strong>Rétegdiagnosztikai labor</strong>: izolált kísérletsorozat,
+amelyben a syscall, page cache, block layer és device aktivitás külön
+mérhető, és a mérési határok explicit módon jelöltek.</li>
+<li><strong>Tartóssági szerződés</strong>: a <code>fsync</code> a
+fájladatot, a directory <code>fsync</code> a rename utáni névbejegyzést
+küldi a stable storage felé; ezek nélkül a crash utáni állapot nem
+garantált.</li>
+<li><strong>Virtuális disk flush</strong>: a VM-ből kiadott cache flush
+kérés, amely a <code>virtio-blk</code> rétegen keresztül a hypervisor
+backing file-ig terjed; a tényleges fizikai tartósság a host storage
+rétegtől függ.</li>
+</ul>
+<h3 data-number="10.5.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">10.5.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>Forráskiindulópontok ebben a kérésben nem ellenőrzött bizonyítékok,
+csak további olvasási irányok:</p>
+<ul>
+<li><a href="https://docs.kernel.org/">Kernel dokumentáció</a></li>
+<li><a href="https://man7.org/linux/man-pages/">Linux man-pages</a></li>
+<li><a href="https://nvmexpress.org/specifications/">NVMe
+specifications</a></li>
+</ul>
+<p>Állításonkénti forrásindex (viszonyítási pont: Ubuntu Server 24.04
+LTS, 6.8-as GA kernel, a 24.04 fio-, sysstat- és
+util-linux-csomagja):</p>
+<ul>
+<li>fio paraméterek (<code>invalidate</code>, <code>loops</code>,
+<code>iodepth</code> és szinkron motorok, <code>ioengine</code>,
+<code>output-format</code>):
+https://fio.readthedocs.io/en/latest/fio_doc.html.</li>
+<li><code>iostat -dx</code> oszlopai:
+https://man7.org/linux/man-pages/man1/iostat.1.html;
+<code>/sys/block/&lt;dev&gt;/stat</code>:
+https://docs.kernel.org/block/stat.html.</li>
+<li><code>fsync(2)</code>, <code>rename(2)</code>:
+https://man7.org/linux/man-pages/man2/fsync.2.html,
+https://man7.org/linux/man-pages/man2/rename.2.html.</li>
+<li><code>wipefs(8)</code>, <code>blkdiscard(8)</code>:
+https://man7.org/linux/man-pages/man8/wipefs.8.html,
+https://man7.org/linux/man-pages/man8/blkdiscard.8.html.</li>
+<li>Flush/FUA a blokkrétegben:
+https://docs.kernel.org/block/writeback_cache_control.html.</li>
+</ul>
+<p>A példák laborban ellenőrizendők; dátumozott futtatási napló
+(verziók, strace/iostat/fio JSON kimenet, sikeres és hibás ág) még nem
+készült.</p>
+<p>Ellenőrzési hiányok: a laborban bemutatott latency értékek és chart
+adatok hipotetikusak, nem valós mérésből származnak. A tényleges
+<code>fio</code>, <code>strace</code>, <code>iostat</code> kimenetek a
+labhoston futtatandók; az aktuális kernel, <code>virtio-blk</code> és
+hypervisor viselkedés support matrixa ellenőrizendő. A <code>fio</code>
+pontos verziója és a használt <code>ioengine</code> capability a labor
+kezdetén rögzítendő. A virtuális disk host-oldali fsync garantálása a
+hypervisor specifikációjából ellenőrizendő, ebben az alfejezetben nem
+igazolt.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d049.html">← 10.4 IOPS, queue és Linux I/O statisztikák</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d051.html">11.1 Path, inode, link és filesystem namespace →</a></div>
+</nav>
+</body>
+</html>

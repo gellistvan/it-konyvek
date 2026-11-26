@@ -1,0 +1,952 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>50.5 Full-stack telemetria és alert labor – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch50">50 Metrics, logs, traces és observability platform</a></p>
+<div class="links"><a class="prev" rel="prev" href="d249.html">← 50.4 OpenTelemetry, distributed trace és C++ instrumentation</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d251.html">51.1 SLI/SLO/SLA és felhasználói szolgáltatásminőség →</a></div>
+</nav>
+<h2 data-number="50.5" id="d250"><span
+class="header-section-number">50.5</span> Full-stack telemetria és alert
+labor</h2>
+<p>A full-stack telemetria labor célja, hogy ugyanazt a hibát ne csak
+egy nézetben lássuk. A metrika, log és trace eltérő felbontású
+bizonyítékot ad: a metrika aggregált statisztika, a log eseményszintű
+napló, a trace pedig parent-child ok-okozati lánc. Egy p99-es
+latency-növekedéshez például a metrika megmondja, hogy a
+<code>/api/query</code> lassult, a log megmutatja, hogy sok request
+<code>DB_TIMEOUT</code> hibával zárult, a trace pedig megmutatja, hogy a
+lassúság a <code>auth_token</code> feloldásból vagy a database
+response-ból ered. Ebben a laborban egy izolált
+Prometheus/Loki/Tempo/Grafana stacket és egy C++ labszolgáltatást
+építünk, hibát generálunk, három nézetben vizsgáljuk, és olyan riasztást
+adunk ki, amelyhez runbook tartozik.</p>
+<h3 data-number="50.5.1" id="definíció-és-scope"><span
+class="header-section-number">50.5.1</span> Definíció és scope</h3>
+<p><strong>Full-stack telemetria</strong> alatt itt azt értjük, hogy a
+rendszer minden rétegéből gyűjtünk jelet: a Linux hosztból <em>node
+exporterrel</em>, az alkalmazásból <em>Prometheus metric
+endpointtal</em> és <em>OpenTelemetry (OTel) tracer/log
+bridge-dzsel</em>, valamint a hálózati útból a normál request logokkal.
+A jelek a <em>collector/backend</em> rétegbe kerülnek, ahol
+erőforráskorlátot és retention policy-t kapnak.</p>
+<p>A labban három adatosztályt különböztetünk meg:</p>
+<ol type="1">
+<li><strong>Metric</strong>: numerikus idősor, például
+<code>lab_order_http_requests_total</code> vagy
+<code>lab_order_http_request_duration_seconds_bucket</code>.
+Aggregálásra, alertingra és dashboard trendre jó, de egyedi request nem
+azonosítható belőle.</li>
+<li><strong>Log</strong>: strukturált esemény, például
+<code>request_start</code> vagy <code>db_timeout</code>; a
+<code>request_id</code> és a <code>trace_id</code> a JSON-sor mezője
+(Lokiban szükség esetén structured metadata), nem stream-label (lásd <a
+href="d248.html">Központi logplatform és adatpipeline</a>). Labelben
+csak alacsony kardinalitású dimenziók vannak (<code>job</code>,
+<code>namespace</code>, <code>host</code>); a nagy kardinalitású mezőkre
+lekérdezéskor <code>| json | request_id="…"</code> szűréssel
+keresünk.</li>
+<li><strong>Trace</strong>: span-fa. A root span a bejövő request, a
+gyermek spanek a külső hívások. A <code>trace_id</code> az egész
+requestet, a <code>span_id</code> az egy lépést, a
+<code>parent_span_id</code> a hívási relációt jelöli.</li>
+</ol>
+<p>Az <strong>alert pipeline</strong> az a lánc, amely a
+Prometheus-riasztást Alertmanagernek küldi, ahol a <em>route, group_by,
+silence</em> dönt arról, hány értesítés megy ki, és milyen
+retry/intervallum mellett. Az alerthez mindig kapcsolunk egy
+<code>runbook_url</code> annotációt, mert a riasztás nem a megoldás,
+hanem az üzemeltetési szerződés kezdőpontja.</p>
+<h3 data-number="50.5.2"
+id="exporter-collector-és-backend-resource-config"><span
+class="header-section-number">50.5.2</span> Exporter, collector és
+backend resource config</h3>
+<p>A labor topológia két izolált labVM-et használ:</p>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr>
+<th>Host</th>
+<th>Komponens</th>
+<th>Port</th>
+<th>Owner/UID</th>
+<th>Feladat</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>lab-app-01</code></td>
+<td><code>node_exporter</code></td>
+<td>9100</td>
+<td><code>root</code>/systemd</td>
+<td>Linux CPU/memória/disk/fd metrika</td>
+</tr>
+<tr>
+<td><code>lab-app-01</code></td>
+<td><code>lab-order-svc</code></td>
+<td>8080, 9102</td>
+<td><code>lab-app-uid</code></td>
+<td>C++ szolgáltatás, <code>/metrics</code>, OTLP exporter</td>
+</tr>
+<tr>
+<td><code>lab-mon-01</code></td>
+<td><code>otel-collector</code></td>
+<td>4317/4318</td>
+<td><code>otel-uid</code></td>
+<td>Metric push/log/trace fogadás, batching</td>
+</tr>
+<tr>
+<td><code>lab-mon-01</code></td>
+<td><code>prometheus</code></td>
+<td>9090</td>
+<td><code>prometheus-uid</code></td>
+<td>Tsdb, rule evaluation, alerting</td>
+</tr>
+<tr>
+<td><code>lab-mon-01</code></td>
+<td><code>loki</code></td>
+<td>3100</td>
+<td><code>loki-uid</code></td>
+<td>Logbackend</td>
+</tr>
+<tr>
+<td><code>lab-mon-01</code></td>
+<td><code>tempo</code></td>
+<td>3200</td>
+<td><code>tempo-uid</code></td>
+<td>Tracebackend</td>
+</tr>
+<tr>
+<td><code>lab-mon-01</code></td>
+<td><code>grafana</code></td>
+<td>3000</td>
+<td><code>grafana-uid</code></td>
+<td>Dashboard, query, access</td>
+</tr>
+<tr>
+<td><code>lab-mon-01</code></td>
+<td><code>alertmanager</code></td>
+<td>9093</td>
+<td><code>alertmanager-uid</code></td>
+<td>Routing, grouping, silence</td>
+</tr>
+</tbody>
+</table>
+<figure id="fig-d250-telemetria-topologia">
+<div class="fig-interactive"><iframe src="figures/html/d250-telemetria-topologia.html" title="A lab-app-01 gépen a node_exporter a 9100-as, a lab-order-svc a 8080-as és 9102-es porton fut; a lab-mon-01 Prometheusa (9090) 10 másodpercenként scrape-el, a szolgáltatás OTLP-n a collectorba (4317/4318) küld, amely a lokiba (3100) és a tempóba (3200) exportál; a Grafana (3000) lekérdez; a Prometheus riasztásait az Alertmanager (9093) severity szerint a lab-page vagy a lab-default webhookra irányítja." loading="lazy" style="width:100%;border:0;height:600px"></iframe><noscript><img src="figures/img/d250-telemetria-topologia.png" style="width:95.0%"
+alt="A lab-app-01 gépen a node_exporter a 9100-as, a lab-order-svc a 8080-as és 9102-es porton fut; a lab-mon-01 Prometheusa (9090) 10 másodpercenként scrape-el, a szolgáltatás OTLP-n a collectorba (4317/4318) küld, amely a lokiba (3100) és a tempóba (3200) exportál; a Grafana (3000) lekérdez; a Prometheus riasztásait az Alertmanager (9093) severity szerint a lab-page vagy a lab-default webhookra irányítja." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d250-telemetria-topologia.png" style="width:95.0%"
+alt="A lab-app-01 gépen a node_exporter a 9100-as, a lab-order-svc a 8080-as és 9102-es porton fut; a lab-mon-01 Prometheusa (9090) 10 másodpercenként scrape-el, a szolgáltatás OTLP-n a collectorba (4317/4318) küld, amely a lokiba (3100) és a tempóba (3200) exportál; a Grafana (3000) lekérdez; a Prometheus riasztásait az Alertmanager (9093) severity szerint a lab-page vagy a lab-default webhookra irányítja." /></details></div>
+<figcaption>Full-stack telemetria labor: jelutak (scrape, OTLP push,
+log/trace export) és riasztási lánc (Prometheus → Alertmanager →
+receiver → runbook)</figcaption>
+</figure>
+<p>A <code>lab-mon-01</code> hoston a stack konténerben fut, a névadó
+Compose project <code>lab-telemetry</code>. A Prometheus erőforrása és
+retention policy-je:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">services</span><span class="kw">:</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">prometheus</span><span class="kw">:</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co">    # LAB_PINNED_VERSION helyére a labban rögzített, konkrét tag kerül</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">image</span><span class="kw">:</span><span class="at"> prom/prometheus:LAB_PINNED_VERSION</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">cpus</span><span class="kw">:</span><span class="at"> </span><span class="st">&#39;2.0&#39;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">mem_limit</span><span class="kw">:</span><span class="at"> 2g</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">command</span><span class="kw">:</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> --config.file=/etc/prometheus/prometheus.yml</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> --storage.tsdb.retention.time=7d</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> --storage.tsdb.retention.size=10GB</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> --query.max-concurrency=20</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">ports</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;9090:9090&quot;</span><span class="kw">]</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">volumes</span><span class="kw">:</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> lab-prometheus-data:/prometheus</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="co">      # a config/rules/ alatt van a lab-service.rules.yml</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> ./config/rules:/etc/prometheus/rules:ro</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="fu">volumes</span><span class="kw">:</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">lab-prometheus-data</span><span class="kw">:</span><span class="at"> </span><span class="kw">{}</span></span></code></pre></div>
+<p>Ez a <code>compose.yaml</code> csak a Prometheus szolgáltatás
+részlete, nem önállóan futtatható stack. A teljes
+<code>lab-telemetry</code> projektben ugyanígy szerepel az
+<code>alertmanager</code> (erre hivatkozik a scrape config
+<code>alertmanager:9093</code> célja), az <code>otel-collector</code>, a
+<code>loki</code>, a <code>tempo</code> és a <code>grafana</code>
+szolgáltatás, mindegyik konkrét, pinelt image-taggel és saját named
+volume-mal; a <code>LAB_PINNED_VERSION</code> helykitöltő, így ebben a
+formában nem pullolható. Smoke teszt a teljes stackre:
+<code>docker compose config</code>, majd <code>up -d</code> után a
+<code>/-/ready</code> (Prometheus), <code>/-/healthy</code>
+(Alertmanager), <code>:3100/ready</code> (Loki),
+<code>:3200/ready</code> (Tempo) és <code>:3000/api/health</code>
+(Grafana) végpont, végül egy telemetria-körút (metrika, log és trace a
+Grafanában). A verziózárolt, tesztelt csomag a könyv
+laborrepositoryjának része; ennek hiánya ellenőrzési hiány (lásd a
+források blokkot).</p>
+<p>A <code>node_exporter</code> a <code>lab-app-01</code>-on systemd
+unitban fut, és csak a localhost/rfc5737 dokumentációs labcímről
+scrape-elhető; a valódi labban ez a kijelölt labháló IP-je. A Prometheus
+scrape config:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">global</span><span class="kw">:</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">scrape_interval</span><span class="kw">:</span><span class="at"> 10s</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">evaluation_interval</span><span class="kw">:</span><span class="at"> 30s</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="fu">alerting</span><span class="kw">:</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">alertmanagers</span><span class="kw">:</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">static_configs</span><span class="kw">:</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="fu">targets</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&#39;alertmanager:9093&#39;</span><span class="kw">]</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="fu">rule_files</span><span class="kw">:</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> /etc/prometheus/rules/lab-service.rules.yml</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="fu">scrape_configs</span><span class="kw">:</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">job_name</span><span class="kw">:</span><span class="at"> lab-order-svc</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">scrape_interval</span><span class="kw">:</span><span class="at"> 10s</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">metrics_path</span><span class="kw">:</span><span class="at"> /metrics</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">static_configs</span><span class="kw">:</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">targets</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&#39;192.0.2.10:9102&#39;</span><span class="kw">]</span><span class="co">  # RFC5737 példa; labban lab-app-01 IP</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">lab</span><span class="kw">:</span><span class="at"> d250</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-order</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">job_name</span><span class="kw">:</span><span class="at"> node</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">static_configs</span><span class="kw">:</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">targets</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&#39;192.0.2.10:9100&#39;</span><span class="kw">]</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">lab</span><span class="kw">:</span><span class="at"> d250</span></span></code></pre></div>
+<p>Az OpenTelemetry Collector memory limiterrel és batch processzorral
+védi a backendeket:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">receivers</span><span class="kw">:</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">otlp</span><span class="kw">:</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">protocols</span><span class="kw">:</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">http</span><span class="kw">:</span><span class="at"> </span><span class="kw">{}</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">grpc</span><span class="kw">:</span><span class="at"> </span><span class="kw">{}</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="fu">processors</span><span class="kw">:</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">memory_limiter</span><span class="kw">:</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">check_interval</span><span class="kw">:</span><span class="at"> 1s</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">limit_mib</span><span class="kw">:</span><span class="at"> </span><span class="dv">512</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">batch</span><span class="kw">:</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">timeout</span><span class="kw">:</span><span class="at"> 5s</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">send_batch_size</span><span class="kw">:</span><span class="at"> </span><span class="dv">1024</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="fu">exporters</span><span class="kw">:</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">otlphttp/loki</span><span class="kw">:</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">endpoint</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;http://loki:3100/otlp&quot;</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">otlp</span><span class="kw">:</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">endpoint</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;tempo:4317&quot;</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">tls</span><span class="kw">:</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">insecure</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a><span class="fu">service</span><span class="kw">:</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">pipelines</span><span class="kw">:</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">logs</span><span class="kw">:</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">receivers</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="at">otlp</span><span class="kw">]</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">processors</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="at">memory_limiter</span><span class="kw">,</span><span class="at"> batch</span><span class="kw">]</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">exporters</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="at">otlphttp/loki</span><span class="kw">]</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">traces</span><span class="kw">:</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">receivers</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="at">otlp</span><span class="kw">]</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">processors</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="at">memory_limiter</span><span class="kw">,</span><span class="at"> batch</span><span class="kw">]</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">exporters</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="at">otlp</span><span class="kw">]</span></span></code></pre></div>
+<p>A fenti OTel Collector config a komponensmodell szempontjából mutatja
+a lényeget. A logokat OTLP-n küldjük a Lokiba: a Collector-contrib
+korábbi <code>loki</code> exportere elavult, újabb kiadásokból
+eltávolították, a Loki 3.x viszont natívan fogad OTLP-t a
+<code>/otlp</code> végponton. A pontos componentverziók és a
+pipeline-névvaliditás a pinelt Collector- és Loki-verzióval a lab
+buildjén ellenőrizendő.</p>
+<p>A C++ szolgáltatásban a metric és trace azonos requestcontextből
+indul (fogalmi vázlat; a prometheus-cpp és az opentelemetry-cpp API-ja a
+pinelt verzión ellenőrizendő):</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">auto</span> tracer <span class="op">=</span> trace<span class="op">::</span>Provider<span class="op">::</span>GetTracerProvider<span class="op">()-&gt;</span>GetTracer<span class="op">(</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;lab-order-svc&quot;</span><span class="op">,</span> <span class="st">&quot;lab2025.01&quot;</span><span class="op">);</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="co">// A Register() családot (Family&lt;Counter&gt;&amp;) ad; az Add() a sorozatot.</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="co">// A build_id deployonként egy érték: alacsony kardinalitású label.</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="kw">auto</span><span class="op">&amp;</span> requests_family <span class="op">=</span> prometheus<span class="op">::</span>BuildCounter<span class="op">()</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>Name<span class="op">(</span><span class="st">&quot;lab_order_http_requests_total&quot;</span><span class="op">)</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>Help<span class="op">(</span><span class="st">&quot;Total HTTP requests&quot;</span><span class="op">)</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>Labels<span class="op">({{</span><span class="st">&quot;build_id&quot;</span><span class="op">,</span> BUILD_ID<span class="op">}})</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>Register<span class="op">(*</span>registry<span class="op">);</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="kw">auto</span><span class="op">&amp;</span> duration_family <span class="op">=</span> prometheus<span class="op">::</span>BuildHistogram<span class="op">()</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>Name<span class="op">(</span><span class="st">&quot;lab_order_http_request_duration_seconds&quot;</span><span class="op">)</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>Help<span class="op">(</span><span class="st">&quot;HTTP request latency&quot;</span><span class="op">)</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>Labels<span class="op">({{</span><span class="st">&quot;build_id&quot;</span><span class="op">,</span> BUILD_ID<span class="op">}})</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>Register<span class="op">(*</span>registry<span class="op">);</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="kw">auto</span><span class="op">&amp;</span> duration <span class="op">=</span> duration_family<span class="op">.</span>Add<span class="op">(</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">{{</span><span class="st">&quot;namespace&quot;</span><span class="op">,</span> <span class="st">&quot;lab-order&quot;</span><span class="op">},</span> <span class="op">{</span><span class="st">&quot;endpoint&quot;</span><span class="op">,</span> <span class="st">&quot;/api/query&quot;</span><span class="op">}},</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>    prometheus<span class="op">::</span>Histogram<span class="op">::</span>BucketBoundaries<span class="op">{</span><span class="fl">0.05</span><span class="op">,</span> <span class="fl">0.1</span><span class="op">,</span> <span class="fl">0.25</span><span class="op">,</span> <span class="fl">0.5</span><span class="op">,</span> <span class="fl">1.0</span><span class="op">});</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> HandleQuery<span class="op">(</span><span class="at">const</span> Request<span class="op">&amp;</span> req<span class="op">,</span> Response<span class="op">&amp;</span> resp<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>  <span class="kw">auto</span> span <span class="op">=</span> tracer<span class="op">-&gt;</span>StartSpan<span class="op">(</span><span class="st">&quot;/api/query&quot;</span><span class="op">);</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>  <span class="kw">auto</span> ctx <span class="op">=</span> span<span class="op">-&gt;</span>GetContext<span class="op">();</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>  LogEvent<span class="op">(</span><span class="st">&quot;request_start&quot;</span><span class="op">,</span> <span class="op">{</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a>      <span class="op">{</span><span class="st">&quot;trace_id&quot;</span><span class="op">,</span> ctx<span class="op">.</span>trace_id<span class="op">().</span>ToLowerBase16<span class="op">()},</span></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a>      <span class="op">{</span><span class="st">&quot;span_id&quot;</span><span class="op">,</span> ctx<span class="op">.</span>span_id<span class="op">().</span>ToLowerBase16<span class="op">()},</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a>      <span class="op">{</span><span class="st">&quot;request_id&quot;</span><span class="op">,</span> req<span class="op">.</span>request_id<span class="op">},</span></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a>      <span class="op">{</span><span class="st">&quot;build_id&quot;</span><span class="op">,</span> BUILD_ID<span class="op">}});</span></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a>  <span class="co">// ... a kérés feldolgozása, resp kitöltése ...</span></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a>  duration<span class="op">.</span>Observe<span class="op">(</span>req<span class="op">.</span>latency_seconds<span class="op">);</span></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a>  requests_family</span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a>      <span class="op">.</span>Add<span class="op">({{</span><span class="st">&quot;namespace&quot;</span><span class="op">,</span> <span class="st">&quot;lab-order&quot;</span><span class="op">},</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a>            <span class="op">{</span><span class="st">&quot;endpoint&quot;</span><span class="op">,</span> <span class="st">&quot;/api/query&quot;</span><span class="op">},</span></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a>            <span class="op">{</span><span class="st">&quot;status&quot;</span><span class="op">,</span> <span class="bu">std::</span>to_string<span class="op">(</span>resp<span class="op">.</span>status<span class="op">)}})</span></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a>      <span class="op">.</span>Increment<span class="op">();</span></span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a>  span<span class="op">-&gt;</span>End<span class="op">();</span>  <span class="co">// End() nélkül a span nem exportálódik</span></span>
+<span id="cb4-39"><a href="#cb4-39" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>build_id</code> a deploymentkorrelációhoz kell: a metrikákon
+konstans labelként (deployonként egy érték, tehát alacsony
+kardinalitású), a logban és a trace-ben mezőként szerepel, így ha a hiba
+csak egy buildhez tartozik, mindhárom nézetben <code>build_id</code>
+szerint szűrhetünk. A <code>request_id</code> nagy kardinalitású, ezért
+csak a logban és a trace-attribútumban él, metrikalabelben nem. A pontos
+API (például <code>Labels()</code> a builderen, a
+<code>BucketBoundaries</code> típus) a pinelt prometheus-cpp verzión
+ellenőrizendő.</p>
+<h3 data-number="50.5.3" id="dashboard-és-tesztelt-promql"><span
+class="header-section-number">50.5.3</span> Dashboard és tesztelt
+PromQL</h3>
+<p>A Grafana dashboard nem csak képet rajzol, hanem a query-t futtatható
+lekérdezésként is kezeli. A laborpanorámában két panellel dolgozunk.</p>
+<p>Hibaarány:</p>
+<pre class="promql"><code>sum by (namespace, endpoint) (
+  rate(lab_order_http_requests_total{status=~&quot;5..&quot;}[5m])
+)
+/
+sum by (namespace, endpoint) (
+  rate(lab_order_http_requests_total[5m])
+)</code></pre>
+<p>P99 latency:</p>
+<pre class="promql"><code>histogram_quantile(0.99,
+  sum by (le, namespace, endpoint) (
+    rate(lab_order_http_request_duration_seconds_bucket[10m])
+  )
+)</code></pre>
+<p>Ezeket a Grafana „Explore” nézetben is lefuttatjuk, mielőtt alertbe
+tesszük. A <em>tesztelt PromQL</em> itt azt jelenti, hogy a query-t
+legalább normál, nulla-forgalmú, valamint generált hibás időszakban is
+kiértékeljük, és <code>promtool test rules</code> syntax/fixture teszten
+is átengedjük. A riasztásszabály:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">groups</span><span class="kw">:</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-order-service</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">rules</span><span class="kw">:</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">alert</span><span class="kw">:</span><span class="at"> LabOrderHighErrorRate</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="fu">        expr</span><span class="kw">: </span><span class="ch">|</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>          sum by (namespace, endpoint) (</span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>            rate(lab_order_http_requests_total{status=~&quot;5..&quot;}[5m])</span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>          )</span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>          /</span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>          sum by (namespace, endpoint) (</span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>            rate(lab_order_http_requests_total[5m])</span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>          ) &gt; 0.05</span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">for</span><span class="kw">:</span><span class="at"> 5m</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">severity</span><span class="kw">:</span><span class="at"> page</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">lab</span><span class="kw">:</span><span class="at"> d250</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">annotations</span><span class="kw">:</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a><span class="fu">          summary</span><span class="kw">: </span><span class="ch">&gt;-</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>            5xx error rate &gt; 5% on</span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>            {{ $labels.namespace }}/{{ $labels.endpoint }}</span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">runbook_url</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;https://git.invalid/lab-runbooks/d250-error-rate.md&quot;</span></span></code></pre></div>
+<p>A fixture-alapú PromQL unit teszt egy pozitív és egy negatív
+esettel:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">rule_files</span><span class="kw">:</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> lab-service.rules.yml</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="fu">evaluation_interval</span><span class="kw">:</span><span class="at"> 1m</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="fu">tests</span><span class="kw">:</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="co">  # Pozitív eset: 10 hibás / 100 sikeres kérés percenként</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="co">  # hibaarány = 10 / 110 ≈ 9,1% &gt; 5%</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">interval</span><span class="kw">:</span><span class="at"> 1m</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">input_series</span><span class="kw">:</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a><span class="kw">      - </span><span class="fu">series</span><span class="kw">:</span><span class="at"> </span><span class="ch">&gt;-</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>          lab_order_http_requests_total{status=&quot;500&quot;,</span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>          endpoint=&quot;/api/query&quot;,namespace=&quot;lab-order&quot;}</span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">values</span><span class="kw">:</span><span class="at"> </span><span class="st">&#39;0+10x10&#39;</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="kw">      - </span><span class="fu">series</span><span class="kw">:</span><span class="at"> </span><span class="ch">&gt;-</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>          lab_order_http_requests_total{status=&quot;200&quot;,</span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>          endpoint=&quot;/api/query&quot;,namespace=&quot;lab-order&quot;}</span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">values</span><span class="kw">:</span><span class="at"> </span><span class="st">&#39;0+100x10&#39;</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">promql_expr_test</span><span class="kw">:</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a><span class="kw">      - </span><span class="fu">expr</span><span class="kw">:</span><span class="at"> </span><span class="ch">|</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>          sum by (namespace, endpoint) (</span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>            rate(lab_order_http_requests_total{status=~&quot;5..&quot;}[5m])</span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>          )</span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a>          /</span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>          sum by (namespace, endpoint) (</span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a>            rate(lab_order_http_requests_total[5m])</span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a>          ) &gt; bool 0.05</span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">eval_time</span><span class="kw">:</span><span class="at"> 10m</span></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">exp_samples</span><span class="kw">:</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="kw">-</span><span class="at"> </span><span class="fu">labels</span><span class="kw">:</span><span class="at"> </span><span class="st">&#39;{namespace=&quot;lab-order&quot;, endpoint=&quot;/api/query&quot;}&#39;</span></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">value</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">alert_rule_test</span><span class="kw">:</span></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">eval_time</span><span class="kw">:</span><span class="at"> 10m</span></span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">alertname</span><span class="kw">:</span><span class="at"> LabOrderHighErrorRate</span></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">exp_alerts</span><span class="kw">:</span></span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="kw">-</span><span class="at"> </span><span class="fu">exp_labels</span><span class="kw">:</span></span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">severity</span><span class="kw">:</span><span class="at"> page</span></span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">lab</span><span class="kw">:</span><span class="at"> d250</span></span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-order</span></span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">endpoint</span><span class="kw">:</span><span class="at"> /api/query</span></span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">exp_annotations</span><span class="kw">:</span></span>
+<span id="cb8-40"><a href="#cb8-40" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">summary</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;5xx error rate &gt; 5% on lab-order//api/query&quot;</span></span>
+<span id="cb8-41"><a href="#cb8-41" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">runbook_url</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;https://git.invalid/lab-runbooks/d250-error-rate.md&quot;</span></span>
+<span id="cb8-42"><a href="#cb8-42" aria-hidden="true" tabindex="-1"></a><span class="co">  # Negatív eset: 1 hibás / 100 sikeres kérés percenként</span></span>
+<span id="cb8-43"><a href="#cb8-43" aria-hidden="true" tabindex="-1"></a><span class="co">  # hibaarány = 1 / 101 ≈ 0,99% &lt; 5%</span></span>
+<span id="cb8-44"><a href="#cb8-44" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">interval</span><span class="kw">:</span><span class="at"> 1m</span></span>
+<span id="cb8-45"><a href="#cb8-45" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">input_series</span><span class="kw">:</span></span>
+<span id="cb8-46"><a href="#cb8-46" aria-hidden="true" tabindex="-1"></a><span class="kw">      - </span><span class="fu">series</span><span class="kw">:</span><span class="at"> </span><span class="ch">&gt;-</span></span>
+<span id="cb8-47"><a href="#cb8-47" aria-hidden="true" tabindex="-1"></a>          lab_order_http_requests_total{status=&quot;500&quot;,</span>
+<span id="cb8-48"><a href="#cb8-48" aria-hidden="true" tabindex="-1"></a>          endpoint=&quot;/api/query&quot;,namespace=&quot;lab-order&quot;}</span>
+<span id="cb8-49"><a href="#cb8-49" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">values</span><span class="kw">:</span><span class="at"> </span><span class="st">&#39;0+1x10&#39;</span></span>
+<span id="cb8-50"><a href="#cb8-50" aria-hidden="true" tabindex="-1"></a><span class="kw">      - </span><span class="fu">series</span><span class="kw">:</span><span class="at"> </span><span class="ch">&gt;-</span></span>
+<span id="cb8-51"><a href="#cb8-51" aria-hidden="true" tabindex="-1"></a>          lab_order_http_requests_total{status=&quot;200&quot;,</span>
+<span id="cb8-52"><a href="#cb8-52" aria-hidden="true" tabindex="-1"></a>          endpoint=&quot;/api/query&quot;,namespace=&quot;lab-order&quot;}</span>
+<span id="cb8-53"><a href="#cb8-53" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">values</span><span class="kw">:</span><span class="at"> </span><span class="st">&#39;0+100x10&#39;</span></span>
+<span id="cb8-54"><a href="#cb8-54" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">alert_rule_test</span><span class="kw">:</span></span>
+<span id="cb8-55"><a href="#cb8-55" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">eval_time</span><span class="kw">:</span><span class="at"> 10m</span></span>
+<span id="cb8-56"><a href="#cb8-56" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">alertname</span><span class="kw">:</span><span class="at"> LabOrderHighErrorRate</span></span>
+<span id="cb8-57"><a href="#cb8-57" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">exp_alerts</span><span class="kw">:</span><span class="at"> </span><span class="kw">[]</span></span></code></pre></div>
+<p>A pozitív eset 10 hibás és 100 sikeres kérést ad percenként: a
+hibaarány
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>10</mn><mi>/</mi><mn>110</mn><mo>≈</mo><mn>0</mn><mo>,</mo><mn>091</mn></mrow><annotation encoding="application/x-tex">10/110 \approx 0{,}091</annotation></semantics></math>,
+azaz kb. 9,1%, így a <code>&gt; bool 0.05</code> kifejezés értéke 1, és
+a <code>for: 5m</code> letelte után az alert firing. A <code>bool</code>
+módosító nélkül az összehasonlítás szűrő volna: a feltételt teljesítő
+sorozat az eredeti hányadossal (≈ 0,091) maradna, nem 1-gyel. A negatív
+eset (1 hibás / 100 sikeres,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mi>/</mi><mn>101</mn><mo>≈</mo><mn>0</mn><mo>,</mo><mn>0099</mn></mrow><annotation encoding="application/x-tex">1/101 \approx 0{,}0099</annotation></semantics></math>,
+kb. 0,99%) nem tüzel. A hivatalos <code>promtool</code> verzió és a
+fixture-szintaxis a labban pinelt Prometheus kiadáson ellenőrizendő; a
+<code>promtool test rules</code> futtatása még nem történt meg.</p>
+<h3 data-number="50.5.4" id="logrequesttracedeploy-correlation"><span
+class="header-section-number">50.5.4</span> Log/request/trace/deploy
+correlation</h3>
+<p>A korreláció kulcsa, hogy a logba írt <code>trace_id</code>
+megegyezik a Tempóban élő span trace azonosítójával. A hibás request
+logját a Lokihoz intézett query-vel keressük:</p>
+<pre class="logql"><code>{job=&quot;lab-order-svc&quot;} | json | request_id=&quot;req-7f3a&quot;
+  | line_format &quot;{{.msg}} level={{.level}}&quot;</code></pre>
+<p>Ha a <code>request_id</code>-t nem ismerjük, a hibaarányos
+időablakban a <code>db_timeout</code> eseményeket keressük:</p>
+<pre class="logql"><code>{job=&quot;lab-order-svc&quot;} |= &quot;db_timeout&quot; | json
+  | line_format &quot;build_id={{.build_id}} trace_id={{.trace_id}}&quot;</code></pre>
+<p>A kinyert <code>trace_id</code>-t a Grafana/Tempo trace nézetbe
+illesztve megkapjuk a span-fát, például:</p>
+<table>
+<thead>
+<tr>
+<th>Span</th>
+<th>Parent</th>
+<th>Duration</th>
+<th>Error</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/api/query</code></td>
+<td>root</td>
+<td>810 ms</td>
+<td>true</td>
+</tr>
+<tr>
+<td><code>postgres.query</code></td>
+<td>root</td>
+<td>800 ms</td>
+<td>true</td>
+</tr>
+<tr>
+<td><code>auth_token.resolve</code></td>
+<td>root</td>
+<td>5 ms</td>
+<td>false</td>
+</tr>
+</tbody>
+</table>
+<p>A deploymentkorrelációhoz a panelen a
+<code>sum by (build_id) (rate(lab_order_http_requests_total{status=~"5.."}[5m]))</code>
+query-t használjuk; ez azért működik, mert a 50.5.2 vázlatában minden
+<code>lab_order_*</code> metrika konstans <code>build_id</code> labelt
+kap. Ha a hibás időablak csak a <code>build_id="b-2025.07-test"</code>
+értéknél látszik, akkor a hiba változtatásból ered, nem fizikai
+degradációból. Ez nem bizonyítja a root cause-t, de a hibát
+scope-olja.</p>
+<h3 data-number="50.5.5" id="errorlatencysaturation-fixture"><span
+class="header-section-number">50.5.5</span> Error/latency/saturation
+fixture</h3>
+<p>A labor hiba- és terhelésgenerátora a lab szolgáltatásban kap egy
+<code>/_lab/error</code> és <code>/_lab/saturate</code> endpointot. A
+<code>/_lab/error?mode=500</code> bekapcsolása után a
+<code>lab-order-svc</code> minden <code>/api/query</code> kérésnél
+DB-timeoutot szimulál: a kérés egy <code>postgres.query</code> spanben
+800 ms-ot vár, a spant <code>Error</code> státusszal zárja,
+<code>db_timeout</code> eseményt naplóz <code>trace_id</code>-val,
+növeli a <code>lab_order_db_timeouts_total</code> számlálót, és
+<code>HTTP 500</code> választ ad (a
+<code>lab_order_http_requests_total{status="500"}</code> nő). A hibamód
+csak a beérkező forgalmon látszik, ezért mellette terhelést kell
+generálni. A <code>/_lab/saturate</code> egy rövid, CPU-bound spin
+függvényt hív, amellyel a <code>node_cpu_seconds_total</code> és a
+process CPU idősor emelkedik, de a szolgáltatás maga nem ír ki
+hibát.</p>
+<p>Egyetlen kérés a <code>lab-app-01</code> hoston (az URL idézőjelben,
+mert a <code>?</code> shellben globkarakter):</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">lab-app-01$</span> curl <span class="at">-s</span> <span class="at">-o</span> /dev/null <span class="at">-w</span> <span class="st">&#39;%{http_code}\n&#39;</span> <span class="dt">\</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;http://127.0.0.1:8080/api/query?item=100&#39;</span></span></code></pre></div>
+<p>Az incidens szimulációja: a hibamód bekapcsolása, majd kb. 300 s-os
+terhelés (10 kérés/s), a válaszkódok összesítésével:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-app-01</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> <span class="at">-X</span> POST <span class="st">&#39;http://127.0.0.1:8080/_lab/error?mode=500&#39;</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="va">$(</span><span class="fu">seq</span> 1 3000<span class="va">)</span><span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>  <span class="ex">curl</span> <span class="at">-s</span> <span class="at">-o</span> /dev/null <span class="at">-w</span> <span class="st">&#39;%{http_code}\n&#39;</span> <span class="dt">\</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>    <span class="st">&#39;http://127.0.0.1:8080/api/query?item=100&#39;</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>  <span class="fu">sleep</span> 0.1</span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span> <span class="kw">|</span> <span class="fu">sort</span> <span class="kw">|</span> <span class="fu">uniq</span> <span class="at">-c</span></span></code></pre></div>
+<p>A CPU-fixture PromQL-je a host-szintű CPU-kihasználtságot
+(utilization) adja; a nevező a magszám, mert a <code>mode="idle"</code>
+sorozatból CPU-nként pontosan egy van:</p>
+<pre class="promql"><code>sum by (instance) (
+  rate(node_cpu_seconds_total{mode!=&quot;idle&quot;,job=&quot;node&quot;}[5m])
+)
+/
+count by (instance) (node_cpu_seconds_total{mode=&quot;idle&quot;,job=&quot;node&quot;})</code></pre>
+<p>A <code>node_cpu_seconds_total</code> CPU-nként nyolc
+<code>mode</code> sorozatot ad (idle, iowait, irq, nice, softirq, steal,
+system, user), ezért a szűretlen <code>count</code> a magszám
+nyolcszorosát adná. Ez a USE-modell (<a
+href="d246.html">Metrics/logs/traces és service questions</a>) szerinti
+<strong>utilization</strong>, nem saturation: 80%-os kihasználtság
+mellett lehet nulla várakozás. Valódi telítettségi jel a CPU-ra
+várakozás, például a PSI-metrika
+<code>rate(node_pressure_cpu_waiting_seconds_total[5m])</code> (ha a
+node_exporter pressure collectora engedélyezett), vagy a
+<code>node_load1</code> és a magszám aránya 1 fölött. A pontos képlet
+NUMA és throttle szempontból a laborban finomítandó.</p>
+<h3 data-number="50.5.6"
+id="alertmanager-routing-grouping-silence"><span
+class="header-section-number">50.5.6</span> Alertmanager routing,
+grouping, silence</h3>
+<p>Az Alertmanager configban a <code>route</code> fa a
+<code>severity=page</code> riasztásokat a <code>lab-page</code>
+receiverbe, a többit a <code>lab-default</code> receiverbe
+irányítja:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="fu">route</span><span class="kw">:</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">receiver</span><span class="kw">:</span><span class="at"> lab-default</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">group_by</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&#39;alertname&#39;</span><span class="kw">,</span><span class="at"> </span><span class="st">&#39;namespace&#39;</span><span class="kw">,</span><span class="at"> </span><span class="st">&#39;endpoint&#39;</span><span class="kw">]</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">group_wait</span><span class="kw">:</span><span class="at"> 30s</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">group_interval</span><span class="kw">:</span><span class="at"> 5m</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">repeat_interval</span><span class="kw">:</span><span class="at"> 1h</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">routes</span><span class="kw">:</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">matchers</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&#39;severity=&quot;page&quot;&#39;</span><span class="kw">]</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">receiver</span><span class="kw">:</span><span class="at"> lab-page</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">group_by</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&#39;alertname&#39;</span><span class="kw">,</span><span class="at"> </span><span class="st">&#39;namespace&#39;</span><span class="kw">]</span></span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a><span class="fu">receivers</span><span class="kw">:</span></span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-default</span></span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">webhook_configs</span><span class="kw">:</span></span>
+<span id="cb14-15"><a href="#cb14-15" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">url</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;http://gitops-lab-webhook.invalid/alerts&quot;</span></span>
+<span id="cb14-16"><a href="#cb14-16" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-page</span></span>
+<span id="cb14-17"><a href="#cb14-17" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">webhook_configs</span><span class="kw">:</span></span>
+<span id="cb14-18"><a href="#cb14-18" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">url</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;http://gitops-lab-webhook.invalid/page&quot;</span></span></code></pre></div>
+<p>A <code>group_by</code> lényege, hogy ugyanazon endpoint több alertje
+egyetlen értesítésben menjen ki, ne okozzon notification floodot. A
+<code>group_wait</code> 30 másodpercet vár, amíg további riasztások
+érkeznek ugyanabba a groupba. A <code>repeat_interval</code> csak akkor
+küld ismétlést, ha a firing state továbbra is fennáll.</p>
+<p>A false-positive ellenőrzéshez ideiglenes silence-t hozunk létre:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="ex">lab-mon-01$</span> sudo <span class="at">-u</span> alertmanager amtool <span class="dt">\</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--alertmanager.url</span><span class="op">=</span>http://127.0.0.1:9093 <span class="dt">\</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>  silence add alertname=LabOrderHighErrorRate <span class="dt">\</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--duration</span><span class="op">=</span>2h <span class="dt">\</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--comment</span><span class="op">=</span><span class="st">&quot;lab d250 false-positive test, runbook_verify&quot;</span></span></code></pre></div>
+<p>A silence nem oldja meg a hibát, csak az értesítést tartja nyugton,
+amíg a runbookot ellenőrizzük. A silencet expiráció és a csapatba való
+visszajelzés nélkül nem hagyhatjuk meg; a teszt végén kézzel
+lezárjuk:</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="ex">lab-mon-01$</span> amtool <span class="at">--alertmanager.url</span><span class="op">=</span>http://127.0.0.1:9093 <span class="dt">\</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a>  silence expire <span class="va">$(</span><span class="ex">amtool</span> <span class="at">--alertmanager.url</span><span class="op">=</span>http://127.0.0.1:9093 <span class="dt">\</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a>    silence query <span class="at">-q</span> alertname=LabOrderHighErrorRate<span class="va">)</span></span></code></pre></div>
+<h3 data-number="50.5.7" id="retention-query-és-access-cleanup"><span
+class="header-section-number">50.5.7</span> Retention, query és access,
+cleanup</h3>
+<p>A backend-retention a Prometheusnál
+<code>--storage.tsdb.retention.time=7d</code> és
+<code>--storage.tsdb.retention.size=10GB</code>; a Loki vagy Tempo
+esetében a laborban külön config szükséges. A retention célja a
+kapacitás és a query-latency kordában tartása, nem a backup. A labban a
+<code>7d/10GB</code> csak a laboron belüli rövid ablakra van
+tervezve.</p>
+<p>A Grafana access control szintjén a laborban három szerep van: admin
+a stack tulajdonosnak, viewer a fejlesztőnek, és nincs anonymous access.
+A Prometheus query API-t és a Grafana datasource-ot nem tesszük ki a
+laboron kívülre. Ha a query túl drága, a kapcsolódó backend logban
+<code>query timeout</code> vagy <code>query frontend</code> hiba jelenik
+meg; ilyenkor a query-t szűkítjük, nem a limitet emeljük meg
+automatikusan.</p>
+<p>A labor tisztításához a lab saját compose projectjét állítjuk le:</p>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="ex">lab-mon-01$</span> docker compose <span class="at">--project-name</span> lab-telemetry down <span class="at">-v</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Csak a lab-telemetry projecthez tartozó volume-ok törlődnek.</span></span></code></pre></div>
+<p>A <code>-v</code> csak a named volume-ot törli; ha bind mount config
+van, az a lab repository része marad.</p>
+<h3 data-number="50.5.8" id="kidolgozott-példa"><span
+class="header-section-number">50.5.8</span> Kidolgozott példa</h3>
+<ol type="1">
+<li><p><strong>Desired state</strong>: a <code>lab-order-svc</code>
+metrikái elérhetők a Prometheusból, a <code>LabOrderHighErrorRate</code>
+alert definiált, az Alertmanager route a <code>lab-page</code>
+receiverre küldi <code>page</code> súlyosság esetén.</p></li>
+<li><p><strong>Előfeltétel</strong>: a <code>lab-mon-01</code> hoston a
+<code>lab-telemetry</code> compose stack fut, a
+<code>lab-app-01</code>-on a <code>node_exporter</code> és a
+<code>lab-order-svc</code> fut.</p></li>
+<li><p><strong>Deploy és ellenőrzés</strong>:</p></li>
+</ol>
+<div class="sourceCode" id="cb18"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="ex">lab-mon-01$</span> cd /srv/lab-telemetry</span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="ex">lab-mon-01$</span> docker compose <span class="at">--project-name</span> lab-telemetry config</span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="ex">lab-mon-01$</span> docker compose <span class="at">--project-name</span> lab-telemetry up <span class="at">-d</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="ex">lab-mon-01$</span> curl <span class="at">-sf</span> http://127.0.0.1:9090/-/ready</span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="ex">lab-mon-01$</span> curl <span class="at">-sf</span> http://127.0.0.1:9093/-/healthy</span></code></pre></div>
+<p>Rollback:
+<code>docker compose --project-name lab-telemetry down</code>.</p>
+<ol start="4" type="1">
+<li><strong>Hiba generálása</strong>: a <code>lab-app-01</code>-on
+bekapcsoljuk a DB-timeoutot szimuláló 500-as módot, és öt percig
+folyamatos forgalmat generálunk (forgalom nélkül a hibaarány 0/0, azaz
+üres eredmény, és az alert nem tüzel).</li>
+</ol>
+<div class="sourceCode" id="cb19"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-app-01</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> <span class="at">-X</span> POST <span class="st">&#39;http://127.0.0.1:8080/_lab/error?mode=500&#39;</span></span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="va">$(</span><span class="fu">seq</span> 1 3000<span class="va">)</span><span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a>  <span class="ex">curl</span> <span class="at">-s</span> <span class="at">-o</span> /dev/null <span class="at">-w</span> <span class="st">&#39;%{http_code}\n&#39;</span> <span class="dt">\</span></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a>    <span class="st">&#39;http://127.0.0.1:8080/api/query?item=100&#39;</span></span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a>  <span class="fu">sleep</span> 0.1</span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span> <span class="kw">|</span> <span class="fu">sort</span> <span class="kw">|</span> <span class="fu">uniq</span> <span class="at">-c</span></span></code></pre></div>
+<ol start="5" type="1">
+<li><p><strong>Három nézet</strong>:</p>
+<ul>
+<li><strong>Metric</strong>: Grafana/Prometheus Explore query fut; a
+hibaarány 5% fölötti, a p99 250 ms fölé emelkedik.</li>
+<li><strong>Log</strong>: Loki query
+<code>{job="lab-order-svc"} |= "db_timeout"</code> a hibás requestekben
+<code>trace_id</code>-t ad.</li>
+<li><strong>Trace</strong>: Tempo trace nézet a
+<code>trace_id</code>-val megmutatja a <code>postgres.query</code> span
+800 ms-os hibáját.</li>
+</ul></li>
+<li><p><strong>Alert és runbook</strong>: ha a 50.5.6 false-positive
+silence-ét már létrehoztad, előbb szüntesd meg
+(<code>amtool … silence expire</code>, lásd fent), mert aktív silence
+mellett az Alertmanager nem értesít. Ezután a
+<code>LabOrderHighErrorRate</code> alert firing az Alertmanagerben; a
+group_by miatt egyetlen page jön. A runbook lépései: ellenőrizd a
+Prometheus <code>up{job="lab-order-svc"} == 0</code> kifejezést; ha
+<code>up 0</code>, a scrape hibás, ne az alkalmazást deployold; húzd ki
+a log/trace korrelációt; ha a hiba <code>build_id</code> változás után
+jött, rollback legyen az első akció; ha a <code>db_timeout</code> span
+folyamatosan időzik, a database query-t vizsgáld.</p></li>
+<li><p><strong>Postcondition</strong>: az Alertmanager aktív alertje a
+<code>LabOrderHighErrorRate</code>, a Grafana dashboard mindhárom
+adatforrásból mutat jeladást, a runbook ellenőrzése megtörtént, a
+false-positive teszt silence-e kézzel lezárva
+(<code>amtool silence query</code> üres).</p></li>
+</ol>
+<h3 data-number="50.5.9" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">50.5.9</span> Tipikus hibák és
+ellenpróbák</h3>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Tünet</th>
+<th>Valószínű ok</th>
+<th>Ellenpróba</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Alert rövid hibatüske után kiold</td>
+<td>A rövid <code>rate()</code> ablak zajos, a tüske a <code>for</code>
+idejénél tovább tartott a küszöb fölött</td>
+<td><code>promtool test rules</code> fixture-vel tesztelj tüskés és
+stabil inputot; Grafana Explore-ban ellenőrizd az adott időablakot</td>
+</tr>
+<tr>
+<td>Minden notification külön-külön megy</td>
+<td>Rossz <code>group_by</code></td>
+<td>Nézd meg az Alertmanager <code>/api/v2/alerts/groups</code>
+kimenetét, és módosítsd a <code>group_by</code> labelsetjét</td>
+</tr>
+<tr>
+<td>Az alert nem megy ki, bár a Prometheusban firing</td>
+<td>Alertmanager route nem matching</td>
+<td><code>amtool config routes</code> vagy a route matcherek
+ellenőrzése</td>
+</tr>
+<tr>
+<td>Sok régi adat, lassú Grafana query</td>
+<td>Nincs retention vagy túl nagy a time range</td>
+<td><code>--storage.tsdb.retention.time</code> és
+<code>retention.size</code> beállítása; a query range szűkítése</td>
+</tr>
+<tr>
+<td>A silence elrejti a hibát, de nem javítja</td>
+<td>A silence nem root cause fix</td>
+<td>Győződj meg róla, hogy a silence expirál, és a runbookot nem
+silence-vel zárják le</td>
+</tr>
+</tbody>
+</table>
+<p>A gyakori false-positive ok a rövid <code>rate()</code> ablak: egy
+rövid hibatüske a kifejezést átmenetileg a küszöb fölé viszi; a
+<code>for</code> ezt csak akkor szűri ki, ha a tüske rövidebb a
+<code>for</code> idejénél. A <code>rate()</code> ablaka és a
+<code>for</code> egymástól független: a <code>for</code> azt írja elő,
+hogy a kifejezés minden kiértékeléskor igaz legyen a megadott ideig. Az
+ablak legyen legalább a scrape_interval négyszerese, a <code>for</code>
+pedig az elfogadható észlelési késéshez igazodjon. Ha az ablak kevesebb
+mint két mintát fog, az eredmény üres, és az alert nem tüzel – ez false
+negative. A <code>promtool test rules</code> és a Grafana Explore
+együttes használata mindkét esetet kimutatja.</p>
+<h3 data-number="50.5.10" id="feladatok"><span
+class="header-section-number">50.5.10</span> Feladatok</h3>
+<h4 data-number="50.5.10.1"
+id="magyarázó-feladat-három-nézet-leképezése"><span
+class="header-section-number">50.5.10.1</span> 1. Magyarázó feladat:
+három nézet leképezése</h4>
+<p>Adott a következő hibajel: <code>LabOrderHighLatencyP99</code> alert
+tüzei, de a <code>LabOrderHighErrorRate</code> nem. Logban
+<code>slow_query</code> események jelennek meg egy <code>build_id</code>
+érték után. Melyik metrika, log és trace kifejezés segít a hibát
+scope-olni? Indokold, miért nem elég a metrika önmagában.</p>
+<h4 data-number="50.5.10.2"
+id="adminisztratívkonfigurációs-feladat-alert-és-silence"><span
+class="header-section-number">50.5.10.2</span> 2.
+Adminisztratív/konfigurációs feladat: alert és silence</h4>
+<p>Írj Prometheus alert rule-t <code>LabOrderHighCpuUtilization</code>
+néven, amely akkor tüzel, ha a <code>lab-app-01</code> node_exporterén
+mért CPU-kihasználtság (utilization) 10 percen át 80% feletti. Állítsd
+be az Alertmanager route-ot úgy, hogy a <code>severity=page</code> alert
+a <code>lab-page</code> receiverbe menjen, és a riasztás mellé csatolj
+runbook URL-t. Hozz létre egy 30 perces silence-t a false-positive
+teszteléshez, és írd le az ellenőrzést.</p>
+<h4 data-number="50.5.10.3"
+id="diagnosztikaifailure-feladat-hibaüzemeltetés-és-runbook"><span
+class="header-section-number">50.5.10.3</span> 3. Diagnosztikai/failure
+feladat: hibaüzemeltetés és runbook</h4>
+<p>A <code>lab-order-svc</code> db-timeout hibát mutat, a Prometheusban
+a <code>lab_order_db_timeouts_total</code> növekszik, a logban
+<code>db_timeout</code> események <code>trace_id</code>-val, a trace-ben
+a <code>postgres.query</code> span 500 ms-os. Írj rövid runbookot a
+következő formában: hipotézis, adatgyűjtés, egy változtatás,
+verification, rollback. Melyik PromQL megerősítené, hogy a hiba a
+<code>postgres.query</code> spanből, és nem az autentikációból ered?</p>
+<h3 data-number="50.5.11" id="megoldások"><span
+class="header-section-number">50.5.11</span> Megoldások</h3>
+<h4 data-number="50.5.11.1" id="megoldás"><span
+class="header-section-number">50.5.11.1</span> 1. Megoldás</h4>
+<p>A metrika a 250 ms-nál lassabb kérések aránya buildenként:
+<code>1 - (sum by (build_id) (rate(lab_order_http_request_duration_seconds_bucket{le="0.25"}[5m])) / sum by (build_id) (rate(lab_order_http_request_duration_seconds_count[5m])))</code>.
+A <code>le="0.25"</code> bucket a 250 ms-nál gyorsabb vagy azzal egyenlő
+kérések kumulatív számlálója, ezért a lassú arány az 1-ből kivont
+hányados. A <code>build_id</code> a 50.5.2 vázlata szerint a metrikák
+konstans labelje (deployonként egy érték), így a bontás megmutatja, hogy
+a lassulás adott buildhez tartozik-e. A log:
+<code>{job="lab-order-svc"} |= "slow_query" | json | line_format "{{.build_id}} {{.trace_id}} {{.msg}}"</code>.
+Ez kinyeri a <code>trace_id</code>-t és a <code>build_id</code>-t. A
+trace: a <code>trace_id</code> lekérdezés a Tempo által megmutatja, hogy
+a <code>postgres.query</code> span a lassú, és nem a
+<code>auth_token.resolve</code>. A metrika önmagában azért nem elég,
+mert csak aggregált idősoron látunk, nem tudjuk, hogy a lassúságot egy
+lassú adatbázislekérdezés vagy a request queue-ban eltöltött várakozás
+okozta-e, ami a backlog-saturation jele.</p>
+<h4 data-number="50.5.11.2" id="megoldás-1"><span
+class="header-section-number">50.5.11.2</span> 2. Megoldás</h4>
+<p>Prometheus rule:</p>
+<div class="sourceCode" id="cb20"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="kw">-</span><span class="at"> </span><span class="fu">alert</span><span class="kw">:</span><span class="at"> LabOrderHighCpuUtilization</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="fu">  expr</span><span class="kw">: </span><span class="ch">|</span></span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a>    (</span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a>      sum by (instance) (</span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a>        rate(node_cpu_seconds_total{mode!=&quot;idle&quot;,job=&quot;node&quot;}[5m])</span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a>      )</span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a>      /</span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a>      count by (instance) (node_cpu_seconds_total{mode=&quot;idle&quot;,job=&quot;node&quot;})</span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a>    ) &gt; 0.8</span>
+<span id="cb20-10"><a href="#cb20-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">for</span><span class="kw">:</span><span class="at"> 10m</span></span>
+<span id="cb20-11"><a href="#cb20-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb20-12"><a href="#cb20-12" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">severity</span><span class="kw">:</span><span class="at"> page</span></span>
+<span id="cb20-13"><a href="#cb20-13" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">lab</span><span class="kw">:</span><span class="at"> d250</span></span>
+<span id="cb20-14"><a href="#cb20-14" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">annotations</span><span class="kw">:</span></span>
+<span id="cb20-15"><a href="#cb20-15" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">summary</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;CPU utilization &gt; 80% on {{ $labels.instance }}&quot;</span></span>
+<span id="cb20-16"><a href="#cb20-16" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">runbook_url</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;https://git.invalid/lab-runbooks/d250-cpu-utilization.md&quot;</span></span></code></pre></div>
+<p>A nevező a magszám: a <code>mode="idle"</code> sorozatból CPU-nként
+egy van. A
+<code>count by (instance) (rate(node_cpu_seconds_total[5m]))</code>
+nevező hibás volna, mert CPU-nként mind a nyolc <code>mode</code>
+sorozatot számolja: egy teljesen terhelt 4 magos hoston az arány
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>4</mn><mi>/</mi><mn>32</mn><mo>=</mo><mn>0</mn><mo>,</mo><mn>125</mn></mrow><annotation encoding="application/x-tex">4/32 = 0{,}125</annotation></semantics></math>
+lenne 1,0 helyett, és a szabály sosem tüzelne. Ellenpróba:
+<code>promtool test rules</code> 4 <code>cpu</code> × 8
+<code>mode</code> input sorozattal, ahol teljes terhelésnél a kifejezés
+értéke 1,0. A szabály utilizationt mér; ha telítettségre (saturation)
+kell riasztani, a PSI-alapú
+<code>rate(node_pressure_cpu_waiting_seconds_total[5m])</code> a
+megfelelő jel.</p>
+<p>Alertmanager route a <code>severity=page</code> matcherrel a
+<code>lab-page</code> receiverbe irányul; a receiver webhook URL-je
+<code>http://gitops-lab-webhook.invalid/page</code>. A silence:</p>
+<div class="sourceCode" id="cb21"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="ex">lab-mon-01$</span> sudo <span class="at">-u</span> alertmanager amtool <span class="dt">\</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--alertmanager.url</span><span class="op">=</span>http://127.0.0.1:9093 <span class="dt">\</span></span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a>  silence add alertname=LabOrderHighCpuUtilization <span class="dt">\</span></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--duration</span><span class="op">=</span>30m <span class="dt">\</span></span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--comment</span><span class="op">=</span><span class="st">&quot;lab d250 false-positive test&quot;</span></span></code></pre></div>
+<p>Ellenőrzés:
+<code>amtool silence query alertname=LabOrderHighCpuUtilization</code>.
+Postcondition: a silence 30 percig aktív; a <code>severity=page</code>
+route a <code>lab-page</code> receiverbe irányít; a Prometheus
+<code>alerts</code> felületén a rule <code>firing</code> vagy
+<code>pending</code> állapotú, de Alertmanager nem értesít.</p>
+<h4 data-number="50.5.11.3" id="megoldás-2"><span
+class="header-section-number">50.5.11.3</span> 3. Megoldás</h4>
+<p>Runbook vázlat:</p>
+<ul>
+<li><strong>Hipotézis</strong>: a db-timeout a
+<code>postgres.query</code> spanben jelentkezik, és a hiba az új
+buildkód-változásból érkezett.</li>
+<li><strong>Adatgyűjtés</strong>:
+<code>rate(lab_order_db_timeouts_total[5m])</code>,
+<code>rate(lab_order_http_requests_total[5m])</code> arány, loki query
+<code>{job="lab-order-svc"} |= "db_timeout"</code>, tempo trace
+<code>trace_id</code>. A PromQL
+<code>sum by (build_id) (rate(lab_order_db_timeouts_total[5m]))</code>
+megmutatja, hogy csak a rossz buildnél nőtt a timeout.</li>
+<li><strong>Egy változtatás</strong>: rollback a korábbi buildre, mert a
+deployment révén a hiba a buildhez köthető.</li>
+<li><strong>Verification</strong>: a
+<code>lab_order_db_timeouts_total</code> rate 5 perc alatt 0-ra csökken,
+az alert <code>inactive</code>.</li>
+<li><strong>Rollback</strong>: ha a build-rollback nem javít, a
+változtatás nem segített: állítsd vissza az új buildet (vagy maradj a
+régin, ha az stabil), és új hipotézisként vizsgáld a DB oldali okot,
+például a connection pool telítettségét.</li>
+</ul>
+<p>A span-időtartamot PromQL-ből csak akkor lehet lekérdezni, ha valami
+span-metrikát állít elő: a jelen stackben ilyen nincs. Ha a Collectorban
+<code>spanmetrics</code> connector fut (a pinelt contrib-verzión
+ellenőrizendő; a metrikanév a connector beállításától és a
+Prometheus-exporttól függ), a p95 span-időtartam:
+<code>histogram_quantile(0.95, sum by (le, span_name) (rate(&lt;spanmetrics duration bucket&gt;{span_name=~"postgres.query|auth_token.resolve"}[10m])))</code>.
+Ha a <code>postgres.query</code> p95-je kb. 500 ms, az
+<code>auth_token.resolve</code>-é pedig 5 ms alatt marad, a hiba nem az
+autentikációból ered. Span-metrika nélkül a megerősítés a Tempo
+trace-ekből történik (a <code>db_timeout</code> logok
+<code>trace_id</code>-jai alapján).</p>
+<h3 data-number="50.5.12" id="rövid-összefoglaló"><span
+class="header-section-number">50.5.12</span> Rövid összefoglaló</h3>
+<p>A full-stack telemetria labor a hiba ok-okozati láncát metrika, log
+és trace korrelációjával vizsgálja. A Prometheus alert nem önálló ábra,
+hanem üzemeltetési szerződés: a rule-hoz runbook URL tartozik, az
+Alertmanager route/grouping/silence pedig a notification policy-t tartja
+kordában. A laborban a PromQL query-t előbb fixture-teszttel
+ellenőrizzük, majd a generált hibát három nézetben azonosítjuk. A
+retention, query access és cleanup a backend kapacitás- és jogosultsági
+határait rögzíti.</p>
+<p>Továbbhasznált definíciók:</p>
+<ul>
+<li><strong>Metric/log/trace correlation</strong>: a
+<code>trace_id</code> és a <code>request_id</code> az egyes nézetekben
+ugyanazt az eseményt címezi, így a hibát nem kell szövegkereséssel
+összeilleszteni.</li>
+<li><strong>Alert pipeline</strong>: Prometheus rule evaluation -&gt;
+Alertmanager routing/grouping/silence -&gt; notification receiver -&gt;
+runbook.</li>
+<li><strong>Saturation fixture</strong>: a rendszer telítettségét
+szimuláló, ellenőrzött hibaterhelés, amely nem tévesztendő össze a
+valódi termelési hibaforgással.</li>
+</ul>
+<h3 data-number="50.5.13" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">50.5.13</span> Források és ellenőrzési
+hiányok</h3>
+<p>Forrásindex (állítás → hivatalos forrás → hivatkozott verzió):</p>
+<ul>
+<li>Alerting rule, <code>for</code>, annotációk: <a
+href="https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/">Prometheus
+– Alerting rules</a> — a labban pinelt Prometheus 2.x/3.x kiadás.</li>
+<li><code>promtool test rules</code>, <code>promql_expr_test</code>,
+<code>alert_rule_test</code>: <a
+href="https://prometheus.io/docs/prometheus/latest/configuration/unit_testing_rules/">Prometheus
+– Unit testing for rules</a>.</li>
+<li>Összehasonlító operátorok és a <code>bool</code> módosító,
+<code>histogram_quantile</code>, <code>rate</code>: <a
+href="https://prometheus.io/docs/prometheus/latest/querying/operators/">Prometheus
+– Operators</a>, <a
+href="https://prometheus.io/docs/prometheus/latest/querying/functions/">Prometheus
+– Functions</a>.</li>
+<li>Alertmanager route, <code>group_by</code>, silence,
+<code>amtool</code>: <a
+href="https://prometheus.io/docs/alerting/latest/configuration/">Prometheus
+– Alertmanager configuration</a>.</li>
+<li><code>node_cpu_seconds_total</code>, pressure collector: <a
+href="https://github.com/prometheus/node_exporter">node_exporter
+repository</a> — a pinelt 1.x kiadás README-je.</li>
+<li>prometheus-cpp Family/Counter/Histogram API: <a
+href="https://github.com/jupp0r/prometheus-cpp">prometheus-cpp
+repository</a> — a pinelt release.</li>
+<li>Collector <code>otlphttp</code> exporter, <code>spanmetrics</code>
+connector: <a
+href="https://opentelemetry.io/docs/collector/">OpenTelemetry
+Collector</a> és a contrib disztribúció; Loki OTLP-fogadás: <a
+href="https://grafana.com/docs/loki/latest/send-data/otel/">Grafana Loki
+– Ingesting logs to Loki using OpenTelemetry Collector</a> — Loki
+3.x.</li>
+<li>LogQL: <a href="https://grafana.com/docs/loki/latest/query/">Grafana
+Loki – LogQL</a>; Tempo: <a
+href="https://grafana.com/docs/tempo/latest/">Grafana Tempo
+documentation</a>.</li>
+<li>USE-módszer és riasztási elvek: <a
+href="https://sre.google/books/">Site Reliability Engineering</a>.</li>
+</ul>
+<p>Ellenőrzési hiányok: a példák laborban ellenőrizendők; dátumozott
+futtatási napló (tool <code>--version</code>, parancskimenet, sikeres és
+hibás ág) még nincs. a labban használt Prometheus, Alertmanager, OTel
+Collector, Loki, Tempo és Grafana pontos verziói, config-validitása és
+API-change-ek ebben a kérésben nem kerültek ellenőrzésre. A
+<code>LAB_PINNED_VERSION</code> és a fixture-test szintaxis a lab
+buildjén validálandó. A <code>promtool test rules</code> hivatalos
+kimeneti formátuma a pinelt Prometheus kiadáson igazolandó. A compose
+resource limit szintaxisa és a Docker Engine verziófüggősége a labhoston
+ellenőrizendő.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d249.html">← 50.4 OpenTelemetry, distributed trace és C++ instrumentation</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d251.html">51.1 SLI/SLO/SLA és felhasználói szolgáltatásminőség →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

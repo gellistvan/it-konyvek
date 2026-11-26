@@ -1,0 +1,836 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>41.1 Pod network, CNI, Service és EndpointSlice – Linux és
+DevOps rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch41">41 Kubernetes networking, Gateway és storage</a></p>
+<div class="links"><a class="prev" rel="prev" href="d200.html">← 40.5 Workload rollout és scheduling labor</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d202.html">41.2 Ingress API, Gateway API és edge routing →</a></div>
+</nav>
+<h2 data-number="41.1" id="d201"><span
+class="header-section-number">41.1</span> Pod network, CNI, Service és
+EndpointSlice</h2>
+<h3 data-number="41.1.1" id="motiváció"><span
+class="header-section-number">41.1.1</span> Motiváció</h3>
+<p>Egy C++ szolgáltatás Kubernetesben ritkán egyetlen Pod. A Deployment
+több replikát futtat, a kliensek pedig nem egy konkrét Pod IP-t akarnak
+ismerni, hanem egy stabil nevet és címet. Az üzemeltetés során a
+leggyakoribb hibaforrás az, ha a fejlesztő a Pod IP, a Service ClusterIP
+és a DNS név viszonyát nem választja szét. Például a
+<code>curl http://my-svc</code> időtúllépést ad, miközben a
+<code>curl http://10.244.2.7:8080</code> működik. Ebből a tünetből nem
+tudjuk eldönteni, hogy a DNS, a Service adatút vagy a Pod readiness
+hibás-e. A d201 célja ezért az, hogy a Pod network, CNI, Service és
+EndpointSlice rétegeken keresztül mutassa be a névtől a valós Pod
+endpointig tartó adatutat, és diagnosztikai döntést adjon a CNI, DNS és
+datapath hibák szétválasztására.</p>
+<h3 data-number="41.1.2" id="definíciók-és-működés"><span
+class="header-section-number">41.1.2</span> Definíciók és működés</h3>
+<h4 data-number="41.1.2.1" id="pod-network-és-cniipam"><span
+class="header-section-number">41.1.2.1</span> Pod network és
+CNI/IPAM</h4>
+<p>A Kubernetes hálózati alapmodellje nem határozza meg az
+implementációt, csak elvárásokat: minden Pod egyedi, clusterben
+routolható IP-t kap; minden Pod közvetlenül elérheti a többi Pod-ot a
+saját IP-jükön, Network Address Translation (NAT) nélkül. A Pod hálózati
+namespace-e saját interfészt, routing táblát és socketeket lát. A
+kubelet a Pod sandbox létrehozását CRI-hívással a container runtime-tól
+(containerd vagy CRI-O) kéri. A runtime létrehozza a Pod network
+namespace-ét, majd a <code>/etc/cni/net.d</code> konfiguráció alapján
+meghívja a <strong>Container Network Interface (CNI)</strong> pluginját
+(<code>ADD</code> művelet). A plugin a már létező namespace-ben
+interfészt hoz létre, és beállítja a <strong>CNI IP Address Management
+(IPAM)</strong> plugintől kapott Pod IP-t. Hibakereséskor ezért a
+runtime (<code>journalctl -u containerd</code>) és a CNI-plugin naplója
+a releváns forrás, nem a kubelet egyedül.</p>
+<p>Két fő CNI adatút létezik:</p>
+<ul>
+<li><strong>Routed</strong>: a Pod IP-prefix a node-okon külön
+alhálózatként jelenik meg, a Linux kernel továbbítja a csomagot a
+node-ok között, és a route-ot a CNI (például Calico BGP-vel)
+hirdeti.</li>
+<li><strong>Overlay</strong>: a Pod forgalom a node-ok között külső UDP
+fejléccel utazik, tipikusan VXLAN vagy Geneve segítségével, ahogyan a
+d163-ban tanult underlay/overlay elkülönülés mutatja. A CNI (például
+Flannel, Cilium) a belső Pod Ethernet-keretet beágyazza, a cél node
+IP-jéhez irányítja, és a fogadó oldalon kicsomagolja.</li>
+</ul>
+<p>A CNI-plugin és az IPAM tehát elválasztható réteg. A Cilium például
+eBPF datapath-ot és overlay-t is tud; a Calico alapvetően routed
+datapath-ot használ. A diagnosztikában először mindig azt kell
+tisztázni, hogy a cluster milyen CNI-t használ.</p>
+<h4 data-number="41.1.2.2" id="service-clusterip-és-endpointslice"><span
+class="header-section-number">41.1.2.2</span> Service, ClusterIP és
+EndpointSlice</h4>
+<p>A <strong>Service</strong> egy stabil, virtuális név és IP-cím, amely
+a Pod-ok mögötti workload elé kerül. Három fő típus:</p>
+<ul>
+<li><strong>ClusterIP</strong>: csak a cluster belső hálózatáról
+elérhető virtuális IP.</li>
+<li><strong>NodePort</strong>: a ClusterIP mellett minden node ugyanazon
+a porton is kiteszi a szolgáltatást.</li>
+<li><strong>LoadBalancer</strong>: a cloud provider vagy a cluster load
+balancere a NodePort fölé egy külső címet hoz létre.</li>
+</ul>
+<p>A Service és a Pod-ok közötti kapcsolat a <strong>selector</strong>.
+A Service controller figyeli a hozzá tartozó Pod-okat, és azokról
+<strong>EndpointSlice</strong> objektumokat generál. Az EndpointSlice a
+selectorra illeszkedő Pod-ok IP-jeit és portjait tartalmazza,
+endpointonként állapotjelzőkkel: <code>conditions.ready</code>
+(forgalmat kaphat), <code>conditions.serving</code> (a readiness szerint
+kiszolgálna, terminálás alatt is) és
+<code>conditions.terminating</code>. A tagság és a készenlét tehát külön
+dolog: a nem ready Pod is szerepelhet a listában
+<code>ready: false</code> értékkel, de a datapath alapértelmezésben csak
+a ready endpointokra küld forgalmat. Két ellenpélda: selector nélküli
+Service-hez az EndpointSlice-ot nem a controller, hanem a felhasználó
+vagy egy külső controller kezeli (például clusteren kívüli backendhez);
+a <code>publishNotReadyAddresses: true</code> Service-mező (tipikusan
+headless StatefulSet-Service) pedig a nem ready endpointokat is
+közzéteszi a DNS-ben és ready-ként kezelteti. A Service DNS neve a
+készenléttől függetlenül létezik, így elképzelhető, hogy a név
+feloldódik ClusterIP-re, de nincs egyetlen ready endpoint sem.</p>
+<h4 data-number="41.1.2.3" id="datapath-kube-proxy-vagy-ebpf"><span
+class="header-section-number">41.1.2.3</span> Datapath: kube-proxy vagy
+eBPF</h4>
+<p>A Service ClusterIP absztrakció: egy virtuális IP:port pár, amelyhez
+az API nem ír elő konkrét megvalósítást. Az implementációt a
+node-onkénti datapath adja; Linuxon jellemzően a
+<strong>kube-proxy</strong> állítja elő. A kube-proxy üzemmódjai:</p>
+<ul>
+<li><strong>iptables</strong> (alapértelmezett): a Service IP:portra
+érkező forgalmat netfilter DNAT-szabályok irányítják egy Pod IP-re; az
+állapot a <code>conntrack</code> táblában látszik.</li>
+<li><strong>ipvs</strong>: kernel szintű L4 load balancer, a
+Service-címek a <code>kube-ipvs0</code> dummy interfészen ülnek.</li>
+<li><strong>nftables</strong>: újabb mód (az upstream release notes
+szerint 1.31-ben béta, 1.33-tól GA); a szabályokat az
+<code>nft list ruleset</code> mutatja.</li>
+</ul>
+<p>A korábbi <code>userspace</code> mód az 1.26-os kiadással megszűnt.
+Ubuntu 24.04-en az <code>iptables</code> parancs is az nft backenden
+fut, ezért iptables módban az <code>iptables-save</code> és az
+<code>nft list ruleset</code> ugyanazokat a szabályokat mutatja más
+formában. A pontos módot és verziót a labcluster minorjához kell
+igazítani.</p>
+<p>Az eBPF-alapú CNI-k (például Cilium) a kube-proxy kiváltására
+(kube-proxy replacement) is képesek: a Service-fordítás eBPF-mapben,
+socket-LB esetén már a <code>connect()</code> hívásnál történik, ezért a
+netfilter <code>conntrack</code> táblában nincs DNAT-bejegyzés. A két
+adatút különbsége:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Szempont</th>
+<th>kube-proxy iptables mód</th>
+<th>Cilium kube-proxy replacement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fordítás helye</td>
+<td>netfilter DNAT a csomagúton</td>
+<td>eBPF program (socket-LB: <code>connect()</code>)</td>
+</tr>
+<tr>
+<td>Állapot megfigyelése</td>
+<td><code>iptables-save</code>, <code>conntrack -L</code></td>
+<td><code>cilium-dbg service list</code>,
+<code>cilium-dbg bpf lb list</code></td>
+</tr>
+<tr>
+<td>Üres <code>conntrack</code> kimenet</td>
+<td>hibajel</td>
+<td>normál működés</td>
+</tr>
+</tbody>
+</table>
+<p>A diagnosztikában ezért először azt kell rögzíteni, melyik
+implementáció fut, mert ugyanaz a megfigyelés a két esetben mást
+jelent.</p>
+<h4 data-number="41.1.2.4" id="névfeloldás-coredns-sel"><span
+class="header-section-number">41.1.2.4</span> Névfeloldás
+CoreDNS-sel</h4>
+<p>A clusterben a Service nevek feloldásáért a <strong>CoreDNS</strong>
+felel. A Pod <code>/etc/resolv.conf</code> fájljában a nameserver a
+CoreDNS Service IP-je, a search domain pedig például:</p>
+<pre><code>nameserver 10.96.0.10
+search lab-demo.svc.cluster.local svc.cluster.local cluster.local
+options ndots:5</code></pre>
+<p>A rövid <code>lab-app-svc</code> név feloldásakor a resolver először
+<code>lab-app-svc.lab-demo.svc.cluster.local</code>, majd a további
+search domaineket próbálja. Az <code>ndots:5</code> azt jelenti
+(<code>man 5 resolv.conf</code>), hogy a rendszer csak akkor próbálja a
+nevet elsőként abszolút névként, ha legalább öt pontot tartalmaz;
+különben előbb a search listán megy végig. A
+<code>lab-app-svc.lab-demo.svc.cluster.local</code> névben csak négy
+pont van (4 &lt; 5), ezért ez is először a search-listán fut végig
+(<code>…cluster.local.lab-demo.svc.cluster.local</code> stb.), és csak
+utána kérdezi abszolút névként. Ez felesleges extra DNS-kéréseket és
+késleltetést okozhat. Ezt a záró ponttal megadott abszolút név
+(<code>lab-app-svc.lab-demo.svc.cluster.local.</code>) vagy a Pod
+<code>dnsConfig.options</code> <code>ndots</code> értékének csökkentése
+szünteti meg.</p>
+<h4 data-number="41.1.2.5" id="conntrack-snat-mtu-és-ipv6"><span
+class="header-section-number">41.1.2.5</span> Conntrack, SNAT, MTU és
+IPv6</h4>
+<p>Ha a Pod külső internetre beszél, a node kimenő forgalmán
+<strong>SNAT</strong> történik, mert a Pod IP nem routolható a clusteren
+kívülről. A Linux <code>conntrack</code> táblája tartja nyilván a
+SNAT/DNAT átalakítások állapotát, és nagy forgalomnál telítődhet. A
+Service IP-re érkező DNAT-szabályok is a conntrack-en keresztül
+dolgoznak, ezért a kube-proxy konfigurációs hiba, például a NodePort
+DNAT hiánya, a <code>Service</code> elérhetetlenségében jelentkezik.</p>
+<p>Az overlay hálózatokban az MTU kérdés kritikus, ahogyan d163
+tárgyalta: a VXLAN fejléc megnöveli a külső csomag méretét. Ha a node
+fizikai interfész MTU-ja 1500, IPv4 underlay feletti VXLAN-nál a Pod
+MTU-ját legfeljebb 1450-re kell állítani, különben a nagy csomagok
+eldobódnak vagy fragmentálódnak. Ez a tünet jellegzetes: ping működik,
+de nagy HTTP válasz vagy <code>scp</code> lassul, akadozik.</p>
+<p>IPv6 esetén a CNI és a Service kettős veremmel működhet: a Pod kaphat
+IPv6 címet, a Service pedig dual-stack <code>ClusterIP</code>-t. A
+konfiguráció során mindig ellenőrizni kell, hogy a CNI és a Kubernetes
+egyaránt dual-stack vagy csak egyetlen protokollt támogat.</p>
+<h4 data-number="41.1.2.6" id="rétegek-és-adatút"><span
+class="header-section-number">41.1.2.6</span> Rétegek és adatút</h4>
+<p>Az alábbi táblázat a name resolution és datapath réteghatárokat
+foglalja össze.</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Kérdés</th>
+<th>Réteg</th>
+<th>Felelős</th>
+<th>Ellenőrzés</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Mi a Pod IP?</td>
+<td>Pod network</td>
+<td>CNI/IPAM</td>
+<td><code>kubectl get pod -o wide</code></td>
+</tr>
+<tr>
+<td>Mi a Service neve?</td>
+<td>DNS</td>
+<td>CoreDNS</td>
+<td><code>nslookup</code> a Podból</td>
+</tr>
+<tr>
+<td>Mi a Service IP?</td>
+<td>Kubernetes state</td>
+<td>Service object</td>
+<td><code>kubectl get svc</code></td>
+</tr>
+<tr>
+<td>Mely Pod-ok készek?</td>
+<td>EndpointSlice</td>
+<td>kube-controller-manager, readiness probe</td>
+<td><code>kubectl get endpointslices</code></td>
+</tr>
+<tr>
+<td>Hogyan jut a névtől az IP-ig?</td>
+<td>Service datapath</td>
+<td>kube-proxy vagy eBPF CNI</td>
+<td><code>conntrack</code>, <code>iptables</code>, Cilium state</td>
+</tr>
+<tr>
+<td>Mi történik a Pod IP-vel az external úton?</td>
+<td>SNAT</td>
+<td>node iptables/nftables</td>
+<td><code>conntrack -L</code></td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="41.1.3" id="kidolgozott-példa"><span
+class="header-section-number">41.1.3</span> Kidolgozott példa</h3>
+<p>A példa egy izolált labclusteren fut: context
+<code>lab-cluster</code>, namespace <code>lab-demo</code>, workerek
+<code>lab-node-2</code> és <code>lab-node-3</code>. Labprofil: a CNI
+Cilium VXLAN overlay módban, kube-proxy replacement
+<strong>nélkül</strong>; a Service-datapath a kube-proxy
+<strong>iptables</strong> módja. Underlay MTU 1500, Pod MTU 1450. A
+létrehozandó objektum: egy <code>lab-app</code> Deployment és egy
+<code>lab-app-svc</code> Service.</p>
+<p>Jogosultság: a kubectl parancsok a fejlesztői <code>dev-lab</code>
+accounttal futnak; a node-on végzett lekérdezések
+(<code>conntrack</code>, <code>iptables-save</code>) UID 0-t igényelnek.
+A namespace-ben a quota a <code>lab-quota</code>.</p>
+<p>Eszközök: a <code>registry.lab.example/cpp-demo:1.0.0</code>
+alkalmazásimage és később az <code>nginx:1.27</code> sem tartalmaz
+garantáltan <code>ping</code>, <code>nslookup</code> vagy
+<code>curl</code> eszközt. A diagnosztikai parancsokat ezért a labor
+saját debug image-éből
+(<code>registry.lab.example/netdebug:1.0.0</code>, Ubuntu 24.04 alapú,
+<code>iputils-ping</code>, <code>dnsutils</code> és <code>curl</code>
+csomaggal) futtatjuk, <code>kubectl debug</code> ephemeral
+containerként, amely a cél Pod network namespace-ében fut.</p>
+<p>Először hozzuk létre a Deploymentet és a Service-t:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-app.yaml</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> apps/v1</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Deployment</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-app</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-demo</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">replicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">selector</span><span class="kw">:</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">matchLabels</span><span class="kw">:</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">app</span><span class="kw">:</span><span class="at"> lab-app</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">template</span><span class="kw">:</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">app</span><span class="kw">:</span><span class="at"> lab-app</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">containers</span><span class="kw">:</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> app</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">image</span><span class="kw">:</span><span class="at"> registry.lab.example/cpp-demo:1.0.0</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">ports</span><span class="kw">:</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="kw">-</span><span class="at"> </span><span class="fu">containerPort</span><span class="kw">:</span><span class="at"> </span><span class="dv">8080</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">readinessProbe</span><span class="kw">:</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">httpGet</span><span class="kw">:</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">path</span><span class="kw">:</span><span class="at"> /ready</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">port</span><span class="kw">:</span><span class="at"> </span><span class="dv">8080</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">initialDelaySeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">periodSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">5</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a><span class="pp">---</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> v1</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Service</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-app-svc</span></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-demo</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">type</span><span class="kw">:</span><span class="at"> ClusterIP</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">selector</span><span class="kw">:</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">app</span><span class="kw">:</span><span class="at"> lab-app</span></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">ports</span><span class="kw">:</span></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> http</span></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">port</span><span class="kw">:</span><span class="at"> </span><span class="dv">8080</span></span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">targetPort</span><span class="kw">:</span><span class="at"> </span><span class="dv">8080</span></span></code></pre></div>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-demo apply <span class="at">-f</span> lab-app.yaml</span></code></pre></div>
+<p>Várható: a Deployment két Pod-ot létrehoz, a Service ClusterIP-t kap,
+és az EndpointSlice két ready endpointot tartalmaz. Ellenőrizzük a Pod
+IP-ket és a Service-t:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-demo get pods <span class="at">-o</span> wide</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-demo get svc lab-app-svc <span class="at">-o</span> wide</span></code></pre></div>
+<p>Illusztratív kimenet:</p>
+<pre><code>NAME                      READY   STATUS    IP           NODE
+lab-app-5d8c9f6b4-7c2xg   1/1     Running   10.244.1.5   lab-node-2
+lab-app-5d8c9f6b4-9v4kp   1/1     Running   10.244.3.8   lab-node-3
+
+NAME          TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)
+lab-app-svc   ClusterIP   10.96.123.45    &lt;none&gt;        8080/TCP</code></pre>
+<p>Most nézzük az EndpointSlice-ot:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-demo get endpointslices <span class="dt">\</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-l</span> kubernetes.io/service-name=lab-app-svc <span class="at">-o</span> yaml</span></code></pre></div>
+<p>A YAML-ben az <code>endpoints</code> lista a selectorra illeszkedő
+Pod-ok IP-jét, a <code>ports</code> lista a port nevét és számát
+mutatja. Ha egy Pod readiness probe-ja bukik, az endpoint a listában
+marad, de <code>conditions.ready: false</code> értékkel.</p>
+<p>A Service DNS feloldás ellenőrzése az egyik Pod network
+namespace-éből, debug ephemeral containerrel:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-demo debug <span class="at">-it</span> lab-app-5d8c9f6b4-7c2xg <span class="dt">\</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--image</span><span class="op">=</span>registry.lab.example/netdebug:1.0.0 <span class="at">--target</span><span class="op">=</span>app <span class="at">--</span> <span class="dt">\</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>  nslookup lab-app-svc.lab-demo.svc.cluster.local.</span></code></pre></div>
+<p>Várható válasz: a ClusterIP <code>10.96.123.45</code>.</p>
+<p>Az adatút tovább: ugyanebből a Podból HTTP kérés a Service névre:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-demo debug <span class="at">-it</span> lab-app-5d8c9f6b4-7c2xg <span class="dt">\</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--image</span><span class="op">=</span>registry.lab.example/netdebug:1.0.0 <span class="at">--target</span><span class="op">=</span>app <span class="at">--</span> <span class="dt">\</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>  curl <span class="at">-sv</span> http://lab-app-svc:8080/ready</span></code></pre></div>
+<p>A Service útvonal működik, ha a datapath (itt a kube-proxy iptables
+DNAT-szabálya) egy ready Pod IP-re fordítja a célcímet. Ha a Service-név
+és a Pod IP közvetlen elérése is sikeres, akkor a datapath és a DNS is
+rendben van.</p>
+<p>A Service-fordítás állapota a kliens Pod node-ján
+(<code>lab-node-2</code>, UID 0) látszik a conntrack táblában; a
+parancsot a fenti <code>curl</code> futtatása közben vagy közvetlenül
+utána kell kiadni:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> conntrack <span class="at">-L</span> <span class="at">-d</span> 10.96.123.45</span></code></pre></div>
+<p>Iptables módban egy sikeres kérés után itt DNAT-bejegyzés látszik
+(eredeti cél <code>10.96.123.45</code>, válaszirány egy Pod IP-ről). Ha
+nincs bejegyzés, miközben a kérés bukik, a kube-proxy adatút hibás.
+Cilium kube-proxy replacement mellett ez a kimenet helyes működésnél is
+üres; ott az ellenőrzés
+<code>kubectl --context lab-cluster -n kube-system exec ds/cilium -c cilium-agent -- cilium-dbg service list</code>.</p>
+<p>MTU gyorsteszt Pod IP-k között, a <code>lab-node-2</code>-n futó
+Podból a <code>lab-node-3</code>-on futó Pod felé (az ICMP a
+ClusterIP-re nem jellemzi az adatutat):</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-demo debug <span class="at">-it</span> lab-app-5d8c9f6b4-7c2xg <span class="dt">\</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--image</span><span class="op">=</span>registry.lab.example/netdebug:1.0.0 <span class="at">--target</span><span class="op">=</span>app <span class="at">--</span> <span class="dt">\</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>  ping <span class="at">-M</span> do <span class="at">-s</span> 1422 <span class="at">-c</span> 2 10.244.3.8</span></code></pre></div>
+<p>A <code>-s</code> az ICMP payload mérete; a kimenő IPv4-csomag ennél
+28 bájttal nagyobb (8 B ICMP-fejléc + 20 B IPv4-fejléc). 1450 bájtos Pod
+MTU mellett tehát a <code>-s 1422</code> (1450 B-os csomag) a
+legnagyobb, ami átmegy. Ellenpróba: <code>-s 1423</code>-mal a
+parancsnak <code>-M do</code> miatt már a Podon belül el kell buknia
+(„message too long”), ez a helyes MTU jele, nem hiba. Ha viszont a
+<code>-s 1422</code> nem megy át, a Pod MTU nagyobb az overlay által
+ténylegesen átvihető méretnél, vagy az underlay interfész MTU-ja kisebb
+a vártnál. A d163-ban leírtakat itt alkalmazzuk: az underlay MTU legyen
+legalább a belső MTU plusz 50 bájt (IPv4 underlay esetén: külső IPv4 20
+B + UDP 8 B + VXLAN 8 B + a beágyazott Ethernet-keret fejléce 14 B; IPv6
+underlaynél 70 B).</p>
+<h3 data-number="41.1.4" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">41.1.4</span> Tipikus hibák és
+ellenpróbák</h3>
+<p><strong>Hiba 1: A Service név NXDOMAIN vagy timeout, de a Pod IP
+elérhető.</strong></p>
+<p>Ez DNS hiba, nem datapath hiba. Ellenpróba: <code>curl</code> a Pod
+IP-vel működik, de <code>curl</code> a Service névvel nem. A d137
+szerint a DNS hiba lehet NXDOMAIN, SERVFAIL vagy timeout. Ellenőrizzük a
+CoreDNS podokat, a <code>resolv.conf</code>-ot a Podban, és a query
+logot. A rövid név és az <code>ndots:5</code> miatt a search domain lánc
+többször próbálhat; a négy pontot tartalmazó teljes név is. A
+diagnosztikában a záró ponttal megadott abszolút név
+(<code>lab-app-svc.lab-demo.svc.cluster.local.</code>) egyetlen
+lekérdezést küld, így a search-lánc hatása kizárható.</p>
+<p><strong>Hiba 2: A Service név feloldódik, de a <code>curl</code>
+azonnal „Connection refused”-ot ad.</strong></p>
+<p>Itt az EndpointSlice-ra kell gyanakodni. Ha a selector nem
+illeszkedik, az EndpointSlice üres; ha a Pod-ok readiness probe-ja
+bukik, az endpointok <code>ready: false</code> állapotúak. Mindkét
+esetben nincs ready célpont: kube-proxy iptables/IPVS módban és Cilium
+alatt a datapath az endpoint nélküli Service-re REJECT/ICMP unreachable
+választ ad, ezért a kliens azonnal elutasítást kap, nem timeoutot.
+Timeout esetén inkább datapath- vagy NetworkPolicy-dropot keress (Hiba
+3). Ellenpróba:
+<code>kubectl get endpointslices -l kubernetes.io/service-name=&lt;svc&gt; -o yaml</code>
+üres vagy csak <code>ready: false</code> endpointokat mutat. A javítás a
+selector vagy a readiness probe logikája. A port eltérése másként
+jelentkezik: numerikus <code>targetPort</code> esetén a
+<code>containerPort</code> csak informatív mező, az endpoint megjelenik,
+de a Podon az adott porton nincs listener, és a kérés a Podtól kap
+„connection refused”-ot. Név szerinti <code>targetPort</code>
+(<code>targetPort: http</code>) esetén az a Pod, amelynek nincs ilyen
+nevű <code>containerPort</code>-ja, kimarad az EndpointSlice-ból.</p>
+<p><strong>Hiba 3: A Pod-to-Pod működik, de a Pod-to-Service
+nem.</strong></p>
+<p>A Pod IP közvetlen elérése sikeres, a Service IP elérése timeout. Ez
+datapath hiba, jellemzően a kube-proxy iptables/ipvs szabály hiánya vagy
+eBPF CNI state eltérés. Ellenpróba iptables módban: a kliens Pod
+node-ján <code>sudo iptables-save | grep lab-demo/lab-app-svc</code> nem
+mutat DNAT szabályt, illetve a
+<code>conntrack -L -d &lt;ClusterIP&gt;</code> a kérés alatt nem
+tartalmaz NAT bejegyzést. Először a kube-proxy pod naplóját nézzük, majd
+a CNI állapotát. Cilium kube-proxy replacement mellett az üres conntrack
+nem hibajel; ott a <code>cilium-dbg service list</code> (az agent
+Podjában) mutatja, hogy a Service backendjei bekerültek-e.</p>
+<p><strong>Hiba 4: Nagy fájl átvitel lassul, de a ping
+működik.</strong></p>
+<p>Ez overlay MTU problémára utal. A kis ICMP csomagok átmennek, a nagy
+TCP szegmensek fragmentálódhatnak vagy eldobódnak. A VXLAN/Geneve
+overhead miatt a Pod MTU-t csökkenteni kell. Ellenpróba:
+<code>ping -M do -s 1472</code> (1500 B-os IPv4-csomag) a Pod-ból a
+másik node-on futó cél Pod felé nem megy át, a <code>-s 1422</code>
+(1450 B) igen; a különbség a 28 B ICMP+IPv4 fejléc. A CNI dokumentáció a
+szükséges MTU értéket specifikálja.</p>
+<p><strong>Hiba 5: A backend Pod nem látja a külső kliens forrás IP-jét
+(NodePort/LoadBalancer).</strong></p>
+<p><code>externalTrafficPolicy: Cluster</code> (alapértelmezés) mellett
+a NodePort/LoadBalancer forgalmat a fogadó node más node-on futó Podra
+is továbbíthatja, ezért SNAT-ot kap: a backend a node IP-jét látja.
+<code>Local</code> beállítással a forrás IP megmarad, de a forgalom csak
+a fogadó node helyi, ready Pod-jaihoz megy, és a Pod nélküli node-ok a
+load balancer health checkjén elbuknak. ClusterIP Service-re ez a mező
+nem állítható; a clusteren belüli ClusterIP-forgalomnál a kube-proxy
+csak DNAT-ot végez (a <code>masqueradeAll</code> és a hairpin esetét
+kivéve), így a backend a kliens Pod IP-jét látja. Ellenpróba: a NodePort
+Service <code>externalTrafficPolicy</code> értéke <code>Cluster</code>,
+és a backend naplójában node IP szerepel forráscímként.</p>
+<h3 data-number="41.1.5" id="feladatok"><span
+class="header-section-number">41.1.5</span> Feladatok</h3>
+<h4 data-number="41.1.5.1" id="feladat-1-elemzés-és-magyarázat"><span
+class="header-section-number">41.1.5.1</span> Feladat 1 – Elemzés és
+magyarázat</h4>
+<p>Adott az alábbi Service és EndpointSlice YAML kivágat:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> v1</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Service</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-analysis</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-demo</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">type</span><span class="kw">:</span><span class="at"> ClusterIP</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">selector</span><span class="kw">:</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">app</span><span class="kw">:</span><span class="at"> lab-analysis</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">ports</span><span class="kw">:</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> http</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">port</span><span class="kw">:</span><span class="at"> </span><span class="dv">80</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">targetPort</span><span class="kw">:</span><span class="at"> </span><span class="dv">8080</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a><span class="pp">---</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> discovery.k8s.io/v1</span></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> EndpointSlice</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-analysis-7gc2x</span></span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-demo</span></span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">kubernetes.io/service-name</span><span class="kw">:</span><span class="at"> lab-analysis</span></span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a><span class="fu">addressType</span><span class="kw">:</span><span class="at"> IPv4</span></span>
+<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a><span class="fu">ports</span><span class="kw">:</span></span>
+<span id="cb11-24"><a href="#cb11-24" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> http</span></span>
+<span id="cb11-25"><a href="#cb11-25" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">port</span><span class="kw">:</span><span class="at"> </span><span class="dv">8080</span></span>
+<span id="cb11-26"><a href="#cb11-26" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">protocol</span><span class="kw">:</span><span class="at"> TCP</span></span>
+<span id="cb11-27"><a href="#cb11-27" aria-hidden="true" tabindex="-1"></a><span class="fu">endpoints</span><span class="kw">:</span></span>
+<span id="cb11-28"><a href="#cb11-28" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">addresses</span><span class="kw">:</span></span>
+<span id="cb11-29"><a href="#cb11-29" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fl">10.244.2.80</span></span>
+<span id="cb11-30"><a href="#cb11-30" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">conditions</span><span class="kw">:</span></span>
+<span id="cb11-31"><a href="#cb11-31" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">ready</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span></code></pre></div>
+<p>Magyarázd meg, mi a szerepe a Service <code>port</code> és
+<code>targetPort</code> mezőjének, és miért térhetnek el egymástól;
+továbbá milyen feltételek mellett kerül be a Pod az EndpointSlice-ba, és
+mikor kap forgalmat. Milyen következménye lenne annak, ha a
+<code>selector</code> nem illeszkedne?</p>
+<h4 data-number="41.1.5.2"
+id="feladat-2-adminisztráció-és-konfiguráció"><span
+class="header-section-number">41.1.5.2</span> Feladat 2 – Adminisztráció
+és konfiguráció</h4>
+<p>Hozz létre egy új Deploymentet és Service-t <code>lab-svc-test</code>
+néven a <code>lab-demo</code> namespace-ben. A Deployment futtasson egy
+egyszerű <code>nginx:1.27</code> konténert, a Service típusa ClusterIP,
+port 80, targetPort 80. Ellenőrizd, hogy:</p>
+<ul>
+<li>a Pod IP-ket és a Service ClusterIP-t;</li>
+<li>az EndpointSlice a ready Pod-ot tartalmazza;</li>
+<li>a Service név feloldódik, és HTTP választ ad a Podból;</li>
+<li>az MTU a Podok között legalább 1400 bájt payloaddal működik.</li>
+</ul>
+<p>A módosító parancs előtt és után futtasd a megfelelő ellenőrző
+parancsokat.</p>
+<h4 data-number="41.1.5.3"
+id="feladat-3-hibadiagnosztika-és-recovery"><span
+class="header-section-number">41.1.5.3</span> Feladat 3 –
+Hibadiagnosztika és recovery</h4>
+<p>A clusteren egy jelentés jön: a Service <code>lab-app-svc</code> név
+feloldódik, de a HTTP kérés a Service IP-re timeout. A közvetlen Pod IP
+elérése a másik Podból azonban működik. Keretezd a hibát: mi a
+legvalószínűbb réteg? Tervezz diagnosztikai lépéseket:</p>
+<ul>
+<li>Ellenőrizd az EndpointSlice-ot;</li>
+<li>a kube-proxy vagy CNI datapath állapotát;</li>
+<li>a node-on a conntrack táblát;</li>
+<li>a Service YAML-t és a selector illeszkedést;</li>
+<li>az MTU-t.</li>
+</ul>
+<p>Végül javítsd a hibát, és hajtsd végre a verifikációt.</p>
+<h3 data-number="41.1.6" id="megoldások"><span
+class="header-section-number">41.1.6</span> Megoldások</h3>
+<h4 data-number="41.1.6.1" id="feladat-1-megoldása"><span
+class="header-section-number">41.1.6.1</span> Feladat 1 megoldása</h4>
+<p>A Service <code>port</code> az a port, amelyen a Service ClusterIP
+elérhető a kliensek számára; a <code>targetPort</code> pedig a Pod
+tényleges portja, ahová a DNAT irányítja a forgalmat. A kettő azért
+térhet el, mert a kliensek felé stabil, konvencionális portot (itt 80)
+érdemes mutatni, miközben a konténer nem privilegizált porton (8080)
+hallgat; a datapath a <code>port</code>-ra érkező forgalmat a
+<code>targetPort</code>-ra fordítja. Ha a Pod a <code>8080</code>-on
+hallgat, de a <code>targetPort</code> <code>80</code> lenne, az endpoint
+megjelenne, de a Podon a 80-as porton nincs listener, a kérés
+„connection refused”-dal bukna. Az EndpointSlice azokat a Pod-okat
+tartalmazza, amelyekre a Service selector illeszkedik; a
+<code>conditions.ready: true</code> jelöli, hogy az endpoint forgalmat
+kaphat (a readiness probe sikeres). A nem ready Pod
+<code>ready: false</code> állapottal a listában maradhat, de forgalmat
+nem kap. Ha a selector nem illeszkedik, az EndpointSlice üres marad; a
+Service név és IP létezik, de a datapath (kube-proxy iptables/IPVS,
+Cilium) az endpoint nélküli Service-re azonnal elutasítással (REJECT,
+„connection refused”) válaszol, nem timeouttal.</p>
+<h4 data-number="41.1.6.2" id="feladat-2-megoldása"><span
+class="header-section-number">41.1.6.2</span> Feladat 2 megoldása</h4>
+<p>YAML létrehozása:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-svc-test.yaml</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> apps/v1</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Deployment</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-svc-test</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-demo</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">replicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">selector</span><span class="kw">:</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">matchLabels</span><span class="kw">:</span></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">app</span><span class="kw">:</span><span class="at"> lab-svc-test</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">template</span><span class="kw">:</span></span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">app</span><span class="kw">:</span><span class="at"> lab-svc-test</span></span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">containers</span><span class="kw">:</span></span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> web</span></span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">image</span><span class="kw">:</span><span class="at"> nginx:1.27</span></span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">ports</span><span class="kw">:</span></span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="kw">-</span><span class="at"> </span><span class="fu">containerPort</span><span class="kw">:</span><span class="at"> </span><span class="dv">80</span></span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a><span class="pp">---</span></span>
+<span id="cb12-23"><a href="#cb12-23" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> v1</span></span>
+<span id="cb12-24"><a href="#cb12-24" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Service</span></span>
+<span id="cb12-25"><a href="#cb12-25" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb12-26"><a href="#cb12-26" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-svc-test</span></span>
+<span id="cb12-27"><a href="#cb12-27" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-demo</span></span>
+<span id="cb12-28"><a href="#cb12-28" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb12-29"><a href="#cb12-29" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">type</span><span class="kw">:</span><span class="at"> ClusterIP</span></span>
+<span id="cb12-30"><a href="#cb12-30" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">selector</span><span class="kw">:</span></span>
+<span id="cb12-31"><a href="#cb12-31" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">app</span><span class="kw">:</span><span class="at"> lab-svc-test</span></span>
+<span id="cb12-32"><a href="#cb12-32" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">ports</span><span class="kw">:</span></span>
+<span id="cb12-33"><a href="#cb12-33" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> http</span></span>
+<span id="cb12-34"><a href="#cb12-34" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">port</span><span class="kw">:</span><span class="at"> </span><span class="dv">80</span></span>
+<span id="cb12-35"><a href="#cb12-35" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">targetPort</span><span class="kw">:</span><span class="at"> </span><span class="dv">80</span></span></code></pre></div>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-demo apply <span class="at">-f</span> lab-svc-test.yaml</span></code></pre></div>
+<p>Ellenőrzések:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="va">K</span><span class="op">=</span><span class="st">&quot;kubectl --context lab-cluster -n lab-demo&quot;</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="va">$K</span> get pods <span class="at">-l</span> app=lab-svc-test <span class="at">-o</span> wide</span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="va">$K</span> get svc lab-svc-test <span class="at">-o</span> wide</span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="va">$K</span> get endpointslices <span class="at">-l</span> kubernetes.io/service-name=lab-svc-test <span class="at">-o</span> yaml</span></code></pre></div>
+<p>A Podból futtatott tesztekhez először állítsd be a két shellváltozót;
+a <code>PEER_IP</code> egy olyan Pod IP-je legyen (például a
+<code>lab-app</code> egyik Podjáé), amely a
+<code>get pods -o wide</code> szerint másik node-on fut, mint a
+<code>lab-svc-test</code> Pod:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="va">POD</span><span class="op">=</span><span class="va">$($K</span> get pod <span class="at">-l</span> app=lab-svc-test <span class="at">-o</span> jsonpath=<span class="st">&#39;{.items[0].metadata.name}&#39;</span><span class="va">)</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="va">PEER_IP</span><span class="op">=</span>10.244.3.8</span></code></pre></div>
+<p>Az <code>nginx:1.27</code> image-ben nincs garantáltan
+<code>curl</code>/<code>ping</code>, ezért a debug image-et használjuk
+ephemeral containerként:</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="va">$K</span> debug <span class="at">-it</span> <span class="st">&quot;</span><span class="va">$POD</span><span class="st">&quot;</span> <span class="at">--image</span><span class="op">=</span>registry.lab.example/netdebug:1.0.0 <span class="dt">\</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--target</span><span class="op">=</span>web <span class="at">--</span> curl <span class="at">-s</span> <span class="at">-o</span> /dev/null <span class="at">-w</span> <span class="st">&#39;%{http_code}\n&#39;</span> <span class="dt">\</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a>  http://lab-svc-test.lab-demo.svc.cluster.local.</span></code></pre></div>
+<p>MTU teszt a másik node-on futó Pod IP-jére; 1400 B payload = 1428
+B-os IPv4-csomag, ami 1450-es Pod MTU alatt van:</p>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="va">$K</span> debug <span class="at">-it</span> <span class="st">&quot;</span><span class="va">$POD</span><span class="st">&quot;</span> <span class="at">--image</span><span class="op">=</span>registry.lab.example/netdebug:1.0.0 <span class="dt">\</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--target</span><span class="op">=</span>web <span class="at">--</span> ping <span class="at">-M</span> do <span class="at">-s</span> 1400 <span class="at">-c</span> 2 <span class="st">&quot;</span><span class="va">$PEER_IP</span><span class="st">&quot;</span></span></code></pre></div>
+<p>Postcondition: a Deployment <code>Available</code>, a Service
+ClusterIP létezik, az EndpointSlice <code>ready: true</code> endpointot
+tartalmaz, a curl <code>200</code>-as HTTP kódot ír ki, az MTU ping 1400
+bájttal 0% csomagvesztést mutat. Rollback:
+<code>kubectl --context lab-cluster -n lab-demo delete -f lab-svc-test.yaml</code>.</p>
+<h4 data-number="41.1.6.3" id="feladat-3-megoldása"><span
+class="header-section-number">41.1.6.3</span> Feladat 3 megoldása</h4>
+<p><strong>Réteg kiválasztása a tünetből.</strong> A név feloldódik (DNS
+rendben), a Pod IP közvetlenül elérhető (Pod network és az alkalmazás
+rendben), a Service IP-re viszont <strong>timeout</strong> jön, nem
+azonnali elutasítás. Üres vagy csak nem ready endpointokat tartalmazó
+Service-nél „connection refused” jönne, ezért a legvalószínűbb réteg a
+Service-datapath (kube-proxy), kisebb eséllyel egy NetworkPolicy-drop.
+Az MTU itt nem jelölt: egy kis HTTP-kérés nem bukik MTU miatt, és a Pod
+IP-s út működik.</p>
+<ol type="1">
+<li><strong>Kizárás: EndpointSlice és Service YAML</strong> (gyors
+ellenpróba a feltételezés megerősítésére):</li>
+</ol>
+<div class="sourceCode" id="cb18"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="va">K</span><span class="op">=</span><span class="st">&quot;kubectl --context lab-cluster -n lab-demo&quot;</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="va">$K</span> get endpointslices <span class="at">-l</span> kubernetes.io/service-name=lab-app-svc <span class="at">-o</span> yaml</span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="va">$K</span> get svc lab-app-svc <span class="at">-o</span> yaml</span></code></pre></div>
+<p>Várt: legalább egy <code>ready: true</code> endpoint, a
+<code>selector</code> illeszkedik a Pod-címkékre, a
+<code>targetPort</code> a Pod listener portja. Ha ez teljesül, az
+endpoint-réteg kizárva.</p>
+<ol start="2" type="1">
+<li><strong>Datapath a kliens Pod node-ján</strong>
+(<code>lab-node-2</code>, UID 0; a labprofil szerint kube-proxy iptables
+mód):</li>
+</ol>
+<div class="sourceCode" id="cb19"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> iptables-save <span class="kw">|</span> <span class="fu">grep</span> <span class="st">&#39;lab-demo/lab-app-svc&#39;</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> conntrack <span class="at">-L</span> <span class="at">-d</span> 10.96.123.45</span></code></pre></div>
+<p>Ha nincs a Service-re vonatkozó DNAT-szabály, és a kérés alatt nincs
+conntrack-bejegyzés, a kube-proxy nem programozta be a Service-t ezen a
+node-on. (Cilium kube-proxy replacement esetén ehelyett:
+<code>kubectl --context lab-cluster -n kube-system exec ds/cilium -c cilium-agent -- cilium-dbg service list</code>;
+a munkaállomásról
+<code>cilium --context lab-cluster status --wait</code>.)</p>
+<ol start="3" type="1">
+<li><strong>Gyökérok a kube-proxy állapotából</strong>:</li>
+</ol>
+<div class="sourceCode" id="cb20"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="va">KS</span><span class="op">=</span><span class="st">&quot;kubectl --context lab-cluster -n kube-system&quot;</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="va">$KS</span> get pods <span class="at">-l</span> k8s-app=kube-proxy <span class="at">-o</span> wide</span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a><span class="va">$KS</span> logs ds/kube-proxy <span class="at">--tail</span><span class="op">=</span>50</span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a><span class="va">$KS</span> get configmap kube-proxy <span class="at">-o</span> yaml</span></code></pre></div>
+<p>Tipikus ok (a napló alapján döntsd el): a kube-proxy Podok (köztük a
+<code>lab-node-2</code>-é) <code>CrashLoopBackOff</code>-ban vannak,
+mert a <code>kube-proxy</code> ConfigMap egy korábbi módosítása
+érvénytelen (például elgépelt <code>mode</code>). A javítás a naplóban
+megnevezett hiba kijavítása a ConfigMapben, majd a DaemonSet
+újraindítása:</p>
+<div class="sourceCode" id="cb21"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="va">$KS</span> get configmap kube-proxy <span class="at">-o</span> yaml <span class="op">&gt;</span> kube-proxy-cm.bak.yaml</span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="va">$KS</span> edit configmap kube-proxy</span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a><span class="va">$KS</span> rollout restart ds/kube-proxy</span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a><span class="va">$KS</span> rollout status ds/kube-proxy</span></code></pre></div>
+<p>A Pod puszta törlése nem javít: a hibás konfigurációval az új Pod is
+összeomlik. Rollback: a mentett ConfigMap visszaállítása
+(<code>$KS replace -f kube-proxy-cm.bak.yaml</code>), majd ismét
+<code>$KS rollout restart ds/kube-proxy</code>.</p>
+<p><strong>Verifikáció:</strong> a <code>curl</code> a Service névvel és
+a ClusterIP-vel is sikeres (a debug image-ből), az EndpointSlice ready
+endpointot tartalmaz, az
+<code>iptables-save | grep 'lab-demo/lab-app-svc'</code> DNAT-szabályt
+mutat, és a kérés alatt megjelenik a conntrack-bejegyzés. MTU-gyanú
+esetén az MTU-t Pod IP-k között kell tesztelni
+(<code>ping -M do -s 1422</code> a másik node-on futó Pod IP-jére), nem
+a ClusterIP-re: a ClusterIP-re küldött ICMP echo-ra iptables módban és
+Cilium alatt általában nem jön válasz, mert a fordítás csak a Service
+TCP/UDP portjaira vonatkozik.</p>
+<h3 data-number="41.1.7" id="rövid-összefoglaló"><span
+class="header-section-number">41.1.7</span> Rövid összefoglaló</h3>
+<p>A Pod network réteg a CNI/IPAM felelőssége; a Pod IP a valós cél. A
+Service ClusterIP absztrakció (virtuális IP:port), amelyet a datapath
+valósít meg: kube-proxy iptables/nftables módban DNAT-tal, IPVS-ben
+kernel-load-balancerrel, Cilium kube-proxy replacementtel eBPF-ben. Az
+EndpointSlice tagságát selectoros Service-nél a selector, a
+forgalmazhatóságot az endpoint
+<code>ready</code>/<code>serving</code>/<code>terminating</code>
+feltétele adja; selector nélküli Service-nél az EndpointSlice-ot kézzel
+vagy külső controller kezeli, a <code>publishNotReadyAddresses</code>
+pedig a nem ready endpointokat is közzéteszi. A DNS a CoreDNS és a Pod
+<code>resolv.conf</code> search domainje szerint válaszol.</p>
+<p>A hibakeresés nem egyetlen rögzített sorrend, hanem az első tünet
+szerinti elágazás; minden ágban a bizonyíték (parancskimenet) dönt:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Első tünet</th>
+<th>Első vizsgált réteg</th>
+<th>Elsődleges bizonyíték</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NXDOMAIN/SERVFAIL vagy DNS-timeout</td>
+<td>DNS</td>
+<td><code>nslookup &lt;név&gt;.</code> a Podból, CoreDNS Podok és
+napló</td>
+</tr>
+<tr>
+<td>Azonnali „connection refused” a Service-re</td>
+<td>EndpointSlice</td>
+<td>üres vagy csak <code>ready: false</code> endpointok, selector</td>
+</tr>
+<tr>
+<td>503 egy ingress/proxy mögött</td>
+<td>EndpointSlice, readiness</td>
+<td>ready endpointok száma, probe-események</td>
+</tr>
+<tr>
+<td>Timeout a Service-re, Pod IP működik</td>
+<td>datapath, NetworkPolicy</td>
+<td><code>iptables-save</code>/<code>nft list ruleset</code> vagy
+<code>cilium-dbg service list</code>, kube-proxy napló</td>
+</tr>
+<tr>
+<td>Kis kérés működik, nagy átvitel akad</td>
+<td>MTU</td>
+<td><code>ping -M do -s 1422</code> Pod IP-k között</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong>CNI/IPAM:</strong> a Pod hálózati namespace és
+IP-hozzárendelés rétege.</li>
+<li><strong>Service ClusterIP:</strong> a Pod-ok elé helyezett stabil
+virtuális IP.</li>
+<li><strong>EndpointSlice:</strong> a Service selectorához tartozó ready
+Pod IP-k és portok.</li>
+</ul>
+<h3 data-number="41.1.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">41.1.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>Hivatkozott verzió: a 43.1 laborprofiljának Kubernetes-minorja
+(<code>v1.31</code>), a labprofil szerinti Cilium (a pontos minor a
+telepítéskor rögzítendő; a <code>cilium-dbg</code> név 1.15-től
+érvényes), CoreDNS a kubeadm által telepített verzióban, Ubuntu Server
+24.04 LTS node-ok. A kubernetes.io a legfrissebb kiadást mutatja,
+régebbi minorhoz a lap verzióválasztóját kell használni.</p>
+<ul>
+<li>Kubernetes – Cluster Networking (hálózati modell, CNI): <a
+href="https://kubernetes.io/docs/concepts/cluster-administration/networking/"
+class="uri">https://kubernetes.io/docs/concepts/cluster-administration/networking/</a>;
+Network Plugins: <a
+href="https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/network-plugins/"
+class="uri">https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/network-plugins/</a>.</li>
+<li>CNI specifikáció (<code>ADD</code>/<code>DEL</code>, runtime–plugin
+felelősség): <a href="https://www.cni.dev/docs/spec/"
+class="uri">https://www.cni.dev/docs/spec/</a>.</li>
+<li>Kubernetes – Service (<code>port</code>/<code>targetPort</code>,
+<code>externalTrafficPolicy</code>,
+<code>publishNotReadyAddresses</code>): <a
+href="https://kubernetes.io/docs/concepts/services-networking/service/"
+class="uri">https://kubernetes.io/docs/concepts/services-networking/service/</a>.</li>
+<li>Kubernetes – EndpointSlices
+(<code>ready</code>/<code>serving</code>/<code>terminating</code>): <a
+href="https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/"
+class="uri">https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/</a>.</li>
+<li>Kubernetes – Virtual IPs and Service Proxies (kube-proxy
+iptables/IPVS/nftables módok): <a
+href="https://kubernetes.io/docs/reference/networking/virtual-ips/"
+class="uri">https://kubernetes.io/docs/reference/networking/virtual-ips/</a>.</li>
+<li>Kubernetes – DNS for Services and Pods (<code>ndots</code>,
+<code>dnsConfig</code>): <a
+href="https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/"
+class="uri">https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/</a>;
+<code>resolv.conf(5)</code>: <a
+href="https://man7.org/linux/man-pages/man5/resolv.conf.5.html"
+class="uri">https://man7.org/linux/man-pages/man5/resolv.conf.5.html</a>.</li>
+<li>Kubernetes – Debug Running Pods (ephemeral container,
+<code>kubectl debug --target</code>): <a
+href="https://kubernetes.io/docs/tasks/debug/debug-application/debug-running-pod/"
+class="uri">https://kubernetes.io/docs/tasks/debug/debug-application/debug-running-pod/</a>.</li>
+<li>Cilium dokumentáció – Networking, kube-proxy replacement: <a
+href="https://docs.cilium.io/en/stable/network/"
+class="uri">https://docs.cilium.io/en/stable/network/</a>.</li>
+<li>Linux kernel – VXLAN: <a
+href="https://docs.kernel.org/networking/vxlan.html"
+class="uri">https://docs.kernel.org/networking/vxlan.html</a>;
+<code>ping(8)</code> (<code>-M</code>, <code>-s</code>): <a
+href="https://man7.org/linux/man-pages/man8/ping.8.html"
+class="uri">https://man7.org/linux/man-pages/man8/ping.8.html</a>.</li>
+<li>CoreDNS kézikönyv: <a href="https://coredns.io/manual/"
+class="uri">https://coredns.io/manual/</a>.</li>
+</ul>
+<p>Ellenőrzési hiány: a példák laborban ellenőrizendők; dátumozott
+futtatási napló (reprodukciós trace: <code>kubectl version</code>,
+<code>cilium version</code>, sikeres és hibás ág kimenete) még nem
+készült. A <code>registry.lab.example/netdebug:1.0.0</code> debug
+image-et a labor image-szabálya szerint kell előállítani és rögzíteni. A
+kimenetek illusztratívak.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d200.html">← 40.5 Workload rollout és scheduling labor</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d202.html">41.2 Ingress API, Gateway API és edge routing →</a></div>
+</nav>
+</body>
+</html>

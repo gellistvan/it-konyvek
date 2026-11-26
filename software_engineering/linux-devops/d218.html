@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>44.3 Compute image, instance és autoscaling – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch44">44 Cloud alapmodell, account és identity</a></p>
+<div class="links"><a class="prev" rel="prev" href="d217.html">← 44.2 IAM, role, federation és workload identity</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d219.html">44.4 Accountbaseline, audit, költség és cleanup →</a></div>
+</nav>
+<h2 data-number="44.3" id="d218"><span
+class="header-section-number">44.3</span> Compute image, instance és
+autoscaling</h2>
+<h3 data-number="44.3.1" id="motiváció"><span
+class="header-section-number">44.3.1</span> Motiváció</h3>
+<p>A saját virtualizációs laborban a VM életciklusa libvirt/QEMU alatt
+viszonylag közvetlenül kézben tartható: ismerjük a hostot, a backing
+chain rétegeit, a cloud-init adatforrásokat. A felhőszolgáltató compute
+rétege ezt a modellt üzemeltetési API-val, foglalási rendszerrel és
+elasticitással egészíti ki, de közben a hardver és a hypervisor eltűnik
+mögüle. A szenior fejlesztőnek tudnia kell, hogy egy image-ből indított
+példány (instance) milyen szerződést kap, mit jelent az autoscaling
+health check, és hogyan kezeljük a spot/preemptible megszakítást
+anélkül, hogy a szolgáltatás elveszítse a kéréseket. Ez a fejezet a már
+ismert VM-, image- és cloud-init tudást köti össze a provider compute
+API-jával.</p>
+<h3 data-number="44.3.2" id="definíció-és-működés"><span
+class="header-section-number">44.3.2</span> Definíció és működés</h3>
+<h4 data-number="44.3.2.1"
+id="instance-type-architecture-és-erőforráslimit"><span
+class="header-section-number">44.3.2.1</span> Instance type,
+architecture és erőforráslimit</h4>
+<p>A felhőbeli <strong>példány</strong> (instance) futtatható virtuális
+gép, amelyet a provider által definiált <strong>instance type</strong>
+profil szerint kapunk. Ez a profil hasonló a KVM vCPU/memória
+konfigurációhoz, de szerződésszerűen rögzíti a vCPU-k számát, az
+architektúrát (x86_64 vagy arm64), a memóriát, a hálózati
+sávszélesség-osztályt és a csatlakoztatható blokkeszközök típusát. A
+d168-ban tárgyalt vCPU steal és NUMA pinning itt részben a provider
+schedulere által meghatározott: az adott instance type mögött egy
+foglalási osztály áll, de a guest számára ezt a provider API nem fedi
+fel teljesen. Az operatív kérdés az, hogy a választott type elfér-e a
+kvótában, és elég-e a hálózati/kapacitási fejléchez.</p>
+<p>A <strong>network limit</strong> például megadja, hány virtuális
+hálózati interfész (ENI) csatolható, és ezek mekkora maximális átvitelt
+kapnak. A <strong>storage limit</strong> a csatlakoztatható
+blokkeszközök számát, méretét és teljesítményét jelöli; ephemerális
+instance store és hálózati block storage eltér. A limitjelölések a
+provider dokumentációjában az instance type specifikációjához kötöttek,
+ezért a labmanifestben a konkrét type és a hivatalos aktuális korlát
+rögzítendő.</p>
+<h4 data-number="44.3.2.2"
+id="image-launch-template-és-cloud-init"><span
+class="header-section-number">44.3.2.2</span> Image, launch template és
+cloud-init</h4>
+<p>A <strong>provider image</strong> (pl. AWS AMI, GCP image, Azure
+image) a d171-ben megismert golden image felhőbeli megfelelője: egy
+regionálisan elérhető, verziózott, snapshotból vagy forrásból származó
+boot- és root fájlrendszer. A provider image lehet saját vagy
+megosztott, és identitásmentes, reprodukálható alapnak kell lennie. A
+<strong>launch template</strong> (indítási sablon) a provider compute
+API-jának idempotens, verziózott leírása, amely tartalmazza az image
+azonosítót, instance type-ot, hálózati konfigurációt, IAM szerepet,
+biztonsági csoportot, storage mappinget és user-data-t. A launch
+template tehát a desired state egy darabja, és új verzió létrehozásával
+atomikusan váltható.</p>
+<p>A <strong>user-data</strong> az instance első bootján átadott,
+cloud-init által feldolgozott konfiguráció. Az Amazon EC2-ban például
+<code>#cloud-config</code> YAML vagy shell script; a cloud-init minden
+bootkor lefut, de a user-data általában csak egyszer. A felhőbeli
+cloud-init datasource az EC2 metadata szolgáltatásból tölti be a
+konfigurációt, ezért a d171-ben tárgyalt NoCloud datasource és a
+felhőbeli datasource működése analóg, de az adatforrás más.</p>
+<h4 data-number="44.3.2.3" id="auto-scaling-group-health-és-drain"><span
+class="header-section-number">44.3.2.3</span> Auto Scaling Group, health
+és drain</h4>
+<p>Az <strong>Auto Scaling Group (ASG)</strong> a provider által kezelt,
+dinamikusan változó példányhalmaz. Az ASG jellemzői:
+minimum/maximum/desired capacity, launch template vagy launch
+configuration, egészségügyi ellenőrzés (health check), scaling policy és
+cooldown. A health check lehet EC2 szintű (az instance fut és
+<code>Impaired</code> állapot nélkül) vagy load balancer szintű (a
+target group health check sikeres). Ha egy példány megbukik a health
+checken, az ASG alapesetben terminálja a hibás példányt, majd új
+példányt indít a desired capacity visszaállítására; a csere alatt a
+kapacitás átmenetileg eggyel kisebb (min = desired = 2 mellett ilyenkor
+csak 1 példány szolgál ki). Ha előbb indítást kérünk, azt az ASG
+instance maintenance policy-jében
+(<code>MinHealthyPercentage</code>/<code>MaxHealthyPercentage</code>)
+kell beállítani; a funkció elérhetősége a CLI/API verzióján
+ellenőrizendő.</p>
+<p>A <strong>drain</strong> fogalma itt két részből áll: a load balancer
+connection draining (a meglévő kapcsolatok befejeződnek, új forgalom már
+nem érkezik) és a lifecycle hook (amely lehetővé teszi, hogy a példány
+leállítás előtt külső munkát végezzen el, például metric exportot vagy
+adatbázis detach-et). Az ASG <strong>scale-in protection</strong>
+megakadályozza, hogy a skálázási esemény egy kritikus példányt
+leállítson.</p>
+<h4 data-number="44.3.2.4"
+id="spotpreemptible-interruption-és-retry"><span
+class="header-section-number">44.3.2.4</span> Spot/preemptible
+interruption és retry</h4>
+<p>A <strong>Spot Instance</strong> (AWS) vagy <strong>preemptible
+VM</strong> (GCP) jelentősen olcsóbb, de a provider visszaveheti. A
+megszakítás (interruption) előtt a provider értesítést küld (pl. AWS: 2
+perccel előre), és a példány <code>termination notice</code>-t ír a
+metadata-ba. Az alkalmazásnak ezt a jelzést figyelnie kell: be kell
+fejeznie a kéréseket, le kell választania a munkát, és checkpointot kell
+írnia.</p>
+<p>A <strong>retry</strong> stratégiája két szintű: az ASG capacity
+rebalance vagy mixed instances policy használatával az ASG automatikusan
+más instance type-ra vagy zónára vált, ha a spot kapacitás elfogy. Az
+alkalmazás szintjén a megszakított munka újraütemezhető queue-ból vagy
+idempotens retry-vel. Fontos, hogy a spot instance nem garantál sem
+rendelkezésre állást, sem befejezési időt, ezért stateful munkához nem
+alkalmas.</p>
+<h4 data-number="44.3.2.5" id="quota-placement-és-failure-domain"><span
+class="header-section-number">44.3.2.5</span> Quota, placement és
+failure domain</h4>
+<p>A felhőszolgáltatók <strong>quota</strong> (kvóta) rendszere az
+erőforrások felső határát adja meg: mennyi vCPU, hány instance, mennyi
+EBS kötet, mennyi Elastic IP foglalható egy accountban/régióban. A
+<strong>placement group</strong> a példányok fizikai elhelyezkedését
+szabályozza: cluster (alacsony latency, de közös rack), spread (külön
+hardverre szórás), partition (logikai partíciók). A <strong>failure
+domain</strong> felhőben leginkább az Availability Zone (AZ), amely egy
+adatközpont-csoport; a régió több AZ-t tartalmaz. Az ASG-et több AZ-be
+kell konfigurálni, hogy egy AZ kiesése ne okozza a szolgáltatás teljes
+leállását. A provider <strong>capacity reservation</strong> lehetővé
+teszi, hogy adott AZ-ben garantált kapacitást foglaljunk, ami a spot
+bizonytalanságot csökkenti, de költséggel jár.</p>
+<h4 data-number="44.3.2.6"
+id="metadata-user-data-és-credential-exposure"><span
+class="header-section-number">44.3.2.6</span> Metadata, user-data és
+credential exposure</h4>
+<p>A <strong>példánymetadat-szolgáltatás</strong> (Instance Metadata
+Service, IMDS) az instance belsejéből elérhető HTTP végpont (pl.
+<code>http://169.254.169.254/</code>). Innen a példány lekérdezheti
+saját azonosítóját, régióját, IAM szerepét és a temporary
+credential-eket. A user-data is innen olvasható. A <strong>credential
+exposure</strong> fő kockázata: ha egy rosszul védett webalkalmazás SSRF
+(Server-Side Request Forgery) támadással eléri az IMDS-t, lelophatja az
+IAM role credentialjeit. Ezért az AWS IMDSv2 token-alapú védelmet
+vezetett be: <code>PUT</code> kéréssel tokent kell kérni, majd
+<code>X-aws-ec2-metadata-token</code> fejlécben küldeni. A kötelező
+IMDSv2 a launch template-ben beállítható. A user-data ugyancsak érzékeny
+lehet: ne tartalmazzon hosszú élettartamú secretet; rövid tokeneket,
+secret managert vagy workload identity-t használjunk.</p>
+<h3 data-number="44.3.3" id="kidolgozott-példa"><span
+class="header-section-number">44.3.3</span> Kidolgozott példa</h3>
+<p>Az alábbi példa AWS CLI-t használ, de a konkrét parancsok csak
+illusztratívak: a valós labben ki kell cserélni a sandbox account
+<code>lab-sandbox</code>, a régió <code>eu-central-1</code>, a
+VPC/subnet/security group/IAM role azonosítókat, valamint az AMI ID-t
+(amely régiófüggő és idővel változik). A parancsok egy izolált lab
+accountban futnak, a <code>lab-</code> prefixed erőforrásokkal, a
+cleanup csak ezeket érinti.</p>
+<p><strong>Előfeltétel</strong>: létező VPC, subnet, security group, IAM
+instance role (pl. <code>lab-instance-role</code>), és egy előre
+validált Ubuntu 24.04 LTS AMI az adott régióban (hivatalos AMI ID
+ellenőrzendő).</p>
+<p>A user-data olvasható formában, külön fájlban készül
+(<code>lab-user-data.yaml</code>). A <code>default</code> elem megtartja
+az Ubuntu AMI <code>ubuntu</code> felhasználóját (kulcspáros
+SSH-belépés), a <code>lab</code> user saját shellt, sudo-szabályt és
+SSH-kulcsot kap, a webszerver pedig az ELB health checkhez kell:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">#cloud-config</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">users</span><span class="kw">:</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> default</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">shell</span><span class="kw">:</span><span class="at"> /bin/bash</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">groups</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="at">sudo</span><span class="kw">]</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="co">    # csak labor; productionben NOPASSWD nélkül</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">sudo</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;ALL=(ALL) NOPASSWD:ALL&quot;</span><span class="kw">]</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">ssh_authorized_keys</span><span class="kw">:</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> ssh-ed25519 AAAA...dummy lab@example</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="fu">packages</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="at">nginx</span><span class="kw">]</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="fu">runcmd</span><span class="kw">:</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="kw">[</span><span class="at">systemctl</span><span class="kw">,</span><span class="at"> enable</span><span class="kw">,</span><span class="at"> --now</span><span class="kw">,</span><span class="at"> nginx</span><span class="kw">]</span></span></code></pre></div>
+<p>A fájl sémáját indítás előtt helyben ellenőrizzük:
+<code>cloud-init schema --config-file lab-user-data.yaml</code> (a
+cloud-init csomag része).</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. Launch template létrehozása (dummy ID-k, lab profile)</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-sandbox account, eu-central-1; a UserData a fájl base64-e</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="va">USERDATA_B64</span><span class="op">=</span><span class="va">$(</span><span class="fu">base64</span> <span class="at">-w0</span> lab-user-data.yaml<span class="va">)</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="op">&gt;</span> lt.json <span class="op">&lt;&lt;JSON</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="st">{</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="st">  &quot;ImageId&quot;: &quot;ami-0abc123def4567890&quot;,</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="st">  &quot;InstanceType&quot;: &quot;m7i.large&quot;,</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="st">  &quot;SecurityGroupIds&quot;: [&quot;sg-0lab123&quot;],</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="st">  &quot;IamInstanceProfile&quot;: {&quot;Name&quot;: &quot;lab-instance-role&quot;},</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="st">  &quot;UserData&quot;: &quot;</span><span class="va">${USERDATA_B64}</span><span class="st">&quot;,</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="st">  &quot;MetadataOptions&quot;: {&quot;HttpTokens&quot;: &quot;required&quot;, &quot;HttpEndpoint&quot;: &quot;enabled&quot;},</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="st">  &quot;BlockDeviceMappings&quot;: [</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="st">    {&quot;DeviceName&quot;: &quot;/dev/sda1&quot;,</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="st">     &quot;Ebs&quot;: {&quot;VolumeSize&quot;: 20, &quot;VolumeType&quot;: &quot;gp3&quot;}}</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="st">  ]</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="op">JSON</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="ex">aws</span> ec2 create-launch-template <span class="dt">\</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>  <span class="at">--profile</span> lab-sandbox <span class="dt">\</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>  <span class="at">--region</span> eu-central-1 <span class="dt">\</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>  <span class="at">--launch-template-name</span> lab-web-template <span class="dt">\</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>  <span class="at">--version-description</span> <span class="st">&quot;Baseline web instance&quot;</span> <span class="dt">\</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>  <span class="at">--launch-template-data</span> file://lt.json</span></code></pre></div>
+<p>A launch template API-n a <code>UserData</code> base64-kódolva
+utazik; a <code>MetadataOptions.HttpTokens=required</code> IMDSv2-t
+kényszerít.</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. Instance indítása a launch template-ből (lab-host: lab-sandbox)</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="va">TAGS</span><span class="op">=</span><span class="st">&#39;ResourceType=instance,Tags=[{Key=Name,Value=lab-web-1},&#39;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="va">TAGS</span><span class="op">+=</span><span class="st">&#39;{Key=lab-owner,Value=student-1}]&#39;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="ex">aws</span> ec2 run-instances <span class="dt">\</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--profile</span> lab-sandbox <span class="dt">\</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--region</span> eu-central-1 <span class="dt">\</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--launch-template</span> LaunchTemplateName=lab-web-template,Version=1 <span class="dt">\</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--subnet-id</span> subnet-0lab456 <span class="dt">\</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--count</span> 1 <span class="dt">\</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--tag-specifications</span> <span class="st">&quot;</span><span class="va">$TAGS</span><span class="st">&quot;</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="co"># Várható kimenet (kivonat):</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="co"># {</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="co">#   &quot;Instances&quot;: [{</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="co">#     &quot;InstanceId&quot;: &quot;i-0lab789&quot;,</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="co">#     &quot;State&quot;: {&quot;Name&quot;: &quot;pending&quot;}</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a><span class="co">#   }]</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a><span class="co"># }</span></span></code></pre></div>
+<p>Az IMDS <code>latest/user-data</code> végpontja a nyers, már dekódolt
+tartalmat adja vissza, ezért itt nincs <code>base64 -d</code>:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. Az instance IMDSv2 token lekérése és user-data ellenőrzése</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-web-1, user: ubuntu (UID 1000)</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="va">TOKEN</span><span class="op">=</span><span class="va">$(</span><span class="ex">curl</span> <span class="at">-sf</span> <span class="at">-X</span> PUT <span class="at">-H</span> <span class="st">&quot;X-aws-ec2-metadata-token-ttl-seconds: 60&quot;</span> <span class="dt">\</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>  http://169.254.169.254/latest/api/token<span class="va">)</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-sf</span> <span class="at">-H</span> <span class="st">&quot;X-aws-ec2-metadata-token: </span><span class="va">$TOKEN</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>  http://169.254.169.254/latest/user-data <span class="kw">|</span> <span class="fu">head</span> <span class="at">-1</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="co"># Várt kimenet: #cloud-config</span></span></code></pre></div>
+<p>Az ASG ELB health checkjéhez előbb a target group kell (port 80,
+health-check útvonal <code>/</code>):</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 4. Target group létrehozása (target: lab-sandbox, eu-central-1)</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">aws</span> elbv2 create-target-group <span class="dt">\</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--profile</span> lab-sandbox <span class="dt">\</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--region</span> eu-central-1 <span class="dt">\</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--name</span> lab-web-tg <span class="dt">\</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--protocol</span> HTTP <span class="at">--port</span> 80 <span class="dt">\</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--vpc-id</span> vpc-0lab000 <span class="dt">\</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--health-check-path</span> /</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="va">TG_ARN</span><span class="op">=</span><span class="va">$(</span><span class="ex">aws</span> elbv2 describe-target-groups <span class="dt">\</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--profile</span> lab-sandbox <span class="at">--region</span> eu-central-1 <span class="dt">\</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">--names</span> lab-web-tg <span class="dt">\</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>  <span class="at">--query</span> <span class="st">&#39;TargetGroups[0].TargetGroupArn&#39;</span> <span class="at">--output</span> text<span class="va">)</span></span></code></pre></div>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 5. Auto Scaling Group létrehozása (health check: EC2 + ELB)</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">aws</span> autoscaling create-auto-scaling-group <span class="dt">\</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--profile</span> lab-sandbox <span class="dt">\</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--region</span> eu-central-1 <span class="dt">\</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--auto-scaling-group-name</span> lab-web-asg <span class="dt">\</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--launch-template</span> LaunchTemplateName=lab-web-template,Version=1 <span class="dt">\</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--min-size</span> 2 <span class="dt">\</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--max-size</span> 6 <span class="dt">\</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--desired-capacity</span> 2 <span class="dt">\</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--vpc-zone-identifier</span> <span class="st">&quot;subnet-0lab456,subnet-0lab789&quot;</span> <span class="dt">\</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">--health-check-type</span> ELB <span class="dt">\</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>  <span class="at">--health-check-grace-period</span> 300 <span class="dt">\</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>  <span class="at">--default-cooldown</span> 180 <span class="dt">\</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>  <span class="at">--target-group-arns</span> <span class="st">&quot;</span><span class="va">$TG_ARN</span><span class="st">&quot;</span></span></code></pre></div>
+<p><strong>Ellenőrzési feltétel</strong>: az ASG példányai egészségesek,
+és a target group is <code>healthy</code>-nek látja őket:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aws</span> autoscaling describe-auto-scaling-groups <span class="dt">\</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--profile</span> lab-sandbox <span class="at">--region</span> eu-central-1 <span class="dt">\</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--auto-scaling-group-names</span> lab-web-asg <span class="dt">\</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--query</span> <span class="st">&#39;AutoScalingGroups[0].Instances[].HealthStatus&#39;</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="ex">aws</span> elbv2 describe-target-health <span class="dt">\</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--profile</span> lab-sandbox <span class="at">--region</span> eu-central-1 <span class="dt">\</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--target-group-arn</span> <span class="st">&quot;</span><span class="va">$TG_ARN</span><span class="st">&quot;</span></span></code></pre></div>
+<p>A <code>DesiredCapacity=2</code> mellett két <code>Healthy</code>
+példány és két <code>healthy</code> target a várt állapot. A külön,
+<code>run-instances</code>-szel indított <code>lab-web-1</code> nem az
+ASG tagja; rajta azt ellenőrizzük, hogy IMDSv2 enforced, és a user-data
+a boot után a <code>lab</code> felhasználót létrehozta
+(<code>id lab</code>, <code>cloud-init status --long</code>).</p>
+<p><strong>Rollback</strong>: ha a launch template hibás, új verzióval
+javítható; ha az ASG nem kívánt skálázást okoz, a
+<code>desired-capacity</code> csökkenthető, majd a
+<code>delete-auto-scaling-group</code> (a <code>--force-delete</code>
+csak akkor, ha a példányok nem használatban vannak). A lab cleanup:
+<code>delete-auto-scaling-group</code>, a külön indított
+<code>lab-web-1</code> törlése a saját azonosítójával
+(<code>terminate-instances --instance-ids i-0lab789</code>),
+<code>delete-target-group</code>,
+<code>delete-launch-template</code>.</p>
+<h3 data-number="44.3.4" id="hibák-és-ellenpróbák"><span
+class="header-section-number">44.3.4</span> Hibák és ellenpróbák</h3>
+<p><strong>Tünet</strong>: Az instance <code>pending</code> állapotból
+nem válik <code>running</code>-ba, vagy azonnal <code>terminated</code>
+lesz.<br />
+<strong>Hipotézis</strong>: a kiválasztott instance type az adott AZ-ben
+nem elérhető, vagy a subnet nem illik a type-hoz (pl. arm64 type
+x86_64-only subnet vagy nincs kapacitás).<br />
+<strong>Adatgyűjtés</strong>: ha a példány létre sem jött, az ok a
+<code>run-instances</code> hibaválaszában (ASG-nél a
+<code>aws autoscaling describe-scaling-activities</code>
+<code>StatusMessage</code> mezőjében) olvasható, pl.
+<code>InsufficientInstanceCapacity</code> (pillanatnyi kapacitáshiány)
+vagy <code>Unsupported</code> (a type nem támogatott az AZ-ben). Ha a
+példány létrejött, de azonnal <code>terminated</code> lett, a
+<code>aws ec2 describe-instances --instance-ids i-...</code>
+<code>StateReason.Message</code> mezője mutatja az okot.<br />
+<strong>Egy változtatás</strong>: válasszunk más instance type-ot vagy
+másik AZ-t, és frissítsük a launch template-et új verzióval.<br />
+<strong>Verifikáció</strong>: az új példány <code>running</code> és a
+<code>SystemStatus</code>/<code>InstanceStatus</code>
+<code>ok</code>.</p>
+<p><strong>Tünet</strong>: A user-data által létrehozott felhasználó nem
+jelenik meg a boot után.<br />
+<strong>Hipotézis</strong>: a cloud-init nem tudta beolvasni a
+user-data-t, mert a választott AMI nem tartalmazza a cloud-init
+csomagot, vagy a user-data base64 kódolás hibás.<br />
+<strong>Adatgyűjtés</strong>: <code>cloud-init status --long</code> és a
+<code>/var/log/cloud-init-output.log</code>.<br />
+<strong>Egy változtatás</strong>: használjunk hivatalos, cloud-init-tel
+előkészített AMI-t (pl. Ubuntu cloud image), és ellenőrizzük a user-data
+tartalmát a metadata-ból (az IMDS dekódolva adja vissza), illetve a
+forrásfájlt <code>cloud-init schema --config-file</code>-lal.<br />
+<strong>Verifikáció</strong>: a <code>cloud-init status</code>
+<code>done</code>, a logban nincs <code>DataSourceEc2</code> hiba.</p>
+<p><strong>Tünet</strong>: A spot instance hirtelen
+<code>shutting-down</code> állapotba kerül.<br />
+<strong>Hipotézis</strong>: a spot kapacitás visszavonás vagy
+árverés.<br />
+<strong>Adatgyűjtés</strong>: az instance belsejében
+<code>curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/spot/instance-action</code>
+egy JSON-t ad a <code>termination</code> akcióval és idővel.<br />
+<strong>Egy változtatás</strong>: az ASG-ben <code>overrides</code>
+listával vegyes instance type-okat és AZ-eket adunk meg, valamint
+<code>capacityRebalance=true</code>. Az alkalmazás figyeli a metadata
+értesítést, és drainel.<br />
+<strong>Verifikáció</strong>: a megszakítás után az ASG új példányt
+indít más zónában, a kérések száma nem csökken a load balancer
+statisztikájában.</p>
+<h3 data-number="44.3.5" id="feladatok"><span
+class="header-section-number">44.3.5</span> Feladatok</h3>
+<p><strong>F1 (magyarázó)</strong>: Hasonlítsa össze a d171-ben tanult
+NoCloud datasource és a felhőbeli EC2 metadata alapú cloud-init
+datasource működését. Miben más az adatforrás, és miért nem kell a
+felhőben ISO-t csatolni? Válaszában térjen ki az
+identitásmentességre.</p>
+<p><strong>F2 (adminisztrációs)</strong>: Hozzon létre egy launch
+template-et a fenti példa alapján, de módosítsa az instance type-ot
+arm64-re (pl. <code>m7g.large</code> illusztratív, a tényleges
+elérhetőség ellenőrizendő), és a user-data-t egészítse ki egy web
+szolgáltatás telepítésével (pl. nginx). Indítson egy példányt, majd
+ellenőrizze az IMDSv2 token lekérését és a user-data tartalmát (az IMDS
+már dekódolva adja vissza). Dokumentálja a desired és observed
+state-et.</p>
+<p><strong>F3 (diagnosztikai/failure)</strong>: Szimuláljon
+kapacitáshiányt: válasszon egy nem elérhető instance type + AZ
+kombinációt, és indítson ASG-et. A hibaüzenetből azonosítsa az okot,
+majd módosítsa a launch template-et másik type-ra és AZ-re. Ezután
+konfiguráljon spot interruption kezelést: az instance belsejében egy
+script olvassa a metadata <code>spot/instance-action</code>-t, és a
+<code>systemd</code> graceful shutdown-t indít. Ellenőrizze, hogy az ASG
+a megszakítás után új példányt indít.</p>
+<h3 data-number="44.3.6" id="megoldások"><span
+class="header-section-number">44.3.6</span> Megoldások</h3>
+<p><strong>M1</strong>: A d171 NoCloud datasource egy local ISO-t csatol
+a VM-hez, amelyből a cloud-init olvassa a meta- és user-data-t. Ehhez a
+golden image-nek nincs szüksége hálózatra, de a lemezkép és a
+konfiguráció együtt utazik. A felhőbeli datasource az instance metadata
+HTTP szolgáltatásból kéri le a user-data-t, az instance-id-t, a
+hostname-et stb. Nincs szükség csatolt ISO-ra, mert a provider a launch
+template user-data-ját injektálja a metadata szolgáltatásba. Az
+identitásmentesség itt is követelmény: a provider AMI nem tartalmaz
+machine-id-t, SSH host key-eket vagy bármely instance-specifikus titkot;
+ezeket a cloud-init generálja az első booton. A postcondition: az
+instance az első boot után egyedi identitással és a user-data által
+definiált állapottal fut.</p>
+<p><strong>M2</strong>: Az adminisztrációs feladat parancsai megegyeznek
+a kidolgozott példával, de az <code>InstanceType</code>
+<code>m7g.large</code>, a user-data pedig egy <code>#cloud-config</code>
+YAML, amely <code>packages: [nginx]</code> és egy <code>runcmd</code>
+blokkot tartalmaz a service elindításához. A desired state: a launch
+template arm64, IMDSv2 required, user-data base64 kódolt, a példány
+<code>running</code>. Az observed state: <code>describe-instances</code>
+és a metadata endpoint ellenőrzése. A postcondition: a példány
+belsejéből a tokennel küldött kérés
+(<code>TOKEN=$(curl -sf -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 60" http://169.254.169.254/latest/api/token)</code>,
+majd
+<code>curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-type</code>)
+<code>m7g.large</code>-ot ad vissza, és az nginx service fut. Token
+nélkül a kérés <code>HttpTokens=required</code> mellett 401-et kap. Az
+arm64 type-hoz arm64 AMI kell, ezért az <code>ImageId</code>-t is
+cserélni kell.</p>
+<p><strong>M3</strong>: Valódi kapacitáshiány
+(<code>InsufficientInstanceCapacity</code>) szándékosan nem idézhető
+elő; helyette olyan type/AZ párt választunk, amelyet az
+<code>aws ec2 describe-instance-type-offerings --location-type availability-zone --filters Name=instance-type,Values=&lt;type&gt;</code>
+nem listáz az adott AZ-re. Az ASG indítási kísérlete ilyenkor
+<code>Unsupported</code> hibával bukik; példány nem jön létre, ezért
+<code>describe-instances</code>/<code>StateReason</code> sincs. A hiba
+az ASG-tevékenységben látszik:
+<code>aws autoscaling describe-scaling-activities --auto-scaling-group-name lab-web-asg --max-items 5</code>
+→ <code>StatusCode: Failed</code>,
+<code>StatusMessage: … Unsupported …</code> (szemléltető kimenet). Az
+<code>InsufficientInstanceCapacity</code> esetet csak jelölt
+fixture-kimenetként mutatjuk be. A javítás: új launch template verzió
+más type/AZ-sel. A spot interruption kezelésére az instance
+user-data-jában elhelyezünk egy <code>systemd</code> service-t, amely a
+metadata <code>spot/instance-action</code> endpointot pollozza, és ha
+<code>termination</code> akciót lát, leállítja a web szolgáltatást, majd
+elvégzi a graceful shutdown-t. A postcondition: a megszakítás után a
+logban rögzül a drain, és az ASG
+<code>describe-auto-scaling-groups</code> új példányt mutat
+<code>Healthy</code> állapotban.</p>
+<h3 data-number="44.3.7" id="rövid-összefoglaló"><span
+class="header-section-number">44.3.7</span> Rövid összefoglaló</h3>
+<p>A felhőbeli compute instance egy provider által definiált
+erőforrásprofil, amelyet launch template-ben rögzítünk: image, instance
+type, hálózat, IAM role, storage mapping és user-data. A cloud-init a
+metadata szolgáltatásból kapja a konfigurációt, ezért a template-nek
+identitásmentesnek kell lennie. Az Auto Scaling Group a desired
+capacity-t, health check-et és a drain lifecycle-t valósítja meg; a
+spot/preemptible példány megszakítását pedig a metadata notice és a
+retry/launch template overrides kezeli. A quota, AZ és placement group a
+failure domain-t és a foglalási korlátot jelöli ki. A credential
+exposure kockázatát az IMDSv2, a kötelező token és a user-data-ból
+kizárt secret csökkenti.</p>
+<p>Továbbhasznált definíciók: <strong>launch template</strong>,
+<strong>Auto Scaling Group</strong>, <strong>Spot Instance</strong>,
+<strong>IMDSv2</strong>.</p>
+<h3 data-number="44.3.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">44.3.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>Állításonként (hivatkozott verzió: AWS CLI v2 és a labor Ubuntu 24.04
+LTS AMI-jának cloud-init kiadása; mindkettőt <code>aws --version</code>,
+illetve <code>cloud-init --version</code> kimenettel kell
+rögzíteni):</p>
+<ul>
+<li>Launch template, <code>run-instances</code>, IMDSv2
+(<code>HttpTokens</code>, user-data végpont), Spot interruption notice:
+<a href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/">Amazon
+EC2 User Guide</a> – „Launch templates”, „Instance metadata service”,
+„Spot Instance interruptions”.</li>
+<li>ASG health check, csere-sorrend, instance maintenance policy,
+scaling activities: <a
+href="https://docs.aws.amazon.com/autoscaling/ec2/userguide/">Amazon EC2
+Auto Scaling User Guide</a> – „Health checks”, „Instance maintenance
+policies”, „Verify a scaling activity”.</li>
+<li>Target group és health check: <a
+href="https://docs.aws.amazon.com/elasticloadbalancing/">Elastic Load
+Balancing dokumentáció</a> – Application Load Balancer „Target
+groups”.</li>
+<li>EC2 hibakódok (<code>InsufficientInstanceCapacity</code>,
+<code>Unsupported</code>): az Amazon EC2 API Reference „Error codes”
+oldala a <a href="https://docs.aws.amazon.com/">AWS Documentation</a>
+alatt.</li>
+<li>cloud-config modulok (<code>users</code>, <code>packages</code>,
+<code>runcmd</code>) és a <code>cloud-init schema</code> parancs: <a
+href="https://cloudinit.readthedocs.io/">cloud-init documentation</a> –
+„Module reference” és „CLI commands”; Ubuntu-specifikumok: <a
+href="https://ubuntu.com/server/docs/">Ubuntu Server
+documentation</a>.</li>
+<li>GCP/Azure megfelelők: <a href="https://cloud.google.com/docs">Google
+Cloud Documentation</a> – „Managed instance groups”; <a
+href="https://learn.microsoft.com/azure/">Microsoft Azure
+Documentation</a> – „Virtual Machine Scale Sets”.</li>
+</ul>
+<p><strong>Ellenőrzési státusz:</strong> a kidolgozott példa sikeres ága
+(két <code>healthy</code> target) és hibaágai (<code>Unsupported</code>
+type/AZ, spot interruption) sandbox accountban ellenőrizendők;
+dátumozott futtatási napló még nem készült.</p>
+<p>A fenti hivatkozások seed-források; ebben a kérésben nem volt webes
+keresőeszköz, ezért tartalmukat nem ellenőriztem. A konkrét instance
+type-ok (pl. <code>m7i.large</code>, <code>m7g.large</code>), az AMI ID,
+a kapacitás, a kvóták, az IMDSv2 pontos szintaxisa, a spot interruption
+notice időzítése és az ASG API nevei a provider aktuális
+dokumentációjában ellenőrizendők. A példában szereplő dummy account,
+VPC, subnet, security group és IAM role azonosítók nem valósak; a lab
+inventory-nak kell őket rögzítenie. A cloud-init és a provider
+datasource viselkedése az adott base image verziójától függ.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d217.html">← 44.2 IAM, role, federation és workload identity</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d219.html">44.4 Accountbaseline, audit, költség és cleanup →</a></div>
+</nav>
+</body>
+</html>

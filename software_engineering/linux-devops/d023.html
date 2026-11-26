@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>5.3 Sector, alignment, TRIM és write cache – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch05">5 Tárolóhardver és blokkos adatút</a></p>
+<div class="links"><a class="prev" rel="prev" href="d022.html">← 5.2 NVMe, SCSI, queue és host controller</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d024.html">5.4 RAID, HBA, multipath és erőforrástérkép →</a></div>
+</nav>
+<h2 data-number="5.3" id="d023"><span
+class="header-section-number">5.3</span> Sector, alignment, TRIM és
+write cache</h2>
+<h3 data-number="5.3.1"
+id="miért-kritikus-a-szektorhatár-a-blokkos-adatútnál"><span
+class="header-section-number">5.3.1</span> Miért kritikus a szektorhatár
+a blokkos adatútnál?</h3>
+<p>Egy szenior C++ fejlesztő gyakran feltételezi, hogy a
+<code>write()</code> syscall sikeres visszatérés után az adat „a lemezen
+van”. A blokkos tároló valódi viselkedése ennél összetettebb: a hoszt és
+a device közötti szerződés szektorhatárokon, cache-tulajdonságokon és
+elengedett tartalmakon is múlik. A <a href="d022.html">d022</a>
+alfejezetben látott device queue után most azt vizsgáljuk meg, hogyan
+kell az I/O elrendezést a logikai szektorhoz, a fizikai szektorhoz és a
+device-cache-hez igazítani. A hibás igazítás felesleges
+read-modify-write-ot, a hibás cache-kezelés power loss utáni
+adatvesztést, a hiányzó discard pedig felesleges törlési írásokat
+okozhat. A cél nem a kernel belső implementációjának bemutatása, hanem
+az, hogy a fejlesztő és az üzemeltető ugyanazt a rendezett, tartós,
+szektorokra bontott adatutat lássa.</p>
+<h3 data-number="5.3.2"
+id="definíció-logikai-és-fizikai-szektor-512e-4kn"><span
+class="header-section-number">5.3.2</span> Definíció: logikai és fizikai
+szektor, 512e, 4Kn</h3>
+<p>A block device a tárolót lineáris címekkel, LBA-kkal éri el. Ebben a
+modellben a legkisebb címezhető egység a <strong>logical sector</strong>
+vagy <strong>logical block</strong>. A Linux ezt a méretet
+<code>logical_block_size</code> néven, a <code>blockdev --getss</code>
+kimenetén keresztül mutatja. A valódi tárolóeszköz azonban nagyobb
+<strong>physical sector</strong> méretben programozza a médiát. A Linux
+négy, egymástól független tulajdonságot tesz közzé vagy követel meg,
+ezeket nem szabad összemosni:</p>
+<ul>
+<li><code>logical_block_size</code>: a legkisebb címezhető és elfogadott
+I/O-egység;</li>
+<li><code>physical_block_size</code>: a legkisebb egység, amelyet a
+device RMW nélkül tud írni (teljesítményjellemző);</li>
+<li><code>minimum_io_size</code> (MIN-IO): a device által ajánlott
+legkisebb, büntetés nélküli I/O-méret, <code>optimal_io_size</code>
+(OPT-IO): az ajánlott nagy I/O-méret;</li>
+<li><strong>atomic write unit</strong>: az a méret, amelyre a device
+(vagy az API) kifejezetten garantálja, hogy egy írás vagy teljesen, vagy
+egyáltalán nem hajtódik végre. Ez eszköz- és interfészfüggő, és nem
+következik a fizikai szektorméretből.</li>
+</ul>
+<p>A <strong>torn write</strong> (szakadt írás) az, amikor power loss
+után egy írás csak részben kerül a médiára, így a blokk régi és új adat
+keveréke. A <strong>PLP</strong> (power-loss protection) az eszköz
+energiatárolója, amely áramszünetkor a cache tartalmát még kiírja. A
+tartóssági és atomicitási garanciát tehát a device deklarált atomic
+write unitja, a flush/FUA-szerződés és a PLP adja, nem önmagában a
+sector méret. Ellenpélda: egy 4096 bájtos fizikai szektoros, PLP nélküli
+fogyasztói SATA SSD, amelynek adatlapja nem deklarál power-fail
+atomicitást, egy igazított 4 KiB-os írásnál is hagyhat szakadt szektort
+áramszünetkor.</p>
+<p>A logikai és fizikai szektor viszonya két fontos gyakorlati módot
+ad:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Jellemző</th>
+<th>512e</th>
+<th>4Kn</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Logical sector</td>
+<td>512 B</td>
+<td>4096 B</td>
+</tr>
+<tr>
+<td>Physical sector</td>
+<td>4096 B</td>
+<td>4096 B</td>
+</tr>
+<tr>
+<td>Host látható minimális I/O</td>
+<td>512 B</td>
+<td>4096 B</td>
+</tr>
+<tr>
+<td>RMW kockázat</td>
+<td>Magas, ha a write nem 4K-igazított</td>
+<td>Alacsony, a logical méret már 4K</td>
+</tr>
+</tbody>
+</table>
+<p>A <strong>512e</strong> jelentése 512 bájtos emulált (emulated)
+logikai szektor egy valójában 4096 bájtos fizikai szektoron. A
+<strong>4Kn</strong> a native 4096 bájtos logikai és fizikai szektort
+jelenti. A Linux kernel a <code>logical_block_size</code> értékét
+használja a kérések minimális méretének ellenőrzésére, a
+<code>physical_block_size</code> pedig a partíciók és az optimális I/O
+elrendezés tervezéséhez szükséges. A kettőt soha nem szabad felcserélni:
+a partíció startját a physical szektorhoz kell igazítani, a kérések
+méretét pedig legalább a logical szektor többszörösére.</p>
+<h3 data-number="5.3.3"
+id="derivation-read-modify-write-és-alignment-feltétel"><span
+class="header-section-number">5.3.3</span> Derivation: read-modify-write
+és alignment feltétel</h3>
+<p>Tegyük fel, hogy a device logical szektora
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>b</mi><mi>l</mi></msub><mo>=</mo><mn>512</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">B</mtext></mrow><annotation encoding="application/x-tex">b_l = 512\ \text{B}</annotation></semantics></math>,
+fizikai szektora
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>b</mi><mi>p</mi></msub><mo>=</mo><mn>4096</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">B</mtext></mrow><annotation encoding="application/x-tex">b_p = 4096\ \text{B}</annotation></semantics></math>.
+Ha az alkalmazás egy 512 bájtos írást ad ki egy olyan offsetre, amely
+nem 4096 többszöröse, akkor a device nem tudja a 4096 bájtos fizikai
+szektort kizárólag a hoszt adatával programozni. A device-nek:</p>
+<ol type="1">
+<li>be kell olvasnia a teljes 4096 bájtos régi fizikai szektort a belső
+tárolóból,</li>
+<li>a beolvasott tartalomban le kell cserélnie a hoszt 512 bájtját,</li>
+<li>a módosított 4096 bájtot vissza kell programoznia.</li>
+</ol>
+<p>Ez a <strong>read-modify-write (RMW)</strong>. A hoszt 512 bájtos
+logikai írás helyett a médiaprogramozás legalább 4096 bájtot érint. Az
+írási erősítés (write amplification) ezen a szinten:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>A</mi><mtext mathvariant="normal">RMW</mtext></msub><mo>=</mo><mfrac><msub><mi>b</mi><mi>p</mi></msub><msub><mi>b</mi><mi>l</mi></msub></mfrac><mo>=</mo><mfrac><mn>4096</mn><mn>512</mn></mfrac><mo>=</mo><mn>8</mn></mrow><annotation encoding="application/x-tex">A_{\text{RMW}} = \frac{b_p}{b_l} = \frac{4096}{512} = 8</annotation></semantics></math></p>
+<p>feltéve, hogy a blokk layer nem von össze szomszédos kéréseket. A
+gyakorlatban a Linux I/O scheduler és a page cache merge csökkentheti
+ezt a hatást, de direct I/O, random write vagy rosszul igazított
+partíció esetén a 8-szoros programozási többlet valódi teljesítmény- és
+wear-probléma.</p>
+<p>Két külön feltételt kell megkülönböztetni. Érvényességi feltétel (a
+kernel elfogadja a direct I/O kérést):</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">offset</mtext><mrow><mspace width="0.222em"></mspace><mrow><mi>mod</mi><mo>&#8289;</mo></mrow><mspace width="0.222em"></mspace><msub><mi>b</mi><mi>l</mi></msub></mrow><mo>=</mo><mn>0</mn><mspace width="1.0em"></mspace><mtext mathvariant="normal">és</mtext><mspace width="1.0em"></mspace><mtext mathvariant="normal">size</mtext><mrow><mspace width="0.222em"></mspace><mrow><mi>mod</mi><mo>&#8289;</mo></mrow><mspace width="0.222em"></mspace><msub><mi>b</mi><mi>l</mi></msub></mrow><mo>=</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">\text{offset} \bmod b_l = 0 \quad \text{és} \quad \text{size} \bmod b_l = 0</annotation></semantics></math></p>
+<p>RMW-mentességi feltétel:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">offset</mtext><mrow><mspace width="0.222em"></mspace><mrow><mi>mod</mi><mo>&#8289;</mo></mrow><mspace width="0.222em"></mspace><msub><mi>b</mi><mi>p</mi></msub></mrow><mo>=</mo><mn>0</mn><mspace width="1.0em"></mspace><mtext mathvariant="normal">és</mtext><mspace width="1.0em"></mspace><mtext mathvariant="normal">size</mtext><mrow><mspace width="0.222em"></mspace><mrow><mi>mod</mi><mo>&#8289;</mo></mrow><mspace width="0.222em"></mspace><msub><mi>b</mi><mi>p</mi></msub></mrow><mo>=</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">\text{offset} \bmod b_p = 0 \quad \text{és} \quad \text{size} \bmod b_p = 0</annotation></semantics></math></p>
+<p>Ha csak az első teljesül, a fizikai szektort részlegesen érintő írás
+RMW-t okoz; egy 4096-ra igazított offsetű, de 512 bájtos írás is
+ilyen.</p>
+<p>Egy partíciót például 1 MiB-ra, azaz 2048 darab 512 bájtos szektorra
+kell kezdeni, mert 1 MiB osztható 4096-tal. A régebbi eszközökön gyakran
+látott 63 szektoros start nem osztható 8-cal, ezért a partíción belüli
+minden 4K-s filesystem-blokk 512 B-tal elcsúszik a fizikai
+szektorhatárhoz képest
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>63</mn><mo>⋅</mo><mn>512</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">B</mtext><mrow><mspace width="0.222em"></mspace><mrow><mi>mod</mi><mo>&#8289;</mo></mrow><mspace width="0.222em"></mspace><mn>4096</mn></mrow><mspace width="0.222em"></mspace><mtext mathvariant="normal">B</mtext><mo>=</mo><mn>3584</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">B</mtext></mrow><annotation encoding="application/x-tex">63 \cdot 512\ \text{B} \bmod 4096\ \text{B} = 3584\ \text{B}</annotation></semantics></math>),
+így minden blokk két fizikai szektort érint részben, és mindkettőn RMW
+keletkezhet.</p>
+<figure id="fig-d023-partition-align">
+<div class="fig-interactive"><iframe src="figures/html/d023-partition-align.html" title="Két panel három sávval: logikai 512 bájtos, fizikai 4096 bájtos szektorok és FS-blokkok. A 63-as startnál az FS-blokk0 a 32 256–36 351 bájttartományban a 7. fizikai szektor utolsó 512 és a 8. első 3584 bájtját fedi, 32 256 mod 4096 = 3584. A 2048-as startnál 1 048 576 mod 4096 = 0, az FS-blokk egyetlen fizikai szektorral esik egybe." loading="lazy" style="width:100%;border:0;height:440px"></iframe><noscript><img src="figures/img/d023-partition-align.png" style="width:95.0%"
+alt="Két panel három sávval: logikai 512 bájtos, fizikai 4096 bájtos szektorok és FS-blokkok. A 63-as startnál az FS-blokk0 a 32 256–36 351 bájttartományban a 7. fizikai szektor utolsó 512 és a 8. első 3584 bájtját fedi, 32 256 mod 4096 = 3584. A 2048-as startnál 1 048 576 mod 4096 = 0, az FS-blokk egyetlen fizikai szektorral esik egybe." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d023-partition-align.png" style="width:95.0%"
+alt="Két panel három sávval: logikai 512 bájtos, fizikai 4096 bájtos szektorok és FS-blokkok. A 63-as startnál az FS-blokk0 a 32 256–36 351 bájttartományban a 7. fizikai szektor utolsó 512 és a 8. első 3584 bájtját fedi, 32 256 mod 4096 = 3584. A 2048-as startnál 1 048 576 mod 4096 = 0, az FS-blokk egyetlen fizikai szektorral esik egybe." /></details></div>
+<figcaption>Partícióstart 63 vs. 2048 szektor 512e eszközön: 63-as
+startnál minden 4 KiB-os FS-blokk 3584 bájttal eltolva két fizikai
+szektort érint részben (RMW), 2048-as (1 MiB) startnál pontosan
+egyet.</figcaption>
+</figure>
+<h3 data-number="5.3.4" id="write-cache-fuaflush-és-tartósság"><span
+class="header-section-number">5.3.4</span> Write cache, FUA/flush és
+tartósság</h3>
+<p>A gyors elérések érdekében a legtöbb SSD és SAS/SATA disk
+<strong>volatile write cache</strong>-t használ. A device a write
+parancsot akkor is nyugtázhatja, amikor az adat még csak a cache-ben
+van, nem a nem felejtő médián. Egy <code>fsync()</code>-kel együtt járó,
+normál write esetén a Linux block layer a file system réteg alatt
+<strong>flush cache</strong> parancsot is kiad, például SCSI
+<code>SYNCHRONIZE CACHE</code>, SATA <code>FLUSH CACHE EXT</code> vagy
+NVMe <code>Flush</code>. Ez azt jelenti, hogy a korábban nyugtázott
+írásokat a device köteles a médiára kiírni. A <strong>FUA</strong>
+(Force Unit Access) ezzel szemben magához a write parancshoz kapcsolt
+bit; a device-nek az adott írást közvetlenül a nem felejtő médiára kell
+végrehajtania, nem csupán a cache-be. A kettő célja tehát eltér: a flush
+a korábbi kérések rendezett lezárása, a FUA az adott kérés tartóssági
+kényszere.</p>
+<p>A C++ oldalról a szerződés a következőképpen néz ki:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// A write() önmagában csak a page cache-be írhat; a tartós commit az fsync().</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span>path<span class="op">,</span> O_WRONLY <span class="op">|</span> O_CREAT <span class="op">|</span> O_CLOEXEC<span class="op">,</span> <span class="bn">0640</span><span class="op">);</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>fd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">return</span> handle_errno<span class="op">(</span><span class="st">&quot;open&quot;</span><span class="op">);</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="dt">ssize_t</span> n <span class="op">=</span> write<span class="op">(</span>fd<span class="op">,</span> commit<span class="op">.</span>data<span class="op">(),</span> commit<span class="op">.</span>size<span class="op">());</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>n <span class="op">!=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">ssize_t</span><span class="op">&gt;(</span>commit<span class="op">.</span>size<span class="op">()))</span> <span class="cf">return</span> handle_errno<span class="op">(</span><span class="st">&quot;write&quot;</span><span class="op">);</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>fsync<span class="op">(</span>fd<span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">return</span> handle_errno<span class="op">(</span><span class="st">&quot;fsync&quot;</span><span class="op">);</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>close<span class="op">(</span>fd<span class="op">);</span></span></code></pre></div>
+<p>A <code>fsync()</code> a kernel fájlrendszer-kódon keresztül flush-t
+igényel a device-tól is, amennyiben a filesystem és a device ezt kéri. A
+write-back cache önmagában nem hiba: az <code>fsync()</code> által
+kiadott flush/FUA a nyugtázott adatot a médiára kényszeríti, PLP nélkül
+is. A kockázat az, ha az eszköz a flush-t nem teljesíti (hibás
+firmware), vagy a flush ki van kapcsolva (például a kernel tévesen
+write-through eszköznek hiszi, vagy <code>nobarrier</code> mount). A
+cache állapota Linuxban a <code>queue/write_cache</code> sysfs
+attribútummal, SCSI eszközökön a <code>cache_type</code> segítségével is
+vizsgálható. A PLP-vel rendelkező enterprise SSD-k a power loss esetén
+is ki tudják írni a cache tartalmát; a fogyasztói eszközökön nem szabad
+erre hagyatkozni.</p>
+<h3 data-number="5.3.5" id="trimdiscard-és-thin-provisioning"><span
+class="header-section-number">5.3.5</span> TRIM/discard és thin
+provisioning</h3>
+<p>A <strong>TRIM</strong> a SATA, <strong>UNMAP</strong> a SCSI,
+<strong>Deallocate</strong> az NVMe parancsokban megjelenő eljárás. A
+Linux block layerben <strong>discard</strong> néven jelenik meg. A
+discard jelzi a device-nak, hogy a megadott LBA-tartomány tartalma már
+nem érvényes. Ez két célt szolgál:</p>
+<ol type="1">
+<li>Az SSD Flash Translation Layer (FTL) a garbage collection és a wear
+leveling során a felszabadított oldalakat kihagyhatja, csökkentve a
+write amplificationt.</li>
+<li>Thin provisioned háttér esetén a device visszaadhatja a fizikai
+kapacitást a storage poolnak.</li>
+</ol>
+<p>A discard nem törli a médiát azonnal; a Linux a
+<code>discard_granularity</code> és <code>discard_max_bytes</code> sysfs
+attribútumokat teszi közzé. Ha <code>discard_granularity</code> 0 vagy a
+<code>discard_max_bytes</code> 0, akkor a device nem támogatja a
+discardot. A fájlrendszer-szintű <code>mount -o discard</code> a
+fájlrendszer törlési műveleteit azonnal discard parancsba fordítja; a
+<code>fstrim</code> ezzel szemben batch-jelleggel, ütemezhető módon
+végzi el ugyanezt. Az <code>fstrim</code> hibája, a
+<code>the discard operation is not supported</code> üzenet (a pontos
+szöveg a util-linux verziójától függ, az Ubuntu 24.04 2.39-es kiadásán
+ellenőrizendő) akkor jelenik meg, ha a device nem támogatja a
+képességet, vagy a virtualizációs réteg nem engedi tovább a parancsot. A
+discard a törölt adat olvashatatlanságát önmagában nem garantálja, mert
+a device a tartalmat határozatlanra változtathatja, de nem köteles a
+médiát törölni.</p>
+<h3 data-number="5.3.6"
+id="device-atomic-write-versus-filesystem-atomi-művelet"><span
+class="header-section-number">5.3.6</span> Device atomic write versus
+filesystem atomi művelet</h3>
+<p>A block device garantálhat <strong>device-level atomic
+write</strong>-ot a physical szektor határán belül. Például egy
+igazított 4096 bájtos írás egy 4Kn device-on atomikus lehet: vagy a
+teljes szektor frissül, vagy a régi tartalom marad. A NVMe ezt a
+<strong>Atomic Write Unit Normal (AWUN)</strong> mezővel specifikálja;
+ez a normál működésre vonatkozik, az áramkimaradás alatti atomicitást az
+<strong>Atomic Write Unit Power Fail (AWUPF)</strong> mező adja meg. A
+Linux a device szintű atomi határt csak az újabb (6.11-től) kernelekben
+teszi közzé a <code>queue/atomic_write_*</code> sysfs attribútumokban;
+az Ubuntu 24.04 6.8-as kernelén ezt az eszköz adatlapjából vagy az
+<code>nvme id-ctrl</code> kimenetéből kell kiolvasni. A physical block
+size és az igazított I/O csak az RMW-t kerüli el, atomicitást nem
+garantál.</p>
+<p>A fájlrendszer szintű atomic operation ettől eltér. Egy C++
+alkalmazás nem írhat egyetlen <code>write()</code>-tel több blokkot
+atomikusan, még akkor sem, ha az a device szinten egyetlen parancs is
+lehetne. A fájlrendszer journaling, például az ext4 vagy XFS logja,
+biztosítja, hogy a rename, unlink vagy metadata-ösvény konzisztens
+maradjon power loss után is. Az alkalmazásnak tehát a tartós commitot
+<code>fsync()</code>-kel, a logikus tranzakciót pedig application-level
+protocolokkal kell kiegészítenie. A device atomic write nem helyettesíti
+a tranzakciós naplót, mint ahogy a filesystem journal sem ad tartósságot
+a device cache kiürítése nélkül.</p>
+<h3 data-number="5.3.7"
+id="kidolgozott-példa-lsblk-blockdev-és-sysfs-megfigyelés"><span
+class="header-section-number">5.3.7</span> Kidolgozott példa: lsblk,
+blockdev és sysfs megfigyelés</h3>
+<p>A következő példa egy Ubuntu Server 24.04 LTS labVM-en fut. A cél
+csupán megfigyelés, nem módosítjuk a disken lévő adatot. A labdisk neve
+<code>lab-d023-data</code>, a labVM neve <code>lab-vm1</code>.</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: labhost=lab-vm1, account=student, UID=1000,</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="co"># sudo a blockdev-hez (a sysfs olvasásához nem kell)</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="co"># Előfeltétel: a lab disk létezik, például</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="co"># /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_lab-d023-data</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">DISK</span><span class="op">=</span>/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_lab-d023-data</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="bu">test</span> <span class="at">-b</span> <span class="st">&quot;</span><span class="va">$DISK</span><span class="st">&quot;</span> <span class="kw">||</span> <span class="kw">{</span> <span class="bu">echo</span> <span class="st">&quot;lab disk hiányzik: </span><span class="va">$DISK</span><span class="st">&quot;</span> <span class="op">&gt;&amp;</span><span class="dv">2</span><span class="kw">;</span> <span class="bu">exit</span> 1<span class="kw">;</span> <span class="kw">}</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 1) Eszköz geometria</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="ex">lsblk</span> <span class="at">-p</span> <span class="at">-o</span> NAME,KNAME,TYPE,PHY-SEC,LOG-SEC,MIN-IO,OPT-IO,SCHED,ROTA <span class="st">&quot;</span><span class="va">$DISK</span><span class="st">&quot;</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 2) Szektor méretek blockdev-ből</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> blockdev <span class="at">--getss</span> <span class="at">--getpbsz</span> <span class="at">--getiomin</span> <span class="at">--getioopt</span> <span class="st">&quot;</span><span class="va">$DISK</span><span class="st">&quot;</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="co"># 3) Sysfs queue attribútumok a $DISK kernelneve alapján</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="va">KN</span><span class="op">=</span><span class="va">$(</span><span class="ex">lsblk</span> <span class="at">-ndo</span> KNAME <span class="st">&quot;</span><span class="va">$(</span><span class="fu">readlink</span> <span class="at">-f</span> <span class="st">&quot;</span><span class="va">$DISK</span><span class="st">&quot;</span><span class="va">)</span><span class="st">&quot;</span><span class="va">)</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> f <span class="kw">in</span> /sys/block/<span class="st">&quot;</span><span class="va">$KN</span><span class="st">&quot;</span>/queue/{logical_block_size,physical_block_size,<span class="dt">\</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>write_cache,discard_granularity,discard_max_bytes}<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>  <span class="bu">printf</span> <span class="st">&#39;%s=&#39;</span> <span class="st">&quot;</span><span class="va">$f</span><span class="st">&quot;</span><span class="kw">;</span> <span class="fu">cat</span> <span class="st">&quot;</span><span class="va">$f</span><span class="st">&quot;</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span></code></pre></div>
+<p>A várható, illusztratív kimenet 512e módú disken a következő
+lehet:</p>
+<pre class="text"><code>NAME       KNAME TYPE  PHY-SEC LOG-SEC MIN-IO OPT-IO SCHED ROTA
+/dev/sdb   /dev/sdb disk     4096     512   4096   4096 none     0
+512
+4096
+4096
+4096
+/sys/block/sdb/queue/logical_block_size=512
+/sys/block/sdb/queue/physical_block_size=4096
+/sys/block/sdb/queue/write_cache=write back
+/sys/block/sdb/queue/discard_granularity=4096
+/sys/block/sdb/queue/discard_max_bytes=2147479552</code></pre>
+<p>Az ellenőrzés feltétele: a <code>physical_block_size</code> értéke
+megegyezzen a <code>blockdev --getpbsz</code> kimenetével, a
+<code>logical_block_size</code> pedig a <code>--getss</code>
+kimenetével. A <code>write_cache</code> <code>write back</code> értéke
+jelzi, hogy a device a cache-ben tarthatja a write-ot, ezért a kernel
+flush/FUA parancsot küld; a tartósság feltétele, hogy az eszköz ezeket
+teljesítse (PLP esetén a flush olcsóbb). A (szemléltető) példában a
+labdisk kernelneve <code>sdb</code>. A <code>discard_granularity</code>
+4096 bájt azt jelenti, hogy a discard kéréseket 4096 bájt határra kell
+igazítani, a <code>discard_max_bytes</code> pedig a maximális egyetlen
+discard kérés méretét mutatja.</p>
+<h3 data-number="5.3.8" id="hibák-és-ellenpróbák"><span
+class="header-section-number">5.3.8</span> Hibák és ellenpróbák</h3>
+<h4 data-number="5.3.8.1"
+id="rmw-a-rosszul-igazított-partíció-miatt"><span
+class="header-section-number">5.3.8.1</span> RMW a rosszul igazított
+partíció miatt</h4>
+<p><strong>Tünet:</strong> Egy 512e disken a random 4K write IOPS
+látszólag jóval a specifikáció alatt marad, és az SSD write
+amplification mérőszáma növekszik. <strong>Adatgyűjtés:</strong>
+<code>lsblk -o NAME,PHY-SEC,LOG-SEC</code> szerint
+<code>PHY-SEC=4096</code>, <code>LOG-SEC=512</code>, de a
+<code>parted unit s print</code> szerint a partíció start szektora 63.
+<strong>Hipotézis:</strong> A 63-as start nem 4K-igazított, ezért RMW
+keletkezik. <strong>Egy változtatás:</strong> A lab disken új GPT
+partíció létrehozása 1 MiB igazítással, start szektor 2048.
+<strong>Ellenőrzés:</strong> A start szektor osztható 8-cal, és az I/O
+mérés javul. A rollback a lab disk újraüresítése, például a partíció
+törlésével.</p>
+<h4 data-number="5.3.8.2" id="write-cache-és-power-loss"><span
+class="header-section-number">5.3.8.2</span> Write cache és power
+loss</h4>
+<p><strong>Tünet:</strong> Egy adatbázis-motornál power loss után a
+legutóbbi, <code>fsync()</code>-kel nyugtázott rekord hiányzik, de a
+laborban látható, hogy a device <code>queue/write_cache</code> értéke
+<code>write back</code>, és nincs PLP. <strong>Hipotézis:</strong> Az
+eszköz nem teljesítette a flush-t (a completion ACK a volatile cache-ből
+jött, és a flush-t a firmware figyelmen kívül hagyta), vagy a kernel nem
+küldött flush-t, mert a <code>queue/write_cache</code> kézzel
+<code>write through</code>-ra lett írva, illetve <code>nobarrier</code>
+mount van érvényben. <strong>Javítás:</strong> PLP-vel rendelkező eszköz
+használata, vagy az eszköz cache-ének eszközszintű kikapcsolása a
+labdisken (SATA: <code>hdparm -W 0 /dev/sdX</code>, SCSI:
+<code>sdparm --clear WCE /dev/sdX</code>, NVMe: a Volatile Write Cache
+feature), és a kernel flush-útjának visszaállítása. FIGYELEM: a
+<code>/sys/block/*/queue/write_cache</code> fájlba
+<code>write through</code>-t írni NEM kapcsolja ki az eszköz cache-ét,
+csak a kernel flush-jait, ezért rontja a tartósságot.
+<strong>Ellenpróba:</strong> Ha a hiba PLP-s eszközön is jelentkezik,
+akkor a hibát egy felsőbb rétegben, például hibás fsync használatban
+kell keresni.</p>
+<h4 data-number="5.3.8.3" id="discard-nem-támogatott"><span
+class="header-section-number">5.3.8.3</span> Discard nem támogatott</h4>
+<p><strong>Tünet:</strong> <code>fstrim -v /mnt/lab-d023</code>
+visszaadja:
+<code>fstrim: /mnt/lab-d023: the discard operation is not supported</code>.
+<strong>Adat:</strong>
+<code>cat /sys/block/sdb/queue/discard_granularity</code> kimenete 0,
+<code>discard_max_bytes</code> szintén 0. <strong>Hipotézis:</strong> A
+device vagy a virtualizációs réteg nem enged tovább discard parancsot.
+<strong>Javítás:</strong> Kapcsolja ki erre a mountra az
+<code>fstrim.timer</code> szerinti ütemezett trimet, vagy engedélyezze a
+discard továbbítását a VM-ben (például virtio-scsi controller
+<code>discard=unmap</code> beállítással); ha a mountnál
+<code>discard</code> opció is van, azt is távolítsa el.
+<strong>Rollback:</strong> Az ütemezés és a mount opció visszaállítása
+nem destruktív. Ez a hiba nem igényel globális
+védőmechanizmus-kikapcsolást, csupán a device capability
+ellenőrzését.</p>
+<h3 data-number="5.3.9" id="feladatok"><span
+class="header-section-number">5.3.9</span> Feladatok</h3>
+<h4 data-number="5.3.9.1"
+id="feladat-magyarázó-rmw-költségszámítás"><span
+class="header-section-number">5.3.9.1</span> 1. feladat (magyarázó): RMW
+költségszámítás</h4>
+<p>Egy device
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>b</mi><mi>l</mi></msub><mo>=</mo><mn>512</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">B</mtext></mrow><annotation encoding="application/x-tex">b_l = 512\ \text{B}</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>b</mi><mi>p</mi></msub><mo>=</mo><mn>4096</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">B</mtext></mrow><annotation encoding="application/x-tex">b_p = 4096\ \text{B}</annotation></semantics></math>.
+Egy alkalmazás véletlenszerű offsetekre 512 bájtos írásokat ad ki. Az
+offsetek 512 többszörösei, de nem 4096 többszörösei. Tegyük fel, hogy a
+Linux block layer nem von össze kéréseket. Számítsa ki egyetlen 512
+bájtos írás esetén a mediaprogramozás méretét, és az írási erősítést.
+Magyarázza meg, miért csökken a wear terhelés, ha az offseteket és a
+méreteket 4096-ra igazítjuk.</p>
+<h4 data-number="5.3.9.2"
+id="feladat-adminisztrációs-lab-disk-igazítás-és-ellenőrzés"><span
+class="header-section-number">5.3.9.2</span> 2. feladat
+(adminisztrációs): lab disk igazítás és ellenőrzés</h4>
+<p>A labdisken (<code>lab-d023-data</code>) hozzon létre GPT partíciót 1
+MiB igazítással, ellenőrizze a start szektort, és vizsgálja meg a device
+discard és write cache tulajdonságait. Destruktív parancsot csak a
+kijelölt labdisken hajtson végre. A feladat végén törölje a partíciót,
+és állítsa vissza a labdisk kiinduló állapotát.</p>
+<h4 data-number="5.3.9.3"
+id="feladat-diagnosztikai-lassú-ssd-512e-módban"><span
+class="header-section-number">5.3.9.3</span> 3. feladat (diagnosztikai):
+lassú SSD 512e módban</h4>
+<p>Adott egy hoszt, ahol a <code>sdb</code> nevű SSD-n a 4K random write
+IOPS a specifikáció közel egyharmadát éri el. A sysfsben
+<code>physical_block_size=4096</code>,
+<code>logical_block_size=512</code>. A partíciós táblában az első
+partíció start szektora 63. Gyűjtsön adatokat <code>blockdev</code>-vel,
+<code>lsblk</code>-kel és a sysfsből. Fogalmazzon hipotézist, jelölje
+meg a valószínű réteget, és adjon javaslatot a javításra. Mitől függ,
+hogy a Linux block layer képes-e csökkenteni az RMW hatását?</p>
+<h3 data-number="5.3.10" id="megoldások"><span
+class="header-section-number">5.3.10</span> Megoldások</h3>
+<h4 data-number="5.3.10.1" id="feladat-megoldása"><span
+class="header-section-number">5.3.10.1</span> 1. feladat megoldása</h4>
+<p>Minden 512 bájtos írás egy 4096 bájtos fizikai szektort érint, de nem
+tölti ki. A device a régi tartalom beolvasása után egyesíti az új
+adatot, és a teljes 4096 bájtot programozza. A mediaprogramozás mérete
+4096 B, az írási erősítés
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>8</mn><annotation encoding="application/x-tex">8</annotation></semantics></math>.
+Ha az offset és a méret is 4096-ra igazított, a device az egész fizikai
+szektort újra tudja programozni a régi tartalom beolvasása nélkül, ezért
+az erősítés
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>1</mn><annotation encoding="application/x-tex">1</annotation></semantics></math>.
+A wear csökken, mert a NAND programozási egységek ugyanannyi adatot
+kapnak, de kevesebb oldalt kell programozni.</p>
+<h4 data-number="5.3.10.2" id="feladat-megoldása-1"><span
+class="header-section-number">5.3.10.2</span> 2. feladat megoldása</h4>
+<p>A destruktív lépések előtt ellenőrizze a disk név szerinti
+azonosítóját. A labdisk kijelölt, eldobható eszköz. A parancsok:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: labhost=lab-vm1, account=student, UID=1000, sudo</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Destruktív lépés, kizárólag a lab diskre!</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">DISK</span><span class="op">=</span>/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_lab-d023-data</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="bu">test</span> <span class="at">-b</span> <span class="st">&quot;</span><span class="va">$DISK</span><span class="st">&quot;</span> <span class="kw">||</span> <span class="kw">{</span> <span class="bu">echo</span> <span class="st">&quot;lab disk hiányzik: </span><span class="va">$DISK</span><span class="st">&quot;</span> <span class="op">&gt;&amp;</span><span class="dv">2</span><span class="kw">;</span> <span class="bu">exit</span> 1<span class="kw">;</span> <span class="kw">}</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 1) GPT partíciós tábla</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> parted <span class="at">-s</span> <span class="st">&quot;</span><span class="va">$DISK</span><span class="st">&quot;</span> mklabel gpt</span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 2) Partíció 1 MiB-tól a disk végéig</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> parted <span class="at">-s</span> <span class="st">&quot;</span><span class="va">$DISK</span><span class="st">&quot;</span> mkpart primary 1MiB 100%</span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 3) Szektorpozíció ellenőrzése</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> parted <span class="at">-s</span> <span class="st">&quot;</span><span class="va">$DISK</span><span class="st">&quot;</span> unit s print</span></code></pre></div>
+<p>A várt, illusztratív kimenetben a <code>Partition Table: gpt</code>,
+az első partíció startja <code>2048</code>, ami osztható 8-cal. A device
+tulajdonságok ellenőrzése:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">lsblk</span> <span class="at">-p</span> <span class="at">-o</span> NAME,PHY-SEC,LOG-SEC,MIN-IO,OPT-IO <span class="st">&quot;</span><span class="va">$DISK</span><span class="st">&quot;</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> blockdev <span class="at">--getss</span> <span class="at">--getpbsz</span> <span class="at">--getiomin</span> <span class="at">--getioopt</span> <span class="st">&quot;</span><span class="va">$DISK</span><span class="st">&quot;</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="va">KN</span><span class="op">=</span><span class="va">$(</span><span class="ex">lsblk</span> <span class="at">-ndo</span> KNAME <span class="st">&quot;</span><span class="va">$(</span><span class="fu">readlink</span> <span class="at">-f</span> <span class="st">&quot;</span><span class="va">$DISK</span><span class="st">&quot;</span><span class="va">)</span><span class="st">&quot;</span><span class="va">)</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> f <span class="kw">in</span> /sys/block/<span class="st">&quot;</span><span class="va">$KN</span><span class="st">&quot;</span>/queue/{logical_block_size,physical_block_size,<span class="dt">\</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>write_cache,discard_granularity,discard_max_bytes}<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>  <span class="bu">printf</span> <span class="st">&#39;%s=&#39;</span> <span class="st">&quot;</span><span class="va">$f</span><span class="st">&quot;</span><span class="kw">;</span> <span class="fu">cat</span> <span class="st">&quot;</span><span class="va">$f</span><span class="st">&quot;</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span></code></pre></div>
+<p>Postcondition: A labdisk egyetlen GPT partíciót tartalmaz, a start
+szektor 2048 és 4K-al osztható. A cleanup során a partíció törlése után
+a labdisk újra üres:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Cleanup: visszaállítás az eredeti lab állapotra</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> parted <span class="at">-s</span> <span class="st">&quot;</span><span class="va">$DISK</span><span class="st">&quot;</span> rm 1</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> parted <span class="at">-s</span> <span class="st">&quot;</span><span class="va">$DISK</span><span class="st">&quot;</span> mklabel gpt</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Szükség esetén a labprovision újra elkészíti a disk tartalmát</span></span></code></pre></div>
+<p>A rollback feltétele: a labdisk ne legyen más célra használva, a
+parancsok csak a <code>lab-d023-data</code> azonosítóra terjednek
+ki.</p>
+<h4 data-number="5.3.10.3" id="feladat-megoldása-2"><span
+class="header-section-number">5.3.10.3</span> 3. feladat megoldása</h4>
+<p>Az adatgyűjtő parancsok:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: a hibajegy hosztja, account=student, UID=1000</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="co"># A feladat szerint a vizsgált SSD kernelneve sdb (lsblk-vel ellenőrizve)</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="ex">lsblk</span> <span class="at">-p</span> <span class="at">-o</span> NAME,PHY-SEC,LOG-SEC /dev/sdb</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> blockdev <span class="at">--getss</span> <span class="at">--getpbsz</span> <span class="at">--getiomin</span> <span class="at">--getioopt</span> /dev/sdb</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> parted <span class="at">-s</span> /dev/sdb unit s print</span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sdb/sdb1/alignment_offset</span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> f <span class="kw">in</span> /sys/block/sdb/queue/{physical_block_size,logical_block_size,<span class="dt">\</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>write_cache,discard_granularity}<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>  <span class="bu">printf</span> <span class="st">&#39;%s=&#39;</span> <span class="st">&quot;</span><span class="va">$f</span><span class="st">&quot;</span><span class="kw">;</span> <span class="fu">cat</span> <span class="st">&quot;</span><span class="va">$f</span><span class="st">&quot;</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span></code></pre></div>
+<p>A közölt adatokból: <code>physical_block_size=4096</code>,
+<code>logical_block_size=512</code>, partíció start 63. A hipotézis: a
+partíció rosszul igazított;
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>63</mn><mo>⋅</mo><mn>512</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">B</mtext><mrow><mspace width="0.222em"></mspace><mrow><mi>mod</mi><mo>&#8289;</mo></mrow><mspace width="0.222em"></mspace><mn>4096</mn></mrow><mspace width="0.222em"></mspace><mtext mathvariant="normal">B</mtext><mo>=</mo><mn>3584</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">B</mtext></mrow><annotation encoding="application/x-tex">63 \cdot 512\ \text{B} \bmod 4096\ \text{B} = 3584\ \text{B}</annotation></semantics></math>,
+ezért a fájlrendszer minden 4K-s blokkja két fizikai szektort érint
+részben, és RMW lép fel. A valószínű réteg a partíciós layout (a
+blokkeszköz és a fájlrendszer közötti eltolás), nem az eszköz és nem a
+fájlrendszer. A javaslat: a partíció újralétrehozása 1 MiB (2048
+szektoros) igazítással, az adatok mentése és ellenőrzött visszaállítása
+mellett. A fájlrendszer-blokkméret módosítása a rossz partícióstartot
+nem javítja, mert az FS-blokkok a partíció kezdetéhez igazodnak.
+Ellenőrzés: a <code>/sys/block/sdb/sdb1/alignment_offset</code> értéke 0
+(a 63-as startnál nem 0), illetve a start szektor osztható 8-cal. A
+Linux block layer a kérések összevonásával, például a page cache
+szomszédos dirty lapjainak összefűzésével, csökkentheti az RMW hatását.
+Ha azonban a workload direct I/O-t használ, vagy a kérések nagyon
+szétszórtak, a merge nem segít. A postcondition: a partíció start
+szektora osztható 8-cal, és az adatút 4K-igazított.</p>
+<h3 data-number="5.3.11" id="rövid-összefoglaló"><span
+class="header-section-number">5.3.11</span> Rövid összefoglaló</h3>
+<p>A block device-t a <strong>logical sector</strong> méretében
+címezzük, de a fizikai programozási egység a <strong>physical
+sector</strong>. Az 512e disken a logikai és fizikai méretek eltérése
+indokolja a 4K-igazítást; a rossz igazítás RMW-ot okoz, amely 512 bájtos
+írásnál 8-szoros médiaprogramozást jelent. A <strong>write
+cache</strong> kezelése nélkül a nyugtázott írások nem biztos, hogy a
+nem felejtő médián vannak, ezért a tartóssághoz flush vagy FUA
+szükséges. A <strong>discard/TRIM</strong> a felszabadított
+tartományokat jelzi, csökkenti a write amplificationt, és thin
+provisioningnél visszaadhatja a háttérkapacitást. A device atomic write
+és a fájlrendszer atomi művelet más szerződés.</p>
+<p>Továbbhasznált definíciók:</p>
+<ul>
+<li><strong>Logical sector:</strong> a device LBA-címzésének legkisebb
+egysége.</li>
+<li><strong>Physical sector:</strong> a legkisebb egység, amelyet a
+device RMW nélkül ír; atomicitási garanciát önmagában nem ad (azt a
+deklarált atomic write unit adja).</li>
+<li><strong>TRIM/discard:</strong> a device felé kiadott
+érvénytelenítési jel, amely a törölt LBA-tartományt jelöli.</li>
+</ul>
+<h3 data-number="5.3.12" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">5.3.12</span> Források és ellenőrzési
+hiányok</h3>
+<p>Az alábbi hivatkozások a téma elsődleges dokumentációi, de ebben a
+munkamenetben nem lettek ellenőrizve, nem e fejezet alapján olvasott
+bizonyítékok:</p>
+<ul>
+<li><a href="https://nvmexpress.org/specifications/">NVM Express
+specifications</a> — NVMe flush, FUA, discard és atomic write
+egységek.</li>
+<li><a href="https://docs.kernel.org/">Linux kernel documentation</a> —
+block layer, queue attribútumok, discard és write cache.</li>
+<li><a href="https://ubuntu.com/server/docs/">Ubuntu Server 24.04 LTS
+documentation</a> — lsblk/blockdev/sysfs elérhetőségek és lab
+alapok.</li>
+</ul>
+<p>Ellenőrzési hiányok: a konkrét labdiszk 512e/4Kn képessége, a
+<code>write_cache</code> pontos sysfs elérési útja a labVM kernel
+verziójában, a QEMU discard támogatása, valamint a bemutatott kimenetek
+tényleges mérési eredményei nem ellenőrzöttek. A RMW költségmodell
+hipotetikus, nem mért adaton alapul. A device atomic write határok az
+adott NVMe/SCSI eszköz specifikációjából igazolandók.</p>
+<p>Állításonként ellenőrzendő konkrét források (verzió: Ubuntu Server
+24.04 LTS, 6.8-as GA kernel, util-linux 2.39):</p>
+<ul>
+<li>Blokkeszköz-queue sysfs attribútumai
+(<code>logical_block_size</code>, <code>physical_block_size</code>,
+<code>minimum_io_size</code>, <code>write_cache</code>,
+<code>discard_*</code>): <a
+href="https://docs.kernel.org/admin-guide/abi-testing.html"
+class="uri">https://docs.kernel.org/admin-guide/abi-testing.html</a> (a
+<code>/sys/block/&lt;disk&gt;/queue/</code> bejegyzések), illetve <a
+href="https://docs.kernel.org/block/queue-sysfs.html"
+class="uri">https://docs.kernel.org/block/queue-sysfs.html</a>.</li>
+<li>Write cache, flush és FUA a blokkrétegben: <a
+href="https://docs.kernel.org/block/writeback_cache_control.html"
+class="uri">https://docs.kernel.org/block/writeback_cache_control.html</a>.</li>
+<li><code>fstrim(8)</code>, <code>blockdev(8)</code>,
+<code>lsblk(8)</code>: <a
+href="https://man7.org/linux/man-pages/man8/fstrim.8.html"
+class="uri">https://man7.org/linux/man-pages/man8/fstrim.8.html</a>, <a
+href="https://man7.org/linux/man-pages/man8/blockdev.8.html"
+class="uri">https://man7.org/linux/man-pages/man8/blockdev.8.html</a>,
+<a href="https://man7.org/linux/man-pages/man8/lsblk.8.html"
+class="uri">https://man7.org/linux/man-pages/man8/lsblk.8.html</a>.</li>
+<li>NVMe AWUN/AWUPF, Flush, Deallocate: NVM Express Base Specification,
+Identify Controller adatszerkezet – <a
+href="https://nvmexpress.org/specifications/"
+class="uri">https://nvmexpress.org/specifications/</a>.</li>
+</ul>
+<p>A példák laborban ellenőrizendők; dátumozott futtatási napló
+(reprodukciós trace) még nem készült.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d022.html">← 5.2 NVMe, SCSI, queue és host controller</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d024.html">5.4 RAID, HBA, multipath és erőforrástérkép →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>39.4 Pod, container, config és resource lifecycle – Linux és
+DevOps rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch39">39 Kubernetes alapmodell, API és control plane</a></p>
+<div class="links"><a class="prev" rel="prev" href="d193.html">← 39.3 kubectl, context, namespace és diagnosztika</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d195.html">39.5 Első Kubernetes service és state diagnosztika →</a></div>
+</nav>
+<h2 data-number="39.4" id="d194"><span
+class="header-section-number">39.4</span> Pod, container, config és
+resource lifecycle</h2>
+<h3 data-number="39.4.1" id="motiváció"><span
+class="header-section-number">39.4.1</span> Motiváció</h3>
+<p>Egy C++ szolgáltatás Kubernetesbe helyezésekor a fejlesztő gyakran
+azt feltételezi, hogy a konténer ugyanaz, mint a processz: ha a processz
+fut, akkor a szolgáltatás készen van, és ha leáll, akkor a Kubernetes
+majd rendezi. Ez a modell félrevezető. A Pod nem processz, hanem az
+ütemezés, a hálózat és a lifecycle alapegysége; több konténert is
+tartalmazhat, amelyek osztoznak a hálózati névtéren és a mountolt
+köteteken. A <code>kubectl apply</code> után a Pod életciklusa nem
+redukálódik a konténerindításra: a kubelet ütemezi, init konténereket
+futtat, elvégzi a readiness ellenőrzéseket, majd a törléskor graceful
+shutdown-t vár. Ha ezek a szerződések hiányoznak vagy rosszul vannak
+konfigurálva, a rollout nem lesz megbízható, a Service forgalmat küldhet
+nem kész Podokhoz, és a processz leállhat adatvesztéssel.</p>
+<p>Ebben az alfejezetben a Podot mint lifecycle-egységet tanítjuk: a
+konténer és Pod állapotok közötti határ, az init/sidecar szerepek, a
+konfiguráció bejuttatása, az erőforrás request/limit, a probe-ok és a
+leállítási grace logika. A d177 alfejezetben tárgyalt cgroup v2
+erőforrás-elszámolás itt válik a Kubernetes request/limit
+mechanizmusának alapjává.</p>
+<h3 data-number="39.4.2" id="definíciók"><span
+class="header-section-number">39.4.2</span> Definíciók</h3>
+<ul>
+<li><strong>Pod:</strong> A Kubernetesben ütemezhető legkisebb egység;
+egy vagy több konténert fog össze, amelyek közös Linux network
+namespace-t, volume-okat és lifecycle-ot kapnak. A Pod mindig egy
+Node-on fut.</li>
+<li><strong>Container lifecycle:</strong> A konténeren belüli processz
+állapota a kubelet szemszögéből: <code>Waiting</code> (pl. image pull,
+ContainerCreating), <code>Running</code> (a processz elindult),
+<code>Terminated</code> (a processz kilépett, exit code-dal). Ez
+különbözik a Pod fázisától.</li>
+<li><strong>Resource contract:</strong> A
+<code>spec.containers[].resources</code> alatt megadott
+<code>requests</code> (minimális garantált erőforrás) és
+<code>limits</code> (maximális fogyasztás) kettőse. A request
+befolyásolja a scheduling döntést, a limit a cgroup v2 kontrollereket
+állítja.</li>
+<li><strong>Ready state:</strong> A Pod akkor Ready, ha minden konténere
+fut, és a readiness probe (ha definiált) sikeres. A Service csak Ready
+Podokhoz irányít forgalmat.</li>
+</ul>
+<p>A Pod életciklus fázisai: <code>Pending</code>, <code>Running</code>,
+<code>Succeeded</code>, <code>Failed</code>, <code>Unknown</code>. A
+fázisok a Pod szintű állapotot írják le, míg a konténer állapotok
+alárendeltek. Például egy <code>Running</code> fázisú Podban lehet
+<code>Terminated</code> konténer, ha a restart policy éppen
+újraindítja.</p>
+<h3 data-number="39.4.3"
+id="pod-shared-domain-és-konténerkapcsolatok"><span
+class="header-section-number">39.4.3</span> Pod shared domain és
+konténerkapcsolatok</h3>
+<p>A Pod specifikációban szereplő konténerek ugyanabban a Linux network
+namespace-ben futnak: osztoznak az IP-címen, a port térerőn és a
+localhost-on. Egy konténer <code>127.0.0.1:8080</code> címen elérheti a
+társát, nincs szükség Service-re. A volume-ok is shared mount-ok: ha egy
+<code>emptyDir</code> vagy <code>configMap</code> volume-t több konténer
+mountol, ugyanazt a fájlnézetet látják. Ez a két közös domain teszi
+lehetővé a sidecar mintát.</p>
+<p>Két speciális konténerkategória fontos:</p>
+<ul>
+<li><strong>Init container:</strong> A <code>spec.initContainers</code>
+listában futnak, szigorúan sorrendben, mindegyiknek sikeresen (0 exit
+code) kell lefutnia, mielőtt a normál <code>spec.containers</code>
+elindulna. Init konténerek olyan előkészületre valók, mint a
+konfiguráció letöltése, jogosultságellenőrzés vagy adatbázis migráció.
+Az init konténer mountolhatja ugyanazokat a volume-okat, de nem fut a
+normál konténerekkel egy időben. A klasszikus init konténerre a Pod
+<code>restartPolicy</code>-ja hat (<code>Always</code> esetén
+<code>OnFailure</code>-ként viselkedik: hiba után újrapróbálja); kivétel
+a konténerszintű <code>restartPolicy: Always</code>, amely az init
+konténert sidecarrá teszi (lásd alább).</li>
+<li><strong>Sidecar container:</strong> A Kubernetes újabb verzióiban (a
+pontos feature gate-et és támogatási szintet a lab cluster support
+matrixában ellenőrizni kell) a <code>restartPolicy: Always</code> init
+konténerek sidecarként viselkednek: a fő konténerekkel egy időben
+futnak, de a fő konténerek előtt indulnak el. Klasszikus sidecar példa a
+log shipper vagy service mesh proxy, amely a Pod teljes élettartama
+alatt fut.</li>
+</ul>
+<p>A <code>restartPolicy</code> a Pod szintjén határozza meg a konténer
+újraindítását: <code>Always</code> (alapértelmezett),
+<code>OnFailure</code>, <code>Never</code>. A kubelet a konténer exit
+code-jától függően dönt. A Pod fázisa akkor válik
+<code>Failed</code>-ré, ha minden konténere befejeződött, és legalább
+egy nem 0 exit code-dal (és a restart policy nem indítja újra, például
+<code>Never</code> esetén). Egy hibával kilépett és egy még futó
+konténer mellett a Pod <code>Running</code> marad.</p>
+<h3 data-number="39.4.4"
+id="configmap-és-secret-mint-konfigurációs-input"><span
+class="header-section-number">39.4.4</span> ConfigMap és Secret mint
+konfigurációs input</h3>
+<p>A Kubernetes a konfigurációt és a titkokat a Pod mountolt fájljaiban
+vagy környezeti változóiban juttatja be. A <code>configMap</code> nem
+változtatja meg a konténer image-et, hanem a már futó processznek
+biztosít adatot.</p>
+<ul>
+<li><strong>ConfigMap:</strong> Nem titkos konfiguráció (pl. log szint,
+port, feature flag). A <code>data</code> mezői szöveges kulcs-érték
+párok; a Pod volume-ként mountolhatja a <code>configMap</code> elemeit
+fájlokként, vagy <code>env.valueFrom.configMapKeyRef</code>-fel
+környezeti változóként adhatja át.</li>
+<li><strong>Secret:</strong> Titkos adat (token, jelszó, cert). Kódolás
+<code>base64</code>, de a súly nem a titkosítás, hanem a
+hozzáférés-vezérlés: RBAC, etcd encryption, ne logolj. A Secret
+<code>stringData</code> mezője írható plain textben, a szerver tárolja
+base64-ben. A Pod <code>secretKeyRef</code>-fel env-ként vagy mountolt
+fájlként kapja.</li>
+</ul>
+<p>A mountolt ConfigMap/Secret frissítése nem azonnali; a kubelet
+periodikus szinkronizálással frissíti a mountolt fájlokat, de az
+alkalmazásnak figyelnie kell a fájlváltozást, vagy újra kell indítania a
+processzt. Az env-ként bejuttatott értékek nem frissülnek a Pod
+életében. A ConfigMap és Secret mérete 1 MiB alatt van (etcd limit), ezt
+nagy konfiguráció esetén külön megoldással kell kezelni.</p>
+<h3 data-number="39.4.5" id="cpumemory-request-és-limit"><span
+class="header-section-number">39.4.5</span> CPU/memory request és
+limit</h3>
+<p>A <code>resources</code> mező a konténer specifikációban adja meg a
+resource contract-ot:</p>
+<ul>
+<li><code>requests</code>: a scheduler által lefoglalt (ütemezési)
+erőforrások. A scheduler a node allocatable kapacitásából vonja le a
+requestek összegét, és csak akkor köti a Podot a Node-ra, ha a requestek
+kielégíthetők. A CPU-request a cgroup v2-ben <code>cpu.weight</code>-re
+képeződik (relatív részesedés versengéskor); a memória-request
+alapértelmezésben nem kerül a cgroupba –
+<code>memory.min</code>/<code>memory.low</code> beállítás csak az alfa
+MemoryQoS feature gate mellett történik –, így az ütemezési és
+eviction-szempont, nem kernelgarancia.</li>
+<li><code>limits</code>: a fogyasztás felső korlátja. A CPU-nál a cgroup
+v2 <code>cpu.max</code> throttlingot okoz, ha a konténer többet próbál
+fogyasztani, mint a limit; a memóriánál a <code>memory.max</code>
+túllépése OOM-kill-t eredményez. A CPU throttle nem állítja le a
+processzt, csak lassítja; a memória-limit hard kill.</li>
+</ul>
+<p>A QoS osztályt a requestek és limitek viszonya határozza meg:</p>
+<ul>
+<li><code>Guaranteed</code>: minden konténerben CPU-ra és memóriára is
+van limit, és a request azonos vele. (Ha csak limit van megadva, a
+request alapértelmezésben a limit értékét kapja.)</li>
+<li><code>Burstable</code>: legalább egy konténernek van CPU- vagy
+memória-requestje vagy -limitje, de nem teljesül a Guaranteed
+feltétel.</li>
+<li><code>BestEffort</code>: egyik konténernek sincs sem requestje, sem
+limitje.</li>
+</ul>
+<p>Node-nyomásnál a kubelet az eviction-sorrendet nem a QoS osztályból
+számítja, hanem (1) abból, hogy a Pod használata meghaladja-e a
+requestjét, (2) a Pod prioritásából, (3) a requesthez viszonyított
+használatból. A QoS osztály az OOM-killer pontozását
+(<code>oom_score_adj</code>) befolyásolja. A BestEffort Pod requestje 0,
+ezért bármilyen használata meghaladja azt, így a gyakorlatban az elsők
+között kerül sorra.</p>
+<h3 data-number="39.4.6" id="probe-ok-és-readiness-szerződés"><span
+class="header-section-number">39.4.6</span> Probe-ok és readiness
+szerződés</h3>
+<figure id="fig-d194-pod-eletciklus">
+<div class="fig-interactive"><iframe src="figures/html/d194-pod-eletciklus.html" title="(a) 0–30 s: az init-check 0–2 s között fut, config ok, exit 0; az api konténer 2 s-tól Running. A startup probe 2 s-onként fut, 2, 4, 6 s-kor sikertelen, 8 s-kor sikeres. A readiness ezután 9, 14, 19, 24, 29 s-kor fut és sikeres, a liveness első futása 12 s-kor, majd 22 s-kor. A Pod Ready 9 s-tól True, ettől a Pod IP-je az EndpointSlice-ban van. (b) Törlés T-kor: deletionTimestamp, az EndpointSlice-ból kivezetés késleltetve, a preStop sleep 3 T és T+3 között fut, T+3-kor SIGTERM, a drain után T+5-kor kilépés; ha az alkalmazás nem lép ki, T+30-kor SIGKILL. A 30 s-os grace keret a preStopot és a drain-t is tartalmazza." loading="lazy" style="width:100%;border:0;height:560px"></iframe><noscript><img src="figures/img/d194-pod-eletciklus.png" style="width:100.0%"
+alt="(a) 0–30 s: az init-check 0–2 s között fut, config ok, exit 0; az api konténer 2 s-tól Running. A startup probe 2 s-onként fut, 2, 4, 6 s-kor sikertelen, 8 s-kor sikeres. A readiness ezután 9, 14, 19, 24, 29 s-kor fut és sikeres, a liveness első futása 12 s-kor, majd 22 s-kor. A Pod Ready 9 s-tól True, ettől a Pod IP-je az EndpointSlice-ban van. (b) Törlés T-kor: deletionTimestamp, az EndpointSlice-ból kivezetés késleltetve, a preStop sleep 3 T és T+3 között fut, T+3-kor SIGTERM, a drain után T+5-kor kilépés; ha az alkalmazás nem lép ki, T+30-kor SIGKILL. A 30 s-os grace keret a preStopot és a drain-t is tartalmazza." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d194-pod-eletciklus.png" style="width:100.0%"
+alt="(a) 0–30 s: az init-check 0–2 s között fut, config ok, exit 0; az api konténer 2 s-tól Running. A startup probe 2 s-onként fut, 2, 4, 6 s-kor sikertelen, 8 s-kor sikeres. A readiness ezután 9, 14, 19, 24, 29 s-kor fut és sikeres, a liveness első futása 12 s-kor, majd 22 s-kor. A Pod Ready 9 s-tól True, ettől a Pod IP-je az EndpointSlice-ban van. (b) Törlés T-kor: deletionTimestamp, az EndpointSlice-ból kivezetés késleltetve, a preStop sleep 3 T és T+3 között fut, T+3-kor SIGTERM, a drain után T+5-kor kilépés; ha az alkalmazás nem lép ki, T+30-kor SIGKILL. A 30 s-os grace keret a preStopot és a drain-t is tartalmazza." /></details></div>
+<figcaption>A lab-cpp-api Pod életciklusa a kidolgozott példa
+probe-paramétereivel: (a) indulás, (b) leállítás – a preStop a SIGTERM
+előtt fut, a 30 s-os keret mindkettőt tartalmazza (modell, nem
+mérés)</figcaption>
+</figure>
+<p>A kubelet háromféle probe-ot futtathat a konténeren:</p>
+<ul>
+<li><strong>startup probe:</strong> A konténer indulásakor fut, amíg
+sikeres nem lesz; ha többször meghiúsul, a konténert újraindítja. Lassan
+induló alkalmazásoknál védi a liveness probe-ot az indítási ablakban. Ha
+a startup probe definiált, a liveness csak a sikeres startup után
+indul.</li>
+<li><strong>readiness probe:</strong> Azt jelzi, hogy a konténer készen
+áll-e a kérések fogadására. Ha sikertelen, a Pod <code>Ready</code>
+állapota false lesz, és a Service nem irányít hozzá forgalmat. A
+readiness nem indít újra konténert.</li>
+<li><strong>liveness probe:</strong> Azt ellenőrzi, hogy a konténer
+„él-e”, azaz nem ragadt-e be. Ha a liveness meghiúsul, a kubelet
+újraindítja a konténert. A liveness nem a lokális hibakeresés eszköze,
+hanem a restart politika triggerje.</li>
+</ul>
+<p>A probe típusai: <code>httpGet</code> (HTTP-GET kérés, 2xx/3xx válasz
+sikeres), <code>tcpSocket</code> (TCP-connect siker), <code>exec</code>
+(parancs futtatása a konténerben, 0 exit code), <code>grpc</code> (gRPC
+health check). Mindegyiknél <code>initialDelaySeconds</code>,
+<code>periodSeconds</code>, <code>timeoutSeconds</code>,
+<code>successThreshold</code>, <code>failureThreshold</code>
+állítható.</p>
+<p>A readiness probe a Service forgalom szempontjából a Kubernetes
+szolgáltatás szerződése. Ha nincs readiness probe, a kubelet akkor is
+Readynek jelzi a Podot, amikor a processz elindult, de még nem képes
+kéréseket kiszolgálni. Ez tipikus deploy hiba: a rollout alatt a régi és
+új Podok közötti átmenetben a Service forgalmat küldhet nem inicializált
+Podokhoz.</p>
+<h3 data-number="39.4.7"
+id="termination-grace-és-workload-shutdown"><span
+class="header-section-number">39.4.7</span> Termination grace és
+workload shutdown</h3>
+<p>Amikor a Pod törlődik (pl. <code>kubectl delete pod</code>, rollout,
+node drain), a kubelet a következő leállítási szekvenciát hajtja
+végre:</p>
+<ol type="1">
+<li>A Pod <code>deletionTimestamp</code>-ot kap
+(<code>Terminating</code>). Ezzel párhuzamosan, de késleltetéssel (az
+EndpointSlice-frissítés és a kube-proxy/ingress szabályfrissítés néhány
+száz ms – néhány s alatt terjed szét) a végpontvezérlő kivezeti a Pod
+endpointját; a forgalom tehát nem szűnik meg azonnal.</li>
+<li>Ha definiált, a kubelet lefuttatja a <code>lifecycle.preStop</code>
+hookot. A preStop tipikusan rövid várakozásra (<code>sleep</code>) való,
+hogy az endpoint-kivezetés a SIGTERM előtt szétterjedjen, vagy drain
+jelzésre.</li>
+<li>Ezután a kubelet <code>SIGTERM</code>-et küld a konténer fő
+processzének (PID 1). Az alkalmazásnak ezt el kell kapnia, és el kell
+kezdenie a graceful shutdown-t: új kéréseket már nem fogad, a függőben
+lévőket befejezi, erőforrásokat felszabadít.</li>
+<li>A preStop és a leállás együtt legfeljebb
+<code>terminationGracePeriodSeconds</code> ideig (alapértelmezés 30
+másodperc) tarthat; ha a preStop túllépi, a kubelet egyszer 2 s
+hosszabbítást ad. Ha a processz addig nem áll le, <code>SIGKILL</code>-t
+küld.</li>
+</ol>
+<p>A C++ fejlesztő felelőssége: a signal handler
+(<code>std::signal</code>, vagy
+<code>signalfd</code>/<code>sigwait</code> alapú eseményhurok) kezelje a
+<code>SIGTERM</code>-et, és állítsa le a szolgáltatást a tranzakciók
+befejezése után. Handler nélkül a viselkedés attól függ, hogy a processz
+PID 1-e (vö. <a href="d187.html">d187</a>): PID 1-ként a handler nélküli
+SIGTERM hatástalan, a processz a grace végéig fut, majd a SIGKILL öli
+meg (exit 137); ha nem PID 1 (például init folyamat alatt fut), azonnal
+kilép (exit 143). Egyik sem graceful, mindkettő adatvesztéshez vezethet.
+A <code>terminationGracePeriodSeconds</code> értékét úgy kell
+megválasztani, hogy nagyobb legyen, mint a leglassabb in-flight kérés
+befejezési ideje.</p>
+<h3 data-number="39.4.8" id="kidolgozott-példa"><span
+class="header-section-number">39.4.8</span> Kidolgozott példa</h3>
+<p>A következő példa egy lab környezetben definiál egy C++ HTTP API
+Podot ConfigMap-pel, Secret-tel, resource request/limit-tel, probe-okkal
+és graceful shutdown-nal. Feltételezzük, hogy a
+<code>registry.lab.example/cpp-api:1.2.3</code> image már elérhető a lab
+registry-ben, tartalmaz <code>/bin/sh</code>-t (a preStop hook miatt;
+shell nélküli minimális image-nél a Kubernetes 1.30+
+<code>preStop: sleep: {seconds: 3}</code> akciója használható,
+verziófüggő), és az alkalmazás a <code>/startup</code>,
+<code>/ready</code>, <code>/live</code> endpointokat szolgálja ki a
+8080-as porton. A lab target: <code>lab-cluster</code> context,
+<code>lab-d194</code> namespace. Módosítás előtti állapot: a namespace
+már létezik.</p>
+<p>Először a ConfigMap és Secret:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> v1</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> ConfigMap</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-cpp-config</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-d194</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="fu">data</span><span class="kw">:</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="fu">  app.conf</span><span class="kw">: </span><span class="ch">|</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    log_level=debug</span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    listen=0.0.0.0:8080</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="pp">---</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> v1</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Secret</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-cpp-secret</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-d194</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="fu">type</span><span class="kw">:</span><span class="at"> Opaque</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="fu">stringData</span><span class="kw">:</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">token</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;dummy-token-not-real&quot;</span></span></code></pre></div>
+<p>Alkalmazás:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-d194 apply <span class="at">-f</span> config.yaml</span></code></pre></div>
+<p>Várható kimenet: <code>configmap/lab-cpp-config created</code>,
+<code>secret/lab-cpp-secret created</code>.</p>
+<p>A Pod manifest:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> v1</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Pod</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-cpp-api</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-d194</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">app</span><span class="kw">:</span><span class="at"> lab-cpp-api</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">restartPolicy</span><span class="kw">:</span><span class="at"> Always</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">terminationGracePeriodSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">30</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">initContainers</span><span class="kw">:</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> init-check</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">image</span><span class="kw">:</span><span class="at"> busybox:1.36</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">command</span><span class="kw">:</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> sh</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> -c</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a><span class="kw">    - </span><span class="ch">|</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>      echo &quot;init: checking mounted config&quot;</span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>      test -f /etc/lab-config/app.conf &amp;&amp; echo &quot;config ok&quot;</span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">volumeMounts</span><span class="kw">:</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> config-volume</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">mountPath</span><span class="kw">:</span><span class="at"> /etc/lab-config</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">containers</span><span class="kw">:</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> api</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">image</span><span class="kw">:</span><span class="at"> registry.lab.example/cpp-api:1.2.3</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">ports</span><span class="kw">:</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">containerPort</span><span class="kw">:</span><span class="at"> </span><span class="dv">8080</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">requests</span><span class="kw">:</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">cpu</span><span class="kw">:</span><span class="at"> 100m</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">memory</span><span class="kw">:</span><span class="at"> 128Mi</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">limits</span><span class="kw">:</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">cpu</span><span class="kw">:</span><span class="at"> 250m</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">memory</span><span class="kw">:</span><span class="at"> 256Mi</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">env</span><span class="kw">:</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> SECRET_TOKEN</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">valueFrom</span><span class="kw">:</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">secretKeyRef</span><span class="kw">:</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-cpp-secret</span></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">key</span><span class="kw">:</span><span class="at"> token</span></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">volumeMounts</span><span class="kw">:</span></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> config-volume</span></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">mountPath</span><span class="kw">:</span><span class="at"> /etc/lab-config</span></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">readOnly</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">startupProbe</span><span class="kw">:</span></span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">httpGet</span><span class="kw">:</span></span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">path</span><span class="kw">:</span><span class="at"> /startup</span></span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">port</span><span class="kw">:</span><span class="at"> </span><span class="dv">8080</span></span>
+<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">periodSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">failureThreshold</span><span class="kw">:</span><span class="at"> </span><span class="dv">30</span></span>
+<span id="cb3-51"><a href="#cb3-51" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">timeoutSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb3-52"><a href="#cb3-52" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">readinessProbe</span><span class="kw">:</span></span>
+<span id="cb3-53"><a href="#cb3-53" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">httpGet</span><span class="kw">:</span></span>
+<span id="cb3-54"><a href="#cb3-54" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">path</span><span class="kw">:</span><span class="at"> /ready</span></span>
+<span id="cb3-55"><a href="#cb3-55" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">port</span><span class="kw">:</span><span class="at"> </span><span class="dv">8080</span></span>
+<span id="cb3-56"><a href="#cb3-56" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">periodSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">5</span></span>
+<span id="cb3-57"><a href="#cb3-57" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">failureThreshold</span><span class="kw">:</span><span class="at"> </span><span class="dv">3</span></span>
+<span id="cb3-58"><a href="#cb3-58" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">timeoutSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb3-59"><a href="#cb3-59" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">initialDelaySeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb3-60"><a href="#cb3-60" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">livenessProbe</span><span class="kw">:</span></span>
+<span id="cb3-61"><a href="#cb3-61" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">httpGet</span><span class="kw">:</span></span>
+<span id="cb3-62"><a href="#cb3-62" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">path</span><span class="kw">:</span><span class="at"> /live</span></span>
+<span id="cb3-63"><a href="#cb3-63" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">port</span><span class="kw">:</span><span class="at"> </span><span class="dv">8080</span></span>
+<span id="cb3-64"><a href="#cb3-64" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">periodSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">10</span></span>
+<span id="cb3-65"><a href="#cb3-65" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">failureThreshold</span><span class="kw">:</span><span class="at"> </span><span class="dv">3</span></span>
+<span id="cb3-66"><a href="#cb3-66" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">timeoutSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb3-67"><a href="#cb3-67" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">initialDelaySeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">10</span></span>
+<span id="cb3-68"><a href="#cb3-68" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">lifecycle</span><span class="kw">:</span></span>
+<span id="cb3-69"><a href="#cb3-69" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">preStop</span><span class="kw">:</span></span>
+<span id="cb3-70"><a href="#cb3-70" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">exec</span><span class="kw">:</span></span>
+<span id="cb3-71"><a href="#cb3-71" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">command</span><span class="kw">:</span></span>
+<span id="cb3-72"><a href="#cb3-72" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="kw">-</span><span class="at"> sh</span></span>
+<span id="cb3-73"><a href="#cb3-73" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="kw">-</span><span class="at"> -c</span></span>
+<span id="cb3-74"><a href="#cb3-74" aria-hidden="true" tabindex="-1"></a><span class="kw">          - </span><span class="ch">|</span></span>
+<span id="cb3-75"><a href="#cb3-75" aria-hidden="true" tabindex="-1"></a>            # a hook kimenete nem kerül a konténernaplóba, ezért</span>
+<span id="cb3-76"><a href="#cb3-76" aria-hidden="true" tabindex="-1"></a>            # a fő processz stdoutjára írunk</span>
+<span id="cb3-77"><a href="#cb3-77" aria-hidden="true" tabindex="-1"></a>            echo &quot;preStop: draining&quot; &gt; /proc/1/fd/1</span>
+<span id="cb3-78"><a href="#cb3-78" aria-hidden="true" tabindex="-1"></a>            sleep 3</span>
+<span id="cb3-79"><a href="#cb3-79" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">volumes</span><span class="kw">:</span></span>
+<span id="cb3-80"><a href="#cb3-80" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> config-volume</span></span>
+<span id="cb3-81"><a href="#cb3-81" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">configMap</span><span class="kw">:</span></span>
+<span id="cb3-82"><a href="#cb3-82" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-cpp-config</span></span></code></pre></div>
+<p>Alkalmazás és ellenőrzés:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-d194 apply <span class="at">-f</span> pod.yaml</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-d194 get pod lab-cpp-api <span class="at">-o</span> wide</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-d194 describe pod lab-cpp-api</span></code></pre></div>
+<p>Várható kimenet (illusztratív, nem mért): a Pod fázisa
+<code>Running</code>, <code>READY</code> oszlop <code>1/1</code>, az
+Eventsben az init konténer sikeres lefutása, a <code>Started</code>
+állapot és a probe-ok sikere látható. A <code>describe</code> mutatja a
+QoS osztályt (<code>Burstable</code>, mert a CPU request és limit
+különbözik) és a resource requesteket/limiteket. A
+<code>kubectl logs lab-cpp-api -c init-check</code> az init üzenetet
+mutatja.</p>
+<p>A readiness szerződés ellenőrzése:
+<code>kubectl get endpoints -n lab-d194</code> a Pod IP-jét csak akkor
+tartalmazza, ha a readiness probe sikeres. A liveness hiba esetén a
+<code>kubectl describe pod</code> a <code>Liveness probe failed</code>
+eseményt és a restart count növekedését jelzi. A termination tesztelése:
+egy másik terminálban <code>kubectl logs -f lab-cpp-api -c api</code>,
+majd <code>kubectl delete pod lab-cpp-api</code>. A Pod
+<code>Terminating</code> állapotba kerül; a naplóban a preStop által a
+fő processz stdoutjára írt <code>preStop: draining</code> sor, majd az
+alkalmazás saját leállási üzenete (például <code>graceful exit</code>)
+jelenik meg, és a processz 30 mp-en belül leáll. Az <code>exec</code>
+típusú hook saját kimenetét a kubelet nem írja a konténer naplójába; a
+hook hibája csak eseményként (<code>FailedPreStopHook</code>) látszik:
+<code>kubectl get events --field-selector involvedObject.name=lab-cpp-api</code>.</p>
+<h3 data-number="39.4.9" id="hibák-és-ellenpróbák"><span
+class="header-section-number">39.4.9</span> Hibák és ellenpróbák</h3>
+<p><strong>Readiness probe hiánya vagy rossz endpoint.</strong> Ha nincs
+readiness probe, a Service forgalmat küld a Podnak azelőtt, hogy az
+alkalmazás ténylegesen készen állna. Tünet: a rollout alatt 502-es
+hibák, lassú kérések. Hipotézis: a <code>kubectl describe pod</code>
+mutatja a Ready állapotot, de az alkalmazás logja még inicializál.
+Adatgyűjtés: <code>kubectl logs</code>,
+<code>kubectl get endpoints</code>. Javítás: readiness probe hozzáadása,
+például egy <code>/ready</code> endpointra.</p>
+<p><strong>Liveness probe túl agresszív.</strong> Ha a liveness
+<code>failureThreshold</code> túl alacsony, vagy a
+<code>timeoutSeconds</code> túl rövid, egy átmeneti GC pause vagy lock a
+konténer újraindítását okozza. Tünet: a Pod folyamatosan
+<code>CrashLoopBackOff</code>-ba kerül, a restart count nő. Hipotézis: a
+liveness probe logjai mutatják a sikertelen kísérleteket. Javítás: a
+liveness threshold növelése, vagy a startup probe bevezetése, hogy az
+indítási ablak ne számítson liveness hibának.
+<strong>Ellenpróba:</strong> a liveness endpoint különválasztása a
+readiness-től, hogy az alkalmazás lassú, de működő állapota ne indítson
+restartot.</p>
+<p><strong>Request/limit összekeverése.</strong> Ha a
+<code>requests</code> nincs megadva, csak <code>limits</code>, a request
+a limit értékét örökli: ha minden konténer minden erőforrására van
+limit, a Pod <code>Guaranteed</code>, ha csak részben,
+<code>Burstable</code>. BestEffort csak request és limit nélkül lesz. A
+fordított hiba a gyakori: túl alacsony request mellett a Pod használata
+meghaladja a requestjét, és node-nyomásnál ez teszi az eviction
+elsődleges jelöltjévé. Tünet: a Pod hirtelen <code>Evicted</code> lesz.
+Hipotézis: a <code>kubectl describe pod</code> mutatja a QoS osztályt és
+az eviction reason-t (melyik erőforrás, mennyi a használat a requesthez
+képest). Javítás: minden konténerre a valós használathoz igazított
+explicit request és limit; kritikus workloadnál azonos értékek
+(Guaranteed QoS) és megfelelő <code>priorityClassName</code>.</p>
+<p><strong>ConfigMap frissítés nem terjed.</strong> A mountolt ConfigMap
+file frissítése akár perceket is késhet, és az alkalmazás nem figyeli a
+fájlváltozást. Tünet: a konfiguráció módosítása után a Pod régi értéket
+használ. Hipotézis: a fájl mtime-ja a konténerben nem új. Javítás: az
+alkalmazás indítson újra a config reloadra, vagy a Pod újraindítása
+rollout-lal (pl. Deployment rolling update).
+<strong>Ellenpróba:</strong> env-ként beadott ConfigMap érték soha nem
+frissül, ezt csak Pod újraindítással lehet változtatni.</p>
+<p><strong>Graceful shutdown hiánya.</strong> A C++ processz nem kezeli
+a SIGTERM-et, ezért PID 1-ként a grace lejártáig fut, majd a kubelet
+SIGKILL-lel öli meg (exit 137). Tünet: a rollout közben a kliensek
+connection reset hibát kapnak, adatvesztés. Hipotézis: a
+<code>kubectl logs</code> nem mutat leállási logot. Javítás: signal
+handler a C++ kódban, és <code>terminationGracePeriodSeconds</code>
+beállítás a leghosszabb kérés lefutásánál nagyobbra.</p>
+<h3 data-number="39.4.10" id="feladatok"><span
+class="header-section-number">39.4.10</span> Feladatok</h3>
+<ol type="1">
+<li><p><strong>Magyarázó feladat.</strong> Egy Pod manifestben a
+readiness probe a 9090-es portot ellenőrzi, de a konténer a 8080-ason
+hallgat, és nincs startup probe. Írja le, mi lesz a Pod fázisa, Ready
+állapota, és fog-e forgalmat kapni a Service-től. Indokolja, miért nem
+<code>Failed</code> a Pod.</p></li>
+<li><p><strong>Adminisztrációs/konfigurációs feladat.</strong> Hozzon
+létre a <code>lab-d194</code> namespace-ben egy
+<code>lab-cpp-worker</code> Podot, amely:</p>
+<ul>
+<li><code>registry.lab.example/cpp-worker:1.0.0</code> image-et
+használ,</li>
+<li>CPU request 50m, limit 100m; memory request 64Mi, limit 64Mi,</li>
+<li><code>lab-cpp-worker-config</code> ConfigMap-ből egy
+<code>worker.conf</code> fájlt mountol a <code>/etc/lab-worker/</code>
+alá,</li>
+<li><code>lab-cpp-worker-secret</code> Secretből a
+<code>db_password</code> kulcsot mint <code>DB_PASSWORD</code>
+környezeti változót adja át. Ellenőrizze a QoS osztályt a
+<code>kubectl describe</code> kimenetében. Mi a QoS osztály, ha a CPU
+request 50m, limit 100m, de a memory request 64Mi és limit 64Mi?</li>
+</ul></li>
+<li><p><strong>Diagnosztikai/failure/recovery feladat.</strong> A
+<code>lab-cpp-api</code> Pod <code>CrashLoopBackOff</code> állapotban
+van. A <code>kubectl describe pod lab-cpp-api</code> a következő
+eseményt mutatja:
+<code>Liveness probe failed: HTTP probe failed with statuscode: 500</code>.
+A <code>kubectl logs lab-cpp-api -c api</code> nem mutat exceptiont, de
+a <code>/live</code> endpoint 500-at ad, míg a <code>/ready</code>
+200-at. Magyarázza el, miért van CrashLoopBackOff, és milyen lépésekkel
+állítaná helyre úgy, hogy a readiness probe továbbra is a
+<code>/ready</code>-t ellenőrizze.</p></li>
+</ol>
+<h3 data-number="39.4.11" id="megoldások"><span
+class="header-section-number">39.4.11</span> Megoldások</h3>
+<p><strong>1. feladat megoldása.</strong> A Pod fázisa
+<code>Running</code> lesz, mert a konténer elindul és a processz fut. A
+Ready állapot azonban <code>0/1</code> lesz, mert a readiness probe
+folyamatosan <code>connection refused</code> hibát kap a 9090-es porton.
+A Service ezért nem irányít forgalmat a Podhoz. A Pod nem lesz
+<code>Failed</code>, mert a fő konténer nem lépett ki; a readiness hiba
+nem indít újra. Postcondition: a Pod Running, de nem Ready; a Service
+endpoints listája nem tartalmazza a Pod IP-jét.</p>
+<p><strong>2. feladat megoldása.</strong> A ConfigMap és Secret
+létrehozása után a Pod YAML:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> v1</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Pod</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-cpp-worker</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-d194</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">containers</span><span class="kw">:</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> worker</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">image</span><span class="kw">:</span><span class="at"> registry.lab.example/cpp-worker:1.0.0</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">requests</span><span class="kw">:</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">cpu</span><span class="kw">:</span><span class="at"> 50m</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">memory</span><span class="kw">:</span><span class="at"> 64Mi</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">limits</span><span class="kw">:</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">cpu</span><span class="kw">:</span><span class="at"> 100m</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">memory</span><span class="kw">:</span><span class="at"> 64Mi</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">env</span><span class="kw">:</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> DB_PASSWORD</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">valueFrom</span><span class="kw">:</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">secretKeyRef</span><span class="kw">:</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-cpp-worker-secret</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">key</span><span class="kw">:</span><span class="at"> db_password</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">volumeMounts</span><span class="kw">:</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> config-volume</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">mountPath</span><span class="kw">:</span><span class="at"> /etc/lab-worker</span></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">readOnly</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">volumes</span><span class="kw">:</span></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> config-volume</span></span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">configMap</span><span class="kw">:</span></span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-cpp-worker-config</span></span></code></pre></div>
+<p>Indoklás: a memory request és limit azonos (64Mi), a CPU request
+(50m) és limit (100m) különböző, ezért a QoS osztály
+<code>Burstable</code>. Ha a CPU is azonos lenne,
+<code>Guaranteed</code>. Postcondition:
+<code>kubectl describe pod lab-cpp-worker -n lab-d194</code> a
+<code>QoS Class: Burstable</code> sort mutatja, a container requestek és
+limitek helyesek.</p>
+<p><strong>3. feladat megoldása.</strong> A liveness probe hibája azért
+okoz CrashLoopBackOff-ot, mert a <code>failureThreshold</code> elérése
+után a kubelet újraindítja a konténert. A <code>/live</code> 500-as
+válasza valószínűleg alkalmazáshiba (pl. a health check kód nem a valós
+állapotot adja vissza, hanem egy hibás állapotot). A
+<code>lab-cpp-api</code> csupasz Pod: a Pod spec probe-mezői
+immutable-ek, ezért a liveness letiltása vagy a
+<code>failureThreshold</code> növelése <code>kubectl apply</code>-jal
+<code>pod updates may not change fields other than ...</code> hibával
+elutasítódna. A javítás lépései: a C++ kódban meg kell javítani a
+<code>/live</code> endpoint logikáját, hogy 200-at adjon, ha a processz
+él (a liveness különváljon a readiness-től), új image-et kell építeni,
+és a Podot a módosított <code>pod.yaml</code>-lal újra létrehozni:
+<code>kubectl delete pod lab-cpp-api -n lab-d194</code>, majd
+<code>kubectl apply -f pod.yaml</code> (vagy
+<code>kubectl replace --force -f pod.yaml</code>). Ha a kódjavításig
+átmeneti enyhítés kell, a magasabb <code>failureThreshold</code> is csak
+újralétrehozással vihető be. Éles workloadnál a Pod template a
+Deploymentben él, ott a módosítás rolling update-et indít (<a
+href="d196.html">d196</a>). Recovery-ellenőrzés:
+<code>kubectl get pod lab-cpp-api -n lab-d194 -o jsonpath='{.status.containerStatuses[0].restartCount}'</code>
+két, egymást pár perccel követő lekérdezésben azonos, és a
+<code>READY</code> oszlop <code>1/1</code>. <strong>Ellenpróba:</strong>
+a liveness probe letiltása nem lehet tartós megoldás, mert akkor a
+beállt processz nem indul újra. Helyes diagnózis: a liveness a processz
+létét, nem a szolgáltatás tranzakciós képességét ellenőrzi; a
+<code>/live</code> 200 kell legyen, ha a processz fut, a
+<code>/ready</code> pedig akkor, ha a forgalmat fogadni tudja.
+Postcondition: a Pod Ready <code>1/1</code>, a restart count nem nő, a
+readiness továbbra is a <code>/ready</code>-t ellenőrzi.</p>
+<h3 data-number="39.4.12" id="rövid-összefoglaló"><span
+class="header-section-number">39.4.12</span> Rövid összefoglaló</h3>
+<p>A Pod a Kubernetes lifecycle alapegysége: a benne lévő konténerek
+osztoznak a hálózati névtéren és a volume-okon, de a konténer state-ek
+és a Pod fázisok külön kezelendők. Az init konténerek sorrendben futnak,
+a sidecar konténerek a fő konténerekkel együtt élnek. A konfigurációt
+ConfigMap és Secret mountok vagy env-ek adják, a resource request/limit
+a cgroup v2-n keresztül garantál és korlátoz, és meghatározza a QoS
+osztályt. A startup, readiness és liveness probe-ok a készenlét és a
+restart szerződése; a Service csak Ready Podokhoz irányít. A termination
+grace és a preStop lehetővé teszi a graceful shutdown-t, amelyet a C++
+alkalmazásnak SIGTERM kezeléssel kell támogatnia.</p>
+<p>Továbbhasznált definíciók:</p>
+<ul>
+<li><strong>Pod lifecycle fázis:</strong> <code>Pending</code>,
+<code>Running</code>, <code>Succeeded</code>, <code>Failed</code>,
+<code>Unknown</code> Pod szintű állapot, amelyet a konténer state-ek
+összesítése és a restart policy határoz meg.</li>
+<li><strong>Resource contract:</strong> A <code>requests</code>
+garantálja a minimális erőforrást és befolyásolja a schedulingot, a
+<code>limits</code> a cgroup v2 plafont állítja; a kettő viszonya adja a
+QoS osztályt.</li>
+<li><strong>Readiness szerződés:</strong> A Pod akkor kaphat Service
+forgalmat, ha a readiness probe sikeres; a liveness hiba ezzel szemben
+restartot vált ki.</li>
+</ul>
+<h3 data-number="39.4.13" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">39.4.13</span> Források és ellenőrzési
+hiányok</h3>
+<p>Az alábbi hivatkozások a d194 fejezet kiindulópontjai; ebben a
+munkamenetben nem ellenőrzött dokumentumok. A Kubernetes verzió, a
+sidecar feature gate, a probe pontos viselkedése és a QoS eviction
+sorrend a lab cluster support matrixában igazolandó:</p>
+<ul>
+<li><a
+href="https://kubernetes.io/docs/concepts/workloads/pods/">Kubernetes
+Pod documentation</a></li>
+<li><a
+href="https://kubernetes.io/docs/concepts/configuration/configmap/">Kubernetes
+ConfigMap documentation</a></li>
+<li><a
+href="https://kubernetes.io/docs/concepts/configuration/secret/">Kubernetes
+Secret documentation</a></li>
+<li><a
+href="https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/">Kubernetes
+Pod Lifecycle documentation</a></li>
+<li><a
+href="https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/">Kubernetes
+Probes documentation</a></li>
+</ul>
+<p>További állításonkénti normatív források (verzióprofil: a labor
+Kubernetes stabil minor verziója, containerd és cgroup v2 Ubuntu 24.04
+LTS node-okon; a <code>kubectl version</code> kimenetével
+rögzítendő):</p>
+<ul>
+<li>Pod termination sorrend (preStop → SIGTERM → SIGKILL, a grace a
+preStopot is tartalmazza): a fenti Pod Lifecycle oldal „Termination of
+Pods” szakasza</li>
+<li>Container lifecycle hooks (a hook kimenete,
+<code>FailedPreStopHook</code>, <code>sleep</code> akció): <a
+href="https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/"
+class="uri">https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/</a></li>
+<li>Sidecar konténerek (konténerszintű
+<code>restartPolicy: Always</code>): <a
+href="https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/"
+class="uri">https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/</a></li>
+<li>QoS osztályok: <a
+href="https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/"
+class="uri">https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/</a></li>
+<li>Node-pressure eviction (a sorrend nem QoS-alapú): <a
+href="https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/"
+class="uri">https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/</a></li>
+<li>Erőforrás-kezelés (request/limit, cgroup-leképezés): <a
+href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/"
+class="uri">https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/</a></li>
+</ul>
+<p>A példák laborclusterben ellenőrizendők; dátumozott futtatási napló
+még nem készült.</p>
+<p><strong>Ellenőrzési hiányok:</strong> A sidecar konténeres
+<code>restartPolicy: Always</code> init elem pontos stabil támogatása
+verziófüggő; a lab cluster aktuális Kubernetes minor verziójában
+ellenőrizendő. A request/limit cgroup v2 implementációja
+runtime-specifikus; a containerd és a kubelet verziókövetése szükséges.
+A ConfigMap mount frissítési késleltetése és a termination grace
+tényleges időzítése a labpillanatképben méréssel igazolandó. Az itt
+bemutatott YAML és parancsok illusztratívak, lab targeten nem lettek
+futtatva.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d193.html">← 39.3 kubectl, context, namespace és diagnosztika</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d195.html">39.5 Első Kubernetes service és state diagnosztika →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

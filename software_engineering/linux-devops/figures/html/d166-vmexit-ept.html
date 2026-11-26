@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VM exit és nested paging</title>
+<style>
+:root{--fg:#111;--bg:#fff;--muted:#666;--hl:#1f4e79;--hl2:#c55a11;--cell:#fff;--cellhl:#d9d9d9;--line:#000;--code:#f3f3f3}
+@media (prefers-color-scheme:dark){:root{--fg:#eee;--bg:#1b1b1b;--muted:#aaa;--hl:#8fb8e8;--hl2:#f0a060;--cell:#262626;--cellhl:#4a4a4a;--line:#ddd;--code:#2a2a2a}}
+*{box-sizing:border-box}
+body{margin:0;padding:10px;font:14px/1.45 system-ui,sans-serif;color:var(--fg);background:var(--bg)}
+.ctl{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:6px}
+button{font:inherit;padding:3px 10px;cursor:pointer}
+input[type=range]{flex:1;min-width:120px}
+#status{margin:4px 0 6px;min-height:2.9em}
+/* A pszeudokód a rajz ALATT, teljes szélességben (hosszú sorok ne görgessenek oldalra) */
+.wrap{display:flex;flex-direction:column;gap:10px;align-items:stretch}
+svg{width:100%;height:auto;display:block}
+pre#code{width:100%;margin:0;padding:6px 8px;background:var(--code);font:12.5px/1.5 ui-monospace,monospace;white-space:pre;overflow-x:auto}
+pre#code span{display:block;padding:0 4px}
+pre#code span.on{outline:2px solid var(--hl);font-weight:bold}
+svg text:not([fill]){fill:var(--fg);}
+svg text{font-family:system-ui,sans-serif}
+.small{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="ctl" role="group" aria-label="Lejátszás vezérlői">
+  <button id="first" title="Első lépés">⏮</button>
+  <button id="prev" title="Előző lépés">◀ Lépés</button>
+  <button id="play" title="Lejátszás / szünet">▶ Lejátszás</button>
+  <button id="next" title="Következő lépés">Lépés ▶</button>
+  <input id="pos" type="range" min="0" max="0" value="0" aria-label="Lépés kiválasztása">
+  <span id="cnt" class="small"></span>
+</div>
+<div class="ctl">
+<button id="bexit" type="button">VM exit ciklus (9 lépés)</button>
+<button id="bmiss" type="button">Címfordítás: TLB miss</button>
+<button id="bhit" type="button">Címfordítás: TLB hit</button>
+</div>
+<div id="status" aria-live="polite"></div>
+<div class="wrap">
+  <svg id="v" viewBox="0 0 560 300" role="img" aria-label="Bal oldalon a VM exit/entry kilenc eseménye három sávon (non-root vendég, root KVM, root QEMU); jobb oldalon egy cím fordítása: GVA, vendég laptábla, GPA, EPT, HPA, TLB."></svg>
+  <pre id="code" aria-label="Pszeudokód"></pre>
+</div>
+<p class="small">Szemléltető címek és egyszerűsített modell. A CPUID-exitet a KVM a kernelben kezeli, az emulált eszköz I/O-exitjét a QEMU userspace-ben. TLB miss esetén 4 szintű vendég- és EPT-táblánál legfeljebb 24 memóriahivatkozás kell.</p>
+<script>
+// ---- Adat: lépések (a Python-szkript számolja ki és illeszti be, a könyv példájával egyezően) ----
+// Minden lépés: {msg: "állapotsor szövege", line: kiemelt pszeudokódsor indexe vagy -1, ...saját mezők}
+let STEPS = [{"msg": "1/9 non-root: a vendég kernel és alkalmazás közvetlenül a CPU-n fut.", "lane": 0, "ev": 0, "line": -1}, {"msg": "2/9 non-root: a vendég CPUID utasítást hajt végre → VM exit (ok: CPUID).", "lane": 0, "ev": 1, "line": -1}, {"msg": "3/9 root, kernel: a KVM emulálja a CPUID-t (a hypervisor által engedett CPU-jellemzők); nem kell userspace.", "lane": 1, "ev": 2, "line": -1}, {"msg": "4/9 VM entry: a KVM visszaadja a vezérlést, a vendég a következő utasítással folytatja.", "lane": 0, "ev": 3, "line": -1}, {"msg": "5/9 non-root: a vendég fut tovább.", "lane": 0, "ev": 4, "line": -1}, {"msg": "6/9 non-root: OUT utasítás egy emulált eszköz portjára → VM exit (ok: I/O instruction).", "lane": 0, "ev": 5, "line": -1}, {"msg": "7/9 root, kernel: a KVM az exitet nem tudja maga kezelni; a KVM_RUN ioctl visszatér a QEMU-hoz (KVM_EXIT_IO).", "lane": 1, "ev": 6, "line": -1}, {"msg": "8/9 root, userspace: a QEMU device modellje emulálja az eszközregiszter írását, majd újra KVM_RUN-t hív.", "lane": 2, "ev": 7, "line": -1}, {"msg": "9/9 VM entry: a vendég fut tovább. A userspace-kerülő exit (7–8.) sokkal drágább, mint a kernelben kezelt (3.).", "lane": 0, "ev": 8, "line": -1}];
+const CODE = [];          // pszeudokód sorai (üres lista: a panel elrejtve)
+
+// ---- Rajzolás: ezt a függvényt kell az ábrához igazítani ----
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, text){const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);if(text!==undefined)e.textContent=text;svg.appendChild(e);return e;}
+const svg = document.getElementById("v");
+function css(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim();}
+function render(s){
+  // Példa: tömb cellákként, s.a = értékek, s.hl = kiemelt indexek
+  svg.innerHTML = "";
+  const a = s.a || [], w = 48, x0 = (560 - a.length * w) / 2, y0 = 110;
+  a.forEach((v, i) => {
+    const on = (s.hl || []).includes(i);
+    el("rect", {x: x0 + i * w, y: y0, width: w, height: w, fill: on ? css("--cellhl") : css("--cell"), stroke: css("--line"), "stroke-width": on ? 3 : 1.2});
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w / 2 + 6, "text-anchor": "middle", "font-size": 18}, String(v));
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w + 18, "text-anchor": "middle", "font-size": 12, fill: css("--muted")}, String(i));
+  });
+}
+
+function D(){
+  const d = document.createElementNS(NS, "defs"); svg.appendChild(d);
+  const c = css("--line"), m = css("--muted"), h = css("--hl2"), b = css("--hl");
+  d.innerHTML =
+    `<marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="${c}"/></marker>` +
+    `<marker id="ahh" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="${h}"/></marker>` +
+    `<marker id="ahb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="${b}"/></marker>` +
+    `<pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" stroke="${m}" stroke-width="1.3"/></pattern>` +
+    `<pattern id="dots" width="5" height="5" patternUnits="userSpaceOnUse"><circle cx="2.5" cy="2.5" r="0.9" fill="${m}"/></pattern>` +
+    `<pattern id="cross" width="6" height="6" patternUnits="userSpaceOnUse"><path d="M0,0L6,6M6,0L0,6" stroke="${m}" stroke-width="0.8"/></pattern>`;
+}
+function R(x, y, w, h, o){
+  o = o || {};
+  const a = {x: x, y: y, width: w, height: h, rx: (o.rx === undefined ? 4 : o.rx),
+             fill: o.fill || css("--cell"), stroke: o.stroke || css("--line"), "stroke-width": o.sw || 1.2};
+  if (o.dash) a["stroke-dasharray"] = o.dash;
+  const r = el("rect", a);
+  if (o.title) { const t = document.createElementNS(NS, "title"); t.textContent = o.title; r.appendChild(t); }
+  return r;
+}
+function T(x, y, s, o){
+  o = o || {};
+  const a = {x: x, y: y, "text-anchor": o.a || "middle", "font-size": o.fs || 12};
+  if (o.fill) a.fill = o.fill;
+  if (o.bold) a["font-weight"] = "bold";
+  if (o.mono) a["font-family"] = "ui-monospace,monospace";
+  return el("text", a, s);
+}
+function A(x1, y1, x2, y2, o){
+  o = o || {};
+  const a = {x1: x1, y1: y1, x2: x2, y2: y2, stroke: o.stroke || css("--line"), "stroke-width": o.sw || 1.5};
+  if (!o.noh) a["marker-end"] = "url(#" + (o.m || "ah") + ")";
+  if (o.both) a["marker-start"] = "url(#" + (o.m || "ah") + ")";
+  if (o.dash) a["stroke-dasharray"] = o.dash;
+  return el("line", a);
+}
+function X(x, y, r, o){
+  o = o || {};
+  const c = o.stroke || css("--hl2"), w = o.sw || 3;
+  el("line", {x1: x - r, y1: y - r, x2: x + r, y2: y + r, stroke: c, "stroke-width": w});
+  el("line", {x1: x - r, y1: y + r, x2: x + r, y2: y - r, stroke: c, "stroke-width": w});
+}
+
+const EV = [[0, "vendég fut", "1/9 non-root: a vendég kernel és alkalmazás közvetlenül a CPU-n fut."], [0, "CPUID", "2/9 non-root: a vendég CPUID utasítást hajt végre → VM exit (ok: CPUID)."], [1, "KVM kezeli", "3/9 root, kernel: a KVM emulálja a CPUID-t (a hypervisor által engedett CPU-jellemzők); nem kell userspace."], [0, "VM entry", "4/9 VM entry: a KVM visszaadja a vezérlést, a vendég a következő utasítással folytatja."], [0, "vendég fut", "5/9 non-root: a vendég fut tovább."], [0, "I/O port írás", "6/9 non-root: OUT utasítás egy emulált eszköz portjára → VM exit (ok: I/O instruction)."], [1, "KVM_RUN visszatér", "7/9 root, kernel: a KVM az exitet nem tudja maga kezelni; a KVM_RUN ioctl visszatér a QEMU-hoz (KVM_EXIT_IO)."], [2, "device model", "8/9 root, userspace: a QEMU device modellje emulálja az eszközregiszter írását, majd újra KVM_RUN-t hív."], [0, "VM entry → fut", "9/9 VM entry: a vendég fut tovább. A userspace-kerülő exit (7–8.) sokkal drágább, mint a kernelben kezelt (3.)."]], LANES = ["non-root: vendég (kernel + alkalmazás)", "root, kernel: KVM", "root, userspace: QEMU"], EXITS = [{"msg": "1/9 non-root: a vendég kernel és alkalmazás közvetlenül a CPU-n fut.", "lane": 0, "ev": 0, "line": -1}, {"msg": "2/9 non-root: a vendég CPUID utasítást hajt végre → VM exit (ok: CPUID).", "lane": 0, "ev": 1, "line": -1}, {"msg": "3/9 root, kernel: a KVM emulálja a CPUID-t (a hypervisor által engedett CPU-jellemzők); nem kell userspace.", "lane": 1, "ev": 2, "line": -1}, {"msg": "4/9 VM entry: a KVM visszaadja a vezérlést, a vendég a következő utasítással folytatja.", "lane": 0, "ev": 3, "line": -1}, {"msg": "5/9 non-root: a vendég fut tovább.", "lane": 0, "ev": 4, "line": -1}, {"msg": "6/9 non-root: OUT utasítás egy emulált eszköz portjára → VM exit (ok: I/O instruction).", "lane": 0, "ev": 5, "line": -1}, {"msg": "7/9 root, kernel: a KVM az exitet nem tudja maga kezelni; a KVM_RUN ioctl visszatér a QEMU-hoz (KVM_EXIT_IO).", "lane": 1, "ev": 6, "line": -1}, {"msg": "8/9 root, userspace: a QEMU device modellje emulálja az eszközregiszter írását, majd újra KVM_RUN-t hív.", "lane": 2, "ev": 7, "line": -1}, {"msg": "9/9 VM entry: a vendég fut tovább. A userspace-kerülő exit (7–8.) sokkal drágább, mint a kernelben kezelt (3.).", "lane": 0, "ev": 8, "line": -1}], MISS = [{"msg": "TLB-keresés: 0x7f3a2c001000 – nincs találat (TLB miss), kétszintű page walk indul.", "hl": ["tlb"], "mode": "miss"}, {"msg": "A vendég CR3 egy GPA; ezt is az EPT fordítja HPA-ra, mielőtt a vendég felső táblaszintje olvasható.", "hl": ["cr3", "ept"], "mode": "miss"}, {"msg": "A vendég laptábla 4 szintje: minden szint bejegyzése GPA-t ad, amelyet egyenként az EPT fordít (vendég által kezelt tábla).", "hl": ["gpt", "ept"], "mode": "miss"}, {"msg": "Eredmény: GVA 0x7f3a2c001000 → GPA 0x1234000 (a vendég laptáblája szerint).", "hl": ["gpa"], "mode": "miss"}, {"msg": "Az EPT (hypervisor) 4 szintje: GPA 0x1234000 → HPA 0x9a5c3000.", "hl": ["ept", "hpa"], "mode": "miss"}, {"msg": "A TLB a végső GVA → HPA párt tárolja; legrosszabb esetben 24 memóriahivatkozás kellett (4 szintű vendég- és EPT-tábla).", "hl": ["tlb", "hpa"], "mode": "miss"}], HITS = [{"msg": "TLB-keresés: 0x7f3a2c001000 – találat (TLB hit).", "hl": ["tlb"], "mode": "hit"}, {"msg": "A CPU közvetlenül a HPA-t használja: 0x9a5c3000; nincs page walk, nincs VM exit.", "hl": ["tlb", "hpa"], "mode": "hit"}];
+const ADDR = ["0x7f3a2c001000", "0x1234000", "0x9a5c3000"];
+document.getElementById("bexit").onclick = () => setSteps(EXITS);
+document.getElementById("bmiss").onclick = () => setSteps(MISS);
+document.getElementById("bhit").onclick = () => setSteps(HITS);
+function render(s){
+  svg.setAttribute("viewBox", "0 0 640 330"); svg.innerHTML = ""; D();
+  const ly = [70, 150, 230];
+  T(190, 22, "VM exit / entry (idő →)", {fs: 12, bold: 1});
+  LANES.forEach((n, i) => { R(110, ly[i] - 28, 270, 56, {rx: 0, fill: i === 0 ? "url(#hatch)" : css("--cell"), stroke: css("--muted"), sw: 0.8});
+    const on = s.lane === i; n.split(": ").forEach((t, j) => T(104, ly[i] - 4 + j*15, t + (j === 0 ? ":" : ""), {a: "end", fs: 10.5, bold: on})); });
+  const inExit = s.ev !== undefined;
+  EV.forEach((e, i) => { const x = 128 + i*29, y = ly[e[0]], on = inExit && i === s.ev, past = inExit && i < s.ev;
+    if (i > 0) { const p = EV[i-1]; A(128 + (i-1)*29, ly[p[0]], x, y, {sw: past || on ? 2 : 1, stroke: past || on ? css("--fg") : css("--muted")}); }
+    el("circle", {cx: x, cy: y, r: on ? 11 : 9, fill: on ? css("--hl2") : (past ? css("--cellhl") : css("--cell")), stroke: css("--line")});
+    T(x, y + 4, String(i + 1), {fs: 10, bold: 1}); });
+  if (inExit) { const e = EV[s.ev]; T(245, 290, `${s.ev + 1}. ${e[1]}`, {fs: 12, bold: 1});
+    T(245, 308, ["non-root mód", "root mód, kernel (KVM)", "root mód, userspace (QEMU)"][e[0]], {fs: 11, fill: css("--muted")}); }
+  // jobb panel
+  T(515, 22, "GVA → GPA → HPA", {fs: 12, bold: 1});
+  const hl = s.hl || [], on = n => hl.includes(n);
+  const box = (y, h, t1, t2, key, dash) => { R(410, y, 210, h, {fill: on(key) ? css("--cellhl") : css("--cell"), sw: on(key) ? 3 : 1.2, dash: dash ? "6 4" : ""});
+    T(515, y + (t2 ? h/2 - 2 : h/2 + 4), t1, {fs: 11, bold: on(key)}); if (t2) T(515, y + h/2 + 13, t2, {fs: 10, fill: css("--muted")}); };
+  box(36, 30, "GVA " + ADDR[0], "", "gva");
+  box(84, 44, "vendég laptábla", "vendég CR3 – vendég kezeli", "gpt");
+  box(146, 30, "GPA " + ADDR[1], "", "gpa");
+  box(194, 44, "EPT / NPT", "hypervisor kezeli", "ept", true);
+  box(256, 30, "HPA " + ADDR[2], "", "hpa");
+  [[66, 84], [128, 146], [176, 194], [238, 256]].forEach(([a, b]) => A(515, a, 515, b));
+  R(410, 296, 210, 28, {fill: on("tlb") ? css("--cellhl") : css("--code"), sw: on("tlb") ? 3 : 1});
+  T(515, 315, s.mode === "hit" ? "TLB: GVA → HPA (hit)" : "TLB: GVA → HPA", {fs: 11, bold: on("tlb")});
+  if (on("cr3")) T(404, 106, "CR3 (GPA) →", {a: "end", fs: 10, fill: css("--hl2")});
+}
+
+
+// ---- Vezérlés (általában nem kell módosítani) ----
+let k = 0, timer = null;
+const pos = document.getElementById("pos"), status = document.getElementById("status");
+const codeEl = document.getElementById("code");
+if (!CODE.length) codeEl.style.display = "none";
+else codeEl.innerHTML = CODE.map((l, i) => `<span id="L${i}">${l.replace(/&/g,"&amp;").replace(/</g,"&lt;")}</span>`).join("");
+pos.max = STEPS.length - 1;
+// Új lépéssor betöltése (pl. saját bemenetből számolva): setSteps(lista)
+function setSteps(list){ stop(); STEPS = list; pos.max = STEPS.length - 1; show(0); }
+function show(i){
+  k = Math.max(0, Math.min(STEPS.length - 1, i));
+  const s = STEPS[k];
+  pos.value = k;
+  document.getElementById("cnt").textContent = `${k + 1}/${STEPS.length}`;
+  status.textContent = s.msg || "";
+  codeEl.querySelectorAll("span").forEach(x => x.classList.remove("on"));
+  if (s.line !== undefined && s.line >= 0) { const L = document.getElementById("L" + s.line); if (L) L.classList.add("on"); }
+  render(s);
+}
+function stop(){ if (timer) { clearInterval(timer); timer = null; } document.getElementById("play").textContent = "▶ Lejátszás"; }
+document.getElementById("first").onclick = () => { stop(); show(0); };
+document.getElementById("prev").onclick = () => { stop(); show(k - 1); };
+document.getElementById("next").onclick = () => { stop(); show(k + 1); };
+document.getElementById("play").onclick = () => {
+  if (timer) { stop(); return; }
+  if (k >= STEPS.length - 1) show(0);
+  document.getElementById("play").textContent = "⏸ Szünet";
+  timer = setInterval(() => { if (k >= STEPS.length - 1) stop(); else show(k + 1); }, 1300);
+};
+pos.oninput = () => { stop(); show(+pos.value); };
+document.addEventListener("keydown", e => { if (e.key === "ArrowRight") { stop(); show(k + 1); } if (e.key === "ArrowLeft") { stop(); show(k - 1); } });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => show(k));
+show(0);
+</script>
+<script>(function(){function s(){var b=document.body;parent.postMessage({figResize:Math.ceil(b.getBoundingClientRect().height)},"*")}addEventListener("load",s);addEventListener("resize",s);if(window.ResizeObserver)new ResizeObserver(s).observe(document.body);s()})()</script></body>
+</html>

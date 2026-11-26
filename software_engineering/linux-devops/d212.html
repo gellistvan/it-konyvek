@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>43.2 etcd, quorum, backup és restore – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch43">43 Kubernetes telepítés, upgrade és cluster üzemeltetés</a></p>
+<div class="links"><a class="prev" rel="prev" href="d211.html">← 43.1 Clusterprofil, bootstrap és HA topológia</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d213.html">43.3 Upgrade, version skew és node lifecycle →</a></div>
+</nav>
+<h2 data-number="43.2" id="d212"><span
+class="header-section-number">43.2</span> etcd, quorum, backup és
+restore</h2>
+<h3 data-number="43.2.1" id="motiváció"><span
+class="header-section-number">43.2.1</span> Motiváció</h3>
+<p>A Kubernetes control plane működése közben az etcd tárolja a cluster
+desired state magját: minden Deployment, Service, ConfigMap, Secret,
+RBAC objektum, PV/PVC leíró, namespaces és a legtöbb kiegészítő
+API-resource adatát. A node-ok, a kubelet és a workloadok
+újraindulhatnak, de ha az etcd adat elveszik, a cluster elveszíti a
+„miért így nézzen ki a rendszer” tervét. A container image-ek és az
+application persistent volume-ok külön védhetők, viszont az etcd nélkül
+a Kubernetes API gyakorlatilag üres lesz, így a cluster state-et
+konzisztens, helyreállítható és rendszeresen ellenőrzött adatként kell
+kezelni. Nem elég a fájlrendszer-szintű backup; a running etcd-ről
+konzisztens pillanatfelvétel kell, mert a plain file copy a memóriában
+lévő, még nem fsync-elt állapotot is tartalmazhat, illetve inkonzisztens
+lehet. A <a href="d047.html">d047</a>-ben tárgyalt <code>fsync</code>
+tartóssági határ és a <a href="d099.html">d099</a>-ben tárgyalt disaster
+recovery keret itt konkrét adatbázis-szintű folyamatot kap.</p>
+<h3 data-number="43.2.2" id="definíció-és-működés"><span
+class="header-section-number">43.2.2</span> Definíció és működés</h3>
+<h4 data-number="43.2.2.1" id="consensus-member-leader-és-quorum"><span
+class="header-section-number">43.2.2.1</span> Consensus, member, leader
+és quorum</h4>
+<p>Az etcd egy elosztott, kulcs-érték jellegű state store, amely a <a
+href="https://raft.github.io/">Raft</a> consensus algoritmust használja.
+A cluster <strong>member</strong>-ekből áll; minden member egy-egy etcd
+server process, tipikusan egy control plane node-on. Egy adott időben az
+egyik member a <strong>leader</strong>, a többi
+<strong>follower</strong>. A write request a leaderhez megy; a leader
+bejegyzi a logba, replikálja a bejegyzést a follower-ökhöz, és csak
+akkor tekinti commitáltnak, ha a <strong>quorum</strong> (többség)
+tartósan megerősítette. A committed entry utána kerül alkalmazásra a
+state machine-ben, tehát olvashatóvá válik lineáris olvasás esetén.</p>
+<p><strong>Definíció: quorum</strong> – egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>n</mi><annotation encoding="application/x-tex">n</annotation></semantics></math>
+méretű etcd cluster esetén a quorum</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>Q</mi><mo>=</mo><mrow><mo stretchy="true" form="prefix">⌊</mo><mfrac><mi>n</mi><mn>2</mn></mfrac><mo stretchy="true" form="postfix">⌋</mo></mrow><mo>+</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">
+Q = \left\lfloor \frac{n}{2} \right\rfloor + 1
+</annotation></semantics></math></p>
+<p>tag. Az etcd csak akkor elérhető írásra és lineáris olvasásra, ha
+legalább
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>Q</mi><annotation encoding="application/x-tex">Q</annotation></semantics></math>
+tag elérhető, egymással kommunikál, és a leader ismeri a quorumot. Ha a
+cluster ennél több tagot veszít, <strong>nem</strong> read-only lesz:
+sem írást, sem lineáris olvasást nem szolgál ki, csak a serializable
+olvasás (<code>etcdctl get --consistency=s</code>) működhet egy tagon,
+esetleg elavult adattal. A kube-apiserver alapértelmezésben lineáris
+olvasást használ, ezért az API a felhasználó számára nagyrészt
+elérhetetlen: a kérések timeouttal vagy
+<code>etcdserver: request timed out</code> jellegű hibával bukanak, a
+<code>kubectl get --raw='/readyz?verbose'</code> kimenetében
+<code>[-]etcd failed</code> sor látszik (a pontos szöveg
+verziófüggő).</p>
+<p>Az availability és a hibatűrés a tagok számától függ:</p>
+<table>
+<thead>
+<tr>
+<th>Tagok száma</th>
+<th>Quorum</th>
+<th>Tűrt hibás tag</th>
+<th>Megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>1</td>
+<td>0</td>
+<td>Lab vagy ideiglenes teszt, nem production</td>
+</tr>
+<tr>
+<td>3</td>
+<td>2</td>
+<td>1</td>
+<td>Minimális production HA cluster</td>
+</tr>
+<tr>
+<td>5</td>
+<td>3</td>
+<td>2</td>
+<td>Nagyobb hibatűrés, nagyobb replikációs költség</td>
+</tr>
+</tbody>
+</table>
+<p>A 4 tag nem előnyös: a quorum 3, tehát ugyanúgy csak 1 hibát tűr,
+mint a 3, de több disk és network overhead. A production etcd-t
+általában 3 vagy 5 memberre méretezik.</p>
+<p>A Raft leader election során a tagok <strong>term</strong>-ekben
+versenyeznek. Ha a current leader leáll, a follower-ök választást
+indítanak; a clustert az új leader veszi át. A read request lineáris
+konszisztenciájához is quorum ellenőrzés kell, mert anélkül egy izolált
+follower régi adatot szolgáltathatna. Az etcdben a
+<code>Serializable</code> read viszont nem igényel quorumot, de nem
+lineáris.</p>
+<h4 data-number="43.2.2.2"
+id="latency-fsync-disk-és-network-függőség"><span
+class="header-section-number">43.2.2.2</span> Latency, fsync, disk és
+network függőség</h4>
+<p>A commit path során az etcd a logot a leader és a quorumot adó
+follower-ök diskjére <code>fsync</code>-kel írja, mielőtt a művelet
+sikeresnek minősül. A leader a bejegyzést párhuzamosan
+<code>fsync</code>-eli és elküldi a followereknek; egy follower nyugtája
+a teljes körutat tartalmazza (oda RTT/2, follower <code>fsync</code>,
+vissza RTT/2). A commithoz a leaderen kívül
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>Q</mi><mo>−</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">Q-1</annotation></semantics></math>
+follower nyugtája kell, ezért a commit a quorumot adó
+<strong>leggyorsabb</strong> followerekre vár, nem a leglassabbra. A
+hozzávetőleges commit time:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mtext mathvariant="normal">commit</mtext></msub><mo>≈</mo><mrow><mi>max</mi><mo>&#8289;</mo></mrow><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>t</mi><mrow><mtext mathvariant="normal">fsync</mtext><mo>,</mo><mi>L</mi></mrow></msub><mo>,</mo><mspace width="0.222em"></mspace><msub><mi>m</mi><mrow><mi>Q</mi><mo>−</mo><mn>1</mn></mrow></msub><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">
+T_{\text{commit}} \approx \max\left(t_{\text{fsync},L},\ m_{Q-1}\right)
+</annotation></semantics></math></p>
+<p>ahol (minden idő ms-ban): -
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>t</mi><mrow><mtext mathvariant="normal">fsync</mtext><mo>,</mo><mi>L</mi></mrow></msub><annotation encoding="application/x-tex">t_{\text{fsync},L}</annotation></semantics></math>
+a leader lokális WAL <code>fsync</code> ideje, -
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>m</mi><mrow><mi>Q</mi><mo>−</mo><mn>1</mn></mrow></msub><annotation encoding="application/x-tex">m_{Q-1}</annotation></semantics></math>
+a followerek
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mtext mathvariant="normal">RTT</mtext><mi>i</mi></msub><mo>+</mo><msub><mi>t</mi><mrow><mtext mathvariant="normal">fsync</mtext><mo>,</mo><mi>i</mi></mrow></msub></mrow><annotation encoding="application/x-tex">\text{RTT}_i + t_{\text{fsync},i}</annotation></semantics></math>
+válaszidői közül a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><mi>Q</mi><mo>−</mo><mn>1</mn><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">(Q-1)</annotation></semantics></math>-edik
+legkisebb, -
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mtext mathvariant="normal">RTT</mtext><mi>i</mi></msub><annotation encoding="application/x-tex">\text{RTT}_i</annotation></semantics></math>
+a leader és az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>i</mi><annotation encoding="application/x-tex">i</annotation></semantics></math>-edik
+follower közötti round-trip time,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>t</mi><mrow><mtext mathvariant="normal">fsync</mtext><mo>,</mo><mi>i</mi></mrow></msub><annotation encoding="application/x-tex">t_{\text{fsync},i}</annotation></semantics></math>
+a follower lokális <code>fsync</code> ideje.</p>
+<p>Számpélda (számított, nem mért):
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>n</mi><mo>=</mo><mn>3</mn></mrow><annotation encoding="application/x-tex">n = 3</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>Q</mi><mo>=</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">Q = 2</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>t</mi><mrow><mtext mathvariant="normal">fsync</mtext><mo>,</mo><mi>L</mi></mrow></msub><mo>=</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">t_{\text{fsync},L} = 2</annotation></semantics></math>
+ms; F1:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0</mn><mo>,</mo><mn>5</mn><mo>+</mo><mn>2</mn><mo>=</mo><mn>2</mn><mo>,</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">0{,}5 + 2 = 2{,}5</annotation></semantics></math>
+ms, F2:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0</mn><mo>,</mo><mn>5</mn><mo>+</mo><mn>30</mn><mo>=</mo><mn>30</mn><mo>,</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">0{,}5 + 30 = 30{,}5</annotation></semantics></math>
+ms. Ekkor
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>m</mi><mn>1</mn></msub><mo>=</mo><mn>2</mn><mo>,</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">m_1 = 2{,}5</annotation></semantics></math>
+ms és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mtext mathvariant="normal">commit</mtext></msub><mo>≈</mo><mrow><mi>max</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><mn>2</mn><mo>;</mo><mspace width="0.222em"></mspace><mn>2</mn><mo>,</mo><mn>5</mn><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mn>2</mn><mo>,</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">T_{\text{commit}} \approx \max(2;\ 2{,}5) = 2{,}5</annotation></semantics></math>
+ms: a lassú F2 nem számít. Ha F1 kiesik,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>m</mi><mn>1</mn></msub><mo>=</mo><mn>30</mn><mo>,</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">m_1 = 30{,}5</annotation></semantics></math>
+ms lesz. A leader lassú diskje viszont mindig számít, mert a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>max</mi><annotation encoding="application/x-tex">\max</annotation></semantics></math>
+első tagja.</p>
+<p>Az alábbi ábra egy írás commit-idővonalát mutatja 3 tagú clusterben:
+a follower nyugtája a teljes körutat (RTT) és a follower
+<code>fsync</code>-jét tartalmazza, és a commit a leader
+<code>fsync</code>-je, valamint a quorumhoz szükséges (Q − 1)-edik
+leggyorsabb follower nyugtája közül a későbbinél következik be.</p>
+<figure id="fig-d212-raft-commit">
+<div class="fig-interactive"><iframe src="figures/html/d212-raft-commit.html" title="Három idővonal: a commit 2,5 ms-nál a gyors follower nyugtájával; F1 kiesésekor 30,5 ms-nál; mindkét follower kiesésekor nincs commit." loading="lazy" style="width:100%;border:0;height:520px"></iframe><noscript><img src="figures/img/d212-raft-commit.png" style="width:90.0%"
+alt="Három idővonal: a commit 2,5 ms-nál a gyors follower nyugtájával; F1 kiesésekor 30,5 ms-nál; mindkét follower kiesésekor nincs commit." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d212-raft-commit.png" style="width:90.0%"
+alt="Három idővonal: a commit 2,5 ms-nál a gyors follower nyugtájával; F1 kiesésekor 30,5 ms-nál; mindkét follower kiesésekor nincs commit." /></details></div>
+<figcaption>Raft-commit idővonala 3 tagú etcd-ben (számított modell, nem
+mérés): (1) normál esetben a commit 2,5 ms-nál a gyors follower
+nyugtájával, a lassú (30 ms-os fsync) follower nem számít; (2) F1
+kiesésekor a commit 30,5 ms-ig vár; (3) mindkét follower kiesésekor
+nincs quorum, nincs commit</figcaption>
+</figure>
+<p>Ha az etcd disk write cache úgy van beállítva, hogy power loss esetén
+adatvesztés lehetséges, az <code>fsync</code> nem ad valódi tartóssági
+garanciát; ezért az etcd dokumentációja alacsony latency SSD-t és
+power-loss protected write cache-t ajánl. A network RTT a control plane
+node-ok közötti kapcsolat késleltetése; ha a follower-ök távoli failure
+domainben vannak, a commit latency növekszik, de a durability javul a
+failure domain szétválasztással. A <code>journald</code> és a <a
+href="d047.html">d047</a>-ben tanult <code>fsync</code> szabályok itt is
+érvényesek.</p>
+<h4 data-number="43.2.2.3"
+id="snapshot-restore-és-member-identity"><span
+class="header-section-number">43.2.2.3</span> Snapshot, restore és
+member identity</h4>
+<p>A Raft log folyamatos növekedését az etcd időszakos
+<strong>snapshot</strong>-okkal tömöríti. Az
+<code>etcdctl snapshot save</code> egy konzisztens pillanatfelvételt
+készít, amely a snapshot időpontjában committed state-et tartalmazza. A
+snapshot nem a futó data directory másolata, hanem az etcd által
+generált, ellenőrzött artifact. A snapshot fájl tartalmazza a key-value
+adatokat, a revisiont, a total key countot és a checksumot.</p>
+<p>A <strong>restore</strong> során az
+<code>etcdctl snapshot restore</code> egy új data directory-t hoz létre.
+Az etcd a data dirben tárolt <strong>member identity</strong>-hez
+kötődik: member ID, cluster ID, peer URL, name. Egy snapshot restore
+alapértelmezésben új single-node cluster-t készít, amelynek az initial
+cluster state új, és a további membereket explicit módon kell felvenni.
+Ha egy meglévő, több tagú etcd clusterbe akarunk egy snapshotot
+visszaállítani, akkor nem egyszerűen a data dirbe másoljuk a fájlt, mert
+a régi member ID és cluster ID ütközhet. A hivatalos disaster recovery
+eljárás szerint vagy az egész etcd clustert a snapshotból újraépítjük,
+vagy a snapshotból egy új membert indítunk, és a többit explicit
+<code>member add</code> paranccsal illesztjük hozzá.</p>
+<p>A peer URL-ek és a certificate-ek is részei a member identity-nek. A
+restored data dirben a <code>--initial-advertise-peer-urls</code> és
+<code>--initial-cluster</code> paramétereknek egyezniük kell a későbbi
+systemd unit és a peer certificate Subject Alternative Name (SAN)
+értékeivel, különben az etcd elutasítja a peer kapcsolatot.</p>
+<h4 data-number="43.2.2.4"
+id="cluster-object-backup-versus-application-volume-backup"><span
+class="header-section-number">43.2.2.4</span> Cluster object backup
+versus application volume backup</h4>
+<p>Az etcd snapshot a Kubernetes <strong>object state</strong>-et menti:
+Deployment spec, Service ClusterIP, Secret adat, RBAC, CRD, namespace és
+hasonló. Ez nem tartalmazza: - a container image rétegeit vagy
+registry-digesteket, - a PersistentVolume on-disk adatokat (például egy
+PostgreSQL database data dirje), - az alkalmazás logjait vagy a node
+local cache-t.</p>
+<p>Egy teljes recovery ezért általában három különálló mentést igényel:
+etcd snapshot a cluster object state-hez, PV snapshot/backup az
+application data-hoz, és a control plane PKI/config backup a
+cert/key/encryption anyagokhoz. A <a href="d099.html">d099</a>-ben
+tárgyalt RPO az etcd snapshot időszerűségétől függ, az application data
+esetén pedig a PV snapshot időszerűségétől.</p>
+<h4 data-number="43.2.2.5"
+id="encryption-keys-és-certificates-recovery"><span
+class="header-section-number">43.2.2.5</span> Encryption keys és
+certificates recovery</h4>
+<p>Ha a Kubernetes API server encryption-at-rest engedélyezett a Secrets
+számára, akkor az etcd tárolt Secret tartalom titkosított. A
+titkosításhoz használt key gyakran a control plane node-on található
+configuration fájlban van, például
+<code>/etc/kubernetes/encryption-config.yaml</code>. Ezt a fájlt az etcd
+snapshot mellett kell menteni, mert a snapshot visszaállítható ugyan, de
+a kulcs nélkül a Secrets nem dekódolhatók.</p>
+<p>A Kubernetes control plane emellett PKI-ra épül: a cluster CA,
+apiserver cert, kubelet client cert, admin cert és etcd peer/server cert
+kulcsfontosságú. A restore akkor lesz használható, ha az etcd adatot
+visszaállítjuk, de a control plane node-okon a megfelelő cert/key párok
+jelen vannak, és a CA-t a kubelet, apiserver és admin client is
+elfogadja. A <code>kubeadm</code> esetén ezek jellemzően
+<code>/etc/kubernetes/pki/</code> alatt vannak. A cert/key recovery
+ezért nem külön etcd probléma, hanem a control plane recovery része.</p>
+<h4 data-number="43.2.2.6"
+id="supported-recovery-procedure-és-data-verification"><span
+class="header-section-number">43.2.2.6</span> Supported recovery
+procedure és data verification</h4>
+<p>A hivatalos, verziózott etcd recovery eljárás nem „egy parancs
+mindenre”, hanem ellenőrzött lépéssor: snapshot mentés, snapshot status
+ellenőrzés, a memberek izolálása, restore új data dirbe, peer URL és
+cert konfiguráció, az etcd systemd unit indítása, majd data
+verification. A verification nem csak annyi, hogy a daemon fut; a
+tartalmat is tesztelni kell. Az <code>etcdctl snapshot status</code> a
+fájl integritását és a revision adatot mutatja. A restore után
+<code>etcdctl get</code> lekérdezéssel ellenőrizhető, hogy a várt
+kulcsok – például a Kubernetes <code>/registry/deployments</code> prefix
+– jelen vannak, és <code>kubectl get</code> mutatja a recovery
+időpontjában érvényes API objektumokat.</p>
+<h3 data-number="43.2.3" id="kidolgozott-példa"><span
+class="header-section-number">43.2.3</span> Kidolgozott példa</h3>
+<p>A példa a 43.1-ben felépített clustert folytatja, annak
+inventoryjával: - Cluster: <code>lab-cluster</code> - Control plane
+node-ok: <code>lab-cp1</code> (10.42.0.11), <code>lab-cp2</code>
+(10.42.0.12), <code>lab-cp3</code> (10.42.0.13) - Etcd memberek:
+ugyanezen a három node-on (kubeadm stacked etcd, static pod), 3 tag -
+Cél: snapshot készítése <code>lab-cp1</code>-en, majd izolált restore
+teszt egy disposable könyvtárba, ideiglenes etcd-vel és kulcsszintű
+ellenőrzéssel</p>
+<p>Eszközök: a node-on a cluster etcd-verziójával (kubeadm 1.31 alatt
+3.5.x;
+<code>kubectl -n kube-system get pod etcd-lab-cp1 -o jsonpath='{.spec.containers[0].image}'</code>)
+egyező <code>etcdctl</code>, <code>etcdutl</code> és <code>etcd</code>
+bináris, az etcd hivatalos release-tarballjából. Az etcd 3.5-től a
+snapshot restore és status offline művelete az <code>etcdutl</code>; az
+<code>etcdctl snapshot restore/status</code> deprecated.</p>
+<p>A példa feltételezi a <code>kubeadm</code> által generált cert
+path-eket; más telepítő esetén az elérési utak és a peer URL-ek
+eltérhetnek.</p>
+<h4 data-number="43.2.3.1" id="előfeltétel-és-inventory"><span
+class="header-section-number">43.2.3.1</span> Előfeltétel és
+inventory</h4>
+<p>A lab host <code>lab-cp1</code> state: - OS: Ubuntu Server 24.04 LTS,
+patched kernel - Etcd cert-ek: <code>/etc/kubernetes/pki/etcd/</code> -
+Etcd data dir: <code>/var/lib/etcd</code> - Privilege: <code>root</code>
+vagy <code>sudo</code></p>
+<p>A módosító parancsok itt snapshotot és disposable restore könyvtárat
+hoznak létre, az élő etcd adatot nem írják. A cleanup csak a megadott
+<code>lab-</code> prefixű fájlokra terjed ki.</p>
+<h4 data-number="43.2.3.2" id="snapshot-készítése"><span
+class="header-section-number">43.2.3.2</span> Snapshot készítése</h4>
+<p>Az etcd member lista lekérdezése a <code>lab-cp1</code> node-on:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-cp1, account: root, context: lab-cluster</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># cél: member lista, majd a leader azonosítása</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="va">PKI</span><span class="op">=</span>/etc/kubernetes/pki/etcd</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="va">TLS</span><span class="op">=</span><span class="st">&quot;--cacert=</span><span class="va">$PKI</span><span class="st">/ca.crt --cert=</span><span class="va">$PKI</span><span class="st">/server.crt --key=</span><span class="va">$PKI</span><span class="st">/server.key&quot;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="ex">etcdctl</span> member list <span class="at">--endpoints</span><span class="op">=</span>https://127.0.0.1:2379 <span class="va">$TLS</span></span></code></pre></div>
+<p>Várható kimenet (illusztratív):</p>
+<pre class="text"><code>8e9e…, started, lab-cp1, https://10.42.0.11:2380, https://10.42.0.11:2379, false
+1f8a…, started, lab-cp2, https://10.42.0.12:2380, https://10.42.0.12:2379, false
+b57f…, started, lab-cp3, https://10.42.0.13:2380, https://10.42.0.13:2379, false</code></pre>
+<p>A mezők:
+<code>ID, STATUS, NAME, PEER ADDRS, CLIENT ADDRS, IS LEARNER</code>. Az
+utolsó mező azt jelzi, hogy a tag learner-e (nem szavazó, nem számít a
+quorumba), nem a leader-szerepet; egészséges 3 tagú clusterben mindhárom
+<code>false</code>. A leadert az <code>endpoint status</code>
+<code>IS LEADER</code> oszlopa mutatja:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">etcdctl</span> endpoint status <span class="at">--cluster</span> <span class="at">-w</span> table <span class="dt">\</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--endpoints</span><span class="op">=</span>https://127.0.0.1:2379 <span class="va">$TLS</span></span></code></pre></div>
+<p>Ezután snapshot készítése:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-cp1, root, lab-cluster</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co"># cél: konzisztens etcd snapshot + checksum</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="va">BACKUP_DIR</span><span class="op">=</span><span class="st">&quot;/var/backups/etcd&quot;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="va">SNAPSHOT_FILE</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${BACKUP_DIR}</span><span class="st">/snapshot-</span><span class="va">$(</span><span class="fu">date</span> <span class="at">-u</span> +%Y%m%dT%H%M%SZ<span class="va">)</span><span class="st">.db&quot;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> <span class="st">&quot;</span><span class="va">${BACKUP_DIR}</span><span class="st">&quot;</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="ex">etcdctl</span> snapshot save <span class="st">&quot;</span><span class="va">${SNAPSHOT_FILE}</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--endpoints</span><span class="op">=</span>https://127.0.0.1:2379 <span class="dt">\</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--cacert</span><span class="op">=</span>/etc/kubernetes/pki/etcd/ca.crt <span class="dt">\</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">--cert</span><span class="op">=</span>/etc/kubernetes/pki/etcd/server.crt <span class="dt">\</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>  <span class="at">--key</span><span class="op">=</span>/etc/kubernetes/pki/etcd/server.key</span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="fu">sha256sum</span> <span class="st">&quot;</span><span class="va">${SNAPSHOT_FILE}</span><span class="st">&quot;</span> <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">${SNAPSHOT_FILE}</span><span class="st">.sha256&quot;</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-lh</span> <span class="st">&quot;</span><span class="va">${SNAPSHOT_FILE}</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">${SNAPSHOT_FILE}</span><span class="st">.sha256&quot;</span></span></code></pre></div>
+<p>Várható kimenet:</p>
+<pre class="text"><code>Snapshot saved at /var/backups/etcd/snapshot-20250408T120000Z.db
+-rw------- 1 root root 2.3M Apr  8 12:00 snapshot-...db
+-rw------- 1 root root   99 Apr  8 12:00 snapshot-...db.sha256</code></pre>
+<p>A snapshot jogosultsága alapból korlátozott; a fájlt off-node,
+dedicated backup locationre kell másolni, mert a helyi node disk nem ad
+failure domain védelmet.</p>
+<h4 data-number="43.2.3.3" id="snapshot-status-ellenőrzés"><span
+class="header-section-number">43.2.3.3</span> Snapshot status
+ellenőrzés</h4>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-cp1, root, lab-cluster</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">etcdutl</span> snapshot status <span class="st">&quot;</span><span class="va">${SNAPSHOT_FILE}</span><span class="st">&quot;</span> <span class="at">--write-out</span><span class="op">=</span>table</span></code></pre></div>
+<p>Várható kimenet:</p>
+<pre class="text"><code>+----------+----------+------------+------------+
+|   HASH   | REVISION | TOTAL KEYS | TOTAL SIZE |
++----------+----------+------------+------------+
+| 8f3a...d |  1234567 |       1234 | 2.3 MB     |
++----------+----------+------------+------------+</code></pre>
+<p>A <code>REVISION</code> és a <code>TOTAL KEYS</code> azt mutatja,
+hogy a snapshot nem üres, és a <code>HASH</code> az integritást
+biztosítja.</p>
+<h4 data-number="43.2.3.4" id="disposable-restore-teszt"><span
+class="header-section-number">43.2.3.4</span> Disposable restore
+teszt</h4>
+<p>Az élő cluster adatirányát nem módosítjuk; a restore egy új, izolált
+data dirbe készül, és egy ideiglenes, csak loopbacken hallgató
+etcd-példánnyal kulcsszinten ellenőrizzük. Mivel a
+<code>lab-cp1</code>-en futó etcd már foglalja a 2379/2380 portokat, az
+ideiglenes példány a 2479/2480 portot használja, TLS nélkül, csak a
+<code>127.0.0.1</code> címen:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-cp1, root, lab-cluster</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="va">RESTORE_DIR</span><span class="op">=</span><span class="st">&quot;/var/lib/etcd-lab-restore-test&quot;</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="va">PEER</span><span class="op">=</span>http://127.0.0.1:2480</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="va">CLIENT</span><span class="op">=</span>http://127.0.0.1:2479</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="ex">etcdutl</span> snapshot restore <span class="st">&quot;</span><span class="va">${SNAPSHOT_FILE}</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--name</span> lab-restore-test <span class="dt">\</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--initial-cluster</span> <span class="st">&quot;lab-restore-test=</span><span class="va">${PEER}</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--initial-cluster-token</span> <span class="st">&quot;lab-restore-token&quot;</span> <span class="dt">\</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--initial-advertise-peer-urls</span> <span class="st">&quot;</span><span class="va">${PEER}</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">--data-dir</span> <span class="st">&quot;</span><span class="va">${RESTORE_DIR}</span><span class="st">&quot;</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="ex">etcd</span> <span class="at">--name</span> lab-restore-test <span class="at">--data-dir</span> <span class="st">&quot;</span><span class="va">${RESTORE_DIR}</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>  <span class="at">--listen-client-urls</span> <span class="st">&quot;</span><span class="va">${CLIENT}</span><span class="st">&quot;</span> <span class="at">--advertise-client-urls</span> <span class="st">&quot;</span><span class="va">${CLIENT}</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>  <span class="at">--listen-peer-urls</span> <span class="st">&quot;</span><span class="va">${PEER}</span><span class="st">&quot;</span> <span class="at">--initial-advertise-peer-urls</span> <span class="st">&quot;</span><span class="va">${PEER}</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>  <span class="at">--initial-cluster</span> <span class="st">&quot;lab-restore-test=</span><span class="va">${PEER}</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>  <span class="op">&gt;</span> /tmp/lab-restore-etcd.log <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span> <span class="kw">&amp;</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a><span class="va">ETCD_PID</span><span class="op">=</span><span class="va">$!</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 5</span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a><span class="ex">etcdctl</span> <span class="at">--endpoints</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${CLIENT}</span><span class="st">&quot;</span> endpoint health</span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a><span class="ex">etcdctl</span> <span class="at">--endpoints</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${CLIENT}</span><span class="st">&quot;</span> get /registry/namespaces/ <span class="dt">\</span></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>  <span class="at">--prefix</span> <span class="at">--keys-only</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-c</span> <span class="st">&#39;^/registry/namespaces/&#39;</span></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a><span class="bu">kill</span> <span class="st">&quot;</span><span class="va">${ETCD_PID}</span><span class="st">&quot;</span></span></code></pre></div>
+<p>Várható (illusztratív) eredmény: az <code>endpoint health</code>
+<code>is healthy</code>, a számláló legalább <code>4</code> (a
+<code>default</code>, <code>kube-system</code>,
+<code>kube-public</code>, <code>kube-node-lease</code> névterek, plusz a
+labor saját névterei). Ez bizonyítja, hogy a snapshotból működő,
+lekérdezhető adatbázis lett, nem csak egy könyvtár. A restore során az
+<code>etcdutl</code> létrehozza a <code>member/</code> alkönyvtárat az
+új member ID-vel; az élő cluster taglistáját ez nem módosítja. A teszt
+után a <code>${RESTORE_DIR}</code> könyvtárat a labor scratch-területére
+mozgatjuk (nem az élő <code>/var/lib/etcd</code> mellé hagyjuk). Valódi
+recovery lépéseit a 3. feladat megoldása mutatja.</p>
+<h3 data-number="43.2.4" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">43.2.4</span> Tipikus hibák és
+ellenpróbák</h3>
+<p><strong>A plain file copy mint snapshot.</strong> Ha valaki futó etcd
+data dir másolatát használja, az a snapshot pillanatában memóriában lévő
+nem commitált állapot miatt inkonzisztens lehet. Tünet: a restore után
+az etcd <code>bad snapshot</code> vagy <code>unexpected EOF</code> hiba.
+Helyes eljárás: mindig <code>etcdctl snapshot save</code>.</p>
+<p><strong>Cert mismatch.</strong> A restored etcd nem indul, vagy a
+peer connection hibát ad:
+<code>x509: certificate signed by unknown authority</code>. Hipotezis: a
+<code>--cacert</code>, <code>--cert</code> vagy <code>--key</code> path
+nem a restored data dirhez tartozó node PKI-jából való. Ellenpróba:
+<code>openssl x509 -noout -subject -issuer</code> a cert-en, és
+<code>etcdctl --endpoints ... member list</code> a restored
+endpointon.</p>
+<p><strong>Restore a meglévő clusterbe peer URL frissítés
+nélkül.</strong> Ha a snapshotot visszaállítjuk egy tag data dirjébe, de
+a régi member ID és cluster ID megmarad, a többi member elutasítja a
+connectet, és split-brain vagy <code>member ID mismatch</code> lép fel.
+Ezért a restore-t új initial cluster-token és új name megadásával kell
+tervezni, és a többi membert szabályozottan hozzáadni.</p>
+<p><strong>Lassú disk vagy network.</strong> A commit latency növekedése
+látszik az etcd metrikákban
+(<code>etcd_disk_wal_fsync_duration_seconds</code>,
+<code>etcd_network_peer_round_trip_time_seconds</code>). Az etcd
+ajánlása szerint a WAL-fsync p99 értéke legyen 10 ms alatt; tartósan e
+fölött a commit-latencia nő, és a naplóban <code>slow fdatasync</code>
+figyelmeztetés jelenik meg. Leader-választást a heartbeat (alapból 100
+ms) és az election timeout (alapból 1000 ms) kimaradása vált ki, ehhez
+több száz ms-os fsync- vagy hálózati kiugrás kell (az alapértékeket a
+használt etcd-verzióhoz ellenőrizni kell). Tünet: a kubectl parancsok
+lassulnak, <code>etcdctl endpoint health</code> ingadozó. A diagnózis a
+node disk IOPS és a peer RTT mérése; a javítás a disk vagy a network
+path cseréje, nem a timeout globális növelése.</p>
+<p><strong>Csak etcd snapshot, de a Secrets titkosítási kulcs nincs
+mentve.</strong> A restore sikeres, de a Secret-ek olvashatatlanok.
+Tünet: <code>kubectl get secret -n app</code> hiba, az apiserver logban
+decrypt error. Az encryption config és key mentése ugyanabba a recovery
+artifactbe kell.</p>
+<h3 data-number="43.2.5" id="feladatok"><span
+class="header-section-number">43.2.5</span> Feladatok</h3>
+<h4 data-number="43.2.5.1"
+id="magyarázó-feladat-quorum-és-member-availability"><span
+class="header-section-number">43.2.5.1</span> 1. Magyarázó feladat:
+quorum és member availability</h4>
+<p>Egy etcd cluster 5 tagból áll. Számold ki a quorumot, és add meg,
+hány tag hirtelen leállása után marad írható a cluster. Magyarázd el,
+mit jelent, ha 3 tag leáll, és miért nem elegendő a 2 elérhető tag.
+Feltételezd, hogy a hálózat a maradék tagok között rendben van.</p>
+<h4 data-number="43.2.5.2"
+id="adminisztrációskonfigurációs-feladat-automatikus-etcd-snapshot"><span
+class="header-section-number">43.2.5.2</span> 2.
+Adminisztrációs/konfigurációs feladat: automatikus etcd snapshot</h4>
+<p>Írj egy bash scriptet <code>lab-etcd-snapshot.sh</code> néven, amely
+a <code>lab-cp1</code> node-on, <code>root</code> jogosultsággal: -
+létrehozza a <code>/var/backups/etcd</code> könyvtárat, - timestamp
+alapú snapshot fájlt készít, - SHA-256 checksumot ír, - a 7×24 óránál
+régebbi snapshotokat és a hozzájuk tartozó checksumokat törli, - a
+script legyen <code>set -euo pipefail</code>-lel idempotensen
+futtatható. A script ne használjon éles cloud storage-ot; a cél a
+lokális lab backup könyvtár. Ellenőrizd, hogy a snapshot fájl és a
+checksum megjelenik.</p>
+<h4 data-number="43.2.5.3"
+id="diagnosztikaifailurerecovery-feladat-one-member-restore-és-control-plane-visszatérés"><span
+class="header-section-number">43.2.5.3</span> 3.
+Diagnosztikai/failure/recovery feladat: one-member restore és control
+plane visszatérés</h4>
+<p>A <code>lab-cp1</code> etcd data directory-ja korrupt lett, a member
+nem indul el. A cluster jelenleg egy membere sem ér quorumot, mert
+korábban mindhárom tag ugyanazon a node-hálózati failure domainen volt,
+és a kiesés mindent érintett. A snapshot fájl rendelkezésre áll. Tervezd
+meg a recovery lépéseket egy támogatott single-node restore esetén:
+milyen parancsokkal állítasz vissza egy új data dir-t, milyen cert és
+peer URL konfigurációt használsz, és hogyan ellenőrzöd, hogy a cluster
+object state visszatért-e? Add meg a postconditiont, és azt is, miért
+nem szabad a régi, korrupt data dir-t egyszerűen felülírni.</p>
+<h3 data-number="43.2.6" id="megoldások"><span
+class="header-section-number">43.2.6</span> Megoldások</h3>
+<h4 data-number="43.2.6.1" id="quorum-és-member-availability"><span
+class="header-section-number">43.2.6.1</span> 1. Quorum és member
+availability</h4>
+<p>Az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>n</mi><mo>=</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">n=5</annotation></semantics></math>
+esetén a quorum:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>Q</mi><mo>=</mo><mrow><mo stretchy="true" form="prefix">⌊</mo><mfrac><mn>5</mn><mn>2</mn></mfrac><mo stretchy="true" form="postfix">⌋</mo></mrow><mo>+</mo><mn>1</mn><mo>=</mo><mn>2</mn><mo>+</mo><mn>1</mn><mo>=</mo><mn>3</mn></mrow><annotation encoding="application/x-tex">
+Q = \left\lfloor \frac{5}{2} \right\rfloor + 1 = 2 + 1 = 3
+</annotation></semantics></math></p>
+<p>Tehát a cluster írható, ha legalább 3 tag elérhető. Így 2 tag
+leállása esetén a maradék 3 tag quorumot ad, a cluster írható. 3 tag
+leállása esetén 2 tag marad, ami kevesebb, mint
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>Q</mi><mo>=</mo><mn>3</mn></mrow><annotation encoding="application/x-tex">Q=3</annotation></semantics></math>,
+ezért a cluster sem írást, sem lineáris olvasást nem szolgál ki (nem
+read-only: csak a serializable olvasás működhet, elavult adattal). A 2
+elérhető tag nem tudja garantálni, hogy egy korábbi write ne csak a
+másik oldalon commitálódott; ezért a Raft biztonsági tulajdonsága miatt
+nem írhat.</p>
+<p>Postcondition: a cluster 2 tag-kiesés után is írható; 3 tag-kieséskor
+a write útvonal leáll, de a 2 tag adatot nem korrumpál, és a kiesés
+visszaállása után újra quorumot érhetnek el.</p>
+<h4 data-number="43.2.6.2" id="automatikus-etcd-snapshot-script"><span
+class="header-section-number">43.2.6.2</span> 2. Automatikus etcd
+snapshot script</h4>
+<p>A script:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/usr/bin/env bash</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="bu">set</span> <span class="at">-euo</span> pipefail</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Lab etcd snapshot script</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: lab-cp1, root, lab-cluster</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="va">BACKUP_DIR</span><span class="op">=</span><span class="st">&quot;/var/backups/etcd&quot;</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="va">ETCD_ENDPOINT</span><span class="op">=</span><span class="st">&quot;https://127.0.0.1:2379&quot;</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="va">CA_CERT</span><span class="op">=</span><span class="st">&quot;/etc/kubernetes/pki/etcd/ca.crt&quot;</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="va">SERVER_CERT</span><span class="op">=</span><span class="st">&quot;/etc/kubernetes/pki/etcd/server.crt&quot;</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a><span class="va">SERVER_KEY</span><span class="op">=</span><span class="st">&quot;/etc/kubernetes/pki/etcd/server.key&quot;</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a><span class="va">TIMESTAMP</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$(</span><span class="fu">date</span> <span class="at">-u</span> +%Y%m%dT%H%M%SZ<span class="va">)</span><span class="st">&quot;</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span class="va">SNAPSHOT_FILE</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${BACKUP_DIR}</span><span class="st">/snapshot-</span><span class="va">${TIMESTAMP}</span><span class="st">.db&quot;</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> <span class="st">&quot;</span><span class="va">${BACKUP_DIR}</span><span class="st">&quot;</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a><span class="ex">etcdctl</span> snapshot save <span class="st">&quot;</span><span class="va">${SNAPSHOT_FILE}</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>  <span class="at">--endpoints</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${ETCD_ENDPOINT}</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a>  <span class="at">--cacert</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${CA_CERT}</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a>  <span class="at">--cert</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${SERVER_CERT}</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a>  <span class="at">--key</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${SERVER_KEY}</span><span class="st">&quot;</span></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a><span class="fu">sha256sum</span> <span class="st">&quot;</span><span class="va">${SNAPSHOT_FILE}</span><span class="st">&quot;</span> <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">${SNAPSHOT_FILE}</span><span class="st">.sha256&quot;</span></span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a><span class="co"># Retention: a 7*24 óránál régebbi snapshotok és checksumok törlése</span></span>
+<span id="cb9-26"><a href="#cb9-26" aria-hidden="true" tabindex="-1"></a><span class="fu">find</span> <span class="st">&quot;</span><span class="va">${BACKUP_DIR}</span><span class="st">&quot;</span> <span class="at">-maxdepth</span> 1 <span class="at">-type</span> f <span class="dt">\</span></span>
+<span id="cb9-27"><a href="#cb9-27" aria-hidden="true" tabindex="-1"></a>  <span class="dt">\(</span> <span class="at">-name</span> <span class="st">&#39;snapshot-*.db&#39;</span> <span class="at">-o</span> <span class="at">-name</span> <span class="st">&#39;snapshot-*.db.sha256&#39;</span> <span class="dt">\)</span> <span class="dt">\</span></span>
+<span id="cb9-28"><a href="#cb9-28" aria-hidden="true" tabindex="-1"></a>  <span class="at">-mmin</span> +<span class="va">$((</span><span class="dv">7</span> <span class="op">*</span> <span class="dv">24</span> <span class="op">*</span> <span class="dv">60</span><span class="va">))</span> <span class="at">-print</span> <span class="at">-delete</span></span>
+<span id="cb9-29"><a href="#cb9-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-30"><a href="#cb9-30" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-lh</span> <span class="st">&quot;</span><span class="va">${SNAPSHOT_FILE}</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">${SNAPSHOT_FILE}</span><span class="st">.sha256&quot;</span></span></code></pre></div>
+<p>Ellenőrzés: a parancs kimenetén látszik a snapshot és a
+<code>.sha256</code> fájl; a <code>find</code> a törölt fájlokat kiírja
+(<code>-print</code>). A <code>-mtime +7</code> helyett
+<code>-mmin</code> kell: a <code>-mtime</code> egész napokra kerekít
+lefelé, így a <code>+7</code> csak a legalább 8 napos fájlokat találná
+meg, a 7,5 naposat nem; a <code>.sha256</code> mintára pedig azért van
+szükség, hogy ne maradjanak árva checksumok. A
+<code>set -euo pipefail</code> miatt bármely etcdctl hiba leállítja a
+scriptet, így nem generál üres checksumot.</p>
+<p>Postcondition: a <code>/var/backups/etcd</code> alatt az adott
+<code>lab-cp1</code> node-on van legalább egy snapshot + checksum pár,
+és a retention után nincs 7×24 óránál régebbi snapshot vagy
+checksum.</p>
+<h4 data-number="43.2.6.3" id="one-member-restore-tervezése"><span
+class="header-section-number">43.2.6.3</span> 3. One-member restore
+tervezése</h4>
+<p>A parancsok a kidolgozott példa <code>PKI</code> és <code>TLS</code>
+shellváltozóit használják. A cluster kubeadm stacked topológiájú: az
+etcd és a kube-apiserver static pod
+(<code>/etc/kubernetes/manifests/etcd.yaml</code>,
+<code>kube-apiserver.yaml</code>), nincs <code>etcd.service</code>,
+ezért systemd unit helyett a static pod manifesteket kezeljük. A
+recovery lépéssor:</p>
+<ol type="1">
+<li><p><strong>Snapshot kiválasztása</strong>: a legfrissebb,
+<code>etcdutl snapshot status</code>-szal és a <code>.sha256</code>
+checksummal ellenőrzött snapshot, például
+<code>/var/backups/etcd/snapshot-&lt;id&gt;.db</code>.</p></li>
+<li><p><strong>A control plane leállítása mindhárom CP node-on</strong>:
+a static pod manifestek kimozgatása (a kubelet leállítja a podokat):</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-cp1, lab-cp2, lab-cp3, root</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> /root/lab-manifests-hold</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="fu">mv</span> /etc/kubernetes/manifests/kube-apiserver.yaml <span class="dt">\</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>  /etc/kubernetes/manifests/etcd.yaml /root/lab-manifests-hold/</span></code></pre></div></li>
+<li><p><strong>Restore új data dirbe a <code>lab-cp1</code>-en</strong>;
+a <code>--name</code> és a peer URL a node 43.1 szerinti nevével és
+címével egyezik, mert a peer tanúsítvány SAN-je erre szól:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-cp1, root</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">etcdutl</span> snapshot restore <span class="st">&quot;</span><span class="va">${SNAPSHOT_FILE}</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--name</span> lab-cp1 <span class="dt">\</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--initial-cluster</span> <span class="st">&quot;lab-cp1=https://10.42.0.11:2380&quot;</span> <span class="dt">\</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--initial-cluster-token</span> <span class="st">&quot;lab-restore-token&quot;</span> <span class="dt">\</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--initial-advertise-peer-urls</span> <span class="st">&quot;https://10.42.0.11:2380&quot;</span> <span class="dt">\</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--data-dir</span> <span class="st">&quot;/var/lib/etcd-lab-restored&quot;</span></span></code></pre></div></li>
+<li><p><strong>Az <code>etcd.yaml</code> módosítása a
+<code>lab-cp1</code>-en</strong> (a
+<code>/root/lab-manifests-hold/</code> alatti példányban): a
+<code>etcd-data</code> hostPath
+<code>path: /var/lib/etcd-lab-restored</code> és a
+<code>--data-dir</code>,
+<code>--initial-cluster=lab-cp1=https://10.42.0.11:2380</code>,
+<code>--initial-cluster-token=lab-restore-token</code>,
+<code>--initial-cluster-state=new</code>; a <code>--name=lab-cp1</code>
+marad. A tanúsítványokat nem kell „a data dirhez illeszteni”: azok a
+node nevéhez és címéhez (SAN) kötődnek, és a
+<code>/etc/kubernetes/pki/etcd/</code> alatt változatlanok. Ezután az
+<code>etcd.yaml</code> visszamozgatása, és ellenőrzés:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-cp1, root</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mv</span> /root/lab-manifests-hold/etcd.yaml /etc/kubernetes/manifests/</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="ex">crictl</span> ps <span class="at">--name</span> etcd</span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="ex">etcdctl</span> endpoint health <span class="at">--endpoints</span><span class="op">=</span>https://127.0.0.1:2379 <span class="va">$TLS</span></span></code></pre></div></li>
+<li><p><strong>A másik két tag visszaléptetése egyesével</strong>: a
+<code>lab-cp2</code> és a <code>lab-cp3</code> régi data dirje más
+cluster ID-hoz tartozik, ezért nem indulhat vele (cluster ID mismatch).
+A régi <code>/var/lib/etcd</code>-t áthelyezzük (nem töröljük), a
+<code>lab-cp1</code>-en felvesszük az új tagot, majd a node
+<code>etcd.yaml</code>-jában
+<code>--initial-cluster-state=existing</code> és a
+<code>member add</code> kimenete szerinti <code>--initial-cluster</code>
+értékkel, üres data dirrel indítjuk:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-cp2, root</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mv</span> /var/lib/etcd /root/lab-etcd-old-lab-cp2</span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-cp1, root</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="ex">etcdctl</span> member add lab-cp2 <span class="at">--peer-urls</span><span class="op">=</span>https://10.42.0.12:2380 <span class="dt">\</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--endpoints</span><span class="op">=</span>https://127.0.0.1:2379 <span class="va">$TLS</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-cp2, root: etcd.yaml módosítása, majd visszamozgatása</span></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a><span class="fu">mv</span> /root/lab-manifests-hold/etcd.yaml /etc/kubernetes/manifests/</span></code></pre></div>
+<p>A <code>lab-cp3</code> ugyanígy, a <code>lab-cp2</code> sikeres
+csatlakozása után. (Alternatíva: mindhárom node visszaállítása
+ugyanabból a snapshotból, közös <code>--initial-cluster</code>
+listával.)</p></li>
+<li><p><strong>Control plane indítása</strong>: mindhárom node-on a
+<code>kube-apiserver.yaml</code> visszamozgatása, majd
+<code>kubectl get --raw='/readyz?verbose'</code> és
+<code>kubectl get nodes</code>.</p></li>
+<li><p><strong>Data verification</strong>:
+<code>etcdctl get /registry/ --prefix --keys-only | head</code> mutatja
+a Kubernetes objektumok jelenlétét;
+<code>kubectl get deployment --all-namespaces</code> és
+<code>kubectl get secret -n lab-app</code> ellenőrzi a konkrét lab
+objektumokat (ha a Secrets titkosítva vannak, ehhez az encryption config
+is kell).</p></li>
+</ol>
+<p>A régi korrupt data dir-t nem szabad egyszerűen felülírni, mert a
+benne lévő member ID és WAL adatok ütközhetnek a többi taggal, és a
+hibavizsgálathoz is kellhet; a hivatalos recovery új member identityt és
+új cluster konfigurációt épít.</p>
+<p>Postcondition: az <code>etcdctl member list</code> 3 tagot mutat
+(<code>started</code>, <code>IS LEARNER false</code>), az
+<code>endpoint status --cluster</code> pontosan egy leadert; a
+<code>lab-app</code> namespace Deployment és Secret objektumai a
+snapshot időpontjának állapotában jelen vannak; a <code>kubectl</code>
+API válaszol; az RPO a snapshot időpontja, az RTO a mérési terv szerinti
+recovery idő.</p>
+<h3 data-number="43.2.7" id="rövid-összefoglaló"><span
+class="header-section-number">43.2.7</span> Rövid összefoglaló</h3>
+<p>Az etcd a Kubernetes object state elosztott, konszenzus alapú
+tárolója; a quorum határozza meg, hány tag kiesését tűri a cluster
+írásra. A snapshot biztonságos, konzisztens mentési forma, amelyet a
+member identity, cert/key és encryption anyagok mellett kell kezelni. A
+restore-t mindig új member identity-vel, támogatott eljárással,
+adatverifikációval kell végrehajtani, nem a futó data dir másolásával.
+Az etcd snapshot csak a Kubernetes object state-et menti, az application
+volume és a PKI külön recovery artifactet igényel. Az fsync latency, a
+disk és a network kritikus a commit path-on.</p>
+<p><strong>Továbbhasznált definíciók</strong>:</p>
+<ul>
+<li><strong>Quorum</strong>: a consensus működéshez szükséges többség,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>Q</mi><mo>=</mo><mo stretchy="false" form="prefix">⌊</mo><mi>n</mi><mi>/</mi><mn>2</mn><mo stretchy="false" form="postfix">⌋</mo><mo>+</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">Q=\lfloor n/2\rfloor+1</annotation></semantics></math>
+tag; ennyi tag megerősítése kell a commit-hoz.</li>
+<li><strong>etcd snapshot</strong>: konzisztens, ellenőrzött
+pont-in-time mentés, amely a committed key-value state-et
+tartalmazza.</li>
+<li><strong>Member identity</strong>: az etcd tag egyedi azonosítója,
+cluster ID-ja, peer URL-je és kapcsolódó certificate konfigurációja;
+restore-nál újra kell állítani.</li>
+</ul>
+<h3 data-number="43.2.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">43.2.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>Hivatkozott verzió: etcd 3.5.x (a kubeadm 1.31 által telepített etcd
+image minorja; a pontos patch az <code>etcd-lab-cp1</code> pod
+image-tagjéből), Kubernetes <code>v1.31</code> (43.1 labprofil), kubeadm
+stacked etcd static podokkal.</p>
+<ul>
+<li>etcd v3.5 – Disaster recovery (<code>snapshot save</code>,
+<code>etcdutl snapshot restore</code>, új cluster indítása): <a
+href="https://etcd.io/docs/v3.5/op-guide/recovery/"
+class="uri">https://etcd.io/docs/v3.5/op-guide/recovery/</a>.</li>
+<li>etcd v3.5 – Runtime reconfiguration (<code>member add</code>,
+<code>--initial-cluster-state=existing</code>): <a
+href="https://etcd.io/docs/v3.5/op-guide/runtime-configuration/"
+class="uri">https://etcd.io/docs/v3.5/op-guide/runtime-configuration/</a>.</li>
+<li>etcd v3.5 – FAQ (quorum, páros taglétszám, learner): <a
+href="https://etcd.io/docs/v3.5/faq/"
+class="uri">https://etcd.io/docs/v3.5/faq/</a>; Hardware recommendations
+(WAL-fsync p99 &lt; 10 ms): <a
+href="https://etcd.io/docs/v3.5/op-guide/hardware/"
+class="uri">https://etcd.io/docs/v3.5/op-guide/hardware/</a>; Tuning
+(heartbeat 100 ms, election timeout 1000 ms): <a
+href="https://etcd.io/docs/v3.5/tuning/"
+class="uri">https://etcd.io/docs/v3.5/tuning/</a>.</li>
+<li>etcd – <code>etcdctl</code> és <code>etcdutl</code>
+parancsreferencia (<code>member list</code> mezők,
+<code>endpoint status</code>): <a
+href="https://github.com/etcd-io/etcd/blob/main/etcdctl/README.md"
+class="uri">https://github.com/etcd-io/etcd/blob/main/etcdctl/README.md</a>,
+<a href="https://github.com/etcd-io/etcd/blob/main/etcdutl/README.md"
+class="uri">https://github.com/etcd-io/etcd/blob/main/etcdutl/README.md</a>.</li>
+<li>Kubernetes – Operating etcd clusters for Kubernetes (backup,
+restore, static pod): <a
+href="https://kubernetes.io/docs/tasks/administer-cluster/configure-upgrade-etcd/"
+class="uri">https://kubernetes.io/docs/tasks/administer-cluster/configure-upgrade-etcd/</a>.</li>
+<li>Raft: <a href="https://raft.github.io/"
+class="uri">https://raft.github.io/</a>; <code>find(1)</code>
+(<code>-mtime</code> kerekítés, <code>-mmin</code>): <a
+href="https://man7.org/linux/man-pages/man1/find.1.html"
+class="uri">https://man7.org/linux/man-pages/man1/find.1.html</a>.</li>
+</ul>
+<p>Ellenőrzési hiány: a példák laborban ellenőrizendők; dátumozott
+futtatási napló (reprodukciós trace: <code>etcdctl version</code>,
+<code>etcdutl version</code>, snapshot status, a restore-teszt
+kulcsszámlálója, sikeres és hibás ág) még nem készült. A commit-idő
+számpélda számított modell, nem mérés; a kimenetek illusztratívak. A
+snapshot retention script lokális lab célra készült, nem production
+backup storage-ra.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d211.html">← 43.1 Clusterprofil, bootstrap és HA topológia</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d213.html">43.3 Upgrade, version skew és node lifecycle →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

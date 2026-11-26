@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>9.2 Page cache, reclaim, swap és overcommit – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch09">9 Linux virtuális memória és erőforrásnyomás</a></p>
+<div class="links"><a class="prev" rel="prev" href="d041.html">← 9.1 Lapozás, page fault, mmap és copy-on-write</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d043.html">9.3 OOM, PSI és memóriahibák működtetése →</a></div>
+</nav>
+<h2 data-number="9.2" id="d042"><span
+class="header-section-number">9.2</span> Page cache, reclaim, swap és
+overcommit</h2>
+<h3 data-number="9.2.1" id="motiváció"><span
+class="header-section-number">9.2.1</span> Motiváció</h3>
+<p>Egy szenior C++ fejlesztő a saját gépén megszokta, hogy a
+<code>free -h</code> kimenetében a „kevés szabad memória” többnyire nem
+gond: a kernel a memóriát lapgyorsítótárként (page cache) használja.
+Amikor viszont egy Linux hosztot kell üzemeltetni, ugyanez a kimenet
+téves döntésekhez vezethet: feleslegesen swapot adunk hozzá, túl
+agresszívan állítjuk a visszavételt, vagy OOM-killer beavatkozást hívunk
+elő. Az alfejezet azt tanítja meg, hogyan lehet a memória rendelkezésre
+állását a cache, a reclaim, a swap és az overcommit állapotából
+értelmezni, és hogyan lehet a konfigurációt a tényleges munkaterheléshez
+igazítani.</p>
+<h3 data-number="9.2.2" id="page-cache-slab-és-anonymous-memory"><span
+class="header-section-number">9.2.2</span> Page cache, slab és anonymous
+memory</h3>
+<p>A Linux kernel a memóriát lapokban (page) kezeli, és a lapokat
+felhasználásuk szerint kategóriákba sorolja.</p>
+<p>A <strong>page cache</strong> a blokkeszközökről beolvasott
+fájltartalmakat tárolja. Amikor egy folyamat fájlt olvas, a kernel a
+fájl lapjait a page cache-be tölti; a következő olvasás már RAM-ból
+szolgálható ki. Ez a gyakorlatban azt jelenti, hogy egy nagy fájl
+egyszeri beolvasása után a memória nagy része „Cached” lesz, pedig a
+folyamat már befejezte a munkát. A kernel ezeket a lapokat csak akkor
+adja vissza, ha a memóriára más célból szükség van, mert a felesleges
+újraolvasás drágább, mint a RAM-ban tartás.</p>
+<p>A <strong>slab</strong> a kernel saját belső memóriafoglalási rétege.
+A kernel gyakran ismétlődő, fix méretű objektumokat (inode-ok, dentry-k,
+buffer_head-ek) hoz létre, és ezek lefoglalását a slab allokátor
+gyorsítja. A slab memória a <code>/proc/meminfo</code>
+<code>Slab</code>, <code>SReclaimable</code> és <code>SUnreclaim</code>
+mezőiben jelenik meg. A <code>SReclaimable</code> egy része
+memórianyomás alatt visszavehető, a <code>SUnreclaim</code> nem.</p>
+<p>Az <strong>anonymous memory</strong> (névtelen memória) olyan lapok
+összessége, amelyek nem fájlhoz kötöttek. Ide tartozik a C++ heap, a
+stack, a <code>mmap(MAP_ANONYMOUS)</code> leképezések, a process data
+szegmensei. Az anonymous lapoknak – a page cache lapjaival ellentétben –
+nincs fájl a háttérben; ha a kernelnek fel kell szabadítania őket, akkor
+azok tartalmát swapba kell írnia, vagy a processz megölésekor el kell
+dobnia.</p>
+<p>Egy folyamat memóriahasználatát az
+<code>/proc/&lt;pid&gt;/smaps</code> mutatja részletesen, például a
+<code>Rss</code> (resident set size) mezőben. A <code>VmRSS</code>
+értéket (<code>/proc/&lt;pid&gt;/status</code>) a <code>ps -o rss</code>
+és a <code>top</code> RES oszlopa is mutatja. A C++-ban a heap egy
+<code>std::vector&lt;char&gt;</code> lefoglalása az allocatoron
+keresztül <code>mmap</code>-et vagy <code>brk</code>-ot hív, és a kernel
+anonymous lapokat hoz létre – a fizikai lapok azonban csak az első
+íráskor (page fault) kerülnek kiosztásra.</p>
+<h3 data-number="9.2.3" id="memavailable-versus-memfree"><span
+class="header-section-number">9.2.3</span> MemAvailable versus
+MemFree</h3>
+<p>A <code>/proc/meminfo</code> két gyakran félreértett mezője a
+<code>MemFree</code> és a <code>MemAvailable</code>. Előbbi a
+ténylegesen szabad, semmire sem használt lapok számát mutatja. Utóbbi
+egy becslés: mennyi memória áll rendelkezésre új allokációkhoz anélkül,
+hogy swapolnánk. A kernel a <code>MemAvailable</code> értékét a
+<code>MemFree</code>-ből kiindulva úgy számolja, hogy a fájl-LRU
+lapjainak (Active(file) + Inactive(file)) és a visszavehető
+kernelobjektumoknak (<code>KReclaimable</code>) azt a részét adja hozzá,
+amely a watermarkok megtartása mellett felszabadítható. A
+<code>Cached</code> mezőben szereplő <code>Shmem</code> (tmpfs,
+<code>/dev/shm</code>, megosztott anonim memória) nem dobható el, ezért
+nem számít bele: nagy <code>Shmem</code> mellett a <code>Cached</code>
+nagy, a <code>MemAvailable</code> mégis kicsi lehet. A
+<code>MemFree</code> tehát konzervatív, a <code>MemAvailable</code> a
+gyakorlati döntésekhez használható.</p>
+<p>Példa: ha egy hoszton <code>MemFree</code> 200 MiB, de
+<code>Cached</code> 4 GiB, és a cache legnagyobb része tiszta (clean),
+akkor a <code>MemAvailable</code> 3 GiB felett lehet. A rendszer nem
+„fogy ki a memóriából”, csupán a kernel a szabad lapokat cache-ként
+használja. A <code>free -h</code> kimenetben a <code>available</code>
+oszlop ezt a becslést mutatja.</p>
+<h3 data-number="9.2.4" id="reclaim-és-dirty-writeback"><span
+class="header-section-number">9.2.4</span> Reclaim és dirty
+writeback</h3>
+<p>A <strong>reclaim</strong> az a folyamat, amikor a kernel
+memórianyomás hatására lapokat szabadít fel. A reclaimet a háttérben a
+<code>kswapd</code> kernel szál végzi, amikor a szabad lapok a low
+watermark alá esnek. Ha a <code>kswapd</code> nem tud lépést tartani, és
+a szabad memória a min watermark közelébe ér, maga az allokáló processz
+végez <strong>direct reclaimet</strong> – ez okozza a latency-tüskéket
+és a PSI <code>some</code> növekedését (lásd 9.3). Nincs szigorú „előbb
+a cache, aztán a swap” sorrend: egy körben a kernel az inactive fájl- és
+anonymous LRU-listát a swappiness szerinti arányban szkenneli, és közben
+a slab shrinkerek is futnak. A lapfajták sorsa:</p>
+<ul>
+<li><strong>Tiszta page cache lap</strong>: a fájltartalom a
+háttértárolón megvan, így a lap egyszerűen eldobható.</li>
+<li><strong>Dirty page cache lap</strong>: csak a writeback után vehető
+vissza; a kiírást elsősorban a flusher szálak végzik, a reclaim
+legfeljebb siettetheti vagy átugorja a lapot.</li>
+<li><strong>Anonymous lap</strong>: nincs mögötte fájl, ezért swap
+eszközre kell írni (swap nélkül nem vehető vissza).</li>
+<li><strong>Slab reclaimable objektumok</strong> (például dentry-k,
+inode-ok): a shrinkerek minden reclaim-körben visszavehetik őket.</li>
+</ul>
+<p>A <strong>dirty writeback</strong> a dirty page cache lapok kiírása a
+háttértárolóra, amelyet a kernel a <code>vm.dirty_ratio</code>,
+<code>vm.dirty_background_ratio</code> és a kapcsolódó paraméterekkel
+vezérel. Amikor a dirty lapok aránya eléri a
+<code>dirty_background_ratio</code> értékét, a kernel háttérben elkezdi
+a kiírást; ha a <code>dirty_ratio</code> fölé nő, a folyamatok I/O-ra
+várnak. A writeback minősége befolyásolja a tartósságot és a
+késleltetést: ha túl sok dirty lap halmozódik fel, egy hirtelen reclaim
+nagy I/O csúcsot okoz.</p>
+<p>A <code>MemAvailable</code> becslés nem tesz különbséget tiszta és
+dirty fájllap között; a dirty lapok magas aránya ezért azt jelenti, hogy
+a becsült memória egy része csak writeback után, késleltetéssel
+szabadítható fel.</p>
+<h3 data-number="9.2.5" id="swap-swappiness-zswapzram"><span
+class="header-section-number">9.2.5</span> Swap, swappiness,
+zswap/zram</h3>
+<p>A <strong>swap</strong> az anonymous lapok háttértárolóra való
+kiírását és onnan való visszaolvasását jelenti. A swap lehet dedikált
+partíció vagy swapfile. Az <code>/etc/fstab</code> vagy a
+<code>systemd.swap</code> unit hivatkozik rá. A
+<code>swapon --show</code> listázza az aktív swap eszközöket.</p>
+<p>A <strong>swappiness</strong> egy 0–200 közötti (Linux 5.8 óta;
+korábban 0–100) vezérlő paraméter (<code>/proc/sys/vm/swappiness</code>,
+alapértéke 60), amely azt befolyásolja, hogy a kernel a reclaim során
+mennyire agresszíven választja az anonymous lapok swapolását a page
+cache eldobásával szemben. Alacsony érték (például 10) esetén a kernel
+inkább a tiszta cache-t dobja el, és csak akkor swapol, ha már alig
+maradt cache. Magasabb érték esetén a kernel hamarabb swapol anonymous
+lapokat, hogy több RAM maradjon cache-nek; 100-nál a kernel az anonymous
+és a fájllapok visszavételét azonos költségűnek tekinti, 100 fölötti
+érték főleg zram/zswap mellett indokolt, ahol a swap olcsóbb a fájl
+újraolvasásánál. A swappiness nem 0/1 kapcsoló, és az optimális érték
+munkaterhelés-függő.</p>
+<p>A <strong>zswap</strong> egy tömörített RAM-cache a swap eszköz
+előtt. Amikor a kernel anonymous lapot swapolna, a zswap megpróbálja azt
+tömörítve a RAM-ban tartani; ha a tömörített cache megtelik, a lap a
+tényleges swap eszközre kerül. A zswap tehát csökkenti a swap I/O
+mennyiségét, de a RAM-ot is fogyasztja.</p>
+<p>A <strong>zram</strong> egy RAM-ban létrehozott tömörített
+blokkeszköz, amelyet swap eszközként lehet használni. A zram mögött
+nincs tényleges háttértároló; a tömörített adat mindig a RAM-ban van. A
+zram swapként való használata növeli a rendelkezésre álló swap méretet
+anélkül, hogy lemezt érintene, de nem növeli a fizikai RAM-ot: a
+tömörítés hatékonysága határozza meg a tényleges nyereséget. A zswap és
+a zram különböző rétegben dolgozik, és egyszerre is használható, de
+ilyenkor tisztázni kell az adatutat.</p>
+<h3 data-number="9.2.6" id="overcommit-és-commit-accounting"><span
+class="header-section-number">9.2.6</span> Overcommit és commit
+accounting</h3>
+<p>A Linux alapesetben <strong>overcommit</strong> politikát alkalmaz: a
+kernel megengedi, hogy a folyamatok több virtuális memóriát foglaljanak
+le, mint amennyi a RAM és a swap összege. Ez a C++ fejlesztő számára
+ismerős, mert a <code>malloc</code> vagy a <code>new</code> nem
+feltétlenül foglal azonnal fizikai lapot. A Linux
+<code>vm.overcommit_memory</code> három értéke:</p>
+<ul>
+<li><code>0</code> (heurisztikus): a kernel ésszerű keretek között
+engedi a túlfoglalást, elutasítva a nyilvánvalóan lehetetlen
+allokációkat.</li>
+<li><code>1</code> (mindig): minden allokációt enged.</li>
+<li><code>2</code> (commit limit): a kernel a <code>CommitLimit</code>
+értéket nem lépi túl; a limitet a RAM, a swap és a
+<code>vm.overcommit_ratio</code> határozza meg.</li>
+</ul>
+<p>A <strong>commit accounting</strong> a már vállalt (commitált)
+privát, írható címtartomány nyilvántartása – nem fizikai foglalás, és
+jóval kisebb lehet a VSZ-nél. Ezt a <code>/proc/meminfo</code>
+<code>Committed_AS</code> mezője mutatja, míg a <code>CommitLimit</code>
+a strict módban megengedett maximum. Hugepage-ek nélkül
+<code>CommitLimit</code> = <code>SwapTotal</code> +
+<code>MemTotal</code> × <code>overcommit_ratio</code>/100 (ha a
+<code>vm.overcommit_kbytes</code> nem 0, a ratio helyett az érvényes): a
+keret a swap teljes mérete plusz a RAM <code>overcommit_ratio</code>
+százaléka. Például 4 GiB RAM, 1 GiB swap és ratio = 50 mellett 1 + 2 = 3
+GiB. A commit accounting nem garantálja, hogy a fizikai lapok
+rendelkezésre állnak, csak azt, hogy a kernel nem lépi túl a beállított
+keretet.</p>
+<p>A C++-ban a heap lefoglalása csak virtuális címtérfoglalás, a fizikai
+lapok az első íráskor jönnek létre. Ha a kernel nem tud lapot adni,
+akkor az overcommit politika szerint OOM-killer avatkozhat be.</p>
+<h3 data-number="9.2.7" id="memory-growth-versus-leak"><span
+class="header-section-number">9.2.7</span> Memory growth versus
+leak</h3>
+<p>A <strong>memory growth</strong> (memórianövekedés) olyan növekedést
+jelent, amely a munkaterhelés méretével arányos, és a munka befejeztével
+a memória felszabadul vagy újrahasznosításra kerül. Példa: egy
+képfeldolgozó szolgáltatás a bemeneti kép méretétől függően növeli a
+heapjét, de a kérés után visszaadja a memóriát az allocatornak.</p>
+<p>A <strong>memory leak</strong> (szivárgás) ezzel szemben monoton
+növekedést mutat anélkül, hogy a folyamat logikája indokolná. A folyamat
+RSS-e idővel egyre nő, és a memóriát soha nem adja vissza. A két eset
+elkülönítése operatív döntés: ha a növekedés a leak jele, a folyamatot
+újra kell indítani, és a kódot javítani. Ha a növekedés legitim, akkor a
+kapacitást kell hozzáigazítani.</p>
+<p>A diagnosztika a <code>/proc/&lt;pid&gt;/smaps_rollup</code>
+(processzszintű összeg; a <code>smaps</code> VMA-nként ad sorokat)
+<code>Rss</code> és <code>Pss</code> (proportional set size) mezőiből,
+valamint a <code>/proc/&lt;pid&gt;/statm</code> <code>resident</code>
+oszlopából áll. Időbeli mintavételezéssel (például
+<code>ps -o etime,rss</code>) trendet lehet felvenni. A kernel PSI
+(Pressure Stall Information) a <code>/proc/pressure/memory</code> alatt
+mutatja a memórianyomás hatására bekövetkező várakozásokat, ami annak a
+jele, ha a reclaim már a futó folyamatokat lassítja.</p>
+<h3 data-number="9.2.8" id="kidolgozott-példa"><span
+class="header-section-number">9.2.8</span> Kidolgozott példa</h3>
+<p>A példa a <code>lab-vm-01</code> nevű izolált labor VM-en fut. A
+megfigyelő parancsok sima felhasználóként (<code>UID</code>
+<code>lab</code>) futtathatók; a konfiguráció-módosítás
+<code>root</code> joggal történik (<code>sudo</code>). Cél: bemutatni,
+hogyan nő a page cache, hogyan csökken a <code>MemFree</code>, miközben
+a <code>MemAvailable</code> elfogadható marad, és hogyan reagál a
+rendszer az anonymous memóriára.</p>
+<p>Előfeltétel: a VM-en van legalább 4 GiB RAM, és egy legalább 1 GiB
+méretű tesztfájl a <code>labdisk</code>-en (ext4), például
+<code>/mnt/labdata/testfile</code>. Ha nincs, hozzuk létre
+<code>oflag=direct</code>-tel, hogy az írás ne hagyja a fájl lapjait a
+page cache-ben (buffered <code>dd</code> után a fájl már resident lenne,
+és a lenti beolvasás nem mutatna változást):</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-vm-01, UID: lab</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">dd</span> if=/dev/urandom of=/mnt/labdata/testfile bs=1M count=1024 <span class="dt">\</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>   oflag=direct status=progress</span></code></pre></div>
+<p>Kezdjük a kiinduló memóriastátusszal; a <code>fincore</code>
+(util-linux) a fájl resident lapjait mutatja:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-vm-01, UID: lab</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">free</span> <span class="at">-h</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;MemTotal|MemFree|MemAvailable|Cached|Dirty&#39;</span> /proc/meminfo</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;SwapTotal|SwapFree|Slab&#39;</span> /proc/meminfo</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="ex">fincore</span> /mnt/labdata/testfile</span></code></pre></div>
+<p>Várt illusztratív kimenet (nem tényleges mérés): <code>MemFree</code>
+viszonylag magas, <code>Cached</code> kicsi, <code>MemAvailable</code>
+közel a <code>MemFree</code>-hez; a <code>fincore</code> RES oszlopa 0
+közeli.</p>
+<p>Növeljük meg a page cache-t a tesztfájl beolvasásával, majd nézzük
+meg az állapotot:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-vm-01, UID: lab</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /mnt/labdata/testfile <span class="op">&gt;</span> /dev/null</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="fu">free</span> <span class="at">-h</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;MemFree|MemAvailable|Cached&#39;</span> /proc/meminfo</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="ex">fincore</span> /mnt/labdata/testfile</span></code></pre></div>
+<p>Várt hatás: a <code>fincore</code> RES értéke kb. 1 GiB, a
+<code>Cached</code> megnő közel 1 GiB-tal, a <code>MemFree</code>
+lecsökken, a <code>MemAvailable</code> azonban csak kismértékben
+csökken, mert a tiszta cache visszavonható.</p>
+<p>Most indítsunk egy rövid C++ programot, amely 1 GiB anonymous
+memóriát foglal és megérint, hogy ténylegesen fizikai lapokat kapjon.
+Mentsd <code>anon_test.cpp</code> néven:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// target: lab-vm-01, UID: lab</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;unistd.h&gt;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">char</span><span class="op">&gt;</span> v<span class="op">(</span><span class="dv">1</span><span class="bu">UL</span> <span class="op">&lt;&lt;</span> <span class="dv">30</span><span class="op">,</span> <span class="ch">&#39;x&#39;</span><span class="op">);</span> <span class="co">// 1 GiB, minden lap érintve</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    sleep<span class="op">(</span><span class="dv">120</span><span class="op">);</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Fordítás és futtatás háttérben:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-vm-01, UID: lab</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">g++</span> <span class="at">-O0</span> <span class="at">-g</span> <span class="at">-o</span> /tmp/anon_test anon_test.cpp</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="ex">/tmp/anon_test</span> <span class="kw">&amp;</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="va">ANON_PID</span><span class="op">=</span><span class="va">$!</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;PID=</span><span class="va">$ANON_PID</span><span class="st">&quot;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 5</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="fu">free</span> <span class="at">-h</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="fu">ps</span> <span class="at">-o</span> pid,rss,vsz,cmd <span class="at">-p</span> <span class="va">$ANON_PID</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;MemFree|MemAvailable|Cached|SwapFree&#39;</span> /proc/meminfo</span></code></pre></div>
+<p>Várt hatás: a folyamat RSS-e körülbelül 1 GiB-ra nő; a
+<code>MemFree</code> és a <code>MemAvailable</code> lecsökken; a
+<code>Cached</code> esetleg csökken, mert a reclaim a tiszta cache-t
+dobja el, ha nyomás van. Ha swap van, a swappiness alapján esetleg
+néhány lap swapra kerül, de 4 GiB RAM esetén valószínűleg nem.</p>
+<p>Állítsuk be a swapot és a swappiness értékét, hogy demonstráljuk a
+kernel viselkedését. Ha a VM-en nincs swap, hozzunk létre 1 GiB
+swapfile-t (ez módosító parancs, ezért pontosan jelöljük a
+rollbacket):</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-vm-01, UID: root (sudo)</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Előfeltétel: nincs aktív swapfile a /mnt/labdata/swapfile úton</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="co"># Módosítás:</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> fallocate <span class="at">-l</span> 1G /mnt/labdata/swapfile</span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> chmod 600 /mnt/labdata/swapfile</span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkswap /mnt/labdata/swapfile</span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> swapon /mnt/labdata/swapfile</span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Ellenőrzés:</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="ex">swapon</span> <span class="at">--show</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="fu">free</span> <span class="at">-h</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="co"># Rollback (ha szükséges):</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> swapoff /mnt/labdata/swapfile</span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rm <span class="at">-f</span> /mnt/labdata/swapfile</span></code></pre></div>
+<p>Ezután módosítsuk a swappiness értékét 10-re, és figyeljük meg a
+hatást:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-vm-01, UID: root (sudo)</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Módosítás előtti érték:</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/sys/vm/swappiness</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Előfeltétel: az aktuális érték például 60</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Módosítás:</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> sysctl <span class="at">-w</span> vm.swappiness=10</span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="co"># Ellenőrzés:</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/sys/vm/swappiness</span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="co"># Rollback:</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> sysctl <span class="at">-w</span> vm.swappiness=60</span></code></pre></div>
+<p>A swappiness módosítása nem azonnali, de a következő reclaim
+döntéseknél érvényesül. Végül vizsgáljuk meg az overcommit
+beállításokat:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-vm-01, UID: lab</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/sys/vm/overcommit_memory</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/sys/vm/overcommit_ratio</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;CommitLimit|Committed_AS&#39;</span> /proc/meminfo</span></code></pre></div>
+<p>A várt kimenet például <code>overcommit_memory = 0</code>,
+<code>overcommit_ratio = 50</code>, <code>CommitLimit</code> =
+<code>SwapTotal</code> + <code>MemTotal</code> × 50/100,
+<code>Committed_AS</code> pedig a már vállalt privát, írható
+címtartomány összege; ezt hasonlítja a kernel
+<code>overcommit_memory=2</code> mellett a
+<code>CommitLimit</code>-hez.</p>
+<p>Az <code>overcommit_memory=2</code> kapcsolás veszélyes: ha a
+<code>Committed_AS</code> már nagyobb az új
+<code>CommitLimit</code>-nél, a strict mód azonnal ENOMEM-et ad az új
+allokációknak, a <code>fork</code>/<code>exec</code> – így a rollbackhez
+szükséges <code>sudo</code> is – elbukhat. Ezért csak előellenőrzés
+után, a labkonzolon (nem SSH-n) előre megnyitott root shellben
+teszteljük, és az <code>anon_test</code> legyen leállítva:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-vm-01, UID: root (sudo), a labkonzolon nyitott root shellben</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Előfeltétel: az eredeti értékek mentése</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="va">orig_mode</span><span class="op">=</span><span class="va">$(</span><span class="ex">sysctl</span> <span class="at">-n</span> vm.overcommit_memory<span class="va">)</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="va">orig_ratio</span><span class="op">=</span><span class="va">$(</span><span class="ex">sysctl</span> <span class="at">-n</span> vm.overcommit_ratio<span class="va">)</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;CommitLimit|Committed_AS&#39;</span> /proc/meminfo</span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Új limit kB-ban (ratio=80): legyen legalább 25%-kal nagyobb a Committed_AS-nél</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="fu">awk</span> <span class="st">&#39;/MemTotal/{r=$2} /SwapTotal/{s=$2} /Committed_AS/{c=$2}</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="st">     END{n=s+r*80/100; print &quot;uj_limit&quot;, n, &quot;committed&quot;, c;</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="st">         if (n &lt; c*1.25) print &quot;NE KAPCSOLJ&quot;}&#39;</span> /proc/meminfo</span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="co"># Módosítás (először a ratio, csak utána a mód):</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> sysctl <span class="at">-w</span> vm.overcommit_ratio=80</span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> sysctl <span class="at">-w</span> vm.overcommit_memory=2</span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span class="co"># Ellenőrzés:</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/sys/vm/overcommit_memory</span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;CommitLimit|Committed_AS&#39;</span> /proc/meminfo</span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a><span class="co"># Rollback a mentett értékekre:</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> sysctl <span class="at">-w</span> vm.overcommit_memory=<span class="st">&quot;</span><span class="va">$orig_mode</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>     vm.overcommit_ratio=<span class="st">&quot;</span><span class="va">$orig_ratio</span><span class="st">&quot;</span></span></code></pre></div>
+<p>A példában a módosító parancsok visszaállíthatók, és a labor VM
+rendszerlemezét nem érintik; az <code>overcommit_memory=2</code> lépést
+csak akkor futtasd, ha az előellenőrzés nem írt ki „NE KAPCSOLJ”
+sort.</p>
+<h3 data-number="9.2.9" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">9.2.9</span> Tipikus hibák és
+ellenpróbák</h3>
+<p><strong>1. „Kevés a MemFree, ezért kell több RAM.”</strong><br />
+Tünet: a <code>free -h</code> kevés <code>MemFree</code>-t mutat, de a
+rendszer gyors. Hipotézis: a <code>MemFree</code> alacsony, mert a
+kernel cache-re használja a RAM-ot. Adatgyűjtés:
+<code>grep MemAvailable /proc/meminfo</code>, <code>sar -r</code>. Ha a
+<code>MemAvailable</code> magas, a tünet nem indokolja a bővítést.
+Ellenpróba: futtassunk egy rövid tesztet, amely ténylegesen új lapokat
+igényel, és figyeljük, hogy a kernel visszaveszi-e a cache-t.</p>
+<p><strong>2. „A swappiness 0-ra állítása mindig jó
+válasz.”</strong><br />
+Tünet: a rendszer lelassul, ha a swappiness 0-ra állítjuk, és kevés a
+cache. Hipotézis: a kernel túl sokáig tartja az anonymous lapokat, ami a
+cache-t hamar kifogyasztja, és a folyamatok I/O-ra várnak. Adatgyűjtés:
+<code>/proc/pressure/memory</code>, swap aktivitás. Egy változtatás:
+emeljük a swappiness értékét 10–20–60 lépésekben, és mérjük a tail
+latencyt. A swappiness tuning nem univerzális; a munkaterheléshez kell
+igazítani.</p>
+<p><strong>3. „A zram növeli a fizikai RAM-ot.”</strong><br />
+Tünet: a zram swap bevezetése után a rendszer mégis OOM-ot kap.
+Hipotézis: a zram a RAM-ot tömöríti, de nem növeli a fizikai kapacitást;
+ha a tömörítés alacsony hatékonyságú, a nyereség kicsi. Adatgyűjtés:
+<code>zramctl</code>, <code>free -h</code>, <code>/proc/meminfo</code>.
+Ellenpróba: mérjük a tömörítési arányt, és számoljuk a reális
+kapacitást. Ha a munkaterhelés nem kompresszálható (például már
+tömörített média), a zram alig segít.</p>
+<p><strong>4. „A folyamat RSS növekszik, tehát memory leak
+van.”</strong><br />
+Tünet: egy hosszú futású szolgáltatás RSS-e lassan nő. Hipotézis: lehet
+szivárgás, de lehet legitim cache vagy heap fragmentation is.
+Adatgyűjtés: <code>/proc/&lt;pid&gt;/smaps_rollup</code>
+<code>Rss</code> és <code>Pss</code>, <code>ps -o etime,rss</code>,
+valamint a heap profil (például <code>tcmalloc</code> vagy
+<code>jemalloc</code> statisztikája). A restart csak tüneti kezelés, és
+nem különít el: minden heap-állapotot nulláz, a legitim cache-t és a
+fragmentációt is. Elkülönítő a terhelés-normalizált trend: ha azonos
+terhelés mellett az RSS / feldolgozott kérés arány monoton nő, leak
+gyanús; ha platóra áll, growth vagy fragmentáció. A döntés heap-profil
+(heaptrack, jemalloc prof) alapján születik; a végső bizonyíték a kód
+elemzése és a valgrind/ASan.</p>
+<h3 data-number="9.2.10" id="feladatok"><span
+class="header-section-number">9.2.10</span> Feladatok</h3>
+<h4 data-number="9.2.10.1"
+id="magyarázó-feladat-memavailable-értelmezése"><span
+class="header-section-number">9.2.10.1</span> 1. magyarázó feladat –
+MemAvailable értelmezése</h4>
+<p>Adott a következő <code>/proc/meminfo</code> kivonat egy lab VM-ről
+(illusztratív, nem mért):</p>
+<pre><code>MemTotal:       16384000 kB
+MemFree:          800000 kB
+MemAvailable:    2400000 kB
+Cached:          6500000 kB
+Shmem:           4000000 kB
+SwapTotal:       2048000 kB
+SwapFree:        1800000 kB</code></pre>
+<p>(A <code>/proc/meminfo</code> „kB” egysége valójában KiB, azaz 1024
+bájt.) Magyarázd el, miért alacsony a <code>MemFree</code> és miért
+mutat mégis viszonylag magas <code>MemAvailable</code> értéket. Milyen
+műveleti következménye van ennek, ha egy új folyamat 1 GiB anonymous
+memóriát akar foglalni? Milyen döntést hoznál a swap méretéről?</p>
+<h4 data-number="9.2.10.2"
+id="adminisztrációskonfigurációs-feladat-swap-és-swappiness"><span
+class="header-section-number">9.2.10.2</span> 2.
+adminisztrációs/konfigurációs feladat – swap és swappiness</h4>
+<p>A <code>lab-vm-01</code> VM-en jelenleg a swappiness 60. A
+munkaterhelés egy C++ HTTP szolgáltatás, amely sok fájlt olvas, de kevés
+anonymous memóriát használ. Állítsd be a swappiness értékét 10-re úgy,
+hogy túlélje a rebootot (<code>systemd-sysctl</code> konfigurációval),
+majd ellenőrizd a beállítást. Add meg a módosító parancsokat a
+target/privilege/előfeltétel/rollback megjelölésével.</p>
+<h4 data-number="9.2.10.3"
+id="diagnosztikaifailurerecovery-feladat-memórianövekedés"><span
+class="header-section-number">9.2.10.3</span> 3.
+diagnosztikai/failure/recovery feladat – memórianövekedés</h4>
+<p>Egy hosszú futású C++ worker folyamat RSS-e fokozatosan nő, és a
+rendszer időnként lelassul. A folyamat PID-je 1234 (a laborban a
+tényleges PID). Különítsd el a memory leaket a legitim memory growthtól.
+Használj <code>/proc/&lt;pid&gt;/smaps_rollup</code>,
+<code>/proc/pressure/memory</code> és <code>ps</code> adatokat. Ha
+szivárgást találsz, indítsd újra a worker szolgáltatást, és igazold a
+recoveryt. Adj meg minden parancsot target/UID megjelöléssel.</p>
+<h3 data-number="9.2.11" id="megoldások"><span
+class="header-section-number">9.2.11</span> Megoldások</h3>
+<h4 data-number="9.2.11.1" id="megoldás"><span
+class="header-section-number">9.2.11.1</span> 1. Megoldás</h4>
+<p>A MemFree azért alacsony, mert a kernel a RAM nagy részét page
+cache-ként (<code>Cached</code>) használja. A MemAvailable magasabb,
+mert a kernel a visszavehető fájllapok egy részét beleszámítja a
+rendelkezésre álló memóriába. Ugyanakkor a 6 500 000 KiB
+<code>Cached</code>-ből 4 000 000 KiB <code>Shmem</code> (tmpfs,
+<code>/dev/shm</code>), ami nem dobható el, ezért a MemAvailable csak
+kb. 2,29 GiB (2 400 000 KiB), nem a <code>MemFree + Cached</code>
+összeg. Egy 1 GiB anonymous allokáció tehát várhatóan kielégíthető
+anélkül, hogy kötelezően swapolnánk, bár a kernel néhány cache lapot
+eldobhat. A swap mérete 2 048 000 KiB ≈ 1,95 GiB, a
+<code>SwapFree</code> ≈ 1,72 GiB, tehát ha a munkaterhelés mégis nyomást
+okoz, van tartalék. Postcondition: a tanuló helyesen értelmezi a
+MemAvailable-ot, és nem hoz felesleges bővítési döntést a MemFree
+alapján.</p>
+<h4 data-number="9.2.11.2" id="megoldás-1"><span
+class="header-section-number">9.2.11.2</span> 2. Megoldás</h4>
+<p>A swappiness 10 beállítása a következőképpen, rebootálló módon:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-vm-01, UID: root (sudo)</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Előfeltétel: a jelenlegi swappiness ellenőrzött (például 60)</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/sys/vm/swappiness</span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Módosítás: írjuk a drop-in fájlt</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&#39;vm.swappiness=10&#39;</span> <span class="kw">|</span> <span class="fu">sudo</span> tee /etc/sysctl.d/99-swappiness.conf</span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Azonnali érvényesítés:</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> sysctl <span class="at">--load</span><span class="op">=</span>/etc/sysctl.d/99-swappiness.conf</span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Ellenőrzés:</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/sys/vm/swappiness</span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="co"># Rollback:</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rm <span class="at">-f</span> /etc/sysctl.d/99-swappiness.conf</span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> sysctl <span class="at">-w</span> vm.swappiness=60</span></code></pre></div>
+<p>A <code>systemd-sysctl</code> a boot során automatikusan betölti a
+<code>/etc/sysctl.d/</code> alatti fájlokat. A swappiness 10 azt
+jelenti, hogy a kernel a reclaim során előnyben részesíti a tiszta page
+cache eldobását a swapolással szemben, ami a sok fájlt olvasó HTTP
+szolgáltatásnál csökkenti a felesleges swap I/O-t. Postcondition: a
+swappiness 10 érvényes a futó rendszeren és reboot után is; a rollback
+visszaállítja az eredeti 60-at.</p>
+<h4 data-number="9.2.11.3" id="megoldás-2"><span
+class="header-section-number">9.2.11.3</span> 3. Megoldás</h4>
+<p>Első lépés: gyűjtsünk adatokat a folyamatról:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-vm-01, UID: lab</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ps</span> <span class="at">-o</span> pid,etimes,rss,vsz,cmd <span class="at">-p</span> 1234</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;^(Rss|Pss|Private_Dirty|Anonymous):&#39;</span> /proc/1234/smaps_rollup</span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/pressure/memory</span></code></pre></div>
+<p>A <code>smaps_rollup</code> processzszintű összeget ad; a
+<code>smaps</code> VMA-nként írna ki több száz sort. Második lépés:
+vegyünk mintát egy órán át 5 percenként:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-vm-01, UID: lab</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="va">$(</span><span class="fu">seq</span> 12<span class="va">)</span><span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a>  <span class="fu">date</span> +%s</span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a>  <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;^(Rss|Anonymous):&#39;</span> /proc/1234/smaps_rollup</span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a>  <span class="fu">sleep</span> 300</span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span></code></pre></div>
+<p>Ha a folyamat munka közben az RSS növekszik, de munka után csökken
+vagy platóra áll, akkor memory growth-ról van szó. Ha azonos terhelés
+mellett az RSS és az <code>Anonymous</code> monoton nő (a feldolgozott
+kérések számára vetítve is), az szivárgásra utal; a végső döntéshez
+heap-profil kell. A <code>/proc/pressure/memory</code> <code>some</code>
+és <code>full</code> <code>avg10</code> mezői akkor mutatnak növekedést,
+ha a memórianyomás már a futó folyamatokat lassítja.</p>
+<p>Ha a szivárgás valószínű, a recovery a worker szolgáltatás
+újraindítása (az <code>UNIT</code> változóba a laborban a workert indító
+systemd unit nevét írd), majd alapvonal- és egészségellenőrzés:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-vm-01, UID: root (sudo)</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Előfeltétel: a worker systemd unit alatt fut, nem rendszerkritikus</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="va">UNIT</span><span class="op">=</span>lab-worker.service   <span class="co"># a tényleges unitnév</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> status <span class="st">&quot;</span><span class="va">$UNIT</span><span class="st">&quot;</span> <span class="at">--no-pager</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart <span class="st">&quot;</span><span class="va">$UNIT</span><span class="st">&quot;</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Ellenőrzés:</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> is-active <span class="st">&quot;</span><span class="va">$UNIT</span><span class="st">&quot;</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a><span class="va">NEW_PID</span><span class="op">=</span><span class="va">$(</span><span class="ex">systemctl</span> show <span class="at">-p</span> MainPID <span class="at">--value</span> <span class="st">&quot;</span><span class="va">$UNIT</span><span class="st">&quot;</span><span class="va">)</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a><span class="fu">ps</span> <span class="at">-o</span> pid,etimes,rss,cmd <span class="at">-p</span> <span class="st">&quot;</span><span class="va">$NEW_PID</span><span class="st">&quot;</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/pressure/memory</span></code></pre></div>
+<p>Az újraindítás után az új PID RSS-e az indulási alapvonalon van, a
+szolgáltatás aktív, és a <code>/proc/pressure/memory</code> értékei
+csökkennek. Ez csak tüneti recovery: a végső megoldás a kód javítása, és
+a mintavételt az új PID-re meg kell ismételni. Postcondition: a
+szolgáltatás fut és válaszol, a memórianyomás megszűnt, és a tanuló
+képes különbséget tenni a növekedés és a szivárgás között.</p>
+<h3 data-number="9.2.12" id="rövid-összefoglaló"><span
+class="header-section-number">9.2.12</span> Rövid összefoglaló</h3>
+<p>A Linux memória rendelkezésre állása nem a <code>MemFree</code>-ből,
+hanem a <code>MemAvailable</code>-ből és a reclaim állapotából ítélhető
+meg. A page cache memórianyomás alatt eldobható vagy kiírható, az
+anonymous lapok pedig swapra kerülhetnek. A swappiness, a zswap/zram és
+a swap mérete a munkaterheléshez hangolandó, mert téves beállításuk
+lassulást vagy OOM-ot okozhat. Az overcommit szabályozza a virtuális
+memória túlfoglalását, de nem garantál fizikai lapot. A memórianövekedés
+elkülönítése a szivárgástól az RSS trend és a
+<code>/proc/pressure/memory</code> alapján történik.</p>
+<p><strong>Továbbhasznált definíciók:</strong></p>
+<ul>
+<li><strong>Page cache:</strong> A kernel által a blokkeszközökről
+beolvasott fájltartalmak gyorsítótára, amely memórianyomás alatt
+felszabadítható.</li>
+<li><strong>MemAvailable:</strong> A kernel által becsült, új
+allokációkhoz swap nélkül rendelkezésre álló memória, amely a könnyen
+visszavonható cache-t is figyelembe veszi.</li>
+<li><strong>Reclaim:</strong> A kernel folyamata (<code>kswapd</code> a
+háttérben, direct reclaim az allokáló processzben), amely lapokat
+szabadít fel a memórianyomás csökkentésére, a tiszta cache eldobásával,
+a dirty lapok writeback utáni visszavételével, az anonymous lapok swapra
+helyezésével és a slab shrinkerekkel.</li>
+</ul>
+<h3 data-number="9.2.13" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">9.2.13</span> Források és ellenőrzési
+hiányok</h3>
+<p>A következő források kiindulópontok, nem olvasott vagy ellenőrzött
+bizonyítékok ebben a kérésben:</p>
+<ul>
+<li><a href="https://docs.kernel.org/">Kernel documentation</a></li>
+<li><a href="https://man7.org/linux/man-pages/">Linux man pages</a></li>
+<li><a href="https://systemd.io/">systemd.io</a></li>
+</ul>
+<p>Állításonkénti forrásindex (viszonyítási pont: Ubuntu Server 24.04
+LTS, 6.8-as GA kernel; a docs.kernel.org a legfrissebb kernelt mutatja,
+a 6.8-as eltérést a laborban ellenőrizni kell):</p>
+<ul>
+<li><code>swappiness</code> (0–200), <code>overcommit_memory</code>,
+<code>overcommit_ratio</code>, <code>overcommit_kbytes</code>,
+<code>dirty_*</code>:
+https://docs.kernel.org/admin-guide/sysctl/vm.html.</li>
+<li>Overcommit módok és a <code>CommitLimit</code> képlete:
+https://docs.kernel.org/mm/overcommit-accounting.html.</li>
+<li><code>/proc/meminfo</code> mezői (<code>MemAvailable</code>,
+<code>Shmem</code>, <code>KReclaimable</code>, <code>CommitLimit</code>,
+<code>Committed_AS</code>):
+https://docs.kernel.org/filesystems/proc.html – „meminfo” rész;
+https://man7.org/linux/man-pages/man5/proc_meminfo.5.html.</li>
+<li>zswap: https://docs.kernel.org/admin-guide/mm/zswap.html; zram:
+https://docs.kernel.org/admin-guide/blockdev/zram.html.</li>
+<li>PSI: https://docs.kernel.org/accounting/psi.html.</li>
+<li><code>fincore</code>:
+https://man7.org/linux/man-pages/man1/fincore.1.html (util-linux).</li>
+</ul>
+<p>A példák laborban ellenőrizendők; dátumozott futtatási napló (kernel-
+és tool-verzió, parancskimenet, sikeres és hibás ág) még nem
+készült.</p>
+<p>Ellenőrzési hiány: a swappiness, a zswap/zram és az overcommit pontos
+viselkedése a labor kernelverziójától függ. Az Ubuntu Server 24.04 LTS
+aktuális kerneléhez tartozó dokumentációt és a <code>/proc</code> mezők
+pontos definícióját a laborban ellenőrizni kell. A pédában megadott
+memóriakiinduló értékek illusztratívak, nem tényleges mérések.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d041.html">← 9.1 Lapozás, page fault, mmap és copy-on-write</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d043.html">9.3 OOM, PSI és memóriahibák működtetése →</a></div>
+</nav>
+</body>
+</html>

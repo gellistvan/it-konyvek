@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>50.3 Központi logplatform és adatpipeline – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch50">50 Metrics, logs, traces és observability platform</a></p>
+<div class="links"><a class="prev" rel="prev" href="d247.html">← 50.2 Prometheus, exporter és PromQL</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d249.html">50.4 OpenTelemetry, distributed trace és C++ instrumentation →</a></div>
+</nav>
+<h2 data-number="50.3" id="d248"><span
+class="header-section-number">50.3</span> Központi logplatform és
+adatpipeline</h2>
+<h3 data-number="50.3.1" id="motiváció"><span
+class="header-section-number">50.3.1</span> Motiváció</h3>
+<p>Egy többkomponensű szolgáltatásban a lokális <code>journald</code>, a
+konténer-stdout és az alkalmazásfájl külön-külön csak a hibák szűk
+ablakát mutatja. A szenior C++ fejlesztő számára ismerős a
+függvényhívási lánc, a buffer és a queue fogalma: a központi logplatform
+ugyanezt a gondolatot terjeszti ki a gépek határain túlra. Egy request
+végighaladhat egy API gateway-en, egy compute szolgáltatáson, egy
+háttértáron, de ha minden komponens csak a saját lokális naplójába ír, a
+hibakeresés több SSH-munkamenet és kézi időbélyeg-illesztés lesz. A
+központi logpipeline célja, hogy a tranzakcióhoz tartozó összes esemény
+egyetlen, hozzáféréssel szabályozott, lekérdezhető, retencióval kezelt
+adathalmazba kerüljön, miközben a naplóvesztés és a duplikáció
+kockázatát explicit módon kezeljük.</p>
+<h3 data-number="50.3.2" id="definíció-és-működés"><span
+class="header-section-number">50.3.2</span> Definíció és működés</h3>
+<p>A <strong>központi logplatform</strong> egy olyan adatút (pipeline),
+amely négy szereplőre bontható: <strong>forrás és agent
+(source/agent)</strong>, <strong>gyűjtő és pufferközeg
+(collector/buffer)</strong>, <strong>tároló és index
+(store/index)</strong>, valamint <strong>lekérdezés és riasztás
+(query/alert)</strong>. Az <strong>agent</strong> a forrásgépen futó
+folyamat, amely tail, journald vagy konténer-stdout olvasásával kinyeri
+a logot, majd átalakítja, címkézi és továbbítja. A
+<strong>collector</strong> a hálózati belépési pont, amely a beérkező
+logot fogadja, rendezi és a tárolóba írja. A <strong>store</strong> a
+hosszú távon megőrzött, lekérdezhető adatbázis; ez lehet szabad szöveges
+kereső vagy címkézett, időalapú chunk-rendszer. A <strong>query</strong>
+a felhasználói lekérdezési réteg, gyakran webes felülettel és API-val. A
+logszállítás tipikusan <em>at-least-once</em> szemantikájú: az üzenet
+legalább egyszer megérkezik, de hálózati hiba és retry esetén többször
+is bekerülhet.</p>
+<p>A <strong>logloss</strong> olyan esemény, amikor a forrásnál
+keletkezett log nem jelenik meg a store-ban. Oka lehet a forrás buffer
+túlcsordulása, az agent memóriapufferének elvesztése, a collector
+visszautasítása vagy a disk buffer helytelen commitja. A
+<strong>duplication</strong> ennek az ellenkezője: ugyanaz a
+logbejegyzés többször is bekerül, tipikusan retry vagy olvasási
+offset-visszaállás miatt. A <strong>sensitive data policy</strong>
+azoknak a szabályoknak az összessége, amelyek meghatározzák, milyen adat
+kerülhet naplóba, hogyan kell redactálni (kitakarni), milyen hozzáférési
+szintek léteznek, és meddig őrizhető meg. A cél nem a titkosítás
+utólagos hozzáadása, hanem a szenzitív mezők forrásközeli
+eltávolítása.</p>
+<p>A Linux <code>journald</code> a lokális rendszernapló; a journalba a
+<code>sd_journal_send()</code> API-val vagy a <code>systemd-cat</code>
+paranccsal strukturált mezők is írhatók (a
+<code>sd_journal_print()</code> csak a <code>MESSAGE</code> mezőt tölti
+ki). A konténer-stdout általában a container runtime által a host
+journalba vagy a <code>/var/log/containers</code> alá kerülő JSON-vonal.
+Az agent a journal fájlokat az <code>sd-journal</code> könyvtáron
+keresztül olvassa: perzisztens tárolásnál a
+<code>/var/log/journal</code>, volatilis tárolásnál a
+<code>/run/log/journal</code> könyvtárból. A journaldnak nincs saját
+REST API-ja; HTTP-hozzáférést csak a külön
+<code>systemd-journal-gatewayd</code> szolgáltatás ad. A legtöbb agent
+(Promtail, Vector, Fluent Bit, OpenTelemetry Collector) a journal- és a
+fájlforrást is támogatja. A feldolgozás első lépése a <strong>multiline
+merge</strong>: ha egy Java vagy C++ stack trace több sorban érkezik,
+azokat egy logikai bejegyzéssé kell összevonni. Ezt egy
+<code>firstline</code> reguláris kifejezéssel adjuk meg, amely
+illeszkedik a naplóbejegyzés első sorára – a mintának a tényleges
+logformátumot kell követnie (JSON-sornál például a
+<code>{"timestamp":</code> kezdetet). A második lépés a
+<strong>parsing</strong>: a szöveges logból strukturált mezőket nyerünk
+ki (JSON, key-value, regex). A mezőket két csoportra osztjuk:
+<strong>label</strong> és <strong>tartalmi mező</strong>. A label a
+stream azonosítására szolgál, alacsony kardinalitású értékekkel (host,
+service, environment, cluster, level). A tartalmi mező kezelése a
+store-tól függ: az OpenSearch minden mezőre invertált indexet (index
+mezőt) épít, a Loki viszont csak a labeleket indexeli, a tartalmi mező a
+logsorban marad (lekérdezéskor <code>| json | request_id="r-123"</code>
+szűréssel érhető el), vagy a <code>structured_metadata</code> stage-gel
+külön metaadatként küldhető. A két típust szigorúan el kell különíteni:
+ha egy request ID-t labelbe teszünk, minden kérés új streamet hoz létre,
+ami felrobbantja az indexet és a költséget. A request ID tehát nem
+label; a label a <code>service</code> és a <code>host</code> marad.</p>
+<figure id="fig-d248-logpipeline">
+<div class="fig-interactive"><iframe src="figures/html/d248-logpipeline.html" title="A labapp logsora a Promtail multiline, json, timestamp, labels és replace stage-én át a memóriapufferbe, majd HTTP pushsal a Lokiba jut; a replace után a jelszó REDACTED. Kiesésnél a Lokiban 13:00 és 13:05 között hiány van, a positions 13:05:10-en áll, a visszajátszás a 13:05:00 és 13:05:10 közötti sorokat duplikálja." loading="lazy" style="width:100%;border:0;height:600px"></iframe><noscript><img src="figures/img/d248-logpipeline.png" style="width:95.0%"
+alt="A labapp logsora a Promtail multiline, json, timestamp, labels és replace stage-én át a memóriapufferbe, majd HTTP pushsal a Lokiba jut; a replace után a jelszó REDACTED. Kiesésnél a Lokiban 13:00 és 13:05 között hiány van, a positions 13:05:10-en áll, a visszajátszás a 13:05:00 és 13:05:10 közötti sorokat duplikálja." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d248-logpipeline.png" style="width:95.0%"
+alt="A labapp logsora a Promtail multiline, json, timestamp, labels és replace stage-én át a memóriapufferbe, majd HTTP pushsal a Lokiba jut; a replace után a jelszó REDACTED. Kiesésnél a Lokiban 13:00 és 13:05 között hiány van, a positions 13:05:10-en áll, a visszajátszás a 13:05:00 és 13:05:10 közötti sorokat duplikálja." /></details></div>
+<figcaption>Logpipeline adatút és logloss: (a) a mintasor útja a
+Promtail stage-ein, (b) kiesés, újraindítás és visszajátszás (a 3.
+feladat forgatókönyve)</figcaption>
+</figure>
+<p>A <strong>buffer/retry/backpressure</strong> a logpipeline
+legfontosabb üzembiztonsági kérdése. Az agent fogadja a forrásból érkező
+sorokat, de a hálózat és a collector nem mindig áll rendelkezésre. Ha az
+agent minden sort azonnal elküld, egy hálózati kiesés azonnali logloss-t
+okoz. Ezért az agent egy puffert tart fenn; ez lehet memória- vagy
+disk-alapú. A memóriapuffer gyors, de az agent újraindulásakor
+elveszhet. A diskalapú puffer megőrzi az adatot, de I/O-terhelést
+jelent. Az agent <strong>retry</strong> logikája exponenciális
+visszalépést használ: először rövid, majd egyre hosszabb várakozás, amíg
+a collector ismét elérhetővé válik. A <strong>backpressure</strong> azt
+jelenti, hogy ha a collector túlterhelt, a küldő oldalt visszafogja: a
+Promtail például a <code>batchwait</code> és a <code>batchsize</code>
+növelésével lassítja a küldést, a Vector a <code>buffer.max_size</code>
+elérésekor a forrás olvasását állítja le vagy blokkolja a fogyasztót. A
+Linux kernelben ez a gondolat hasonló a <code>d008</code> fejezetben
+tárgyalt várakozási sorhoz: a sor hosszát explicit módon korlátozni
+kell, és a túlfolyó logot vagy eldobjuk, vagy a forrást lassítjuk. A
+naplózásnál a legtöbb rendszer a <em>drop-oldest</em> policy-t
+választja, mert a szolgáltatás válaszideje fontosabb, mint a teljes
+logmegőrzés; a fontos biztonsági eseményeket azonban szinkron módon kell
+írni.</p>
+<p>A <strong>Loki/OpenSearch támogatott profil</strong> különbsége a
+tárolási modellben van. A Loki a logstreamet a labelkombinációval
+azonosítja, és a log tartalmát tömörített chunkokban tárolja; a
+kereséshez a logstreamet és az időablakot kell ismerni, a tartalmon
+belüli teljes szövegű keresés a chunkok beolvasását jelenti. Az
+OpenSearch (korábbi Elasticsearch) invertált indexet épít minden mezőre,
+ami gyors teljes szövegű keresést ad, de több tárhelyet és CPU-t
+igényel. A jelen tananyag a fogalmi modellt tanítja; a konkrét labbeli
+verziók és a támogatott beállítások a <code>sources.md</code> szerint
+ellenőrizendők.</p>
+<p>A <strong>retention/access/redaction</strong> három egymástól
+független politika. A retention az adatok megőrzési ideje; tipikus
+szabály, hogy a hibakeresési logot 7 napig, a biztonsági auditlogot 90
+napig őrizzük. A hozzáférés (access) a tenant- vagy projekt-alapú
+elkülönítés; a Loki és az OpenSearch is támogatja a fejlécalapú
+tenant-azonosítást és a szerepkör-alapú hozzáférést. A redaction a
+naplóbejegyzésben lévő szenzitív adatok eltávolítása vagy átírása; ezt
+már az agentnél, a forrás közelében el kell végezni, hogy a hálózaton és
+a tárolóban csak a tisztított adat jelenjen meg. A policy kimondja: ne
+kerüljön plaintext jelszó, token, cookie, személyes adat a logba; ha
+mégis megtörténik, az agent reguláris kifejezéssel
+<code>REDACTED</code>-re cseréli.</p>
+<p>A <strong>time skew/order és deploy marker</strong> a többgépes log
+korrelációjának feltétele. A gépek órája eltérhet, ezért a
+logbejegyzésnek két időbélyeget kell hordoznia: a forrásnál rögzített
+<code>timestamp</code>-et és a fogadás időpontját
+(<code>received_at</code>). A sorrend kizárólag a forrásidőből nem
+garantálható, ezért a deploy és a request szintű azonosító, a
+<strong>correlation ID</strong> (lásd <code>d083</code>) az igazi
+rendező kulcs. Minden logbejegyzésnek tartalmaznia kell a szolgáltatás
+verzióját vagy a commit hash-t, a környezet nevét és a correlation ID-t,
+ha van. A deploy marker egy speciális logbejegyzés, amelyet a deploy
+folyamat ír a naplóba a változás elején és végén, hogy a hibakereséskor
+el tudjuk különíteni a régi és az új verzió eseményeit.</p>
+<h3 data-number="50.3.3" id="kidolgozott-példa"><span
+class="header-section-number">50.3.3</span> Kidolgozott példa</h3>
+<p>A következő példa egy izolált labkommunikációt mutat be: a
+<code>vm-logsource</code> gépen fut a <code>labapp</code> szolgáltatás
+és a <code>promtail</code> agent, a <code>vm-logcore</code> gépen a Loki
+és a Grafana. A hálózat a dokumentációs <code>192.0.2.0/24</code>
+tartományt használja; a <code>vm-logsource</code> címe
+<code>192.0.2.10</code>, a <code>vm-logcore</code> címe
+<code>192.0.2.20</code>. A <code>labapp</code> egy C++ szolgáltatás,
+amely soronként egy JSON objektumot ír, például
+<code>{"timestamp":"2025-01-01T13:00:01.123Z","level":"error","message":"db timeout password=hunter2","request_id":"r-123"}</code>;
+egy összeomláskor kiírt stack trace viszont nyers, több soros szövegként
+következik a JSON-sor után. A cél: a journald rendszernapló és a
+<code>labapp</code> logja központilag legyen lekérdezhető, a jelszó
+mezők redactáltak, a hálózati kiesés ne okozzon adatvesztést.</p>
+<p>Először a <code>labapp</code> systemd unitja biztosítja, hogy a
+stdout/stderr a journalba kerüljön, a fájl pedig a
+<code>/var/log/labapp/app.log</code> maradjon. A Promtail konfiguráció
+<code>promtail.yml</code>:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">server</span><span class="kw">:</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">http_listen_port</span><span class="kw">:</span><span class="at"> </span><span class="dv">9080</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">grpc_listen_port</span><span class="kw">:</span><span class="at"> </span><span class="dv">0</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="fu">positions</span><span class="kw">:</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">filename</span><span class="kw">:</span><span class="at"> /var/lib/promtail/positions.yaml</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="fu">clients</span><span class="kw">:</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">url</span><span class="kw">:</span><span class="at"> http://192.0.2.20:3100/loki/api/v1/push</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">batchwait</span><span class="kw">:</span><span class="at"> 1s</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">batchsize</span><span class="kw">:</span><span class="at"> </span><span class="dv">1048576</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">backoff_config</span><span class="kw">:</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">min_period</span><span class="kw">:</span><span class="at"> 100ms</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">max_period</span><span class="kw">:</span><span class="at"> 5m</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">max_retries</span><span class="kw">:</span><span class="at"> </span><span class="dv">10</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="fu">scrape_configs</span><span class="kw">:</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">job_name</span><span class="kw">:</span><span class="at"> journal</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">journal</span><span class="kw">:</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">max_age</span><span class="kw">:</span><span class="at"> 12h</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">host</span><span class="kw">:</span><span class="at"> vm-logsource</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">job</span><span class="kw">:</span><span class="at"> systemd-journal</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">relabel_configs</span><span class="kw">:</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">source_labels</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&#39;__journal__systemd_unit&#39;</span><span class="kw">]</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">target_label</span><span class="kw">:</span><span class="at"> </span><span class="st">&#39;unit&#39;</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">source_labels</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&#39;__journal__hostname&#39;</span><span class="kw">]</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">target_label</span><span class="kw">:</span><span class="at"> </span><span class="st">&#39;host&#39;</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">job_name</span><span class="kw">:</span><span class="at"> labapp</span></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">static_configs</span><span class="kw">:</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">targets</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="at">localhost</span><span class="kw">]</span></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">host</span><span class="kw">:</span><span class="at"> vm-logsource</span></span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">service</span><span class="kw">:</span><span class="at"> labapp</span></span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">environment</span><span class="kw">:</span><span class="at"> lab</span></span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">__path__</span><span class="kw">:</span><span class="at"> /var/log/labapp/app.log</span></span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">pipeline_stages</span><span class="kw">:</span></span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">multiline</span><span class="kw">:</span></span>
+<span id="cb1-40"><a href="#cb1-40" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">firstline</span><span class="kw">:</span><span class="at"> </span><span class="st">&#39;^\{&quot;timestamp&quot;:&#39;</span></span>
+<span id="cb1-41"><a href="#cb1-41" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">max_wait_time</span><span class="kw">:</span><span class="at"> 3s</span></span>
+<span id="cb1-42"><a href="#cb1-42" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">json</span><span class="kw">:</span></span>
+<span id="cb1-43"><a href="#cb1-43" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">expressions</span><span class="kw">:</span></span>
+<span id="cb1-44"><a href="#cb1-44" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">timestamp</span><span class="kw">:</span><span class="at"> timestamp</span></span>
+<span id="cb1-45"><a href="#cb1-45" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">level</span><span class="kw">:</span><span class="at"> level</span></span>
+<span id="cb1-46"><a href="#cb1-46" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">message</span><span class="kw">:</span><span class="at"> message</span></span>
+<span id="cb1-47"><a href="#cb1-47" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">request_id</span><span class="kw">:</span><span class="at"> request_id</span></span>
+<span id="cb1-48"><a href="#cb1-48" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">timestamp</span><span class="kw">:</span></span>
+<span id="cb1-49"><a href="#cb1-49" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">source</span><span class="kw">:</span><span class="at"> timestamp</span></span>
+<span id="cb1-50"><a href="#cb1-50" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">format</span><span class="kw">:</span><span class="at"> RFC3339Nano</span></span>
+<span id="cb1-51"><a href="#cb1-51" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb1-52"><a href="#cb1-52" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">level</span><span class="kw">:</span></span>
+<span id="cb1-53"><a href="#cb1-53" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">match</span><span class="kw">:</span></span>
+<span id="cb1-54"><a href="#cb1-54" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">selector</span><span class="kw">:</span><span class="at"> </span><span class="st">&#39;{service=&quot;labapp&quot;}&#39;</span></span>
+<span id="cb1-55"><a href="#cb1-55" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">stages</span><span class="kw">:</span></span>
+<span id="cb1-56"><a href="#cb1-56" aria-hidden="true" tabindex="-1"></a><span class="co">            # JSON-mező értéke: &quot;password&quot;:&quot;...&quot; -&gt; &quot;password&quot;:&quot;[REDACTED]&quot;</span></span>
+<span id="cb1-57"><a href="#cb1-57" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="kw">-</span><span class="at"> </span><span class="fu">replace</span><span class="kw">:</span></span>
+<span id="cb1-58"><a href="#cb1-58" aria-hidden="true" tabindex="-1"></a><span class="fu">                expression</span><span class="kw">: </span><span class="ch">&gt;-</span></span>
+<span id="cb1-59"><a href="#cb1-59" aria-hidden="true" tabindex="-1"></a>                  (?i)&quot;(?:password|secret|token|session_token)&quot;\s*:\s*&quot;([^&quot;]*)&quot;</span>
+<span id="cb1-60"><a href="#cb1-60" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="fu">replace</span><span class="kw">:</span><span class="at"> </span><span class="st">&#39;[REDACTED]&#39;</span></span>
+<span id="cb1-61"><a href="#cb1-61" aria-hidden="true" tabindex="-1"></a><span class="co">            # key=value alak: password=... -&gt; password=[REDACTED]</span></span>
+<span id="cb1-62"><a href="#cb1-62" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="kw">-</span><span class="at"> </span><span class="fu">replace</span><span class="kw">:</span></span>
+<span id="cb1-63"><a href="#cb1-63" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="fu">expression</span><span class="kw">:</span><span class="at"> </span><span class="st">&#39;(?i)(?:password|secret|token)=([^ &quot;]+)&#39;</span></span>
+<span id="cb1-64"><a href="#cb1-64" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="fu">replace</span><span class="kw">:</span><span class="at"> </span><span class="st">&#39;[REDACTED]&#39;</span></span></code></pre></div>
+<p>A <code>multiline</code> stage <code>firstline</code> mintája a
+JSON-sor kezdetére (<code>{"timestamp":</code>) illeszkedik, így a nyers
+stack trace sorai az előző JSON-bejegyzéshez fűződnek; az ilyen
+összevont bejegyzésen a <code>json</code> stage parse-hibát jelez, de a
+bejegyzés egyben kerül a Lokiba. A <code>timestamp</code> stage nélkül a
+Loki a beolvasás idejét tárolná, nem a forrásidőt. A Promtail
+<code>regex</code> stage csak kinyer (névvel ellátott capture groupokat
+tesz az extracted mapbe), a sort nem módosítja; a sor átírására a
+<code>replace</code> stage szolgál, amely a capture group illeszkedését
+cseréli a <code>replace</code> értékre. A Promtail telepítése után a
+<code>positions</code> fájl fájlonként a feldolgozott bájt-offsetet (a
+journalnál a journal cursort) tárolja. Ha a <code>labapp</code> logjában
+a <code>password=hunter2</code> szerepel, az agent kicseréli, és a store
+már csak a <code>password=[REDACTED]</code> értéket látja; a hatást a
+<code>|= "hunter2"</code> ellenpróba igazolja (üres eredmény). A
+stage-ek pontos szintaxisa a labban rögzített Promtail- (vagy utód
+Grafana Alloy-) verzió dokumentációjából ellenőrizendő.</p>
+<p>A Loki single-node konfiguráció <code>loki-config.yml</code>
+vázlata:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">auth_enabled</span><span class="kw">:</span><span class="at"> </span><span class="ch">false</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">server</span><span class="kw">:</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">http_listen_port</span><span class="kw">:</span><span class="at"> </span><span class="dv">3100</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="fu">common</span><span class="kw">:</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">instance_addr</span><span class="kw">:</span><span class="at"> </span><span class="fl">192.0.2.20</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">path_prefix</span><span class="kw">:</span><span class="at"> /var/lib/loki</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">storage</span><span class="kw">:</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">filesystem</span><span class="kw">:</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">chunks_directory</span><span class="kw">:</span><span class="at"> /var/lib/loki/chunks</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">rules_directory</span><span class="kw">:</span><span class="at"> /var/lib/loki/rules</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">replication_factor</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="fu">schema_config</span><span class="kw">:</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">configs</span><span class="kw">:</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">from</span><span class="kw">:</span><span class="at"> 2025-01-01</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">store</span><span class="kw">:</span><span class="at"> tsdb</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">object_store</span><span class="kw">:</span><span class="at"> filesystem</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">schema</span><span class="kw">:</span><span class="at"> v13</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">index</span><span class="kw">:</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">prefix</span><span class="kw">:</span><span class="at"> index_</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">period</span><span class="kw">:</span><span class="at"> 24h</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a><span class="fu">compactor</span><span class="kw">:</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">working_directory</span><span class="kw">:</span><span class="at"> /var/lib/loki/compactor</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">retention_enabled</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">delete_request_store</span><span class="kw">:</span><span class="at"> filesystem</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a><span class="fu">limits_config</span><span class="kw">:</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">retention_period</span><span class="kw">:</span><span class="at"> 168h</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">max_entries_limit_per_query</span><span class="kw">:</span><span class="at"> </span><span class="dv">5000</span></span></code></pre></div>
+<p>A <code>schema: v13</code> és a <code>store: tsdb</code> a jelen
+példa illusztrációja; az aktuálisan támogatott sémát a labbeli Loki
+verzió dokumentációja alapján kell beállítani. A
+<code>retention_period: 168h</code> hét napos megőrzést ír elő, de csak
+bekapcsolt compactor-retentionnel töröl: a <code>compactor</code> blokk
+<code>retention_enabled: true</code> nélkül a chunkok korlátlanul
+megmaradnak. A <code>compactor</code> kulcsai verziófüggők (a
+<code>delete_request_store</code> újabb kiadásokban kötelező);
+ellenőrzés:
+<code>curl -s http://192.0.2.20:3100/config | grep -A3 retention_enabled</code>.</p>
+<p>A parancsok célzottan:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># vm-logsource, UID 1000: Promtail indítása</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl enable <span class="at">--now</span> promtail</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl status promtail</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">-u</span> promtail <span class="at">--since</span> <span class="st">&quot;5 minutes ago&quot;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /var/lib/promtail/positions.yaml</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="co"># vm-logcore, UID 1000: Loki readiness</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> http://192.0.2.20:3100/ready</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="co"># Lekérdezés Grafana/Loki API-val, vm-logcore, UID 1000</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-G</span> <span class="at">-s</span> <span class="st">&quot;http://192.0.2.20:3100/loki/api/v1/query_range&quot;</span> <span class="dt">\</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>  <span class="at">--data-urlencode</span> <span class="st">&#39;query={service=&quot;labapp&quot;} |= &quot;password&quot;&#39;</span> <span class="dt">\</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>  <span class="at">--data-urlencode</span> <span class="st">&#39;since=15m&#39;</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="co"># Ellenpróba: a plaintext jelszóra nem lehet találat</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-G</span> <span class="at">-s</span> <span class="st">&quot;http://192.0.2.20:3100/loki/api/v1/query_range&quot;</span> <span class="dt">\</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>  <span class="at">--data-urlencode</span> <span class="st">&#39;query={service=&quot;labapp&quot;} |= &quot;hunter2&quot;&#39;</span> <span class="dt">\</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>  <span class="at">--data-urlencode</span> <span class="st">&#39;since=15m&#39;</span></span></code></pre></div>
+<p>A lekérdezés relatív időablakot (<code>since=15m</code>) használ, így
+a labor futtatásakor keletkezett friss sorokat találja. Várható kimenet
+(szemléltető, nem futtatott): a <code>ready</code> válasz
+<code>ready</code>, a <code>journalctl</code> nem mutat hálózati hibát,
+a <code>positions</code> fájl a <code>labapp.log</code> bájt-offsetjét
+tartalmazza, az első query a redactált <code>password=[REDACTED]</code>
+sort adja vissza, a <code>hunter2</code> ellenpróba eredménye üres. A
+<code>request_id</code> nem label: a logsorban marad, és
+<code>{service="labapp"} | json | request_id="r-123"</code> alakú
+lekérdezéssel szűrhető.</p>
+<h3 data-number="50.3.4" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">50.3.4</span> Tipikus hibák és
+ellenpróbák</h3>
+<p><strong>Hiba: túl nagy label-kardinalitás.</strong> A fejlesztő a
+<code>request_id</code>-t labelbe teszi, mert kényelmes szűrni rá. Az
+eredmény több millió stream, lassú lekérdezés és megnövekedett index.
+<em>Adatgyűjtés:</em> <code>loki_ingester_streams_created_total</code>
+vagy <code>loki_discarded_samples_total</code> metrika;
+<em>javítás:</em> a <code>request_id</code> maradjon a logsorban
+(<code>| json</code> szűréssel kereshető) vagy menjen structured
+metadataként, ne label.</p>
+<p><strong>Hiba: multiline nem működik.</strong> A stack trace külön
+sorokként jelenik meg, vagy több bejegyzés egy blokkba olvad.
+<em>Adatgyűjtés:</em> <code>promtail -dry-run</code> vagy a
+<code>positions</code> fájl állapota; <em>javítás:</em> a
+<code>firstline</code> regex nem illeszkedik a naplóformátumra – például
+<code>^\d{4}-\d{2}-\d{2}T</code> mintát vár, de a <code>labapp</code>
+minden bejegyzése <code>{"timestamp":</code>-pal kezdődik, így egyik sor
+sem lesz „első sor”, és a stage a <code>max_wait_time</code> lejártáig
+mindent egy blokkba fűz. A regexet a tényleges formátumhoz
+(<code>^\{"timestamp":</code>) kell igazítani.</p>
+<p><strong>Hiba: logloss újraindításkor.</strong> A Promtail
+memóriapuffert használ, a hálózati kiesés alatt a buffer megtelik, a
+folyamat újraindul, és a még nem továbbított sorok elvesznek.
+<em>Javítás:</em> a <code>clients</code> alatt valós disk buffer
+beállítása a Promtail verziójától függ; ha nincs ilyen, a journald
+source esetén a <code>positions</code> cursor visszaállításával újra
+lehet olvasni a journalból.</p>
+<p><strong>Hiba: duplikáció retry után.</strong> A collector 503-at ad,
+az agent újraküldi, de az első kérés is beírta a logot; a store-ban a
+sor kétszer jelenik meg. <em>Megoldás:</em> a logfogyasztóknak
+idempotensnek kell lenniük, vagy a forrásnak egyedi log ID-t kell adni.
+A pipeline garantáltan at-least-once, ezért a lekérdezésnél számolni
+kell a duplikátumokkal.</p>
+<p><strong>Hiba: szenzitív adat a store-ban.</strong> A redaction stage
+kimarad, vagy nem illeszkedik a JSON mezőre, és a jelszó plaintext kerül
+a Lokiba. <em>Ellenpróba:</em> lekérdezés <code>|= "hunter2"</code>; ha
+visszaad sorokat, a redaction nem működött. <em>Javítás:</em> a
+redactionhöz <code>replace</code> stage kell (a <code>regex</code> stage
+nem ír át), a <code>match</code> selector megfelelő legyen, és a minta a
+JSON-alakra (<code>"password":"…"</code>) is illeszkedjen.</p>
+<p><strong>Hiba: időbélyeg-szinkron eltérés.</strong> A
+<code>vm-logsource</code> órája 30 másodpercet késik, ezért a deploy
+marker után a sorrend nem a valós sorrendet mutatja.
+<em>Adatgyűjtés:</em> <code>chronyc tracking</code> a forráson és a
+core-on; <em>javítás:</em> a forrásidőt a <code>timestamp</code> mezőben
+tartjuk és a Promtail <code>timestamp</code> stage-e ebből állítja be a
+bejegyzés idejét, a <code>received_at</code> pedig a fogadáskor rögzül;
+a deploy marker és a correlation ID a korrelációt függetleníti a
+falóra-eltéréstől.</p>
+<h3 data-number="50.3.5" id="feladatok"><span
+class="header-section-number">50.3.5</span> Feladatok</h3>
+<ol type="1">
+<li><p><strong>Magyarázó feladat:</strong> Tervezzen
+logpipeline-szerződést egy C++ mikroszolgáltatáshoz, amely JSON logot ír
+a stdoutra, és a következő mezőket tartalmazza: <code>timestamp</code>,
+<code>level</code>, <code>message</code>, <code>user_id</code>,
+<code>request_id</code>, <code>session_token</code>. Döntse el, melyik
+mező legyen label, melyik index mező, és milyen redaction szükséges.
+Indokolja a választást, és adjon meg egy háromszintű hozzáférési
+modellt: fejlesztő, operations, security auditor.</p></li>
+<li><p><strong>Adminisztrációs/konfigurációs feladat:</strong> A
+<code>vm-logsource</code> gépen konfigurálja a Promtailt úgy, hogy a
+<code>labapp</code> logját a <code>/var/log/labapp/app.log</code>-ból
+gyűjtse, a stack trace-t multiline összevonja, a
+<code>session_token</code> mezőt redactálja, és a
+<code>request_id</code>-t index mezőként továbbítsa. Adja meg a teljes
+<code>promtail.yml</code> konfigurációt, a <code>positions</code> fájl
+elérési útját, és ellenőrizze, hogy a Loki query visszaadja-e a
+redactált sort. Tüntesse fel a targetet (<code>vm-logsource</code>, UID
+1000), a szükséges jogosultságokat és a rollback lépést.</p></li>
+<li><p><strong>Diagnosztikai/failure recovery feladat:</strong> A
+hálózati kiesés után a Grafana nem mutatja a <code>13:00:00</code> és
+<code>13:05:00</code> közötti <code>labapp</code> hibaeseményeket. A
+<code>journalctl -u promtail</code> nem jelez hibát, a
+<code>positions</code> fájlban tárolt bájt-offset azonban a
+<code>13:05:10</code>-es logsor utáni pozícióra mutat. A Loki
+<code>ready</code> endpoint elérhető, de a query üres. Diagnosztizálja a
+lehetséges okokat, gyűjtsön bizonyítékot, és válasszon egy javítási
+stratégiát a hiányzó adatok visszajátszására. Adjon meg parancsokat és
+ellenőrzési feltételeket a <code>vm-logsource</code> és
+<code>vm-logcore</code> gépekre.</p></li>
+</ol>
+<h3 data-number="50.3.6" id="megoldások"><span
+class="header-section-number">50.3.6</span> Megoldások</h3>
+<ol type="1">
+<li><p><strong>Szerződés és indoklás:</strong> A <code>label</code>
+készlet legyen <code>service</code>, <code>environment</code>,
+<code>host</code>, <code>cluster</code> és <code>level</code> – ezek
+alacsony kardinalitásúak (a <code>level</code> 4–6 értéket vesz fel). A
+<code>user_id</code> és a <code>request_id</code> kérésenként változik,
+ezért nem label: Lokiban a logsorban marad (<code>| json</code>
+szűréssel kereshető) vagy structured metadataként megy, OpenSearch-ben
+index mező. A <code>session_token</code> egyáltalán nem kerülhet
+tárolásra. A redaction: a <code>session_token</code> mezőt már az
+alkalmazásban el kell hagyni, az agentben pedig reguláris kifejezéssel
+<code>REDACTED</code>-re cserélni. A hozzáférés: a fejlesztő csak a
+saját <code>service</code> labelű streamhez fér hozzá; az operations
+csapat az <code>environment</code> és a <code>host</code> dimenzióban
+láthat minden hibát, de nem láthatja a <code>user_id</code> raw értékét;
+a security auditor a redactált napló mellett a retention idejéig
+hozzáfér a teljes audit mezőhöz, de nem a <code>session_token</code>
+plaintexthez. Postcondition: a store-ban nincs plaintext token, a
+labelszám kezelhető.</p></li>
+<li><p><strong>Konfiguráció:</strong> A <code>promtail.yml</code> fenti
+kidolgozott példáját kell használni, de a
+<code>pipeline_stages</code>-ben a <code>session_token</code> mezőt
+kifejezetten redactálni kell. Egy lehetséges kiegészítés:</p></li>
+</ol>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">match</span><span class="kw">:</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">selector</span><span class="kw">:</span><span class="at"> </span><span class="st">&#39;{service=&quot;labapp&quot;}&#39;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">stages</span><span class="kw">:</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="kw">-</span><span class="at"> </span><span class="fu">replace</span><span class="kw">:</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="fu">expression</span><span class="kw">:</span><span class="at"> </span><span class="st">&#39;&quot;session_token&quot;\s*:\s*&quot;([^&quot;]*)&quot;&#39;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="fu">replace</span><span class="kw">:</span><span class="at"> </span><span class="st">&#39;[REDACTED]&#39;</span></span></code></pre></div>
+<p>A <code>replace</code> stage a capture group (az érték) illeszkedését
+cseréli, így a sorban <code>"session_token":"[REDACTED]"</code> marad; a
+<code>regex</code> stage itt nem működne, mert csak kinyer. A
+<code>request_id</code> nem kap <code>labels</code> stage-et, a sorban
+marad. A <code>positions</code> fájl
+<code>/var/lib/promtail/positions.yaml</code>. A Promtailnek jogosultság
+kell a <code>/var/log/labapp/app.log</code> olvasásához és a
+<code>/var/lib/promtail</code> írásához. A
+<code>sudo systemctl restart promtail</code> után ellenőrzés a
+Lekérdezés API-val, valamint a <code>|= "&lt;tokenérték&gt;"</code>
+ellenpróba (üres eredmény). A rollback: a módosítás előtt a
+<code>promtail.yml</code> és a <code>positions.yaml</code> mentése
+(<code>positions.yaml.bak</code>), hiba esetén a Promtail leállítása és
+a mentett fájlok visszaállítása; a <code>positions</code> fájlt nem
+töröljük, mert törlése a teljes fájl és journal
+(<code>max_age: 12h</code>) újraolvasását és tömeges duplikációt okozna.
+Postcondition: a Loki query a redactált sort adja, a
+<code>positions</code> frissül, a <code>journalctl -u promtail</code>
+nem mutat hálózati hibát.</p>
+<ol start="3" type="1">
+<li><strong>Diagnózis és recovery:</strong> A tünet arra utal, hogy a
+Promtail a feldolgozott offsetet a <code>positions</code> fájlban
+rögzítette, mielőtt a Loki ténylegesen persisted volna; ha a buffer
+memóriában volt és a hálózat kiesett, az adat elveszhet. A
+<code>journalctl</code> azért nem mutat hibát, mert a retry log csak a
+háttérben történt, de a folyamat újraindult, és a <code>positions</code>
+fájlból indult tovább. <em>Adatgyűjtés:</em>
+<code>cat /var/lib/promtail/positions.yaml</code>;
+<code>curl http://192.0.2.20:3100/loki/api/v1/query_range</code> a
+hiányzó időablakra; a <code>systemctl status promtail</code> és a
+<code>journalctl -u promtail --since "12:55" --until "13:10"</code>.
+<em>Javítás:</em> ha a napló még elérhető a <code>labapp.log</code>-ban,
+a visszajátszás lépései: (1) <code>sudo systemctl stop promtail</code> –
+futás közben a Promtail periodikusan felülírja a <code>positions</code>
+fájlt; (2) a 13:00-as első sor bájt-offsetjének meghatározása:
+<code>grep -b -m1 '"timestamp":"2025-01-01T13:00' /var/log/labapp/app.log</code>
+(a sor eleji szám a bájt-offset); (3) mentés:
+<code>sudo cp /var/lib/promtail/positions.yaml /var/lib/promtail/positions.yaml.bak</code>;
+(4) a <code>labapp.log</code> offsetjének átírása erre az értékre; (5)
+<code>sudo systemctl start promtail</code>. A visszajátszott sorok csak
+a <code>timestamp</code> stage mellett kerülnek az eredeti
+13:00–13:05-ös időablakba (nélküle a visszajátszás idejével jelennének
+meg); a Loki a túl régi mintákat elutasíthatja
+(<code>reject_old_samples</code>,
+<code>reject_old_samples_max_age</code>), ezt a limitekben ellenőrizni
+kell. A háttérben a <code>clients.max_retries</code> és a
+<code>backoff</code> beállítás nem ad garanciát; a valós garanciához
+disk buffer vagy a forrás újraolvasási képessége kell.
+<em>Ellenőrzés:</em> a query ismétlése a 13:00–13:05 ablakra, és
+<code>count_over_time({service="labapp"}[1m])</code> összevetése a
+forrásfájl soraival. Postcondition: a <code>13:00:00</code> és
+<code>13:05:00</code> közötti események megjelennek; a már egyszer
+beküldött 13:05:00–13:05:10 közötti sorok duplikálódhatnak (a Loki csak
+az azonos időbélyegű és tartalmú sort szűri ki), ezért az átfedő ablakot
+külön ellenőrizzük.</li>
+</ol>
+<h3 data-number="50.3.7" id="rövid-összefoglaló"><span
+class="header-section-number">50.3.7</span> Rövid összefoglaló</h3>
+<p>A <strong>központi logplatform</strong> négyrétegű adatút:
+forrás/agent, gyűjtő/puffer, tároló/index és lekérdezés. A szállítás
+at-least-once, ezért a logloss és a duplikáció explicit tervezést
+igényel: a journald/container logból az agent cursorral olvas, a retry
+exponenciális visszalépéssel, a backpressure pedig a sor hosszát
+korlátozza. A <strong>sensitive data policy</strong> a redactiont a
+forrásközeli agentbe helyezi, a hozzáférést tenant-szinten szabályozza,
+a retenciót időablakhoz köti. A labelkardinalitás alacsony marad, a
+request-azonosítók nem labelek (Lokiban a sorban vagy structured
+metadataként, OpenSearch-ben index mezőként élnek), a deploy marker és a
+correlation ID a többgépes sorrendet és korrelációt biztosítja az
+időbélyeg-szinkron hiányosságai ellenére. A jelen példa a
+Loki/OpenSearch fogalmi modelljére épül, az aktuális verziókat a labban
+ellenőrizni kell.</p>
+<h3 data-number="50.3.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">50.3.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>A jelen kérés nem tartalmazott webes keresőeszközt, ezért az alábbi
+hivatkozások kiindulópontok, nem olvasott vagy ellenőrzött források. A
+Promtail, Loki, OpenSearch, Vector és OpenTelemetry konkrét verziója, a
+<code>schema: v13</code>, a <code>store: tsdb</code> és a redaction
+reguláris kifejezések szintaxisa az Ubuntu Server 24.04 labkörnyezetben
+ellenőrizendő. A példában szereplő kódblokkok illusztratívak, nem
+tekinthetők a labverzió pontos konfigurációjának.</p>
+<p>Forrásindex (állítás → hivatalos forrás → hivatkozott verzió):</p>
+<ul>
+<li>Promtail pipeline stage-ek (<code>multiline</code>,
+<code>json</code>, <code>timestamp</code>, <code>labels</code>,
+<code>match</code>, <code>replace</code>,
+<code>structured_metadata</code>): <a
+href="https://grafana.com/docs/loki/latest/send-data/promtail/stages/">Grafana
+Loki documentation – Send data / Promtail / Stages</a> — a labban
+rögzített Loki/Promtail 3.x kiadás dokumentációja; a Promtail utódja a
+Grafana Alloy, a stage-szintaxis ennek dokumentációjával is
+összevetendő.</li>
+<li>Loki tárolási modell, label-kardinalitás, structured metadata: <a
+href="https://grafana.com/docs/loki/latest/get-started/labels/">Grafana
+Loki documentation – Get started / Labels</a> — Loki 3.x.</li>
+<li>Retention és compactor (<code>retention_enabled</code>,
+<code>delete_request_store</code>, <code>retention_period</code>): <a
+href="https://grafana.com/docs/loki/latest/operations/storage/retention/">Grafana
+Loki documentation – Operations / Storage / Retention</a> — Loki
+3.x.</li>
+<li><code>query_range</code> API és paraméterei (<code>start</code>,
+<code>end</code>, <code>since</code>): <a
+href="https://grafana.com/docs/loki/latest/reference/loki-http-api/">Grafana
+Loki documentation – Reference / Loki HTTP API</a> — Loki 3.x.</li>
+<li>journald, <code>sd_journal_send()</code>, <code>systemd-cat</code>,
+<code>systemd-journal-gatewayd</code>: <a
+href="https://www.freedesktop.org/software/systemd/man/latest/systemd-journald.service.html">systemd-journald.service(8)</a>,
+<a
+href="https://www.freedesktop.org/software/systemd/man/latest/sd_journal_print.html">sd_journal_print(3)</a>,
+<a
+href="https://www.freedesktop.org/software/systemd/man/latest/systemd-journal-gatewayd.service.html">systemd-journal-gatewayd.service(8)</a>
+— az Ubuntu Server 24.04 LTS systemd 255-ös kiadásával összevetve (a
+<code>latest</code> oldal újabb kiadást is leírhat).</li>
+<li>OpenSearch invertált index (összevetés): <a
+href="https://opensearch.org/docs/latest/">OpenSearch documentation</a>
+— a labban választott 2.x kiadás.</li>
+<li>Agent/collector fogalomkör: <a
+href="https://opentelemetry.io/docs/collector/">OpenTelemetry
+documentation – Collector</a>.</li>
+<li>Retention-, hozzáférés- és policy-elvek: <a
+href="https://sre.google/books/">Google SRE Book</a>.</li>
+<li>Ubuntu-üzemeltetés: <a href="https://ubuntu.com/server/docs/">Ubuntu
+Server documentation</a> — 24.04 LTS.</li>
+</ul>
+<p>Ellenőrzési hiány: a példák laborban ellenőrizendők; dátumozott
+futtatási napló (tool <code>--version</code>, parancskimenet, sikeres és
+hibás ág) még nincs. A példában használt Promtail és Loki beállítások
+(multiline, timestamp, replace, retention, backpressure) pontos
+szintaxisa és a labverzióval való kompatibilitás nem ellenőrzött; a
+redaction hatékonyságát (<code>|= "hunter2"</code> ellenpróba), a disk
+buffer és az offset-visszajátszás valós viselkedését a labhoston kell
+igazolni. A várható kimenetek szemléltetők, nem futtatottak.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d247.html">← 50.2 Prometheus, exporter és PromQL</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d249.html">50.4 OpenTelemetry, distributed trace és C++ instrumentation →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

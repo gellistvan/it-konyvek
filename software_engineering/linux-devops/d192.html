@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>39.2 Object, YAML, reconciliation és ownership – Linux és
+DevOps rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch39">39 Kubernetes alapmodell, API és control plane</a></p>
+<div class="links"><a class="prev" rel="prev" href="d191.html">← 39.1 Cluster, node, API és control plane</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d193.html">39.3 kubectl, context, namespace és diagnosztika →</a></div>
+</nav>
+<h2 data-number="39.2" id="d192"><span
+class="header-section-number">39.2</span> Object, YAML, reconciliation
+és ownership</h2>
+<h3 data-number="39.2.1" id="motiváció"><span
+class="header-section-number">39.2.1</span> Motiváció</h3>
+<p>A d111-ben felépített üzemeltetési modell szerint a kívánt állapot
+(<em>desired state</em>), a megfigyelt állapot (<em>observed state</em>)
+és a kettő eltérése (<em>drift</em>) a hosszú távú működtetés alapja. A
+Kubernetes ezt a modellt beépítette az API-rétegbe: minden erőforrás
+rekordjában külön mezők hordozzák a kívánt és a megfigyelt állapotot, a
+kettő közelítését pedig nem a felhasználó parancsai, hanem vezérlők
+(<em>controller</em>) végzik. Fejlesztőként az a gyakori tévhit, hogy a
+<code>kubectl apply</code> egy imperatív telepítő parancs. Valójában egy
+deklaratív szándékot ír a klaszter tárolójába, a többi pedig
+kontrollerek és a kubelet aszinkron munkája. Ez a fejezet az
+API-objektumok szerkezetét, a deklaratív alkalmazást, a kontrollerek
+kiegyenlítő működését, valamint a tulajdonjog és optimista frissítés
+mechanizmusát tárgyalja.</p>
+<h3 data-number="39.2.2" id="az-api-object-és-a-négy-mezőcsoport"><span
+class="header-section-number">39.2.2</span> Az API object és a négy
+mezőcsoport</h3>
+<p><strong>Definíció</strong>: A Kubernetes API-objektum (<em>API
+object</em>) egy típusos, névvel azonosított, az etcd-ben tárolt
+erőforrásrekord, amelyet az API-kiszolgáló sémája hitelesít. A
+wire-formátum YAML vagy JSON, a Go nyelvű szerveroldali reprezentáció
+pedig mezőszintű típusokra bomlik. Minden objektum a következő
+mezőcsoportokra osztható:</p>
+<ul>
+<li><code>apiVersion</code> és <code>kind</code>: a típus egy
+API-csoportban és verzióban, például <code>apps/v1</code>
+<code>Deployment</code>.</li>
+<li><code>metadata</code>: azonosítás és könyvelés, beleértve a
+<code>name</code>, <code>namespace</code>, <code>uid</code>,
+<code>resourceVersion</code>, <code>generation</code>,
+<code>labels</code>, <code>annotations</code>,
+<code>ownerReferences</code> és <code>finalizers</code> mezőket.</li>
+<li><code>spec</code>: a kívánt állapot deklarációja, amelyet a
+felhasználó vagy egy magasabb szintű vezérlő ír.</li>
+<li><code>status</code>: a megfigyelt állapot, amelyet a vezérlő vagy a
+kubelet frissít.</li>
+</ul>
+<p>A <code>spec</code> és <code>status</code> szétválasztása a
+Kubernetes egyik legfontosabb szerződése. A felhasználó a
+<code>spec</code> mezőket módosítja; a <code>status</code> mezőket a
+vezérlő írja. Technikailag a <code>status</code> patch-elhető, de az
+emberi adminisztráció számára a <code>status</code> csak olvasható
+diagnosztikai felület. Ez megfelel a d111-ben tanult elkülönítésnek: a
+<code>spec</code> a <em>desired state</em>, a <code>status</code> az
+<em>observed state</em>, a manifest a <em>config-source</em>, az
+etcd-ben tárolt objektum pedig a <em>stored state</em>. A drift mérése a
+<code>spec</code> és a <code>status</code> különbsége.</p>
+<p>Egy <code>Deployment</code> példában a <code>spec.replicas=3</code> a
+kívánt replikaszám; a <code>status.availableReplicas=2</code> a
+megfigyelt, rendelkezésre álló podok száma. A vezérlő hurok feladata,
+hogy a kettőt közelítse.</p>
+<h3 data-number="39.2.3"
+id="declarative-apply-és-imperative-command"><span
+class="header-section-number">39.2.3</span> Declarative apply és
+imperative command</h3>
+<p>A Kubernetes dokumentációja („Kubernetes Object Management”) három
+objektumkezelési technikát különít el:</p>
+<ol type="1">
+<li><strong>Imperatív parancsok</strong>: az objektumot parancssori
+argumentumokból, manifestfájl nélkül hozzuk létre vagy módosítjuk:
+<code>kubectl create deployment lab-web --image=...</code>,
+<code>kubectl run</code>, <code>kubectl expose</code>,
+<code>kubectl scale deployment lab-web --replicas=3</code>,
+<code>kubectl edit</code>. Ezek közvetlen utasítások egy adott élő
+objektumra.</li>
+<li><strong>Imperatív objektumkonfiguráció</strong>: teljes manifestfájl
+és egy explicit művelet: <code>kubectl create -f</code>,
+<code>kubectl replace -f</code>, <code>kubectl delete -f</code>. A
+<code>create</code> hibát ad, ha az objektum már létezik; a
+<code>replace</code> teljes cserét feltételez, és a felhasználónak
+pontosan ismernie kell a teljes élő objektumot.</li>
+<li><strong>Deklaratív apply</strong>:
+<code>kubectl apply -f manifest.yaml</code>. A parancs kiszámítja a
+manifest és az élő objektum közötti különbséget, és patch-et küld az
+API-kiszolgálónak. Az <code>apply</code> idempotens: ha az élő objektum
+már megfelel a manifestnek, a művelet nem változtat.</li>
+</ol>
+<p>A klasszikus <code>kubectl apply</code> a
+<code>kubectl.kubernetes.io/last-applied-configuration</code>
+annotációban tárolja a legutóbb alkalmazott kívánt konfigurációt. Ebből
+a hármas diff algoritmusa kiszámítja, mely mezőket kell törölni vagy
+módosítani. A szerveroldali apply (<em>server-side apply</em>) ezt a
+folyamatot az API-kiszolgálóba helyezi, és mezőszintű tulajdonjogot
+vezet be. A pontos viselkedés Kubernetes-verziónként változik, ezért a
+laborban a használt kubectl és API-kiszolgáló verziójának
+dokumentációját kell ellenőrizni.</p>
+<p>Az <code>apply</code> nem garantálja, hogy a deklaráció azonnal
+érvénybe lép. A parancs csak a <code>spec</code>-et írja az etcd-be; a
+<code>status</code> később, a vezérlő munkája során változik.</p>
+<h3 data-number="39.2.4"
+id="controller-reconciliation-és-eventual-convergence"><span
+class="header-section-number">39.2.4</span> Controller, reconciliation
+és eventual convergence</h3>
+<p>A Kubernetes-vezérlő (<em>controller</em>) egy olyan vezérlési hurok,
+amely figyeli egy erőforrást, összehasonlítja a <code>spec</code>-et a
+<code>status</code>-szal, és beavatkozik, ha eltérést lát. Ezt a hurkot
+nevezzük <em>reconcile</em> folyamatnak. Szintvezérelt
+(<em>level-triggered</em>) működésű: nem az egyes eseményeket játssza
+vissza, hanem a jelenlegi állapotot olvassa be, és arra reagál. Ha egy
+esemény elveszik, a következő időszakos újraegyeztetés (<em>resync</em>)
+pótolja. Ha a beavatkozás hibát ad, a vezérlő exponenciális
+visszalépéssel újrapróbálja.</p>
+<p>A cél a <em>végső konvergencia</em> (<em>eventual convergence</em>):
+nem garantált, hogy a beavatkozás azonnal befejeződik, de a rendszer
+stabil állapotban a kívánt állapot felé tart. Ez hasonló egy lock-free
+adatszerkezethez: a műveletek közben átmeneti inkonzisztencia
+megengedett, de a végállapot konzisztens lesz.</p>
+<figure id="fig-d192-reconcile-lanc">
+<div class="fig-interactive"><iframe src="figures/html/d192-reconcile-lanc.html" title="Bal oldal: Deployment lab-cache, ReplicaSet lab-cache-hash (ownerReferences a Deploymentre, controller true) és három Pod (ownerReferences a ReplicaSetre), mellettük a Deployment controller, a ReplicaSet controller és a kubelet; pontozott nyíl az olvasás, folytonos az írás. Jobb oldali táblázat: t0 apply 2 replikával, generation 1; t1 reconcile, observedGeneration 1, ReplicaSet 2, 2 Pod; t2 apply 3 replikával, generation 2, observedGeneration még 1, lemaradás; t3 reconcile, observedGeneration 2, spec.replicas 3, status.replicas 3, availableReplicas végig 0; a resourceVersion minden íráskor változik." loading="lazy" style="width:100%;border:0;height:680px"></iframe><noscript><img src="figures/img/d192-reconcile-lanc.png" style="width:100.0%"
+alt="Bal oldal: Deployment lab-cache, ReplicaSet lab-cache-hash (ownerReferences a Deploymentre, controller true) és három Pod (ownerReferences a ReplicaSetre), mellettük a Deployment controller, a ReplicaSet controller és a kubelet; pontozott nyíl az olvasás, folytonos az írás. Jobb oldali táblázat: t0 apply 2 replikával, generation 1; t1 reconcile, observedGeneration 1, ReplicaSet 2, 2 Pod; t2 apply 3 replikával, generation 2, observedGeneration még 1, lemaradás; t3 reconcile, observedGeneration 2, spec.replicas 3, status.replicas 3, availableReplicas végig 0; a resourceVersion minden íráskor változik." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d192-reconcile-lanc.png" style="width:100.0%"
+alt="Bal oldal: Deployment lab-cache, ReplicaSet lab-cache-hash (ownerReferences a Deploymentre, controller true) és három Pod (ownerReferences a ReplicaSetre), mellettük a Deployment controller, a ReplicaSet controller és a kubelet; pontozott nyíl az olvasás, folytonos az írás. Jobb oldali táblázat: t0 apply 2 replikával, generation 1; t1 reconcile, observedGeneration 1, ReplicaSet 2, 2 Pod; t2 apply 3 replikával, generation 2, observedGeneration még 1, lemaradás; t3 reconcile, observedGeneration 2, spec.replicas 3, status.replicas 3, availableReplicas végig 0; a resourceVersion minden íráskor változik." /></details></div>
+<figcaption>Reconcile-lánc és generációk a 2. feladat adataival
+(lab-cache, 2 → 3 replika, dummy image): melyik vezérlő melyik objektum
+spec-jét olvassa és status-át írja</figcaption>
+</figure>
+<p>Például a <code>Deployment</code> vezérlő:</p>
+<ol type="1">
+<li>Olvassa a <code>Deployment</code> <code>spec</code>-jét.</li>
+<li>Létrehozza vagy frissíti a <code>ReplicaSet</code> objektumot.</li>
+<li>A <code>ReplicaSet</code> vezérlő létrehozza vagy törli a
+podokat.</li>
+<li>A kubelet elindítja a podokat, és a <code>status</code> mezőt
+frissíti.</li>
+<li>A <code>Deployment</code> vezérlő frissíti a <code>Deployment</code>
+<code>status</code>-t a <code>ReplicaSet</code> állapotából.</li>
+</ol>
+<p>A <code>status.observedGeneration</code> mező azt jelzi, hogy a
+vezérlő melyik <code>spec</code> generációt dolgozta fel.</p>
+<h3 data-number="39.2.5"
+id="ownerreference-finalizer-garbage-collection"><span
+class="header-section-number">39.2.5</span> OwnerReference, finalizer,
+garbage collection</h3>
+<p>Az objektumok közötti tulajdonviszonyt a
+<code>metadata.ownerReferences</code> lista írja le. A gyermek objektum
+hivatkozik a szülőre az <code>apiVersion</code>, <code>kind</code>,
+<code>name</code> és <code>uid</code> mezővel. A Kubernetes
+szemétgyűjtője (<em>garbage collector</em>) ezt használja: ha a szülő
+objektumot törlik, a gyermekeket is automatikusan törli, hacsak a törlés
+nem árva módban történik (<code>kubectl delete --cascade=orphan</code>).
+A <code>ownerReferences</code> bejegyzés <code>controller</code> mezője
+megmutatja, hogy az adott hivatkozás irányítja-e az objektumot, a
+<code>blockOwnerDeletion</code> pedig meggátolja a szülő törlését, amíg
+a gyermek törlése folyamatban van.</p>
+<p>A <strong>finalizer</strong> egy aszinkron takarítási akadály. Ha az
+objektum <code>metadata.finalizers</code> listájában egy sztring
+szerepel, a törlési kérelem után az API-kiszolgáló nem távolítja el az
+objektumot, csak beállítja a <code>metadata.deletionTimestamp</code>
+mezőt. A finalizert a vezérlő távolítja el, miután a szükséges
+tisztítást elvégezte. Ez hasonlít a C++ destruktorra, de aszinkron, és a
+vezérlő felelőssége. A finalizer önkényes eltávolítása megszakíthatja a
+takarítást, ezért csak akkor szabad kézzel módosítani, ha a vezérlő már
+nem fut, vagy a finalizer egyértelműen árva.</p>
+<h3 data-number="39.2.6" id="labels-annotations-selector"><span
+class="header-section-number">39.2.6</span> Labels, annotations,
+selector</h3>
+<p>A <strong>label</strong> (<code>labels</code>) kulcs-érték párokat
+tárol az objektumon, amelyeket a szelektorok (<em>selector</em>)
+használnak csoportosításra és kiválasztásra. A
+<code>spec.selector</code> a <code>Deployment</code> esetében
+meghatározza, mely podokat kezeli a vezérlő. Az equality-szelektor
+<code>matchLabels</code> formában adható meg; a halmazalapú szelektor
+<code>matchExpressions</code> formában támogatja az <code>In</code>,
+<code>NotIn</code>, <code>Exists</code> és <code>DoesNotExist</code>
+operátorokat. A <code>spec.selector</code> a legtöbb munkaterhelésnél
+nem változtatható meg az objektum létrehozása után, mert ez megtörné a
+tulajdonosi láncot.</p>
+<p>Az <strong>annotation</strong> (<code>annotations</code>)
+tetszőleges, nem azonosító metaadat. Ide kerül a
+<code>kubectl apply</code> által használt
+<code>last-applied-configuration</code>, a build- vagy deployment-hash,
+a monitorozási konfiguráció vagy a tulajdonos elérhetősége. A
+szelektorok nem működnek annotációkra, és a Kubernetes API nem indexeli
+őket keresési célra.</p>
+<h3 data-number="39.2.7"
+id="generation-resourceversion-és-optimistic-update"><span
+class="header-section-number">39.2.7</span> Generation, resourceVersion
+és optimistic update</h3>
+<p>Az objektum minden módosításakor az API-kiszolgáló új értéket ad a
+<code>metadata.resourceVersion</code> mezőnek. Ez opak verzióazonosító:
+a kliens csak azt vizsgálhatja, hogy két érték megegyezik-e, rendezést
+vagy numerikus növekedést nem tételezhet fel (az, hogy a jelenlegi
+implementációban az etcd revíziójából származik, nem része a
+szerződésnek). Az API-kiszolgáló ezt optimista konkurenciakezelésre
+használja: ha a kliens egy frissítést egy már elavult
+<code>resourceVersion</code> alapján küld, a kiszolgáló
+<code>409 Conflict</code> hibát ad. A kliensnek újra kell olvasnia az
+objektumot, és a módosítást a friss verzióra alkalmaznia. Ez a
+read-modify-write ciklus hasonlít a C++ CAS-hurokhoz; a
+<code>kubectl apply</code> ezt a konfliktuskezelést automatikusan
+végzi.</p>
+<p>A <code>metadata.generation</code> csak a <code>spec</code>
+módosításakor növekszik; a <code>status</code> frissítése a
+<code>resourceVersion</code>-t megváltoztatja, de a
+<code>generation</code>-t nem. A <code>status.observedGeneration</code>
+a vezérlő által már feldolgozott <code>spec</code> generációt mutatja.
+Ha a <code>metadata.generation</code> nagyobb, mint a
+<code>status.observedGeneration</code>, a vezérlő még nem dolgozta fel a
+legutóbbi kívánt állapotot.</p>
+<h3 data-number="39.2.8" id="kidolgozott-példa"><span
+class="header-section-number">39.2.8</span> Kidolgozott példa</h3>
+<p>Cél: létrehozni egy <code>Deployment</code> objektumot a
+<code>lab-app</code> namespace-ben, majd megfigyelni a <code>spec</code>
+és <code>status</code> szétválását.</p>
+<p><strong>Lab target</strong>: <code>lab-cluster</code> context,
+<code>lab-app</code> namespace, <code>lab-web</code> objektum. A
+felhasználónak <code>create</code>, <code>get</code>,
+<code>patch</code>, <code>delete</code> jogosultság kell a
+<code>lab-app</code> namespace-ben.</p>
+<p><strong>Előfeltétel</strong>: a <code>lab-app</code> namespace már
+létezik.</p>
+<p><strong>Manifest</strong> <code>lab-web.yaml</code>:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> apps/v1</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Deployment</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-web</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-app</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">app</span><span class="kw">:</span><span class="at"> lab-web</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">owner</span><span class="kw">:</span><span class="at"> lab-exercise</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">replicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">3</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">selector</span><span class="kw">:</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">matchLabels</span><span class="kw">:</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">app</span><span class="kw">:</span><span class="at"> lab-web</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">template</span><span class="kw">:</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">app</span><span class="kw">:</span><span class="at"> lab-web</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">containers</span><span class="kw">:</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> web</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">image</span><span class="kw">:</span><span class="at"> registry.invalid/lab-web:1.0</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">ports</span><span class="kw">:</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="kw">-</span><span class="at"> </span><span class="fu">containerPort</span><span class="kw">:</span><span class="at"> </span><span class="dv">8080</span></span></code></pre></div>
+<p>A <code>registry.invalid</code> dummy képnév; a <code>.invalid</code>
+TLD garantáltan nem éles. A laborban ezért a podok
+<code>ImagePullBackOff</code> állapotba kerülnek, ami pontosan
+demonstrálja a desired és observed közötti driftet. Ha a labor
+rendelkezik elérhető, verzió-lockolt image-dzsel, akkor azt kell
+használni.</p>
+<p><strong>Apply parancs</strong>:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-app apply <span class="at">-f</span> lab-web.yaml</span></code></pre></div>
+<p>Várt kimenet:</p>
+<pre><code>deployment.apps/lab-web created</code></pre>
+<p><strong>Állapot lekérdezése</strong>:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-app get deployment lab-web <span class="at">-o</span> yaml</span></code></pre></div>
+<p>Várt, illusztratív részlet:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-web</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-app</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">generation</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">resourceVersion</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;48213&quot;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">uid</span><span class="kw">:</span><span class="at"> 9b1c4f5e-...</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">replicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">3</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">selector</span><span class="kw">:</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">matchLabels</span><span class="kw">:</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">app</span><span class="kw">:</span><span class="at"> lab-web</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="fu">status</span><span class="kw">:</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">observedGeneration</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">replicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">3</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">updatedReplicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">3</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">readyReplicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">0</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">availableReplicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">0</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">unavailableReplicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">3</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">conditions</span><span class="kw">:</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">type</span><span class="kw">:</span><span class="at"> Progressing</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">status</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;True&quot;</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">type</span><span class="kw">:</span><span class="at"> Available</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">status</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;False&quot;</span></span></code></pre></div>
+<p>Az értelmezés: a <code>spec.replicas=3</code> a kívánt állapot, a
+<code>status.availableReplicas=0</code> a megfigyelt állapot. A
+<code>generation=1</code> és az <code>observedGeneration=1</code> azt
+mutatja, hogy a <code>Deployment</code> vezérlő feldolgozta a specet. Az
+<code>Available=False</code> feltétel a dummy image miatt nem oldódik
+fel; a vezérlő továbbra is próbálkozik, a podok
+<code>ImagePullBackOff</code> állapotban maradnak. Ezt a
+<code>kubectl --context lab-cluster -n lab-app get pods -l app=lab-web</code>
+parancs is mutatja.</p>
+<p><strong>Rollback/cleanup</strong>:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-app delete deployment lab-web</span></code></pre></div>
+<p>Ellenőrzés:
+<code>kubectl --context lab-cluster -n lab-app get deployment lab-web</code>
+<code>NotFound</code> hibát ad.</p>
+<h3 data-number="39.2.9" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">39.2.9</span> Tipikus hibák és
+ellenpróbák</h3>
+<p><strong>Hiba 1: A felhasználó azt hiszi, hogy az apply után minden
+azonnal kész.</strong><br />
+Tünet: a podok <code>Pending</code> vagy <code>ImagePullBackOff</code>
+állapotban vannak, miközben a <code>Deployment</code> létrejött.<br />
+Adatgyűjtés:
+<code>kubectl --context lab-cluster -n lab-app get deployment lab-web -o yaml</code>;
+<code>metadata.generation</code> és
+<code>status.observedGeneration</code> egyenlő, de
+<code>status.availableReplicas</code> kisebb, mint
+<code>spec.replicas</code>.<br />
+Hipotézis: a vezérlő feldolgozta a specet, de a podok még nem érték el a
+kívánt állapotot vagy a kép nem húzható.<br />
+Beavatkozás: ellenőrizze a podeseményeket, és csak akkor módosítson, ha
+a kép vagy a podspec hibás.<br />
+Verification: a podok <code>Ready</code> állapota vagy a hibaüzeneteket
+tartalmazó <code>status.conditions</code> megjelenése.</p>
+<p><strong>Hiba 2: Két párhuzamos módosítás <code>409 Conflict</code>
+hibát ad.</strong><br />
+Tünet: a <code>kubectl edit</code> mentésekor
+<code>409 Conflict: Operation cannot be fulfilled</code>.<br />
+Ok: egy másik kliens az ön olvasása óta módosította az objektumot, így
+az ön által küldött <code>resourceVersion</code> elavult.<br />
+Adatgyűjtés:
+<code>kubectl --context lab-cluster -n lab-app get deployment lab-web -o yaml</code>
+friss <code>resourceVersion</code>-nel.<br />
+Beavatkozás: újra beolvas, a módosítást a friss verzióra alkalmaz.<br />
+Verification: a frissítés sikeresen megtörténik, a
+<code>resourceVersion</code> megváltozott (eltér a korábbitól).</p>
+<p><strong>Hiba 3: Finalizer miatt az objektum törlésre jelölt
+állapotban ragad.</strong><br />
+Tünet: <code>kubectl delete</code> után az objektum még percekig
+létezik.<br />
+Adatgyűjtés:
+<code>kubectl --context lab-cluster -n lab-app get configmap lab-final -o yaml</code>,
+<code>metadata.deletionTimestamp</code> jelen,
+<code>metadata.finalizers</code> nem üres.<br />
+Hipotézis: egy finalizert egy már nem futó vezérlő birtokol, így a
+törlés akadályba ütközik.<br />
+Beavatkozás: a finalizer eltávolítása csak akkor, ha biztos, hogy a
+takarítás nem szükséges.<br />
+Verification: az objektum törlődik.</p>
+<h3 data-number="39.2.10" id="feladatok"><span
+class="header-section-number">39.2.10</span> Feladatok</h3>
+<h4 data-number="39.2.10.1" id="feladat-1-magyarázó-feladat"><span
+class="header-section-number">39.2.10.1</span> Feladat 1: Magyarázó
+feladat</h4>
+<p>Adott az alábbi <code>Deployment</code> kivonat. Válaszolja meg, mely
+mezőcsoportok írója a felhasználó, melyeké a vezérlő, és mi a
+<code>spec.selector</code> szerepe. Mi a különbség a
+<code>resourceVersion</code> és a <code>generation</code> között?</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> apps/v1</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Deployment</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-analyze</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-app</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">generation</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">resourceVersion</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;9102&quot;</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">replicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">selector</span><span class="kw">:</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">matchLabels</span><span class="kw">:</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">app</span><span class="kw">:</span><span class="at"> lab-analyze</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="fu">status</span><span class="kw">:</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">observedGeneration</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">availableReplicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span></code></pre></div>
+<h4 data-number="39.2.10.2" id="feladat-2-adminisztrációs-feladat"><span
+class="header-section-number">39.2.10.2</span> Feladat 2:
+Adminisztrációs feladat</h4>
+<p>Hozzon létre egy <code>lab-cache</code> nevű
+<code>Deployment</code>-et a <code>lab-app</code> namespace-ben 2
+replikával, dummy image-dzsel. Ezután módosítsa a <code>replicas</code>
+értékét 3-ra <code>kubectl apply</code> használatával. Figyelje meg a
+<code>generation</code> és <code>resourceVersion</code> változását,
+valamint a <code>status</code> mezőket.</p>
+<h4 data-number="39.2.10.3" id="feladat-3-diagnosztikai-feladat"><span
+class="header-section-number">39.2.10.3</span> Feladat 3: Diagnosztikai
+feladat</h4>
+<p>Hozzon létre egy <code>lab-final</code> nevű
+<code>ConfigMap</code>-et a <code>lab-app</code> namespace-ben. Adjon
+hozzá egy <code>example.invalid/lab-cleanup</code> finalizert. Ezután
+törölje a <code>ConfigMap</code>-et, és figyelje meg, hogy az objektum
+törlésre jelölt marad (a <code>deletionTimestamp</code> be van állítva,
+de az objektum nem tűnik el). Távolítsa el a finalizert, és ellenőrizze,
+hogy az objektum törlődik.</p>
+<h3 data-number="39.2.11" id="megoldások"><span
+class="header-section-number">39.2.11</span> Megoldások</h3>
+<h4 data-number="39.2.11.1" id="feladat-1-megoldása"><span
+class="header-section-number">39.2.11.1</span> Feladat 1 megoldása</h4>
+<p>A <code>spec</code> mezőket a felhasználó (vagy egy magasabb szintű
+vezérlő) írja; a <code>status</code> mezőket a vezérlő. A
+<code>spec.selector</code> kiválasztja azokat a podokat, amelyeket a
+<code>Deployment</code> kezel. A <code>resourceVersion</code> minden
+írásnál változik, és az optimista konkurenciakezelést szolgálja. A
+<code>generation</code> csak a <code>spec</code> módosításakor
+növekszik, a <code>status</code> frissítésétől nem. A kivonatban a
+<code>metadata.generation=2</code>, de a
+<code>status.observedGeneration=1</code>; ez azt jelenti, hogy a vezérlő
+még nem dolgozta fel a második specgenerációt. <em>Postcondition</em>: a
+válasz elkülöníti a desired és observed mezők íróit, és helyesen
+magyarázza a generációk szerepét.</p>
+<h4 data-number="39.2.11.2" id="feladat-2-megoldása"><span
+class="header-section-number">39.2.11.2</span> Feladat 2 megoldása</h4>
+<p>Lépések:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-app apply <span class="at">-f</span> <span class="at">-</span> <span class="op">&lt;&lt;&#39;EOF&#39;</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="st">apiVersion: apps/v1</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="st">kind: Deployment</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="st">metadata:</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="st">  name: lab-cache</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="st">  namespace: lab-app</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="st">  labels:</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="st">    app: lab-cache</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a><span class="st">    owner: lab-exercise</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a><span class="st">spec:</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="st">  replicas: 2</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a><span class="st">  selector:</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="st">    matchLabels:</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a><span class="st">      app: lab-cache</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a><span class="st">  template:</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a><span class="st">    metadata:</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a><span class="st">      labels:</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a><span class="st">        app: lab-cache</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a><span class="st">    spec:</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a><span class="st">      containers:</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a><span class="st">        - name: cache</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a><span class="st">          image: registry.invalid/lab-cache:1.0</span></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a><span class="op">EOF</span></span></code></pre></div>
+<p>Ellenőrzés:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-app get deployment lab-cache <span class="at">-o</span> yaml</span></code></pre></div>
+<p>Rögzítendő: <code>metadata.generation=1</code>,
+<code>metadata.resourceVersion</code>, <code>spec.replicas=2</code>.
+Ezután módosítsa a manifeszt <code>replicas</code> mezőjét 3-ra, majd
+futtassa újra az <code>apply</code>-t. Az új <code>get</code>
+kimenetében a <code>spec.replicas=3</code>, a
+<code>metadata.generation=2</code>, a <code>resourceVersion</code>
+megváltozott (eltér a korábbitól; nagyság szerint nem hasonlítható), míg
+a <code>status.availableReplicas</code> a dummy image miatt valószínűleg
+0. A <code>kubectl rollout status</code> megakadhat; ez elvárt. A
+<code>rollout status</code> célja a diagnosztika, nem a türelmetlen
+megoldás. <em>Postcondition</em>: a <code>lab-cache</code> Deployment
+létezik, a replikaszám a specben 3, a generáció nőtt, az erőforrásverzió
+változott, és a felhasználó értelmezi a <code>status</code>
+eltérését.</p>
+<p>Cleanup:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-app delete deployment lab-cache</span></code></pre></div>
+<h4 data-number="39.2.11.3" id="feladat-3-megoldása"><span
+class="header-section-number">39.2.11.3</span> Feladat 3 megoldása</h4>
+<p>Hozza létre a ConfigMapet:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-app create configmap lab-final <span class="dt">\</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--from-literal</span><span class="op">=</span>key=value</span></code></pre></div>
+<p>Adjon hozzá finalizert:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-app patch configmap lab-final <span class="dt">\</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--type</span> merge <span class="at">-p</span> <span class="st">&#39;{&quot;metadata&quot;:{&quot;finalizers&quot;:[&quot;example.invalid/lab-cleanup&quot;]}}&#39;</span></span></code></pre></div>
+<p>Törlési kísérlet:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co"># --wait=false: az alapértelmezett --wait=true a finalizer miatt</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="co"># soha nem térne vissza (Ctrl+C-ig)</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-app delete configmap lab-final <span class="dt">\</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--wait</span><span class="op">=</span>false</span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Várható: configmap &quot;lab-final&quot; deleted (azonnal)</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-app get configmap lab-final <span class="dt">\</span></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">-o</span> jsonpath=<span class="st">&#39;{.metadata.deletionTimestamp}{&quot; &quot;}{.metadata.finalizers}{&quot;\n&quot;}&#39;</span></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Várható: egy időbélyeg és [&quot;example.invalid/lab-cleanup&quot;]</span></span></code></pre></div>
+<p>Az objektum törlésre jelölt (a <code>deletionTimestamp</code> be van
+állítva), de a <code>finalizers</code> lista nem üres, ezért nem
+törlődik. A ConfigMap táblás <code>kubectl get</code> nézetében nincs
+STATUS oszlop – a „Terminating” felirat a Pod nézet sajátja –, ezért az
+állapotot a fenti jsonpath vagy a <code>-o yaml</code> mutatja. Ezután
+távolítsa el a finalizert:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-app patch configmap lab-final <span class="dt">\</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--type</span> json <span class="at">-p</span> <span class="st">&#39;[{&quot;op&quot;:&quot;remove&quot;,&quot;path&quot;:&quot;/metadata/finalizers/0&quot;}]&#39;</span></span></code></pre></div>
+<p>Ellenőrizze, hogy az objektum törlődött:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-app get configmap lab-final</span></code></pre></div>
+<p>A <code>NotFound</code> hiba a várt. <em>Postcondition</em>: a
+<code>lab-final</code> ConfigMap nem létezik a <code>lab-app</code>
+namespace-ben, és a törlési akadály megszűnt. Az indoklás: a finalizer
+egy aszinkron takarítási kapu; ha a birtokló vezérlő nem fut, az
+objektum örökre törlésre jelölt (Podnál „Terminating”) állapotban marad.
+Manuális eltávolítás csak lab környezetben, saját objektumon
+történhet.</p>
+<h3 data-number="39.2.12" id="rövid-összefoglaló"><span
+class="header-section-number">39.2.12</span> Rövid összefoglaló</h3>
+<p>A Kubernetes API-objektum a kívánt állapotot a <code>spec</code>, a
+megfigyelt állapotot a <code>status</code> mezőben tárolja, míg a
+<code>metadata</code> azonosítja és könyveli az erőforrást. A deklaratív
+<code>kubectl apply</code> idempotens módon írja a desired állapotot; az
+imperatív parancsok ezzel szemben egyszeri utasítások. A vezérlő
+szintvezérelt reconciliation hurokban közelíti a <code>status</code>-t a
+<code>spec</code>-hez, eventual convergence-t biztosítva. Az
+<code>ownerReferences</code> és a <code>finalizers</code> a tulajdonosi
+és takarítási életciklust vezérli. Továbbhasznált definíciók:
+<strong>API object</strong>, <strong>desired state
+(<code>spec</code>)</strong>, <strong>observed state
+(<code>status</code>)</strong>, <strong>reconciliation</strong>.</p>
+<h3 data-number="39.2.13" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">39.2.13</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li><a href="https://kubernetes.io/docs/">Kubernetes
+documentation</a></li>
+<li><a href="https://opencontainers.org/">Open Container
+Initiative</a></li>
+<li><a href="https://etcd.io/docs/">etcd documentation</a></li>
+</ul>
+<p>Állításonkénti normatív források (verzióprofil: a labor Kubernetes
+stabil minor verziója és a hozzá illő <code>kubectl</code>,
+<code>kubectl version</code> kimenetével rögzítve):</p>
+<ul>
+<li>Kubernetes Object Management (a három technika): <a
+href="https://kubernetes.io/docs/concepts/overview/working-with-objects/object-management/"
+class="uri">https://kubernetes.io/docs/concepts/overview/working-with-objects/object-management/</a></li>
+<li>API-konvenciók (<code>spec</code>/<code>status</code>,
+<code>resourceVersion</code> opak,
+<code>generation</code>/<code>observedGeneration</code>): <a
+href="https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md"
+class="uri">https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md</a></li>
+<li>Resource versions: <a
+href="https://kubernetes.io/docs/reference/using-api/api-concepts/#resource-versions"
+class="uri">https://kubernetes.io/docs/reference/using-api/api-concepts/#resource-versions</a></li>
+<li>Server-side apply: <a
+href="https://kubernetes.io/docs/reference/using-api/server-side-apply/"
+class="uri">https://kubernetes.io/docs/reference/using-api/server-side-apply/</a></li>
+<li>Owners and dependents, finalizers: <a
+href="https://kubernetes.io/docs/concepts/overview/working-with-objects/owners-dependents/"
+class="uri">https://kubernetes.io/docs/concepts/overview/working-with-objects/owners-dependents/</a>,
+<a
+href="https://kubernetes.io/docs/concepts/overview/working-with-objects/finalizers/"
+class="uri">https://kubernetes.io/docs/concepts/overview/working-with-objects/finalizers/</a></li>
+<li><code>kubectl delete</code> (<code>--wait</code>): <a
+href="https://kubernetes.io/docs/reference/kubectl/generated/kubectl_delete/"
+class="uri">https://kubernetes.io/docs/reference/kubectl/generated/kubectl_delete/</a></li>
+</ul>
+<p>A példák laborclusterben ellenőrizendők; dátumozott futtatási napló
+még nem készült.</p>
+<p>Ezek a fejezet seed-forrásai; ebben a kérésben nem volt webes
+keresőeszköz, ezért tartalmukat nem ellenőriztem. Az aktuális,
+támogatott Kubernetes minor verzió, a <code>kubectl apply</code> kliens-
+és szerveroldali viselkedése, a <code>metadata.generation</code> pontos
+szemantikája az egyes erőforrásoknál, valamint a finalizer JSON-patch
+szintaxisa a laborban használt Kubernetes verzió kiadási dokumentációja
+alapján ellenőrizendő. A dummy <code>registry.invalid</code> képnév
+szándékosan nem elérhető; a laborban használt valódi, verzió-lockolt
+imagek elérhetőségét a környezet inventory-jában kell igazolni.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d191.html">← 39.1 Cluster, node, API és control plane</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d193.html">39.3 kubectl, context, namespace és diagnosztika →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>46.5 Idempotens provision és interrupted change labor – Linux
+és DevOps rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch46">46 Infrastructure as Code: OpenTofu/Terraform és állapot</a></p>
+<div class="links"><a class="prev" rel="prev" href="d229.html">← 46.4 IaC CI, test, policy és promotion</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d231.html">47.1 Inventory, SSH, module és playbook →</a></div>
+</nav>
+<h2 data-number="46.5" id="d230"><span
+class="header-section-number">46.5</span> Idempotens provision és
+interrupted change labor</h2>
+<h3 data-number="46.5.1" id="motiváció"><span
+class="header-section-number">46.5.1</span> Motiváció</h3>
+<p>Egy szenior C++ fejlesztő számára a program fordítási idejű
+determinizmus és a repository-ból való reprodukálhatóság magától
+értetődő. Az infrastruktúra-provisioning esetén ugyanez a garancia nem
+adódik ingyen: a felhő vagy virtualizációs API hívása távoli,
+állapotukat egy külön <strong>statefile</strong> tartja nyilván, és egy
+félbeszakadt <code>apply</code> után a tényleges erőforrás, a
+konfiguráció és a state három különböző állapotot mutathat. Ez a
+laborkör azt gyakoroltatja, hogyan ellenőrizzük a <strong>desired
+state</strong> és az <strong>observed state</strong> közötti egyezést,
+hogyan építsük fel a <code>plan</code> → <code>apply</code> → no-op
+<code>plan</code> ellenőrzési láncot, és hogyan lábadozzunk driftből,
+importból, <code>moved</code> műveletből, valamint félbeszakadt
+provisioningből anélkül, hogy a teljes erőforráskészletet
+megsemmisítenénk vagy a state-et kézzel hamisítanánk.</p>
+<h3 data-number="46.5.2" id="definíció-és-működés"><span
+class="header-section-number">46.5.2</span> Definíció és működés</h3>
+<p>Az <strong>idempotens provision</strong> azt jelenti, hogy ugyanazon
+konfigurációból kiindulva ismételt <code>plan</code>/<code>apply</code>
+futtatás nem hoz létre újabb erőforrást, és a meglévőket nem módosítja
+indokolatlanul. Ez nem általános távoli exactly-once garancia; a
+konfiguráció a desired state-et írja le, a statefile a tárolt leképzést
+a távoli azonosítókhoz, a <code>plan</code> pedig a refreshelt observed
+state és a desired state közötti különbséget mutatja. Ha a konfiguráció
+és a state megegyezik a távoli erőforrással, a <code>plan</code>
+<strong>no-op plan</strong>: 0 add, 0 change, 0 destroy.</p>
+<p>A <strong>state lock</strong> a working directory state írását védő
+zár. Hosszabb <code>apply</code> alatt egy második parancs lockhibát
+kaphat; a <code>-lock-timeout</code> opcióval megadható, hány
+időtartamig várakozzon a zár feloldására. A <strong>provider
+lock</strong> ezzel szemben a <code>.terraform.lock.hcl</code> fájlban
+rögzíti a provider verzióját és checksumjait, így a <code>init</code>
+újra lehívható reprodukálható módon. A két zár célja különböző: előbbi a
+state-adat integritását védi, utóbbi a provider-ellátási láncot
+rögzíti.</p>
+<p>A <strong>drift</strong> olyan állapot, amikor a távoli erőforrás
+megváltozott a provsioneren kívül (például egy fájlt kézzel
+módosítottak). A <code>plan</code> ilyenkor change-et vagy
+destroy/replace-t mutat. A <strong>partial success</strong> olyan
+<code>apply</code> eredmény, amelynél egyes erőforrások létrejöttek,
+mások hibát kaptak; a statefile és a config szerinti következő
+<code>apply</code> csak a hiányzó vagy hibás erőforrásokat pótolja. Az
+<strong>import</strong> meglévő távoli objektumot visz a statebe
+anélkül, hogy provisioninget futtatna, a <code>moved</code> blokk pedig
+akkor frissíti a state erőforrás-címét, ha a HCL-ben átnevezzük az
+erőforrást. A <strong>destroy <code>-target</code></strong> csak a
+megadott erőforrás-címeket és a tőlük függőket törli, ezért alkalmas a
+lab resource set explicit szűkítésére.</p>
+<h3 data-number="46.5.3" id="kidolgozott-példa"><span
+class="header-section-number">46.5.3</span> Kidolgozott példa</h3>
+<p>A példa izolált labhoston, <code>labvm01</code>, felhasználó
+<code>lab</code> (UID 1000), working directory
+<code>/home/lab/iac/d230</code>. A cél egy helyi, fixtúra jellegű
+erőforrás-készlet a <code>local</code> és <code>null</code> providerrel.
+A konfiguráció <code>main.tf</code>:</p>
+<pre class="hcl"><code>terraform {
+  required_version = &quot;~&gt; 1.6&quot;
+  required_providers {
+    local = {
+      source  = &quot;hashicorp/local&quot;
+      version = &quot;~&gt; 2.4&quot;
+    }
+    null = {
+      source  = &quot;hashicorp/null&quot;
+      version = &quot;~&gt; 3.2&quot;
+    }
+  }
+}
+
+resource &quot;local_file&quot; &quot;lab_file&quot; {
+  filename = &quot;/home/lab/iac/d230/lab.txt&quot;
+  content  = &quot;d230 idempotens provision\n&quot;
+}
+
+resource &quot;null_resource&quot; &quot;lab_wait&quot; {
+  depends_on = [local_file.lab_file]
+
+  triggers = {
+    content_sha = sha256(local_file.lab_file.content)
+    cmd         = &quot;echo lab_wait-ok&quot;
+  }
+
+  provisioner &quot;local-exec&quot; {
+    command = &quot;${self.triggers.cmd} &gt;&gt; /home/lab/iac/d230/lab_wait.log&quot;
+  }
+}</code></pre>
+<p>A <code>local_file</code> erőforrás a fájlt a megadott tartalommal
+hozza létre; a <code>null_resource</code> egy állapot nélküli
+placeholder, amelynek provisionere egy shell parancsot futtat. A
+provisioner szándékosan <strong>külön fájlba</strong>
+(<code>lab_wait.log</code>) ír: ha a <code>local_file</code> által
+kezelt <code>lab.txt</code>-hez fűzne hozzá, a fájl eltérne a desired
+state-től, és a következő <code>plan</code> sem lehetne no-op. A
+<code>depends_on</code> rögzíti a sorrendet (először a fájl, utána a
+provisioner). A <code>triggers</code> térkép a
+<code>null_resource</code> „bemenete”: bármelyik értékének változása
+cserét (replace) kényszerít, és csak ekkor fut újra a létrehozáskor futó
+(creation-time) provisioner; a <code>provisioner</code> blokk szövegének
+módosítása önmagában nem része a diffnek. A lab célja nem a
+szolgáltatás, hanem a state-kezelés, ezért elegendő.</p>
+<p>Az alábbi lépések mindegyikét a <code>lab</code> felhasználó, a
+<code>labvm01</code> hoston, a <code>/home/lab/iac/d230</code>
+munkakönyvtárban hajtjuk végre.</p>
+<ol type="1">
+<li>Provider inicializálás és lockfile létrehozása:</li>
+</ol>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, user: lab (UID 1000), workdir: /home/lab/iac/d230</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> init</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> providers lock <span class="at">-platform</span><span class="op">=</span>linux_amd64</span></code></pre></div>
+<p>Várható kimenet <code>init</code> esetén:
+<code>OpenTofu has been successfully initialized!</code>, majd a
+lockfile <code>.terraform.lock.hcl</code> létrejön. Az aktuális provider
+release-t és a <code>tofu</code> verzióját a labor előtt ellenőrizni
+kell; az itt szereplő verziószámok illusztratívak.</p>
+<ol start="2" type="1">
+<li>Terv készítése és apply:</li>
+</ol>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> plan <span class="at">-out</span><span class="op">=</span>lab.plan</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> apply lab.plan</span></code></pre></div>
+<p>A <code>plan</code> kimenete:
+<code>Plan: 2 to add, 0 to change, 0 to destroy.</code> Az
+<code>apply</code> létrehozza a <code>lab.txt</code>-t, majd a
+<code>null_resource</code> provisionere a <code>lab_wait.log</code>-ba
+írja a <code>lab_wait-ok</code> sort; a <code>lab.txt</code> tartalma
+pontosan a konfigurációban megadott marad. A statefile
+<code>terraform.tfstate</code> létrejön.</p>
+<ol start="3" type="1">
+<li>No-op ellenőrzés:</li>
+</ol>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> plan</span></code></pre></div>
+<p>Várható:
+<code>No changes. Your infrastructure matches the configuration.</code>
+Ezzel bizonyítottuk, hogy a provision idempotens.</p>
+<ol start="4" type="1">
+<li>Drift generálása és észlelése:</li>
+</ol>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;manual-edit&quot;</span> <span class="op">&gt;&gt;</span> /home/lab/iac/d230/lab.txt</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> plan <span class="at">-detailed-exitcode</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;exit code: </span><span class="va">$?</span><span class="st">&quot;</span></span></code></pre></div>
+<p>A plan 2-es exit code-ot ad, és a kimenet jelzi, hogy a
+<code>local_file.lab_file</code> újra létrejön
+(<code>will be created</code>, összesítő: 1 to add), mert a fájl
+tartalma eltér a desired state-től. A <code>hashicorp/local</code>
+provider <code>local_file</code> erőforrásának nincs helyben módosítása
+(in-place update): a refresh a megváltozott tartalmú fájlt hiányzónak
+tekinti, ezért nem „1 to change”, hanem újralétrehozás látszik; a pontos
+kimenetet a labor futtatásakor kell rögzíteni. A
+<code>null_resource</code> nem cserélődik, mert a
+<code>content_sha</code> triggere a konfigurált tartalomból számolódik,
+az pedig nem változott. A driftből való kiindulás:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> apply <span class="at">-auto-approve</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> plan</span></code></pre></div>
+<p>Az apply visszaállítja a fájlt a desired state-be, a második plan
+ismét no-op.</p>
+<ol start="5" type="1">
+<li><code>moved</code> fixture: átnevezzük az erőforrást a HCL-ben
+<code>lab_file</code>-ról <code>lab_data</code>-ra (a
+<code>null_resource</code> <code>depends_on</code> és
+<code>triggers</code> hivatkozását is
+<code>local_file.lab_data</code>-ra írjuk át). <code>moved</code> blokk
+nélkül a plan destroy/create-et mutatna. Helyette <code>moved</code>
+blokk:</li>
+</ol>
+<pre class="hcl"><code>moved {
+  from = local_file.lab_file
+  to   = local_file.lab_data
+}</code></pre>
+<p>Ezután:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> plan</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> apply <span class="at">-auto-approve</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> state list</span></code></pre></div>
+<p>A state-listában <code>local_file.lab_data</code> jelenik meg, a
+<code>lab_file</code> nem; a plan nem mutat destroy/create-et.</p>
+<ol start="6" type="1">
+<li>State backup:</li>
+</ol>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> state pull <span class="op">&gt;</span> lab-state-<span class="va">$(</span><span class="fu">date</span> <span class="at">-u</span> +%Y%m%dT%H%M%SZ<span class="va">)</span>.json</span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="ex">jq</span> <span class="st">&#39;.resources | length&#39;</span> <span class="op">&lt;</span> lab-state-<span class="pp">*</span>.json</span></code></pre></div>
+<p>A backup fájl egy friss <code>terraform.tfstate</code> JSON-t
+tartalmaz; a <code>jq</code> kimenete 2. A visszaállítás csak kényszerű
+esetben: <code>tofu state push lab-state-....json</code>, de egy
+párhuzamos apply-t előbb le kell állítani, mert a <code>push</code>
+felülírja a state-et.</p>
+<ol start="7" type="1">
+<li>Partial success szimulálása: a <code>main.tf</code>-ben a
+<code>null_resource</code> <code>cmd</code> triggerét
+<code>false</code>-ra cseréljük. A provisioner blokk szövegének átírása
+nem lenne elég, mert az nem része a resource diffjének; a trigger
+változása viszont cserét kényszerít, így a provisioner ténylegesen újra
+lefut:</li>
+</ol>
+<pre class="hcl"><code>  triggers = {
+    content_sha = sha256(local_file.lab_data.content)
+    cmd         = &quot;false&quot;
+  }</code></pre>
+<p>Ekkor a <code>tofu apply -auto-approve</code> a
+<code>null_resource.lab_wait</code> cseréjét tervezi; a régi példány
+törlődik, az új létrehozása közben a provisioner hibázik, az apply nem 0
+exit code-ot ad. A hibás provisioner után a <code>null_resource</code>
+<em>tainted</em> állapotba kerül
+(<code>tofu state show null_resource.lab_wait</code>, illetve a
+következő plan jelzi, hogy a tainted erőforrást cserélni kell). A
+<code>local_file.lab_data</code> érintetlen: a state-ben változatlanul
+szerepel, a fájl tartalma nem módosult. A hibás részt javítva
+(<code>cmd = "echo lab_wait-ok"</code>) a következő
+<code>tofu apply</code> csak a tainted <code>null_resource</code>-t
+cseréli, a többit nem kezdi újra. Ugyanez a hatás a konfiguráció
+módosítása nélkül is elérhető:
+<code>tofu apply -replace=null_resource.lab_wait -auto-approve</code>.</p>
+<ol start="8" type="1">
+<li>Destroy explicit lab resource seten:</li>
+</ol>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> destroy <span class="at">-target</span><span class="op">=</span>null_resource.lab_wait</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">tofu</span> state list</span></code></pre></div>
+<p>A <code>null_resource.lab_wait</code> törlődik, a
+<code>local_file.lab_data</code> megmarad. Ez a destroy csak a nevezett
+erőforrásra terjed ki; a teljes erőforráskészlet törléséhez
+<code>tofu destroy</code> (explicit megerősítéssel) és a munkakönyvtár
+takarítása szükséges.</p>
+<h3 data-number="46.5.4" id="hibák-és-ellenpróbák"><span
+class="header-section-number">46.5.4</span> Hibák és ellenpróbák</h3>
+<p><strong>Lock timeout hiba</strong></p>
+<p>Tünet: <code>Error acquiring the state lock</code> vagy
+<code>Timeout while waiting for state lock</code>. Oka: párhuzamos apply
+vagy álló state lock. Adatgyűjtés: <code>ps -ef | grep tofu</code>.
+Hipotézisellenőrzés: várjunk a lock feloldására, vagy
+<code>tofu apply -lock-timeout=60s</code>. Ha a lock tartósan beragadt
+(például megölt folyamat maradványa), akkor a
+<code>tofu force-unlock &lt;lock-id&gt;</code> használható, de előbb
+ellenőrizni kell, hogy nincs tényleges apply futásban; a force-unlock
+nem rollback, hanem a lock ellenőrizetlen feloldása.</p>
+<p><strong>Drift észrevétlen marad</strong></p>
+<p>Tünet: a <code>plan</code> nem mutat change-et, pedig a távoli
+erőforrás megváltozott. Oka: a konfiguráció nem írja le a teljes desired
+state-et, vagy a state külsőleg frissült. Hipstézis: az
+<code>apply</code> előtti <code>plan</code> refresh nélkül készült.
+Ellenőrzés: <code>tofu plan -refresh-only</code> lefuttatása. Ha a
+provider nem támogat bizonyos attribútum refreshét, a drift nem
+detektálható; ilyenkor explicit disk- vagy API-ellenőrzést kell
+végezni.</p>
+<p><strong>Import rossz resource címmel</strong></p>
+<p>Tünet: a <code>tofu import</code> hibával áll meg, mert a megadott
+resource-cím nem létezik a konfigurációban (a pontos hibaszöveget a
+labor futtatásakor kell rögzíteni). Oka: a HCL-ben nincs ilyen resource,
+vagy a resource típus/cím nem illik. Javítás: a <code>main.tf</code>-ben
+először hozzuk létre a <code>resource</code> blokkot a kívánt címmel, és
+csak utána futtassuk a
+<code>tofu import &lt;cím&gt; &lt;azonosító&gt;</code> parancsot; import
+után a <code>tofu plan</code> no-op kell legyen, ha a konfiguráció
+megegyezik a meglévő objektummal. Fontos korlát: az import csak olyan
+erőforrástípuson működik, amelynek providere importot támogat. A labor
+<code>local_file</code> és <code>null_resource</code> erőforrásainál ez
+a használt <code>hashicorp/local</code>/<code>hashicorp/null</code>
+verzió registry-dokumentációjában ellenőrizendő; ha a típus nem
+importálható, a meglévő <code>lab.txt</code>-t a következő
+<code>apply</code> újra létrehozza, az import-folyamatot pedig
+importálható erőforráson (például sandbox <code>aws_s3_bucket</code>-en)
+kell gyakorolni.</p>
+<p><strong>Partial apply ismételt sikertelensége</strong></p>
+<p>Tünet: az apply újra és újra hibaüzenettel áll meg ugyanazon
+erőforrásnál. Oka: a provisioner vagy provider oldali függőség nem
+idempotens, vagy a lokális oldali feltétel nem teljesül. Adatgyűjtés:
+<code>tofu state list</code>, <code>tofu show</code>, provider log
+<code>TF_LOG=DEBUG</code>. Egy változtatás: a hibás erőforrást töröljük
+a stateből <code>tofu state rm</code> paranccsal, majd az apply újra
+provisioningel; ez veszélyes, ezért előbb backupot kell készíteni.</p>
+<h3 data-number="46.5.5" id="feladatok"><span
+class="header-section-number">46.5.5</span> Feladatok</h3>
+<p><strong>1. Magyarázó feladat: no-op plan értelmezése</strong></p>
+<p>Futtassa le a konfigurációt a példa szerint, majd készítsen egy
+<code>no-op-plan.txt</code> fájlt, amelyben a <code>tofu plan</code>
+kimenetét rögzíti. Magyarázza meg, miért bizonyítja ez a kimenet, hogy a
+provision idempotens; jelölje meg, melyik sor mutatja, hogy nincs
+tervezett művelet, és ellenőrizze
+<code>tofu plan -detailed-exitcode</code> futtatással, hogy az exit code
+0.</p>
+<p><strong>2. Konfigurációs/adminisztrációs feladat: drift és
+moved</strong></p>
+<p>A kiinduló labresource-ből kézzel módosítsa a <code>lab.txt</code>
+fájlt úgy, hogy a tartalom már ne egyezzen a konfigurációval. Készítsen
+<code>plan -detailed-exitcode</code>-ot, mentsen el a kimenetet. Ezután
+állítsa vissza a fájlt <code>apply</code> segítségével, és ellenőrizze
+no-op plan-nel. Végül nevezze át az erőforrást <code>lab_file</code>-ról
+<code>lab_moved</code>-ra a HCL-ben, és oldja meg <code>moved</code>
+blokkal, hogy a state ne legyen destroy/create.</p>
+<p><strong>3. Diagnosztikai/failure feladat: partial success és
+recovery</strong></p>
+<p>Szimuláljon partial apply-t: a <code>null_resource.lab_wait</code>
+<code>cmd</code> triggerét cserélje <code>false</code>-ra, futtasson
+<code>apply</code>-t, rögzítse az exit kódot és a
+<code>null_resource</code> tainted állapotát. Készítsen state backupot a
+hibás állapotról. Állítsa vissza a triggert
+<code>echo lab_wait-ok</code>-ra, futtasson újra <code>apply</code>-t,
+és ellenőrizze, hogy a korábban sikeres <code>local_file</code> nem
+alakult át, valamint hogy a <code>null_resource.lab_wait</code>
+cserélődött. Végül destruálja a <code>null_resource</code>-t, és
+igazolja, hogy a <code>local_file</code> megmaradt.</p>
+<h3 data-number="46.5.6" id="megoldások"><span
+class="header-section-number">46.5.6</span> Megoldások</h3>
+<p><strong>1. feladat</strong></p>
+<p>A <code>tofu plan</code> kimenete a konfiguráció és a state refresh
+utáni egyezését mutatja (szemléltető, nem futtatott; a magyarázó második
+sor verziónként eltér):</p>
+<pre><code>No changes. Your infrastructure matches the configuration.</code></pre>
+<p>Változás nélküli tervnél nincs „Plan: … to add” összesítősor; a „No
+changes” sor jelzi, hogy nincs tervezett művelet. Gépi bizonyítékként a
+<code>tofu plan -detailed-exitcode</code> 0-s exit code-ja szolgál (2
+jelentene változást, 1 hibát). Ez bizonyítja, hogy a második apply nem
+hozna létre újra erőforrást, mert a state és a desired egyezik.
+Postcondition: a <code>no-op-plan.txt</code> a munkakönyvtárban van,
+tartalma a fenti kimenet, és a state <code>local_file.lab_file</code>-t
+tartalmaz.</p>
+<p><strong>2. feladat</strong></p>
+<p>Drift készítése:
+<code>echo "manual-edit" &gt;&gt; /home/lab/iac/d230/lab.txt</code>. A
+<code>tofu plan -detailed-exitcode</code> kimenete:</p>
+<pre><code>Plan: 1 to add, 0 to change, 0 to destroy.</code></pre>
+<p>(Szemléltető, nem futtatott összesítősor: a local provider a
+megváltozott tartalmú fájlt hiányzónak tekinti, ezért a
+<code>local_file.lab_file</code> újra létrejön; a pontos kimenetet a
+labor futtatásakor kell rögzíteni.) Az exit code 2. A javítás
+<code>tofu apply -auto-approve</code> után a fájl tartalma a
+konfigurációban megadott, a no-op plan 0 add/0 change/0 destroy. Az
+átnevezés: a <code>main.tf</code>-ben
+<code>resource "local_file" "lab_moved" { ... }</code>, és a
+<code>moved</code> blokk:</p>
+<pre class="hcl"><code>moved {
+  from = local_file.lab_file
+  to   = local_file.lab_moved
+}</code></pre>
+<p>A <code>null_resource</code> hivatkozásait is
+<code>local_file.lab_moved</code>-ra kell átírni. A
+<code>tofu plan</code> csak az áthelyezést jelzi
+(<code>has moved to</code>), add/change/destroy művelet nélkül.
+<code>tofu apply</code> után <code>tofu state list</code> a
+<code>local_file.lab_moved</code>-et mutatja, a <code>lab_file</code>
+nem létezik. Postcondition: a stateben az erőforrás új címe szerepel, a
+fájl tartalma változatlan, no-op plan.</p>
+<p><strong>3. feladat</strong></p>
+<p>A <code>main.tf</code> <code>null_resource</code> triggere
+<code>cmd = "false"</code>. A trigger változása miatt a plan a
+<code>null_resource.lab_wait</code> cseréjét tervezi; az
+<code>apply -auto-approve</code> alatt a provisioner hibázik, az exit
+code nem 0. A state <code>terraform.tfstate</code> a
+<code>local_file</code> erőforrásra vonatkozóan változatlanul
+tartalmazza a kívánt paramétereket, a <code>null_resource</code> pedig
+tainted állapotban van
+(<code>tofu state show null_resource.lab_wait</code>; a következő plan
+cserét tervez rá). State backup:
+<code>tofu state pull &gt; partial-state-$(date -u +%Y%m%dT%H%M%SZ).json</code>.
+Javítás után <code>cmd = "echo lab_wait-ok"</code>,
+<code>tofu apply -auto-approve</code>: csak a tainted
+<code>null_resource</code> cserélődik. A <code>local_file</code> no-op
+plan-nel igazolhatóan változatlan marad. Végül
+<code>tofu destroy -target=null_resource.lab_wait</code>, majd
+<code>tofu state list</code>: a <code>local_file.lab_moved</code>
+megmarad, a <code>null_resource</code> eltűnt. Postcondition: a stateben
+a <code>local_file</code> a <code>lab_moved</code> címen szerepel, a
+<code>null_resource</code> törölve, a backup fájl érvényes JSON.</p>
+<h3 data-number="46.5.7" id="rövid-összefoglaló"><span
+class="header-section-number">46.5.7</span> Rövid összefoglaló</h3>
+<p>Ez a labor a provision folyamat ellenőrzésére tanította be az
+idempotens desciplinát: a <code>plan</code>-ből kiderül, hogy a
+konfiguráció, a state és a tényleges erőforrás egyezik-e; a no-op plan a
+reprodukálhatóság bizonyítéka. A driftből <code>apply</code>-vel vagy
+refresh-only módban lehet kilábalni; <code>import</code> és
+<code>moved</code> eszközökkel a state igazítható a meglévő
+erőforrásokhoz. Félbeszakadt apply után a state rendben lévő erőforrásai
+nem sérülnek, és a következő apply csak a hiányzó részeket pótolja. A
+destroy-t csak explicit lab resource címre szűkítve futtassuk, és minden
+elágazásnál készítsünk state backupot. Továbbhasznált definíciók:
+<strong>desired state</strong> – a konfigurációban leírt célállapot;
+<strong>observed state</strong> – a refreshelt távoli állapot;
+<strong>no-op plan</strong> – olyan plan, amely 0 add/change/destroy
+értéket jelez.</p>
+<h3 data-number="46.5.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">46.5.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>Az alábbiak ellenőrizendő kiindulópontok, nem ebben a munkamenetben
+olvasott bizonyítékok. Állításonként:</p>
+<ul>
+<li><code>plan</code>/<code>apply</code>,
+<code>-detailed-exitcode</code>, <code>-replace</code>,
+<code>-refresh-only</code>, <code>-lock-timeout</code>,
+<code>force-unlock</code>, <code>state pull/push/rm/list</code>,
+<code>import</code>, <code>moved</code> blokk, provisioner és tainted
+állapot: <a href="https://opentofu.org/docs/">OpenTofu dokumentáció</a>,
+a „CLI commands” és a „Language” (Resources, Provisioners,
+Refactoring/moved) fejezetek; hivatkozott verzió: OpenTofu 1.6.x (a
+<code>main.tf</code> <code>required_version = "~&gt; 1.6"</code>
+korlátja).</li>
+<li>Provider lock (<code>.terraform.lock.hcl</code>,
+<code>tofu providers lock</code>): ugyanott a „Dependency Lock File”
+oldal, OpenTofu 1.6.x.</li>
+<li><code>local_file</code> és <code>null_resource</code> viselkedése
+(ForceNew argumentumok, <code>triggers</code>, importtámogatás): a <a
+href="https://registry.terraform.io/">Terraform Registry</a>
+<code>hashicorp/local</code> 2.4.x és <code>hashicorp/null</code> 3.2.x
+providerdokumentációja.</li>
+<li>Terraform-kompatibilitás: <a
+href="https://developer.hashicorp.com/terraform/docs">HashiCorp
+Terraform dokumentáció</a> – a Terraform és az OpenTofu szintaktikai
+kompatibilitása nem teljes minden feature-re.</li>
+<li><a href="https://docs.aws.amazon.com/">AWS dokumentáció</a> – a lab
+ebben a fejezetben nem használ AWS erőforrást; az importgyakorlat
+importálható sandbox erőforrásához használható, a sandbox scope
+korlátjával.</li>
+</ul>
+<p><strong>Ellenőrzési státusz:</strong> a kidolgozott példa sikeres ága
+(no-op plan) és hibaágai (drift, tainted <code>null_resource</code>,
+import) laborban ellenőrizendők; dátumozott futtatási napló
+(eszközverziókkal és parancskimenettel) még nem készült.</p>
+<p>A jelen szövegben szereplő providerverziók, az OpenTofu 1.6
+kompatibilitási állítások és a <code>tofu providers lock</code> pontos
+viselkedése nem ellenőrzött a kiadási dokumentációban; ezeket a labor
+futtatása előtt a hivatalos release notes és provider registry
+ellenőrzésével kell alátámasztani. Nincs ténylegesen futtatott kimenet,
+minden megadott output illusztratív.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d229.html">← 46.4 IaC CI, test, policy és promotion</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d231.html">47.1 Inventory, SSH, module és playbook →</a></div>
+</nav>
+</body>
+</html>

@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>29.5 TLS/proxy és end-to-end elérhetőségi labor – Linux és
+DevOps rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch29">29 HTTP, TLS, proxy és load balancer</a></p>
+<div class="links"><a class="prev" rel="prev" href="d144.html">← 29.4 Certificate és web edge életciklus</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d146.html">30.1 iproute2, rtnetlink és runtime config →</a></div>
+</nav>
+<h2 data-number="29.5" id="d145"><span
+class="header-section-number">29.5</span> TLS/proxy és end-to-end
+elérhetőségi labor</h2>
+<h3 data-number="29.5.1" id="mit-bizonyít-az-hogy-elérhető"><span
+class="header-section-number">29.5.1</span> Mit bizonyít az, hogy
+„elérhető”?</h3>
+<p>Az edge végpont akkor használható, ha a kliens megfelelő címre jut,
+létrejön a TCP-kapcsolat, sikeres a hitelesített TLS-kézfogás, majd az
+alkalmazás megfelelő HTTP-választ ad. Egy nyitott port, egy érvényes
+tanúsítvány vagy egy <code>200 OK</code> önmagában nem bizonyítja
+mindezt.</p>
+<p><strong>Végponttól végpontig tartó elérhetőség (end-to-end
+availability):</strong> egy meghatározott kliensnézőpontból, névvel,
+bizalmi tárral és időkorláttal végrehajtott, szemantikailag ellenőrzött
+kérés sikeressége.</p>
+<p>A labor ugyanazon izolált VM-en vizsgálja a rétegeket. Ez
+reprodukálható hibakeresési környezet, <strong>nem többhostos
+rendelkezésreállási bizonyíték</strong>. Az előző <a
+href="d144.html">tanúsítvány-életciklus</a> és <a
+href="d140.html">DNS/idő diagnosztika</a> itt egyetlen kérésútban
+találkozik.</p>
+<h3 data-number="29.5.2" id="laborszerződés-és-adatút"><span
+class="header-section-number">29.5.2</span> Laborszerződés és
+adatút</h3>
+<p>Minden parancs célpontja <strong><code>lab-edge</code></strong>,
+Ubuntu Server 24.04 LTS amd64 VM. A normál fiók
+<strong><code>lab-admin</code>, UID 1000</strong>; kizárólag a
+csomagrögzítéshez kell <code>sudo</code>, UID 0. Minden blokk ugyanabban
+a Bash-munkamenetben fut, kivéve a külön jelölt második terminált.</p>
+<p>Előfeltétel: telepített <code>nginx</code>, <code>openssl</code>,
+<code>curl</code>, <code>dnsutils</code>, <code>dnsmasq-base</code>,
+<code>iproute2</code>, <code>tcpdump</code>, <code>python3</code>;
+működő labkonzol. A rendszer nginx-szolgáltatását, resolverét és bizalmi
+tárát nem módosítjuk.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Elem</th>
+<th>Forrás → cél</th>
+<th>Tulajdonos és állapot</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Labor-DNS</td>
+<td>kliens → <code>127.0.0.1:1053</code>, UDP/TCP</td>
+<td>külön dnsmasq-folyamat</td>
+</tr>
+<tr>
+<td>TLS edge</td>
+<td>kliens → <code>127.0.0.1:18443</code>, TCP</td>
+<td>külön nginx-példány</td>
+</tr>
+<tr>
+<td>Elsődleges backend</td>
+<td>nginx → <code>127.0.0.1:18081</code>, TCP</td>
+<td>Python-folyamat</td>
+</tr>
+<tr>
+<td>Tartalék backend</td>
+<td>nginx → <code>127.0.0.1:18082</code>, TCP</td>
+<td>Python-folyamat</td>
+</tr>
+<tr>
+<td>Konfiguráció, PKI, naplók</td>
+<td><code>$HOME/lab-d145</code></td>
+<td><code>lab-admin</code>; törlés a munkamenet végén</td>
+</tr>
+</tbody>
+</table>
+<p>A kívánt állapot: hitelesített HTTPS, elsődleges backendről kapott
+válasz; kiürítés után új kérések a tartalékra mennek. A
+konfigurációforrás a labor könyvtára. A fájlokban tárolt állapotot külön
+kezeljük a <strong>megfigyelt</strong> tanúsítványtól, folyamattól és
+backendválasztól. Minden komponens közös hosthibadoménben van.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-edge, lab-admin, UID 1000</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="bu">test</span> <span class="st">&quot;</span><span class="va">$(</span><span class="fu">hostname</span> <span class="at">-s</span><span class="va">)</span><span class="st">&quot;</span> = lab-edge <span class="kw">&amp;&amp;</span> <span class="bu">test</span> <span class="st">&quot;</span><span class="va">$(</span><span class="fu">id</span> <span class="at">-u</span><span class="va">)</span><span class="st">&quot;</span> <span class="at">-eq</span> 1000 <span class="kw">||</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">{</span> <span class="bu">echo</span> <span class="st">&quot;Hibás labtarget&quot;</span><span class="kw">;</span> <span class="bu">exit</span> 1<span class="kw">;</span> <span class="kw">}</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Ha bármelyik port foglalt, állj meg; ne állíts le idegen folyamatot!</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="ex">ss</span> <span class="at">-H</span> <span class="at">-lntup</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;:(1053|18443|18081|18082)([[:space:]]|$)&#39;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">LAB</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$HOME</span><span class="st">/lab-d145&quot;</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="bu">umask</span> 077</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="st">&quot;</span><span class="va">$LAB</span><span class="st">&quot;</span> <span class="kw">||</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>  <span class="kw">{</span> <span class="bu">echo</span> <span class="st">&#39;STOP: előfeltétel nem teljesül – ne folytasd&#39;</span> <span class="op">&gt;&amp;</span><span class="dv">2</span><span class="kw">;</span> <span class="fu">false</span><span class="kw">;</span> <span class="kw">}</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> <span class="st">&quot;</span><span class="va">$LAB</span><span class="st">&quot;</span> <span class="kw">||</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>  <span class="kw">{</span> <span class="bu">echo</span> <span class="st">&#39;STOP: előfeltétel nem teljesül – ne folytasd&#39;</span> <span class="op">&gt;&amp;</span><span class="dv">2</span><span class="kw">;</span> <span class="fu">false</span><span class="kw">;</span> <span class="kw">}</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="fu">uname</span> <span class="at">-a</span> <span class="op">&gt;</span> lab-profile.txt</span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="ex">dpkg-query</span> <span class="at">-W</span> nginx openssl curl dnsutils dnsmasq-base <span class="dt">\</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>    iproute2 tcpdump python3 systemd <span class="op">&gt;&gt;</span> lab-profile.txt</span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="ex">/usr/sbin/nginx</span> <span class="at">-V</span> <span class="op">&gt;&gt;</span> lab-profile.txt <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="ex">timedatectl</span> status <span class="op">&gt;&gt;</span> lab-profile.txt</span></code></pre></div>
+<p>A portellenőrzés várt eredménye üres; a <code>grep</code> ekkor 1-es
+kilépési kódot ad. A profilfájl a <strong>ténylegesen
+telepített</strong> kiadásokat rögzíti; itt nem állítunk előre
+ellenőrzött csomagrevíziókat.</p>
+<h3 data-number="29.5.3"
+id="kidolgozott-példa-ca-két-backend-és-tls-edge"><span
+class="header-section-number">29.5.3</span> Kidolgozott példa: CA, két
+backend és TLS edge</h3>
+<h4 data-number="29.5.3.1" id="rövid-életű-labor-pki"><span
+class="header-section-number">29.5.3.1</span> Rövid életű labor-PKI</h4>
+<p>A lánc: gyökér-hitelesítésszolgáltató (root CA) → köztes
+hitelesítésszolgáltató (intermediate CA) → szervertanúsítvány. A kliens
+csak a gyökeret kapja bizalmi horgonyként; a szerver a levél- és köztes
+tanúsítványt küldi.</p>
+<p>A titkosítatlan privát kulcsok kizárólag ehhez az eldobható laborhoz
+használhatók. Nem kerülnek rendszerbizalmi tárba, repositoryba vagy
+másik gépre.</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-edge, lab-admin, UID 1000; munkakönyvtár: $LAB</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> req <span class="at">-x509</span> <span class="at">-newkey</span> rsa:2048 <span class="at">-noenc</span> <span class="at">-sha256</span> <span class="at">-days</span> 2 <span class="dt">\</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-subj</span> <span class="st">&quot;/CN=lab-d145-root&quot;</span> <span class="dt">\</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-keyout</span> lab-root.key <span class="at">-out</span> lab-root.crt <span class="dt">\</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">-addext</span> <span class="st">&quot;basicConstraints=critical,CA:TRUE,pathlen:1&quot;</span> <span class="dt">\</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">-addext</span> <span class="st">&quot;keyUsage=critical,keyCertSign,cRLSign&quot;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="op">&gt;</span> lab-int.ext <span class="op">&lt;&lt;&#39;EOF&#39;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="st">basicConstraints=critical,CA:TRUE,pathlen:0</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="st">keyUsage=critical,keyCertSign,cRLSign</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="st">subjectKeyIdentifier=hash</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="st">authorityKeyIdentifier=keyid,issuer</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="op">EOF</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> req <span class="at">-new</span> <span class="at">-newkey</span> rsa:2048 <span class="at">-noenc</span> <span class="dt">\</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>  <span class="at">-subj</span> <span class="st">&quot;/CN=lab-d145-intermediate&quot;</span> <span class="dt">\</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>  <span class="at">-keyout</span> lab-int.key <span class="at">-out</span> lab-int.csr</span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> x509 <span class="at">-req</span> <span class="at">-in</span> lab-int.csr <span class="at">-CA</span> lab-root.crt <span class="dt">\</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>  <span class="at">-CAkey</span> lab-root.key <span class="at">-set_serial</span> 2 <span class="at">-days</span> 2 <span class="at">-sha256</span> <span class="dt">\</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>  <span class="at">-extfile</span> lab-int.ext <span class="at">-out</span> lab-int.crt</span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="op">&gt;</span> lab-leaf.ext <span class="op">&lt;&lt;&#39;EOF&#39;</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a><span class="st">basicConstraints=critical,CA:FALSE</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a><span class="st">keyUsage=critical,digitalSignature,keyEncipherment</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a><span class="st">extendedKeyUsage=serverAuth</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a><span class="st">subjectAltName=DNS:lab-edge.test</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a><span class="op">EOF</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> req <span class="at">-new</span> <span class="at">-newkey</span> rsa:2048 <span class="at">-noenc</span> <span class="dt">\</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>  <span class="at">-subj</span> <span class="st">&quot;/CN=lab-edge.test&quot;</span> <span class="dt">\</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>  <span class="at">-keyout</span> lab-leaf.key <span class="at">-out</span> lab-leaf.csr</span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> x509 <span class="at">-req</span> <span class="at">-in</span> lab-leaf.csr <span class="at">-CA</span> lab-int.crt <span class="dt">\</span></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>  <span class="at">-CAkey</span> lab-int.key <span class="at">-set_serial</span> 3 <span class="at">-days</span> 1 <span class="at">-sha256</span> <span class="dt">\</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>  <span class="at">-extfile</span> lab-leaf.ext <span class="at">-out</span> lab-leaf.crt</span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> lab-leaf.crt lab-int.crt <span class="op">&gt;</span> lab-chain.pem</span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> lab-chain.pem lab-chain.good.pem</span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> verify <span class="at">-CAfile</span> lab-root.crt <span class="at">-untrusted</span> lab-int.crt <span class="dt">\</span></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a>  <span class="at">-purpose</span> sslserver <span class="at">-verify_hostname</span> lab-edge.test lab-leaf.crt</span></code></pre></div>
+<p>Várt eredmény: <code>lab-leaf.crt: OK</code>. Ez <strong>fájlalapú
+láncellenőrzés</strong>, nem bizonyítja, hogy az edge ugyanezt
+küldi.</p>
+<h4 data-number="29.5.3.2"
+id="egészséges-és-forgalomfogadásra-kész-backend"><span
+class="header-section-number">29.5.3.2</span> Egészséges és
+forgalomfogadásra kész backend</h4>
+<p>Az <strong>egészséges (healthy)</strong> folyamat képes működni; a
+<strong>kész (ready)</strong> példány az adott szolgáltatási szerződés
+szerint fogadhat forgalmat. Például az alkalmazás élhet úgy, hogy még
+nincs betöltve az adatállománya.</p>
+<p>A fixture <code>/healthz</code> végpontja mindig 200-at ad; a
+readiness és a többi útvonal 503-at ad egy név szerint kijelölt
+jelzőfájl jelenlétében.</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="op">&gt;</span> lab-backend.py <span class="op">&lt;&lt;&#39;PY&#39;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="st">import sys, time</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="st">from pathlib import Path</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="st">from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="st">port = int(sys.argv[1])</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="st">root = Path(sys.argv[2])</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="st">class Handler(BaseHTTPRequestHandler):</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="st">    def do_GET(self):</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="st">        ready = not (root / f&quot;lab-unready-{port}&quot;).exists()</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="st">        status = 200 if self.path == &quot;/healthz&quot; or ready else 503</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="st">        marker = root / f&quot;lab-inflight-{port}&quot;</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="st">        slow = self.path == &quot;/slow&quot; and status == 200</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="st">        self.log_message(&quot;begin id=%s&quot;,</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="st">                         self.headers.get(&quot;X-Lab-ID&quot;, &quot;-&quot;))</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a><span class="st">        if slow:</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a><span class="st">            marker.touch()</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a><span class="st">        try:</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a><span class="st">            if status == 200:</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a><span class="st">                time.sleep({&quot;/slow&quot;: 4, &quot;/stall&quot;: 8}.get(self.path, 0))</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a><span class="st">            body = f&quot;lab-backend-{port} ready={ready}\n&quot;.encode()</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a><span class="st">            self.send_response(status)</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a><span class="st">            self.send_header(&quot;Content-Type&quot;, &quot;text/plain&quot;)</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a><span class="st">            self.send_header(&quot;Content-Length&quot;, str(len(body)))</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a><span class="st">            self.end_headers()</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a><span class="st">            self.wfile.write(body)</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a><span class="st">        except (BrokenPipeError, ConnectionResetError):</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a><span class="st">            pass  # A timeouttesztben a proxy már lezárhatta a kapcsolatot.</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a><span class="st">        finally:</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a><span class="st">            if slow:</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a><span class="st">                marker.unlink(missing_ok=True)</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a><span class="st">ThreadingHTTPServer((&quot;127.0.0.1&quot;, port), Handler).serve_forever()</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a><span class="op">PY</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> lab-backend.py 18081 <span class="st">&quot;</span><span class="va">$LAB</span><span class="st">&quot;</span> <span class="op">&gt;</span> lab-backend-18081.log <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span> <span class="kw">&amp;</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a><span class="va">LAB_B1_PID</span><span class="op">=</span><span class="va">$!</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> lab-backend.py 18082 <span class="st">&quot;</span><span class="va">$LAB</span><span class="st">&quot;</span> <span class="op">&gt;</span> lab-backend-18082.log <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span> <span class="kw">&amp;</span></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a><span class="va">LAB_B2_PID</span><span class="op">=</span><span class="va">$!</span></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a> <span class="ex">/usr/sbin/dnsmasq</span> <span class="at">--conf-file</span><span class="op">=</span>/dev/null <span class="at">--no-daemon</span> <span class="dt">\</span></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a>  <span class="at">--port</span><span class="op">=</span>1053 <span class="at">--listen-address</span><span class="op">=</span>127.0.0.1 <span class="at">--bind-interfaces</span> <span class="dt">\</span></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a>  <span class="at">--no-hosts</span> <span class="at">--no-resolv</span> <span class="at">--address</span><span class="op">=</span>/lab-edge.test/127.0.0.1 <span class="dt">\</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a>  <span class="op">&gt;</span> lab-dns.log <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span> <span class="kw">&amp;</span></span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a><span class="va">LAB_DNS_PID</span><span class="op">=</span><span class="va">$!</span></span></code></pre></div>
+<h4 data-number="29.5.3.3" id="dedikált-nginx-példány"><span
+class="header-section-number">29.5.3.3</span> Dedikált
+nginx-példány</h4>
+<p>A labor aktív–tartalék topológiát használ. Nincs aktív
+readiness-lekérdezés, automatikus újrapróbálkozás vagy passzív kivonás:
+így a hibák nem rejtőznek el második backend mögött.</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="op">&gt;</span> lab-nginx.conf <span class="op">&lt;&lt;EOF</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="st">daemon off;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="st">worker_processes 1;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="st">worker_shutdown_timeout 10s;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="st">pid </span><span class="va">$LAB</span><span class="st">/lab-nginx.pid;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="st">error_log </span><span class="va">$LAB</span><span class="st">/lab-error.log info;</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="st">events { worker_connections 128; }</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="st">http {</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="st">    client_body_temp_path </span><span class="va">$LAB</span><span class="st">/lab-body;</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="st">    proxy_temp_path </span><span class="va">$LAB</span><span class="st">/lab-proxy;</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="st">    fastcgi_temp_path </span><span class="va">$LAB</span><span class="st">/lab-fastcgi;</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="st">    uwsgi_temp_path </span><span class="va">$LAB</span><span class="st">/lab-uwsgi;</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="st">    scgi_temp_path </span><span class="va">$LAB</span><span class="st">/lab-scgi;</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="st">    log_format lab &#39;</span><span class="dt">\$</span><span class="st">time_iso8601 id=</span><span class="dt">\$</span><span class="st">http_x_lab_id status=</span><span class="dt">\$</span><span class="st">status &#39;</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a><span class="st">                   &#39;upstream=</span><span class="dt">\$</span><span class="st">upstream_addr us=</span><span class="dt">\$</span><span class="st">upstream_status &#39;</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a><span class="st">                   &#39;rt=</span><span class="dt">\$</span><span class="st">request_time urt=</span><span class="dt">\$</span><span class="st">upstream_response_time&#39;;</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a><span class="st">    access_log </span><span class="va">$LAB</span><span class="st">/lab-access.log lab;</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a><span class="st">    ssl_protocols TLSv1.2 TLSv1.3;</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a><span class="st">    upstream lab_pool {</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a><span class="st">        server 127.0.0.1:18081 max_fails=0;</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a><span class="st">        server 127.0.0.1:18082 backup;</span></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a><span class="st">    }</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a><span class="st">    server {</span></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a><span class="st">        listen 127.0.0.1:18443 ssl default_server;</span></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a><span class="st">        ssl_reject_handshake on;</span></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a><span class="st">    }</span></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a><span class="st">    server {</span></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a><span class="st">        listen 127.0.0.1:18443 ssl;</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a><span class="st">        server_name lab-edge.test;</span></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a><span class="st">        ssl_certificate </span><span class="va">$LAB</span><span class="st">/lab-chain.pem;</span></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a><span class="st">        ssl_certificate_key </span><span class="va">$LAB</span><span class="st">/lab-leaf.key;</span></span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-39"><a href="#cb4-39" aria-hidden="true" tabindex="-1"></a><span class="st">        location / {</span></span>
+<span id="cb4-40"><a href="#cb4-40" aria-hidden="true" tabindex="-1"></a><span class="st">            proxy_pass http://lab_pool;</span></span>
+<span id="cb4-41"><a href="#cb4-41" aria-hidden="true" tabindex="-1"></a><span class="st">            proxy_http_version 1.1;</span></span>
+<span id="cb4-42"><a href="#cb4-42" aria-hidden="true" tabindex="-1"></a><span class="st">            proxy_set_header Connection close;</span></span>
+<span id="cb4-43"><a href="#cb4-43" aria-hidden="true" tabindex="-1"></a><span class="st">            proxy_set_header Host </span><span class="dt">\$</span><span class="st">host;</span></span>
+<span id="cb4-44"><a href="#cb4-44" aria-hidden="true" tabindex="-1"></a><span class="st">            proxy_set_header X-Lab-ID </span><span class="dt">\$</span><span class="st">http_x_lab_id;</span></span>
+<span id="cb4-45"><a href="#cb4-45" aria-hidden="true" tabindex="-1"></a><span class="st">            proxy_connect_timeout 1s;</span></span>
+<span id="cb4-46"><a href="#cb4-46" aria-hidden="true" tabindex="-1"></a><span class="st">            proxy_read_timeout 6s;</span></span>
+<span id="cb4-47"><a href="#cb4-47" aria-hidden="true" tabindex="-1"></a><span class="st">            proxy_next_upstream off;</span></span>
+<span id="cb4-48"><a href="#cb4-48" aria-hidden="true" tabindex="-1"></a><span class="st">        }</span></span>
+<span id="cb4-49"><a href="#cb4-49" aria-hidden="true" tabindex="-1"></a><span class="st">    }</span></span>
+<span id="cb4-50"><a href="#cb4-50" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb4-51"><a href="#cb4-51" aria-hidden="true" tabindex="-1"></a><span class="op">EOF</span></span>
+<span id="cb4-52"><a href="#cb4-52" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-53"><a href="#cb4-53" aria-hidden="true" tabindex="-1"></a><span class="fu">lab_nginx()</span> <span class="kw">{</span></span>
+<span id="cb4-54"><a href="#cb4-54" aria-hidden="true" tabindex="-1"></a>    <span class="ex">/usr/sbin/nginx</span> <span class="at">-p</span> <span class="st">&quot;</span><span class="va">$LAB</span><span class="st">/&quot;</span> <span class="at">-c</span> <span class="st">&quot;</span><span class="va">$LAB</span><span class="st">/lab-nginx.conf&quot;</span> <span class="dt">\</span></span>
+<span id="cb4-55"><a href="#cb4-55" aria-hidden="true" tabindex="-1"></a>        <span class="at">-e</span> <span class="st">&quot;</span><span class="va">$LAB</span><span class="st">/lab-error.log&quot;</span> <span class="st">&quot;</span><span class="va">$@</span><span class="st">&quot;</span></span>
+<span id="cb4-56"><a href="#cb4-56" aria-hidden="true" tabindex="-1"></a><span class="kw">}</span></span>
+<span id="cb4-57"><a href="#cb4-57" aria-hidden="true" tabindex="-1"></a><span class="fu">lab_reload()</span> <span class="kw">{</span></span>
+<span id="cb4-58"><a href="#cb4-58" aria-hidden="true" tabindex="-1"></a>    <span class="ex">lab_nginx</span> <span class="at">-t</span> <span class="kw">&amp;&amp;</span> <span class="ex">lab_nginx</span> <span class="at">-s</span> reload</span>
+<span id="cb4-59"><a href="#cb4-59" aria-hidden="true" tabindex="-1"></a><span class="kw">}</span></span>
+<span id="cb4-60"><a href="#cb4-60" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-61"><a href="#cb4-61" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> lab-nginx.conf lab-nginx.good.conf</span>
+<span id="cb4-62"><a href="#cb4-62" aria-hidden="true" tabindex="-1"></a><span class="ex">lab_nginx</span> <span class="at">-t</span> <span class="kw">&amp;&amp;</span></span>
+<span id="cb4-63"><a href="#cb4-63" aria-hidden="true" tabindex="-1"></a>    <span class="ex">lab_nginx</span> <span class="op">&gt;</span> lab-nginx-start.log <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span> <span class="kw">&amp;</span></span>
+<span id="cb4-64"><a href="#cb4-64" aria-hidden="true" tabindex="-1"></a><span class="va">LAB_NGINX_PID</span><span class="op">=</span><span class="va">$!</span></span></code></pre></div>
+<p>A reload aszinkron: a jelzés elküldése még nem bizonyítja az új
+állapotot. Minden változtatás után új klienskapcsolattal ellenőrizz;
+legfeljebb öt másodpercig ismételd a próbát, majd sikertelenségnél
+vizsgáld a naplót.</p>
+<h3 data-number="29.5.4" id="egy-kérés-rétegenkénti-vizsgálata"><span
+class="header-section-number">29.5.4</span> Egy kérés rétegenkénti
+vizsgálata</h3>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-edge, lab-admin, UID 1000</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">dig</span> @127.0.0.1 <span class="at">-p</span> 1053 lab-edge.test A +noall +answer</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="va">LAB_IP</span><span class="op">=</span><span class="va">$(</span><span class="ex">dig</span> @127.0.0.1 <span class="at">-p</span> 1053 lab-edge.test A +short<span class="va">)</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="bu">test</span> <span class="st">&quot;</span><span class="va">$LAB_IP</span><span class="st">&quot;</span> = 127.0.0.1 <span class="kw">||</span> <span class="kw">{</span> <span class="bu">echo</span> <span class="st">&quot;Hibás DNS-válasz&quot;</span><span class="kw">;</span> <span class="bu">exit</span> 1<span class="kw">;</span> <span class="kw">}</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="ex">ss</span> <span class="at">-lntp</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;:(18443|18081|18082)[[:space:]]&#39;</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> s_client <span class="at">-connect</span> <span class="st">&quot;</span><span class="va">$LAB_IP</span><span class="st">:18443&quot;</span> <span class="dt">\</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">-servername</span> lab-edge.test <span class="at">-verify_hostname</span> lab-edge.test <span class="dt">\</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">-verify_return_error</span> <span class="at">-CAfile</span> <span class="st">&quot;</span><span class="va">$LAB</span><span class="st">/lab-root.crt&quot;</span> <span class="dt">\</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">-showcerts</span> <span class="op">&lt;</span>/dev/null</span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="fu">lab_curl()</span> <span class="kw">{</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>    <span class="ex">curl</span> <span class="at">--noproxy</span> <span class="st">&#39;*&#39;</span> <span class="at">--silent</span> <span class="at">--show-error</span> <span class="at">--max-time</span> 10 <span class="dt">\</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>      <span class="at">--cacert</span> <span class="st">&quot;</span><span class="va">$LAB</span><span class="st">/lab-root.crt&quot;</span> <span class="dt">\</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>      <span class="at">--resolve</span> <span class="st">&quot;lab-edge.test:18443:</span><span class="va">$LAB_IP</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$@</span><span class="st">&quot;</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="kw">}</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="ex">lab_curl</span> <span class="at">-v</span> <span class="at">-H</span> <span class="st">&#39;X-Lab-ID: lab-baseline&#39;</span> <span class="dt">\</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>    https://lab-edge.test:18443/</span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a><span class="fu">tail</span> <span class="at">-n</span> 10 lab-access.log lab-error.log</span></code></pre></div>
+<p>Várt ellenőrzési lánc:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Réteg</th>
+<th>Bizonyíték</th>
+<th>Amit nem bizonyít</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DNS</td>
+<td>A rekord: <code>127.0.0.1</code></td>
+<td>A rendszerresolver ugyanígy válaszol</td>
+</tr>
+<tr>
+<td>TCP</td>
+<td><code>ss</code>: listenerek; sikeres kapcsolat</td>
+<td>TLS vagy alkalmazás helyessége</td>
+</tr>
+<tr>
+<td>TLS</td>
+<td>érvényes lánc, megfelelő név</td>
+<td>backend readiness</td>
+</tr>
+<tr>
+<td>HTTP</td>
+<td>200 és <code>lab-backend-18081 ready=True</code></td>
+<td>más kliensút vagy más host elérhetősége</td>
+</tr>
+</tbody>
+</table>
+<p>A <code>--resolve</code> a <code>dig</code> által ellenőrzött címet
+használja, miközben megőrzi a TLS-nevet és a HTTP-hostnevet. Ez
+<strong>kontrollált DNS-bypass</strong>, nem a rendszerresolver
+tesztje.</p>
+<p>Az alábbi ábra ugyanezt a rétegenkénti utat mutatja a következő
+szakasz négy hibainjektálásánál és a drainnél: hol szakad meg a kérés,
+és melyik bizonyíték jelzi.</p>
+<figure id="fig-d145-keresut">
+<div class="fig-interactive"><iframe src="figures/html/d145-keresut.html" title="Az öt hibaeset közül kettő a TLS-rétegen, kettő a HTTP/upstream rétegen, a drain a backendválasztásnál látszik." loading="lazy" style="width:100%;border:0;height:520px"></iframe><noscript><img src="figures/img/d145-keresut.png" style="width:100.0%"
+alt="Az öt hibaeset közül kettő a TLS-rétegen, kettő a HTTP/upstream rétegen, a drain a backendválasztásnál látszik." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d145-keresut.png" style="width:100.0%"
+alt="Az öt hibaeset közül kettő a TLS-rétegen, kettő a HTTP/upstream rétegen, a drain a backendválasztásnál látszik." /></details></div>
+<figcaption>Hol szakad meg a kérésút az egyes hibáknál, és mi
+bizonyítja</figcaption>
+</figure>
+<p>A TLS <strong>szervernév-jelzését (Server Name Indication,
+SNI)</strong> a kliens a kézfogásban küldi; a HTTP <code>Host</code>
+fejléc csak később következik.</p>
+<h4 data-number="29.5.4.1" id="napló-és-csomagnyom-együtt"><span
+class="header-section-number">29.5.4.1</span> Napló és csomagnyom
+együtt</h4>
+<p>Második terminálban, <strong><code>lab-edge</code>,
+<code>lab-admin</code>, <code>sudo</code> → UID 0</strong>:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> timeout <span class="at">--signal</span><span class="op">=</span>INT 12s tcpdump <span class="at">-i</span> lo <span class="at">-nn</span> <span class="at">-s</span> 0 <span class="at">-U</span> <span class="at">-w</span> <span class="at">-</span> <span class="dt">\</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;udp port 1053 or tcp port 1053 or tcp port 18443 or</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="st">   tcp port 18081 or tcp port 18082&#39;</span> <span class="dt">\</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>  <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$HOME</span><span class="st">/lab-d145/lab-trace.pcap&quot;</span></span></code></pre></div>
+<p>A rögzítés alatt ismételd meg a DNS- és HTTPS-próbát. Utána, UID
+1000-ként:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">tcpdump</span> <span class="at">-nn</span> <span class="at">-r</span> <span class="st">&quot;</span><span class="va">$LAB</span><span class="st">/lab-trace.pcap&quot;</span></span></code></pre></div>
+<p>Várt nyom: DNS-kérdés/válasz, kliens–edge TCP-kapcsolat, majd külön
+edge–backend kapcsolat. A TLS-tartalom titkosított; a backend
+HTTP-forgalma nem az, ezért kizárólag dummy adatot használunk. A
+<code>timeout</code> 124-es kódja itt a rögzítési ablak végét
+jelentheti.</p>
+<p>A napló dátuma és a pcap időbélyege falióra-domain; órahibánál ne
+kizárólag ezekkel korrelálj. Használd a <code>lab-baseline</code>
+azonosítót is. Az <code>rt</code> és <code>urt</code> másodpercben
+megadott időtartam, nem abszolút időbélyeg; konkrét implementációjuk
+óraforrását ez a labor nem validálja.</p>
+<h3 data-number="29.5.5" id="hibainjektálás-ellenpróba-és-javítás"><span
+class="header-section-number">29.5.5</span> Hibainjektálás, ellenpróba
+és javítás</h3>
+<h4 data-number="29.5.5.1" id="hiányzó-köztes-tanúsítvány"><span
+class="header-section-number">29.5.5.1</span> Hiányzó köztes
+tanúsítvány</h4>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> lab-leaf.crt lab-chain.pem</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">lab_reload</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="ex">lab_curl</span> https://lab-edge.test:18443/</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Visszaállítás</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> lab-chain.good.pem lab-chain.pem</span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="ex">lab_reload</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="ex">lab_curl</span> <span class="at">--fail</span> https://lab-edge.test:18443/</span></code></pre></div>
+<p>Várt hibajelenség: a konfigurációteszt sikerülhet, de a kliens
+tanúsítvány-ellenőrzési hibát jelez, tipikusan 60-as curl-kóddal. Az
+<code>s_client -showcerts</code> csak a levéltanúsítványt mutatja.</p>
+<p>A helyes javítás a szerverlánc pótlása. A <code>-k</code>, a köztes
+tanúsítvány bizalmi horgonnyá tétele vagy a védelem globális
+kikapcsolása nem megfelelő javítás. A postcondition: kizárólag a
+gyökérrel bízó kliens ismét sikeres.</p>
+<h4 data-number="29.5.5.2" id="sni--és-órafixture"><span
+class="header-section-number">29.5.5.2</span> SNI- és órafixture</h4>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> s_client <span class="at">-connect</span> 127.0.0.1:18443 <span class="at">-noservername</span> <span class="dt">\</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-verify_hostname</span> lab-edge.test <span class="at">-verify_return_error</span> <span class="dt">\</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-CAfile</span> lab-root.crt <span class="op">&lt;</span>/dev/null</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> x509 <span class="at">-in</span> lab-leaf.crt <span class="at">-noout</span> <span class="at">-dates</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="va">LAB_FUTURE</span><span class="op">=</span><span class="va">$((</span> <span class="va">$(</span><span class="fu">date</span> +%s<span class="va">)</span> <span class="op">+</span> <span class="dv">36</span> <span class="op">*</span> <span class="dv">3600</span> <span class="va">))</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> verify <span class="at">-attime</span> <span class="st">&quot;</span><span class="va">$LAB_FUTURE</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">-CAfile</span> lab-root.crt <span class="at">-untrusted</span> lab-int.crt <span class="dt">\</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">-purpose</span> sslserver <span class="at">-verify_hostname</span> lab-edge.test lab-leaf.crt</span></code></pre></div>
+<p>SNI nélkül a default TLS-szerver elutasítja a kézfogást. Ellenpróba:
+ugyanaz a cím helyes <code>-servername</code> értékkel sikeres. Egy
+kézzel beállított HTTP <code>Host</code> fejléc nem javítja a korábban
+meghiúsult TLS-kézfogást.</p>
+<p>Az <code>-attime</code> a kliens ellenőrzési falióráját modellezi,
+Unix-epoch másodpercben. Frissen létrehozott PKI-nál 36 óra múlva a
+levél már lejárt, a kétnapos CA-k még érvényesek. A host óráját nem
+módosítjuk. Valódi incidensben a tanúsítvány érvényességét és a kliens
+időszinkronját külön ellenőrizd.</p>
+<h4 data-number="29.5.5.3" id="healthy-nem-egyenlő-ready"><span
+class="header-section-number">29.5.5.3</span> Healthy nem egyenlő
+ready</h4>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="fu">touch</span> lab-unready-18081</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">--noproxy</span> <span class="st">&#39;*&#39;</span> <span class="at">-i</span> http://127.0.0.1:18081/healthz</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">--noproxy</span> <span class="st">&#39;*&#39;</span> <span class="at">-i</span> http://127.0.0.1:18081/readyz</span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="ex">lab_curl</span> <span class="at">-i</span> https://lab-edge.test:18443/</span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">--</span> lab-unready-18081</span></code></pre></div>
+<p>Várt eredmény: 200, 503, 503. A proxy nem találja ki a readiness
+jelentését. A naplóban <code>status=503</code>, <code>us=503</code> és
+az elsődleges backend címe különíti el ezt a TLS-hibától. HTTP 503
+mellett a curl önmagában sikeres kilépési kódot is adhat; automatizált
+elfogadási próbához használj <code>--fail</code> kapcsolót és
+tartalomellenőrzést.</p>
+<h4 data-number="29.5.5.4" id="timeout-kiürítés-és-reload"><span
+class="header-section-number">29.5.5.4</span> Timeout, kiürítés és
+reload</h4>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">lab_curl</span> <span class="at">-i</span> <span class="at">-H</span> <span class="st">&#39;X-Lab-ID: lab-timeout&#39;</span> <span class="dt">\</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>    https://lab-edge.test:18443/stall</span></code></pre></div>
+<p>Várt eredmény: körülbelül hat másodperc után 504; az error log
+upstream-olvasási timeoutot jelez. A backend nyolc másodpercig nem küld
+választ. A <code>proxy_read_timeout</code> két olvasás közötti
+várakozási korlát, <strong>nem általános teljes kérésdeadline</strong>.
+A curl tíz másodperces teljes korlátja ettől külön szerződés.</p>
+<p>A <strong>kiürítés (drain)</strong> során előbb megszüntetjük az új
+forgalom kiosztását, majd megvárjuk a folyamatban lévő kéréseket:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">--noproxy</span> <span class="st">&#39;*&#39;</span> <span class="at">--fail</span> http://127.0.0.1:18082/readyz</span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="ex">lab_curl</span> <span class="at">--fail</span> <span class="at">-H</span> <span class="st">&#39;X-Lab-ID: lab-drain&#39;</span> <span class="dt">\</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>  https://lab-edge.test:18443/slow <span class="op">&gt;</span> lab-slow.result <span class="kw">&amp;</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="va">LAB_REQUEST_PID</span><span class="op">=</span><span class="va">$!</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="fu">timeout</span> 2s bash <span class="at">-c</span> <span class="dt">\</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;until test -f &quot;$LAB/lab-inflight-18081&quot;; do sleep 0.05; done&#39;</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="cf">then</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a>    <span class="fu">sed</span> <span class="at">-i</span> <span class="st">&#39;s/18081 max_fails=0;/18081 max_fails=0 down;/&#39;</span> <span class="dt">\</span></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a>        lab-nginx.conf</span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a>    <span class="ex">lab_reload</span></span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a><span class="cf">else</span></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;Nem figyeltünk meg folyamatban lévő kérést; a teszt nem értékelhető.&quot;</span></span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a><span class="cf">fi</span></span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a><span class="bu">wait</span> <span class="st">&quot;</span><span class="va">$LAB_REQUEST_PID</span><span class="st">&quot;</span></span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> lab-slow.result</span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a><span class="ex">lab_curl</span> <span class="at">--fail</span> https://lab-edge.test:18443/</span></code></pre></div>
+<p>Várt postcondition: a korábban indított kérés az elsődleges
+backendről sikeresen befejeződik; az új kapcsolaton küldött kérés már
+<code>lab-backend-18082</code> választ kap. A reload alatti régi worker
+még kiszolgálhat meglévő kapcsolatokat. A tíz másodperces
+<code>worker_shutdown_timeout</code> kemény felső korlát: nem garantál
+tetszőleges hosszúságú kérésbefejezést.</p>
+<h3 data-number="29.5.6" id="rollback-és-takarítás"><span
+class="header-section-number">29.5.6</span> Rollback és takarítás</h3>
+<p>A rollback csak addig használható, amíg a rövid életű
+labor-tanúsítvány érvényes:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lab-edge, lab-admin, UID 1000</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> lab-nginx.good.conf lab-nginx.conf</span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> lab-chain.good.pem lab-chain.pem</span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">-f</span> <span class="at">--</span> lab-unready-18081 lab-unready-18082</span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="ex">lab_reload</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a><span class="ex">lab_curl</span> <span class="at">--fail</span> https://lab-edge.test:18443/</span></code></pre></div>
+<p>Elfogadási feltétel: hitelesített TLS, 200, ismét az elsődleges
+backend. Ezután a kizárólag ehhez a laborhoz tartozó folyamatokat és
+könyvtárat távolítjuk el:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="ex">lab_nginx</span> <span class="at">-s</span> quit</span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="bu">wait</span> <span class="st">&quot;</span><span class="va">$LAB_NGINX_PID</span><span class="st">&quot;</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Ugyanaz a shell; a PID-változók a fent indított folyamatokhoz tartoznak.</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="bu">kill</span> <span class="at">-TERM</span> <span class="st">&quot;</span><span class="va">$LAB_DNS_PID</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$LAB_B1_PID</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$LAB_B2_PID</span><span class="st">&quot;</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a><span class="bu">wait</span> <span class="st">&quot;</span><span class="va">$LAB_DNS_PID</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$LAB_B1_PID</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$LAB_B2_PID</span><span class="st">&quot;</span> <span class="kw">||</span> <span class="bu">:</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> <span class="st">&quot;</span><span class="va">$HOME</span><span class="st">&quot;</span> <span class="kw">||</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a>  <span class="kw">{</span> <span class="bu">echo</span> <span class="st">&#39;STOP: előfeltétel nem teljesül – ne folytasd&#39;</span> <span class="op">&gt;&amp;</span><span class="dv">2</span><span class="kw">;</span> <span class="fu">false</span><span class="kw">;</span> <span class="kw">}</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a><span class="bu">test</span> <span class="st">&quot;</span><span class="va">$LAB</span><span class="st">&quot;</span> = <span class="st">&quot;</span><span class="va">$HOME</span><span class="st">/lab-d145&quot;</span> <span class="kw">&amp;&amp;</span> <span class="bu">test</span> ! <span class="at">-L</span> <span class="st">&quot;</span><span class="va">$LAB</span><span class="st">&quot;</span> <span class="kw">&amp;&amp;</span></span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a>    <span class="fu">rm</span> <span class="at">-r</span> <span class="at">--</span> <span class="st">&quot;</span><span class="va">$LAB</span><span class="st">&quot;</span></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a><span class="ex">ss</span> <span class="at">-H</span> <span class="at">-lntup</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;:(1053|18443|18081|18082)([[:space:]]|$)&#39;</span></span></code></pre></div>
+<p>Várt végállapot: nincs laborlistener és nincs laborkönyvtár. A
+fájltörlés nem bizonyít fizikai kulcsmegsemmisítést; VM-snapshot vagy
+külső mentés tartalmazhat másolatot. Emiatt a labor-CA soha ne kapjon
+laboron kívüli bizalmat.</p>
+<h3 data-number="29.5.7" id="feladatok"><span
+class="header-section-number">29.5.7</span> Feladatok</h3>
+<ol type="1">
+<li><strong>Magyarázó:</strong> Miért nem elegendő a nyitott TCP-port és
+a <code>/healthz</code> 200-as válasza az edge elfogadásához?</li>
+<li><strong>Konfigurációs:</strong> Ürítsd ki az elsődleges backendet
+reload segítségével, majd állítsd vissza. Bizonyítsd a folyamatban lévő
+kérés befejeződését és az új kérés célpontját.</li>
+<li><strong>Diagnosztikai:</strong> Egy társad válasszon a hiányzó
+köztes tanúsítvány, SNI-hiány, readiness-hiba és timeout közül. Készíts
+rétegenkénti bizonyítéktáblát; csak egy változtatással javíts, majd
+ismételd meg ugyanazt a klienspróbát.</li>
+</ol>
+<h3 data-number="29.5.8" id="megoldások"><span
+class="header-section-number">29.5.8</span> Megoldások</h3>
+<ol type="1">
+<li><p>A TCP csak kapcsolatfelépítést, a health endpoint csak saját
+szerződését bizonyítja. Kell DNS/címellenőrzés, névhelyes és megbízható
+TLS, valamint szemantikai alkalmazáspróba.
+<strong>Postcondition:</strong> minden réteghez megnevezett bizonyíték
+és bizonyítási korlát tartozik.</p></li>
+<li><p>Előbb igazold a tartalék readinessét; indíts lassú kérést, majd a
+marker megjelenése után állítsd <code>down</code> állapotba az
+elsődlegest és reloadolj. A régi kérés befejezése előtt ne állítsd le a
+backendet. <strong>Postcondition:</strong> régi kérés → 18081; új kérés
+→ 18082; rollback után új kérés → 18081.</p></li>
+<li><p>TLS-lánchibánál <code>showcerts</code> és root-only validáció
+dönt; SNI-hibánál azonos címen a névjelzés változtatása;
+readiness-hibánál upstream 503; timeoutnál 504 és upstream timeoutnapló.
+<strong>Postcondition:</strong> a javított eredeti próba sikeres, a
+bizalmi ellenőrzés változatlanul bekapcsolt, és a napló az elvárt
+backendet mutatja.</p></li>
+</ol>
+<h3 data-number="29.5.9" id="rövid-összefoglaló"><span
+class="header-section-number">29.5.9</span> Rövid összefoglaló</h3>
+<p>A laborban a DNS, TCP, TLS és HTTP külön bizonyítási réteg maradt,
+miközben ugyanazt a szolgáltatási kérést vizsgáltuk. A helyes javítás a
+hibás állapot tulajdonosát célozta: szerverláncot, kliensnévjelzést,
+ellenőrzési időt vagy backendforgalmat. A readiness, timeout és kiürítés
+külön szerződés; egyik sem következik pusztán a folyamat életéből. A
+reload elfogadása új klienskapcsolaton megfigyelt állapotot igényelt. A
+napló és a csomagnyom együtt erősebb bizonyítékot adott, de a közös host
+és a kontrollált resolverút korlátozta az eredmény
+általánosíthatóságát.</p>
+<ul>
+<li><strong>Readiness:</strong> az adott példány alkalmassága új
+szolgáltatási kérés fogadására.</li>
+<li><strong>Drain:</strong> új forgalom kizárása a folyamatban lévő
+munka befejezésének megengedésével.</li>
+<li><strong>SNI:</strong> TLS-kézfogásban küldött szervernév.</li>
+</ul>
+<h3 data-number="29.5.10" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">29.5.10</span> Források és ellenőrzési
+hiányok</h3>
+<p>Nem történt webes forrásolvasás vagy laborfuttatás. A kimenetek
+<strong>várt eredmények</strong>, nem mérések. Elsődleges ellenőrzési
+kiindulópontok:</p>
+<ul>
+<li><a href="https://nginx.org/en/docs/control.html">Nginx: Controlling
+nginx</a> — reload és worker-életciklus.</li>
+<li><a
+href="https://nginx.org/en/docs/http/ngx_http_ssl_module.html">Nginx
+HTTP SSL module</a> — lánc és kézfogás-elutasítás.</li>
+<li><a
+href="https://nginx.org/en/docs/http/ngx_http_proxy_module.html">Nginx
+HTTP proxy module</a> — timeout és újrapróbálkozás.</li>
+<li><a
+href="https://docs.openssl.org/3.0/man1/openssl-s_client/">OpenSSL 3.0:
+openssl-s_client</a> — SNI és szerverellenőrzés.</li>
+<li><a href="https://docs.openssl.org/3.0/man1/openssl-verify/">OpenSSL
+3.0: openssl-verify</a> — név, cél és ellenőrzési idő.</li>
+<li><a href="https://curl.se/docs/manpage.html">curl kézikönyv</a> —
+<code>--resolve</code>, <code>--cacert</code>, <code>--fail</code>.</li>
+</ul>
+<p><strong>Nyitott ellenőrzések:</strong> az Ubuntu konkrét
+csomagrevíziói és buildopciói, a telepített verzióhoz tartozó kapcsolók,
+az időtartammérés óraforrása, valamint a graceful reload tényleges
+viselkedése a célprofilon.</p>
+<p><strong>Verzió- és szakaszhivatkozások</strong> (célprofil: Ubuntu
+Server 24.04 LTS „noble”, GA-kernel 6.8, nginx 1.24, OpenSSL 3.0, curl
+8.5; a pontos csomagrevíziót a labor <code>dpkg-query -W</code> kimenete
+rögzíti; az upstream és <code>latest</code> dokumentáció nem
+automatikusan ehhez a kiadáshoz tartozik):</p>
+<ul>
+<li>nginx: a fenti modul-dokumentáció az 1.24-es kiadáshoz
+illesztve.</li>
+<li>OpenSSL 3.0: a fenti <code>s_client</code> és <code>verify</code>
+oldalak.</li>
+<li>curl: <a
+href="https://manpages.ubuntu.com/manpages/noble/en/man1/curl.1.html">curl(1),
+noble</a> (<code>--resolve</code>, <code>--cacert</code>,
+<code>--write-out</code>).</li>
+</ul>
+<p><strong>Reprodukciós állapot:</strong> dátumozott futtatási napló és
+reprodukciós trace még nincs; a fenti példák nem futottak, laborban
+ellenőrizendők. A laborjegyzőkönyvnek rögzítenie kell a
+<code>uname -r</code> és a <code>dpkg-query -W</code> kimenetét,
+valamint legalább egy sikeres és egy szándékosan hibás ág tényleges
+kimenetét; addig minden közölt kimenet várt, nem mért eredmény.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d144.html">← 29.4 Certificate és web edge életciklus</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d146.html">30.1 iproute2, rtnetlink és runtime config →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

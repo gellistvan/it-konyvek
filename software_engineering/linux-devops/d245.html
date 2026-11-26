@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>49.5 Progressive delivery és recovery labor – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch49">49 CD, release, GitOps és rollback</a></p>
+<div class="links"><a class="prev" rel="prev" href="d244.html">← 49.4 Helm, Kustomize és configuration overlay</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d246.html">50.1 Metrics/logs/traces és service questions →</a></div>
+</nav>
+<h2 data-number="49.5" id="d245"><span
+class="header-section-number">49.5</span> Progressive delivery és
+recovery labor</h2>
+<h3 data-number="49.5.1" id="motiváció"><span
+class="header-section-number">49.5.1</span> Motiváció</h3>
+<p>A d244 alfejezetben a GitOps desired state és a Helm/Kustomize
+overlay segítségével már eljutottunk odáig, hogy egy artifact
+hivatkozható és környezetekbe telepíthető. A d245 labor célja, hogy egy
+hibás C++ szolgáltatás-release-t ne egyszerre, hanem kontrolláltan, kis
+forgalmi szeleten engedjünk be, majd valós üzemi jelekből – metrics,
+logs, traces – döntsünk a folytatásról vagy a visszaállításról. A
+szenior fejlesztői rutin itt akkor hasznos, ha a kódhiba és az operációs
+hiba nem keveredik: a rossz release ugyanolyan artifact-, konfigurációs
+és állapotkezelési probléma, mint egy rossz resource lifetime vagy data
+race a C++ kódban.</p>
+<p>Ebben a laborban a cél nem a C++ hiba javítása, hanem az, hogy a hiba
+üzemi hatását mérjük, és a release-t evidenciával visszavonjuk. A
+visszaállítás csak akkor fogadható el, ha adatkompatibilis: a régebbi
+artifact a tranzakciós adatokkal és sémával együtt működik, nem
+kényszerít destruktív adatmigrációt.</p>
+<h3 data-number="49.5.2" id="definíció-és-működés"><span
+class="header-section-number">49.5.2</span> Definíció és működés</h3>
+<p><strong>Progresszív szállítás (progressive delivery)</strong> alatt
+azt a folyamatot értjük, amelyben egy új verziót fokozatosan teszünk
+elérhetővé a felhasználók egy kis részhalmazának, miközben a
+szolgáltatásminőséget – leggyakrabban hibaarányt és válaszidő-eloszlást
+– folyamatosan mérjük. A <strong>kanári kiadás (canary release)</strong>
+ennek egy gyakori megvalósítása: a régi, <strong>stable</strong> verzió
+mellett elindítunk egy kis példányszámú <strong>canary</strong> verziót,
+és megfigyeljük, hogy a canary podokhoz irányított forgalom milyen
+hibákat produkál.</p>
+<p>Az <strong>immutable artifact</strong> itt a CI által előállított,
+tartalomcímzett OCI image, például
+<code>ghcr.io/lab-org/lab-cpp-service@sha256:...</code>. Az image digest
+nem módosítható; ha új build készül, új digest jön létre. A GitOps
+forrás a desired state: a Git repóban lévő manifest hivatkozik erre a
+digestre, és a GitOps operator (például Argo CD) ezt a state-et
+szinkronizálja a clusterre. A laborban a konkrét szinkronizálást
+explicit <code>kubectl</code> parancsokkal szimuláljuk, mert az aktuális
+Argo CD support- és verziómátrixot ebben a fejezetben nem
+ellenőriztük.</p>
+<p><strong>Data-compatible rollback</strong> azt jelenti, hogy a
+visszaállított korábbi artifact és konfiguráció a jelenlegi tranzakciós
+adatokkal és sémaverzióval együtt dolgozik. Ezt általában az
+<strong>expand-contract</strong> adatbázis-minta biztosítja: először
+additív, visszafelé kompatibilis sémabővítés történik, majd a rollout
+után törölhető a felesleges régi struktúra. A rollback így nem igényel
+lefelé irányuló, adatvesztéssel járó migrációt.</p>
+<p>A <strong>canary analysis timeout</strong> az az időablak, amelyen
+belül a canarynak el kell érnie a megadott SLO-t. Ha a hibaarány vagy a
+p95 latency ezen belül nem tér vissza a tűréshatár alá, a release-t
+vissza kell vonni. Ez különbözik a Deployment
+<code>progressDeadlineSeconds</code> értékétől: az utóbbi a rollout
+előrehaladására, a canary analysis timeout pedig a szolgáltatásminőségre
+vonatkozik.</p>
+<p>A <strong>rendered manifest</strong> a GitOps forrásból – például
+Kustomize overlay-ből – generált tényleges Kubernetes erőforrás. A
+<strong>policy diff</strong> azt mutatja, hogy a változás érint-e
+NetworkPolicy, Pod Security, ResourceQuota, RBAC vagy más policy
+objektumot. A laborban a <code>kubectl diff</code> a rendered manifest
+és a cluster aktuális állapota közötti különbséget vizsgálja; a policy
+diff ugyanezen diff része.</p>
+<h3 data-number="49.5.3" id="kidolgozott-példa"><span
+class="header-section-number">49.5.3</span> Kidolgozott példa</h3>
+<h4 data-number="49.5.3.1" id="lab-kiinduló-állapot"><span
+class="header-section-number">49.5.3.1</span> Lab kiinduló állapot</h4>
+<p>Lab target: <code>lab-cluster</code> context, <code>lab-d245</code>
+namespace, <code>lab-admin</code> UID 1000; a GitOps source
+munkapéldánya a <code>lab-vm-01</code> hoston a
+<code>/srv/gitops/apps/lab-cpp-service</code> útvonalon; az Argo CD
+Application neve <code>lab-cpp-service</code>
+(<code>syncPolicy.automated</code> <code>prune: true</code> és
+<code>selfHeal: true</code> beállítással). A Prometheus a labor
+inventoryja szerint a <code>lab-monitoring</code> namespace-ben fut,
+<code>prometheus</code> nevű Service-szel. A dummy image digestek:</p>
+<ul>
+<li>Stable:
+<code>ghcr.io/lab-org/lab-cpp-service@sha256:0000000000000000000000000000000000000000000000000000000000000000</code></li>
+<li>Canary (hibás):
+<code>ghcr.io/lab-org/lab-cpp-service@sha256:1111111111111111111111111111111111111111111111111111111111111111</code></li>
+</ul>
+<p>A stable deployment neve <code>lab-cpp-service-stable</code>,
+replikák száma 3. A canary Deployment kiinduláskor <strong>nem
+létezik</strong>; az <code>overlays/canary</code> overlay hozza létre 1
+replikával. A Service neve <code>lab-cpp-service</code>, selector:
+<code>app: lab-cpp-service</code>, így mindkét verzió podjait
+kiszolgálja. Mivel a forgalommegosztás itt replikaarányos (3 stable + 1
+canary pod mögött egy Service), a canary a forgalom kb. 25%-át kapja,
+nem egy kis szeletét; kisebb arányhoz Gateway- vagy ingress-súlyozás
+kell (49.2). A C++ szolgáltatás <code>/ready</code> útvonala 200-at ad,
+a <code>/api/handle</code> útvonal pedig az üzleti kérést szolgálja ki.
+A canary image úgy lett elrontva (determinisztikus hibainjektálás a lab
+image-ben), hogy minden harmadik <code>/api/handle</code> kérésre 500-as
+hibát ad, miközben a <code>/ready</code> továbbra is 200.</p>
+<p>Metrikaszerződés (előfeltétel): a szolgáltatás
+<code>http_requests_total</code> számlálót exportál
+<code>error="true"|"false"</code> labellel, a Prometheus a
+<code>lab-d245</code> podokat scrape-eli, és a pod <code>version</code>
+labeljét (<code>stable</code>/<code>canary</code>) <code>version</code>
+metrikalabelként, a namespace-t <code>namespace</code> labelként
+rögzíti. Ha bármelyik hiányzik, a lenti lekérdezés üres eredményt
+ad.</p>
+<h4 data-number="49.5.3.2" id="lépés-rendered-manifestpolicy-diff"><span
+class="header-section-number">49.5.3.2</span> 1. lépés: Rendered
+manifest/policy diff</h4>
+<p>A canary rollout előtt a GitOps munkapéldányban ellenőrizzük, hogy a
+source milyen változást vezetne be:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> /srv/gitops/apps/lab-cpp-service</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-d245 diff <span class="at">-k</span> overlays/canary</span></code></pre></div>
+<p>Várható kimenet (kivonat, dummy, rövidített digest; a canary
+Deployment új objektum, ezért minden sora <code>+</code>):</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode diff"><code class="sourceCode diff"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="va">+ apiVersion: apps/v1</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="va">+ kind: Deployment</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="va">+ metadata:</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="va">+   name: lab-cpp-service-canary</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="va">+ spec:</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="va">+   replicas: 1</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="va">+   selector:</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="va">+     matchLabels:</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="va">+       app: lab-cpp-service</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="va">+       version: canary</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="va">+   template:</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="va">+     spec:</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="va">+       containers:</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="va">+       - name: lab-cpp-service</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="va">+         image: ghcr.io/lab-org/lab-cpp-service@sha256:1111…1111</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="va">+         readinessProbe:</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="va">+           httpGet:</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="va">+             path: /ready</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="va">+             port: 8080</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="va">+           timeoutSeconds: 2</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a><span class="va">+           periodSeconds: 5</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a><span class="va">+           failureThreshold: 2</span></span></code></pre></div>
+<p>A diff nem tartalmaz NetworkPolicy, ResourceQuota vagy RBAC
+változást, tehát policy diff szinten a módosítás csak a workload
+Deploymentre korlátozódik.</p>
+<h4 data-number="49.5.3.3" id="lépés-canary-rollout-elindítása"><span
+class="header-section-number">49.5.3.3</span> 2. lépés: Canary rollout
+elindítása</h4>
+<p>A GitOps source-ba bekerül a canary overlay, a GitOps operator
+szinkronizál. A laborban ezt a következő explicit parancs reprodukálja
+(ugyanabban a munkakönyvtárban):</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> /srv/gitops/apps/lab-cpp-service</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-d245 apply <span class="at">-k</span> overlays/canary</span></code></pre></div>
+<p>A desired state: <code>lab-cpp-service-stable</code> 3 replika,
+<code>lab-cpp-service-canary</code> 1 replika. A canary pod a Service
+selector miatt bekerül az EndpointSlice-ba, és a forgalom kb. negyede
+hozzá érkezik. A readinessProbe a <code>/ready</code> útvonalon 200-at
+lát, így a pod ready lesz.</p>
+<h4 data-number="49.5.3.4"
+id="lépés-determinisztikus-tesztforgalom-és-canary-analysis"><span
+class="header-section-number">49.5.3.4</span> 3. lépés: Determinisztikus
+tesztforgalom és canary analysis</h4>
+<p>A canary analysis timeout 120 másodperc. Friss laborban nincs valódi
+felhasználói forgalom, ezért a mérés idejére ismert ütemű tesztforgalmat
+generálunk: 2400 kérés 20 kérés/s ütemben, azaz 120 s alatt (a
+<code>curlimages/curl</code> image a lab registryből; verziója az
+inventoryban rögzítendő):</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-d245 run lab-load <span class="at">--restart</span><span class="op">=</span>Never <span class="dt">\</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--image</span><span class="op">=</span>curlimages/curl <span class="at">--</span> sh <span class="at">-c</span> <span class="st">&#39;for i in $(seq 1 2400); do</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="st">    curl -s -o /dev/null -X POST http://lab-cpp-service:8080/api/handle</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="st">    sleep 0.05; done&#39;</span></span></code></pre></div>
+<p>A hibaarányt verziónként bontva kérdezzük le, mert a
+namespace-szintű, összevont arány a stable és a canary keverékét mérné,
+nem a canary minőségét:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-monitoring <span class="dt">\</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>  port-forward svc/prometheus 9090:9090 <span class="kw">&amp;</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="va">PF</span><span class="op">=</span><span class="va">$!</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 3   <span class="co"># a port-forward felállása</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="va">Q</span><span class="op">=</span><span class="va">$(</span><span class="fu">cat</span> <span class="op">&lt;&lt;&#39;PROMQL&#39;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="st">sum by (version) (</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="st">  rate(http_requests_total{namespace=&quot;lab-d245&quot;,error=&quot;true&quot;}[1m])</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="st">)</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="st">/</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="st">sum by (version) (rate(http_requests_total{namespace=&quot;lab-d245&quot;}[1m]))</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="op">PROMQL</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="va">)</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> <span class="st">&#39;http://localhost:9090/api/v1/query&#39;</span> <span class="at">--data-urlencode</span> <span class="st">&quot;query=</span><span class="va">$Q</span><span class="st">&quot;</span> <span class="kw">|</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>  <span class="ex">jq</span> <span class="at">-r</span> <span class="st">&#39;.data.result[] | &quot;\(.metric.version) \(.value[1])&quot;&#39;</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="bu">kill</span> <span class="st">&quot;</span><span class="va">$PF</span><span class="st">&quot;</span></span></code></pre></div>
+<p>Várt kimenet (szemléltető, nem tényleges futtatás; a terhelés
+indulása után legalább 60 s-mal):</p>
+<pre><code>stable 0
+canary 0.333</code></pre>
+<figure id="fig-d245-canary-idovonal">
+<div class="fig-interactive"><iframe src="figures/html/d245-canary-idovonal.html" title="A canary hibaaránya a 120 s-os ablakban végig az 5%-os küszöb fölött van, ezért a 130. másodpercben rollback következik; a vegyes arány körülbelül 8,3 százalék, a canary eltűnése után nullára esik." loading="lazy" style="width:100%;border:0;height:560px"></iframe><noscript><img src="figures/img/d245-canary-idovonal.png" style="width:90.0%"
+alt="A canary hibaaránya a 120 s-os ablakban végig az 5%-os küszöb fölött van, ezért a 130. másodpercben rollback következik; a vegyes arány körülbelül 8,3 százalék, a canary eltűnése után nullára esik." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d245-canary-idovonal.png" style="width:90.0%"
+alt="A canary hibaaránya a 120 s-os ablakban végig az 5%-os küszöb fölött van, ezért a 130. másodpercben rollback következik; a vegyes arány körülbelül 8,3 százalék, a canary eltűnése után nullára esik." /></details></div>
+<figcaption>Canary-elemzés idővonala (elméleti modell): verziónkénti és
+vegyes hibaarány, 120 s-os elemzési ablak, rollback</figcaption>
+</figure>
+<p>A canary sor a hibamodellből kiszámítható: minden harmadik
+canary-kérés hibás, tehát az arány
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mi>/</mi><mn>3</mn><mo>≈</mo><mn>0</mn><mo>,</mo><mn>333</mn></mrow><annotation encoding="application/x-tex">1/3 \approx 0{,}333</annotation></semantics></math>
+(tűrés: ±0,02, ha percenként legalább néhány száz canary-kérés érkezik).
+Az összevont, namespace-szintű arány ezzel szemben kb.
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0</mn><mo>,</mo><mn>25</mn><mo>⋅</mo><mn>1</mn><mi>/</mi><mn>3</mn><mo>≈</mo><mn>0</mn><mo>,</mo><mn>083</mn></mrow><annotation encoding="application/x-tex">0{,}25 \cdot 1/3 \approx 0{,}083</annotation></semantics></math>
+(<code>"0.083"</code>, 8,3%) lenne; ez a kube-proxy véletlenszerű
+elosztása miatt ingadozik, és nem a canary minőségét méri. Döntés: a
+canary 33%-os hibaaránya messze meghaladja az 5%-os SLO által
+megengedett hibaarányt. Ha a lekérdezés üres eredményt ad, a
+metrikaszerződés vagy a scrape hiányzik; ez nem „0% hiba”, hanem mérési
+hiba. A log bizonyíték:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-d245 logs <span class="at">-l</span> version=canary <span class="at">--tail</span><span class="op">=</span>20 <span class="kw">|</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>  <span class="fu">grep</span> <span class="st">&#39;status=500&#39;</span> <span class="kw">|</span> <span class="fu">head</span> <span class="at">-5</span></span></code></pre></div>
+<p>Illusztratív kimenet (rövidítve):</p>
+<pre><code>2025-01-01T10:00:05Z status=500 method=POST path=/api/handle trace_id=abcdef12</code></pre>
+<p>A trace azonosító <code>abcdef12</code> alapján a trace platformon
+visszakereshető, hogy a hiba a canary verzióban következett be, a span
+attribútum <code>service.version=canary</code>.</p>
+<h4 data-number="49.5.3.5" id="lépés-döntés-és-rollback"><span
+class="header-section-number">49.5.3.5</span> 4. lépés: Döntés és
+rollback</h4>
+<p>A canary analysis timeout lejárta előtt a hiba nem csökken; a döntés:
+rollback. Két visszaállítási profil van, és mindkettőnek saját elvárt
+végállapota:</p>
+<p><strong>A) profil – Git revert (alapértelmezett).</strong> A GitOps
+repóban a canary commitot reverttel visszavonjuk:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> /srv/gitops/apps/lab-cpp-service</span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> log <span class="at">--oneline</span> <span class="at">-1</span>     <span class="co"># a HEAD a canary overlayt bevezető commit?</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> revert HEAD <span class="at">--no-edit</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> push</span></code></pre></div>
+<p>A GitOps operator a revert után (<code>prune: true</code> miatt) a
+canary Deploymentet <strong>törli</strong>, a stable Deployment
+érintetlen, image digestje a korábbi marad. Elvárt végállapot: a
+<code>lab-cpp-service-canary</code> Deployment nem létezik, a stable 3
+replikával fut. A rollback adatkompatibilis, mert a canary verzió nem
+hajtott végre sémaváltozást.</p>
+<p><strong>B) profil – vészleállítás, ha a Git revert nem érhető el
+azonnal.</strong> Egy kézi <code>scale --replicas=0</code> önmagában nem
+tartós: a GitOps controller (<code>selfHeal</code>) a következő
+reconcile-nál visszaállítaná a Gitben előírt 1 replikát. Ezért előbb
+időkorlátosan, dokumentáltan felfüggesztjük az automatikus syncet (Argo
+CD-ben a <code>syncPolicy.automated</code> eltávolításával, például
+<code>argocd app set lab-cpp-service --sync-policy none</code>; a pontos
+parancs a rögzített Argo CD-verzió dokumentációjából ellenőrizendő), és
+ezt az incidensjegyzőkönyvbe lejárati idővel felírjuk:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-d245 <span class="dt">\</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>  scale deployment lab-cpp-service-canary <span class="at">--replicas</span><span class="op">=</span>0</span></code></pre></div>
+<p>Elvárt köztes állapot: a canary Deployment 0 replikával létezik, és
+két reconciliation ciklus után is 0 marad (a sync fel van függesztve).
+Ezután a lehető leghamarabb végrehajtjuk az A) profil Git revertjét,
+majd visszakapcsoljuk az automatikus syncet; a végállapot ettől kezdve
+az A) profilé (a canary Deployment törlődik). Az élő és a kívánt állapot
+tehát csak kontrollált, időkorlátos ideig tér el.</p>
+<h4 data-number="49.5.3.6" id="lépés-ellenőrzés-és-posztmortem"><span
+class="header-section-number">49.5.3.6</span> 5. lépés: Ellenőrzés és
+posztmortem</h4>
+<p>A rollback után ellenőrizzük az observed state-et:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-d245 get deploy,rs,pods <span class="dt">\</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-l</span> app=lab-cpp-service</span></code></pre></div>
+<p>Postcondition (A profil): a <code>lab-cpp-service-canary</code>
+Deployment nem létezik, a stable deployment 3 replikával fut, és a 3.
+lépés verziónkénti lekérdezésében a canary sor eltűnik, a stable
+hibaaránya 5% alatt van. (B profil köztes állapota: a canary 0
+replikával létezik.) A release/postmortem report minimális sémája:</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Mező</th>
+<th>Példa</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Release ID</td>
+<td><code>rel-2025-01-01-001</code></td>
+</tr>
+<tr>
+<td>Image digest</td>
+<td><code>sha256:1111...</code> (dummy)</td>
+</tr>
+<tr>
+<td>Észlelés</td>
+<td>10:00 UTC, Prometheus canary-hibaarány 33% (vegyes 8,3%)</td>
+</tr>
+<tr>
+<td>Döntés</td>
+<td>canary timeout miatt rollback</td>
+</tr>
+<tr>
+<td>Rollback</td>
+<td>Git revert <code>abc123</code> (A profil); canary Deployment
+törölve, stable nem érintett</td>
+</tr>
+<tr>
+<td>Adatkompatibilitás</td>
+<td>nincs sémaváltozás</td>
+</tr>
+<tr>
+<td>Follow-up</td>
+<td>hibás /api/handle path javítása, canary readiness kibővítése</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="49.5.4" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">49.5.4</span> Tipikus hibák és
+ellenpróbák</h3>
+<p><strong>A readinessProbe nem a user SLO-t méri.</strong> Ha a canary
+image a <code>/ready</code>-n 200-at ad, de a <code>/api/handle</code>
+hibát, a pod ready lesz, és a forgalom hibás lesz. Ellenpróba: a canary
+elemzést ne a readiness jelre, hanem a tényleges, verziónként bontott
+hibaarányra és latencyra alapozzuk.</p>
+<p><strong>Túl rövid canary analysis timeout.</strong> Ha a timeout 10
+másodperc, akkor egy időszakos hiba hamis rollbacket okozhat.
+Ellenpróba: a timeout legyen legalább annyi, hogy az SLO hibaarány
+stabilan látható legyen; a laborban 120 s használható.</p>
+<p><strong>A rollback nem adatkompatibilis.</strong> Ha a canary verzió
+destruktív adatbázis-migrációt futtat, a régi artifact nem tudja olvasni
+a sémát. Ellenpróba: a sémaváltozást expand-contract módon, külön
+kompatibilis release-ben végezzük.</p>
+<p><strong>A Service selector nem fedi le a canaryt.</strong> Ha a
+canary Deployment labelje <code>version: canary</code>, de a Service
+selector <code>app: lab-cpp-service, version: stable</code>, akkor a
+canary pod nem kap forgalmat, így a telemetria nem lesz releváns.
+Ellenpróba: ellenőrizzük az EndpointSlice-t:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-d245 get endpointslices <span class="dt">\</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-l</span> kubernetes.io/service-name=lab-cpp-service <span class="dt">\</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-o</span> jsonpath=<span class="st">&#39;{.items[*].endpoints[*].addresses[*]}&#39;</span></span></code></pre></div>
+<p><strong>A GitOps revert nem törli a canary Deploymentet, ha a
+manifestben nem volt benne a korábbi state.</strong> A revert csak akkor
+hatásos, ha a canary Deployment a GitOps source része volt, és a prune
+engedélyezett. Ellenpróba: a rollback után
+<code>kubectl get deploy</code> ellenőrzése.</p>
+<p><strong>Kézi skálázás GitOps alatt.</strong> A felfüggesztés nélküli
+<code>scale --replicas=0</code>-t a selfHeal visszaírja. Ellenpróba: két
+reconciliation ciklus után a canary replikaszáma; ha visszaállt 1-re, a
+sync nem volt felfüggesztve.</p>
+<p><strong>A log és trace bizonyíték hiányzik.</strong> Ha a canary
+image nem logolja a <code>trace_id</code>-t, a hiba nehezen köthető a
+verzióhoz. Ellenpróba: a canary rollout előtt ellenőrizzük a log
+formátumot és a trace attribútumokat.</p>
+<h3 data-number="49.5.5" id="feladatok"><span
+class="header-section-number">49.5.5</span> Feladatok</h3>
+<ol type="1">
+<li><p><strong>Magyarázó feladat.</strong> A canary rollout során a
+readinessProbe 200-at ad, de a felhasználói kérések 500-as hibát
+produkálnak. Magyarázd el, miért nem elegendő a readinessProbe önmagában
+a canary health megállapításához. Milyen további jeleket kell figyelni,
+és hogyan kerülnéd el, hogy a hibás canary forgalmat kapjon?</p></li>
+<li><p><strong>Adminisztrációs/konfigurációs feladat.</strong> A
+példabeli <code>lab-cpp-service-canary</code> 1 replikával fut, a
+verziónkénti Prometheus query a canaryra 33%-os hibaarányt mutat, és a
+canary analysis timeout 120 s. Add meg a parancsokat a rollbackre
+mindkét profil szerint, és ellenőrizd a végállapotot (postcondition):
+stable 3 replika, a canary Deployment törölve (A) vagy 0 replikán,
+felfüggesztett synccel (B), a stable hibaarány 5% alatt. Indokold a
+GitOps revert és a skálázás közötti különbséget.</p></li>
+<li><p><strong>Diagnosztikai/failure/recovery feladat.</strong> A canary
+image digest <code>sha256:badbad...</code> (dummy) a pod
+<code>/ready</code> útvonalán 2 s után timeoutol, a readinessProbe
+<code>failureThreshold: 2</code>, a Deployment
+<code>progressDeadlineSeconds: 300</code>. A rollout
+<code>ProgressDeadlineExceeded</code> állapotba kerül. Gyűjts
+bizonyítékot a pod eseményeiből és logjaiból, hajtsd végre a rollbacket,
+és készíts rövid posztmortem reportot a megadott séma szerint.</p></li>
+</ol>
+<h3 data-number="49.5.6" id="megoldások"><span
+class="header-section-number">49.5.6</span> Megoldások</h3>
+<ol type="1">
+<li><p>A readinessProbe azt dönti el, hogy a pod kaphat-e forgalmat,
+azaz bekerül-e a Service EndpointSlice-ába; nem a user path üzleti
+helyességét méri (a folyamatélőség a livenessProbe feladata). A hibás
+canary akkor is ready lehet, ha a <code>/ready</code> 200, de a
+<code>/api/handle</code> hibát ad. A canary health megállapításához a
+tényleges forgalom verziónkénti hibaarányát, latency eloszlását,
+valamint a log/trace hibamintáit kell figyelni. A hibás canary
+forgalmának csökkentésére használható a forgalomsúly további szűkítése
+(Gateway/ingress-súlyozással) vagy a canary elemzés automatikus
+leállítása a hibaarány alapján. Postcondition: a canary elemzés nem a
+readiness jelre, hanem a user SLO-ra épül.</p></li>
+<li><p>Rollback parancsok, A) profil (Git revert):</p></li>
+</ol>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> /srv/gitops/apps/lab-cpp-service</span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> log <span class="at">--oneline</span> <span class="at">-1</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> revert HEAD <span class="at">--no-edit</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> push</span></code></pre></div>
+<ol start="2" type="A">
+<li>profil, ha azonnali beavatkozás kell: előbb időkorlátosan
+felfüggesztjük az automatikus syncet (a 4. lépés szerint, a parancs
+verziófüggő), majd:</li>
+</ol>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-d245 <span class="dt">\</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a>  scale deployment lab-cpp-service-canary <span class="at">--replicas</span><span class="op">=</span>0</span></code></pre></div>
+<p>Ellenőrzés: a 3. lépés verziónkénti hibaarány-lekérdezése (a canary
+sor eltűnik, a stable &lt; 0,05), valamint az EndpointSlice, amelyben
+csak stable podcímek maradnak:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-d245 get deploy <span class="at">-l</span> app=lab-cpp-service</span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-d245 get endpointslices <span class="dt">\</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-l</span> kubernetes.io/service-name=lab-cpp-service <span class="dt">\</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-o</span> jsonpath=<span class="st">&#39;{.items[*].endpoints[*].addresses[*]}&#39;</span></span></code></pre></div>
+<p>A GitOps revert a desired state-ből távolítja el a canaryt, így a
+következő szinkronizálás is ugyanazt az állapotot tartja fenn, és a
+canary Deployment törlődik. A skálázás csak azonnali, átmeneti
+beavatkozás; ha a GitOps source továbbra is 1 canary replikát ír elő, a
+GitOps operator felfüggesztett sync nélkül visszaállítja. Postcondition:
+A) <code>lab-cpp-service-stable</code> 3, a canary Deployment nem
+létezik, stable hibaarány &lt; 5%; B) ugyanez, de a canary 0 replikával
+létezik, amíg a revert és a sync visszakapcsolása meg nem történik.</p>
+<ol start="3" type="1">
+<li>Bizonyítékgyűjtés:</li>
+</ol>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-d245 <span class="dt">\</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a>  describe deployment lab-cpp-service-canary <span class="kw">|</span> <span class="fu">tail</span> <span class="at">-20</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-d245 <span class="dt">\</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a>  get events <span class="at">--sort-by</span><span class="op">=</span>.lastTimestamp <span class="kw">|</span> <span class="fu">tail</span> <span class="at">-20</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-d245 logs <span class="at">-l</span> version=canary <span class="at">--tail</span><span class="op">=</span>50</span></code></pre></div>
+<p>Illusztratív bizonyíték: a Deployment
+<code>ProgressDeadlineExceeded</code> feltételt mutat, a pod
+readinessProbe timeout miatt <code>Unhealthy</code> eventet kap. A hiba
+kizárólag a canary Deploymentet érinti; a stable Deployment nem
+változott, ezért azon nincs mit visszaállítani (egy
+<code>rollout undo</code> a stable-t egy régebbi ReplicaSet-revízióra
+forgatná vissza, egészséges szolgáltatáson). Rollback: a canary
+leállítása az A) profil szerinti Git reverttel, vészhelyzetben a B)
+profil szerinti felfüggesztés és skálázás, majd a stable
+változatlanságának ellenőrzése:</p>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-d245 get deploy lab-cpp-service-stable <span class="dt">\</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-o</span> jsonpath=<span class="st">&#39;{.spec.template.spec.containers[0].image}{&quot;\n&quot;}&#39;</span></span></code></pre></div>
+<p>Várt kimenet: változatlanul a <code>…@sha256:0000…</code> digest.
+Posztmortem report:</p>
+<table>
+<thead>
+<tr>
+<th>Mező</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Release ID</td>
+<td><code>rel-2025-01-01-002</code></td>
+</tr>
+<tr>
+<td>Image digest</td>
+<td><code>sha256:badbad...</code> (dummy)</td>
+</tr>
+<tr>
+<td>Észlelés</td>
+<td>canary pod readiness timeout</td>
+</tr>
+<tr>
+<td>Döntés</td>
+<td>rollout timeout miatt rollback</td>
+</tr>
+<tr>
+<td>Rollback</td>
+<td>canary leállítva (revert/scale 0); stable nem érintett</td>
+</tr>
+<tr>
+<td>Adatkompatibilitás</td>
+<td>nincs sémaváltozás</td>
+</tr>
+<tr>
+<td>Follow-up</td>
+<td>canary <code>/ready</code> timeout okának javítása</td>
+</tr>
+</tbody>
+</table>
+<p>Postcondition: a canary nem fut (A: a Deployment törölve, B: 0
+replika felfüggesztett synccel), a stable Deployment változatlanul a
+<code>sha256:0000…</code> digestet futtatja 3 replikával, a Service
+endpointjai csak stable podokat tartalmaznak.</p>
+<h3 data-number="49.5.7" id="rövid-összefoglaló"><span
+class="header-section-number">49.5.7</span> Rövid összefoglaló</h3>
+<p>A d245 labor a progressive delivery kanári kiadását gyakoroltatja:
+egy immutable image digestet GitOps source-ból juttatunk be korlátozott
+forgalommal, majd SLO- és telemetria jelekből döntünk. A rendered
+manifest diff megmutatja a Deployment és policy változást, a canary
+analysis timeout pedig az SLO-k megsértése esetén rollbacket kényszerít.
+A rollback csak akkor biztonságos, ha adatkompatibilis, és a GitOps
+revert a desired state-et is visszaállítja. A bizonyítékokat metrics,
+logs és traces formájában rögzítjük, a hibás release-t pedig posztmortem
+reportban zárjuk. <strong>Továbbhasznált definíciók:</strong>
+progressive delivery, immutable artifact, data-compatible rollback.</p>
+<h3 data-number="49.5.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">49.5.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>Az alábbi hivatkozások a fejezet kiindulópontjai, de a generáláskor
+nem ellenőriztem az aktuális verzió- és support-állapotokat:</p>
+<ul>
+<li><a href="https://opengitops.dev/">OpenGitOps</a></li>
+<li><a href="https://argo-cd.readthedocs.io/en/stable/">Argo CD
+Documentation</a></li>
+<li><a href="https://helm.sh/docs/">Helm Documentation</a></li>
+<li><a href="https://kubernetes.io/docs/">Kubernetes
+Documentation</a></li>
+<li><a href="https://sre.google/books/">Google SRE Books</a></li>
+</ul>
+<p>Állításonként a megerősítendő hivatalos szakaszok:
+<code>kubectl diff -k</code>/<code>apply -k</code>,
+<code>port-forward</code>, <code>run</code>, <code>scale</code> – a
+kubectl referencia (<a
+href="https://kubernetes.io/docs/reference/kubectl/"
+class="uri">https://kubernetes.io/docs/reference/kubectl/</a>);
+readiness/liveness probe – „Configure Liveness, Readiness and Startup
+Probes” (<a
+href="https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/"
+class="uri">https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/</a>);
+<code>progressDeadlineSeconds</code> – „Deployments”; EndpointSlice – <a
+href="https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/"
+class="uri">https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/</a>;
+Argo CD automated sync, <code>prune</code>, <code>selfHeal</code> és a
+sync policy módosítása – „Automated Sync Policy” és az
+<code>argocd app set</code> CLI-oldal (<a
+href="https://argo-cd.readthedocs.io/en/stable/"
+class="uri">https://argo-cd.readthedocs.io/en/stable/</a>); PromQL
+<code>rate</code>, <code>sum by</code> és a HTTP API – a Prometheus
+dokumentáció „Querying basics” és „HTTP API” oldala (<a
+href="https://prometheus.io/docs/prometheus/latest/querying/basics/"
+class="uri">https://prometheus.io/docs/prometheus/latest/querying/basics/</a>,
+<a href="https://prometheus.io/docs/prometheus/latest/querying/api/"
+class="uri">https://prometheus.io/docs/prometheus/latest/querying/api/</a>).
+Hivatkozott verzió: a laborcluster Kubernetes-minorja, a rögzített Argo
+CD- és Prometheus-kiadás (<code>argocd version</code>,
+<code>prometheus --version</code>).</p>
+<p><strong>Ellenőrzési státusz:</strong> a kidolgozott példa sikeres ága
+(A profil: canary törölve, stable változatlan) és hibaágai (B profil
+felfüggesztett synccel, readiness timeout, üres PromQL-eredmény)
+laborclusteren ellenőrizendők; dátumozott futtatási napló még nem
+készült.</p>
+<p>Ellenőrzési hiány: a konkrét Argo CD sync- és diff-parancsok, a
+Kubernetes Gateway API weighted routing support matrix, valamint a
+Prometheus/OpenTelemetry exporter verziók a lab inventoryban
+rögzítendők. A példa ezért explicit <code>kubectl</code> parancsokra és
+dummy digestekre épül, így a valódi GitOps operator viselkedését a
+laborban rögzített, ellenőrzött verzióval kell reprodukálni.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d244.html">← 49.4 Helm, Kustomize és configuration overlay</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d246.html">50.1 Metrics/logs/traces és service questions →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>One-change kísérlet és rollback</title>
+<style>
+:root{--fg:#111;--bg:#fff;--muted:#666;--hl:#1f4e79;--hl2:#c55a11;--cell:#fff;--cellhl:#d9d9d9;--line:#000;--code:#f3f3f3}
+@media (prefers-color-scheme:dark){:root{--fg:#eee;--bg:#1b1b1b;--muted:#aaa;--hl:#8fb8e8;--hl2:#f0a060;--cell:#262626;--cellhl:#4a4a4a;--line:#ddd;--code:#2a2a2a}}
+*{box-sizing:border-box}
+body{margin:0;padding:10px;font:14px/1.45 system-ui,sans-serif;color:var(--fg);background:var(--bg)}
+.ctl{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:6px}
+button{font:inherit;padding:3px 10px;cursor:pointer}
+input[type=range]{flex:1;min-width:120px}
+#status{margin:4px 0 6px;min-height:2.9em}
+/* A pszeudokód a rajz ALATT, teljes szélességben (hosszú sorok ne görgessenek oldalra) */
+.wrap{display:flex;flex-direction:column;gap:10px;align-items:stretch}
+svg{width:100%;height:auto;display:block}
+pre#code{width:100%;margin:0;padding:6px 8px;background:var(--code);font:12.5px/1.5 ui-monospace,monospace;white-space:pre;overflow-x:auto}
+pre#code span{display:block;padding:0 4px}
+pre#code span.on{outline:2px solid var(--hl);font-weight:bold}
+svg text:not([fill]){fill:var(--fg);}
+svg text{font-family:system-ui,sans-serif}
+.small{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="ctl" role="group" aria-label="Lejátszás vezérlői">
+  <button id="first" title="Első lépés">⏮</button>
+  <button id="prev" title="Előző lépés">◀ Lépés</button>
+  <button id="play" title="Lejátszás / szünet">▶ Lejátszás</button>
+  <button id="next" title="Következő lépés">Lépés ▶</button>
+  <input id="pos" type="range" min="0" max="0" value="0" aria-label="Lépés kiválasztása">
+  <span id="cnt" class="small"></span>
+</div>
+<div class="ctl"><label><input type="checkbox" id="two"> két változtatás egyszerre (pool_reuse + LimitNOFILE)</label><script>document.getElementById("two").addEventListener("change", e => { TWO = e.target.checked; show(k); });</script></div>
+<div id="status" aria-live="polite"></div>
+<div class="wrap">
+  <svg id="v" viewBox="0 0 560 300" role="img" aria-label="Idővonal a tünettől a rollbackig; a p95/p99 csak a pool_reuse=true szakaszban csökken, a rollback után visszaáll."></svg>
+  <pre id="code" aria-label="Pszeudokód"></pre>
+</div>
+<p class="small">Illusztratív értékek a 22.5.3 kidolgozott példájából, nem mért adatok. A LimitNOFILE-érték (65536) a hibás, kétváltozós kísérlet szemléltetése.</p>
+<script>
+// ---- Adat: lépések (a Python-szkript számolja ki és illeszti be, a könyv példájával egyezően) ----
+// Minden lépés: {msg: "állapotsor szövege", line: kiemelt pszeudokódsor indexe vagy -1, ...saját mezők}
+let STEPS = [{"i": 0, "line": -1, "msg": "T0 – tünet: $ systemctl status lab-worker --no-pager; journalctl -u lab-worker -n 50 → p95 80 → 250 ms; „cannot open log file” hibák"}, {"i": 1, "line": -1, "msg": "T1 – számlálók: $ pidstat -p 1234 1 10; vmstat 1 10 → %sys 35, minflt/s 9000, fd_nr 980 (soft limit 1024)"}, {"i": 2, "line": -1, "msg": "T2 – stack: $ perf record -g -p 1234 -- sleep 10; perf report --stdio --no-children → __x64_sys_openat, __alloc_pages, do_fault"}, {"i": 3, "line": -1, "msg": "T3 – hipotézis: $ (jegyzet) → root cause: kérésenkénti puffer + napló-open; contributing factor: FD soft limit"}, {"i": 4, "line": -1, "msg": "T4 – before: $ lab_bench … --samples 2000 --concurrency 8 --label before → p50/p95/p99 = 80/250/400 ms"}, {"i": 5, "line": -1, "msg": "T5 – one-change: $ cp lab_worker.conf lab_worker.conf.bak; sed -i 's/^pool_reuse = false/pool_reuse = true/' …; systemctl restart lab-worker → − pool_reuse = false  + pool_reuse = true"}, {"i": 6, "line": -1, "msg": "T6 – after: $ lab_bench … --label after → p50/p95/p99 = 20/45/90 ms"}, {"i": 7, "line": -1, "msg": "T7 – rollback: $ cp lab_worker.conf.bak lab_worker.conf; systemctl restart lab-worker; lab_bench … --label rollback → p50/p95/p99 = 80/245/390 ms – a hatás a pool_reuse-hoz köthető"}, {"i": 8, "line": -1, "msg": "T8 – köv. jelölt: log_fd_reuse: $ (következő one-change: log_fd_reuse = true, a pool_reuse rögzítése után) → egyetlen változó a következő kísérletben"}];
+const CODE = [];          // pszeudokód sorai (üres lista: a panel elrejtve)
+
+// ---- Rajzolás: ezt a függvényt kell az ábrához igazítani ----
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, text){const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);if(text!==undefined)e.textContent=text;svg.appendChild(e);return e;}
+const svg = document.getElementById("v");
+function css(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim();}
+function render(s){
+  // Példa: tömb cellákként, s.a = értékek, s.hl = kiemelt indexek
+  svg.innerHTML = "";
+  const a = s.a || [], w = 48, x0 = (560 - a.length * w) / 2, y0 = 110;
+  a.forEach((v, i) => {
+    const on = (s.hl || []).includes(i);
+    el("rect", {x: x0 + i * w, y: y0, width: w, height: w, fill: on ? css("--cellhl") : css("--cell"), stroke: css("--line"), "stroke-width": on ? 3 : 1.2});
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w / 2 + 6, "text-anchor": "middle", "font-size": 18}, String(v));
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w + 18, "text-anchor": "middle", "font-size": 12, fill: css("--muted")}, String(i));
+  });
+}
+
+let TWO = false;
+const P = [{"t": "T0", "short": "tünet", "pool": false, "p": [80, 250, 400], "meas": false, "cmd": "systemctl status lab-worker --no-pager; journalctl -u lab-worker -n 50", "out": "p95 80 → 250 ms; „cannot open log file” hibák"}, {"t": "T1", "short": "számlálók", "pool": false, "p": [80, 250, 400], "meas": false, "cmd": "pidstat -p 1234 1 10; vmstat 1 10", "out": "%sys 35, minflt/s 9000, fd_nr 980 (soft limit 1024)"}, {"t": "T2", "short": "stack", "pool": false, "p": [80, 250, 400], "meas": false, "cmd": "perf record -g -p 1234 -- sleep 10; perf report --stdio --no-children", "out": "__x64_sys_openat, __alloc_pages, do_fault"}, {"t": "T3", "short": "hipotézis", "pool": false, "p": [80, 250, 400], "meas": false, "cmd": "(jegyzet)", "out": "root cause: kérésenkénti puffer + napló-open; contributing factor: FD soft limit"}, {"t": "T4", "short": "before", "pool": false, "p": [80, 250, 400], "meas": true, "cmd": "lab_bench … --samples 2000 --concurrency 8 --label before", "out": "p50/p95/p99 = 80/250/400 ms"}, {"t": "T5", "short": "one-change", "pool": true, "p": [80, 250, 400], "meas": false, "cmd": "cp lab_worker.conf lab_worker.conf.bak; sed -i 's/^pool_reuse = false/pool_reuse = true/' …; systemctl restart lab-worker", "out": "− pool_reuse = false  + pool_reuse = true"}, {"t": "T6", "short": "after", "pool": true, "p": [20, 45, 90], "meas": true, "cmd": "lab_bench … --label after", "out": "p50/p95/p99 = 20/45/90 ms"}, {"t": "T7", "short": "rollback", "pool": false, "p": [80, 245, 390], "meas": true, "cmd": "cp lab_worker.conf.bak lab_worker.conf; systemctl restart lab-worker; lab_bench … --label rollback", "out": "p50/p95/p99 = 80/245/390 ms – a hatás a pool_reuse-hoz köthető"}, {"t": "T8", "short": "köv. jelölt:\nlog_fd_reuse", "pool": false, "p": [80, 245, 390], "meas": false, "cmd": "(következő one-change: log_fd_reuse = true, a pool_reuse rögzítése után)", "out": "egyetlen változó a következő kísérletben"}];
+function render(s){
+  svg.setAttribute("viewBox", "0 0 640 360");
+  svg.innerHTML = "";
+  const x0 = 140, dx = 57, X = i => x0 + i*dx;
+  const pool = i => P[i].pool, lim = i => TWO && (i === 5 || i === 6);
+  el("text", {x:108, y:26, "text-anchor":"end", "font-size":11.5}, "pool_reuse");
+  el("text", {x:108, y:50, "text-anchor":"end", "font-size":11.5}, "log_fd_reuse");
+  el("text", {x:108, y:74, "text-anchor":"end", "font-size":11.5}, "LimitNOFILE");
+  P.forEach((p, i) => {
+    const on = i <= s.i;
+    el("rect", {x:X(i)-dx/2, y:12, width:dx, height:20, fill: pool(i) ? css("--cellhl") : css("--cell"), stroke: css("--line"), opacity: on ? 1 : 0.35});
+    el("text", {x:X(i), y:27, "text-anchor":"middle", "font-size":10.5, opacity: on ? 1 : 0.35}, pool(i) ? "true" : "false");
+    el("rect", {x:X(i)-dx/2, y:36, width:dx, height:20, fill: css("--cell"), stroke: css("--line"), opacity: on ? 1 : 0.35});
+    el("text", {x:X(i), y:51, "text-anchor":"middle", "font-size":10.5, opacity: on ? 1 : 0.35}, "false");
+    el("rect", {x:X(i)-dx/2, y:60, width:dx, height:20, fill: lim(i) ? css("--cellhl") : css("--cell"), stroke: lim(i) ? css("--hl2") : css("--line"), "stroke-width": lim(i) ? 2.5 : 1, opacity: on ? 1 : 0.35});
+    el("text", {x:X(i), y:75, "text-anchor":"middle", "font-size":10.5, opacity: on ? 1 : 0.35}, lim(i) ? "65536" : "1024");
+    const cur = i === s.i;
+    el("circle", {cx:X(i), cy:104, r: cur ? 9 : 6, fill: cur ? css("--hl") : (on ? css("--cellhl") : css("--bg")), stroke: css("--line")});
+    el("text", {x:X(i), y:128, "text-anchor":"middle", "font-size":11.5, "font-weight": cur ? "bold" : "normal"}, p.t);
+  });
+  el("line", {x1:X(0), y1:104, x2:X(8), y2:104, stroke: css("--line"), "stroke-width":1});
+  // p95/p99 lépcső a megtett lépésekig
+  const yb = 320, sc = 160/400, Y = v => yb - v*sc;
+  el("line", {x1:X(0)-dx/2, y1:Y(100), x2:X(8)+dx/2, y2:Y(100), stroke: css("--muted"), "stroke-dasharray":"2 3"});
+  el("line", {x1:X(0)-dx/2, y1:Y(150), x2:X(8)+dx/2, y2:Y(150), stroke: css("--muted"), "stroke-dasharray":"6 3 2 3"});
+  el("text", {x:X(8)+dx/2, y:Y(100)+14, "text-anchor":"end", "font-size":10, fill: css("--muted")}, "desired p95 < 100");
+  el("text", {x:X(8)+dx/2, y:Y(150)-4, "text-anchor":"end", "font-size":10, fill: css("--muted")}, "desired p99 < 150");
+  [[1, ""], [2, "6 4"]].forEach(([q, dash]) => {
+    let d = "";
+    for (let i = 0; i <= s.i; i++) { const v = P[i].p[q]; d += (i ? "L" : "M") + (X(i)-dx/2) + "," + Y(v) + "L" + (X(i)+dx/2) + "," + Y(v); }
+    el("path", {d:d, fill:"none", stroke: css("--hl"), "stroke-width":2.5, "stroke-dasharray":dash});
+  });
+  el("text", {x:140, y:344, "font-size":11}, "p95: folytonos, p99: szaggatott vonal [ms]");
+  el("line", {x1:X(0)-dx/2, y1:yb, x2:X(8)+dx/2, y2:yb, stroke: css("--line")});
+  for (let v = 0; v <= 400; v += 100) el("text", {x:X(0)-dx/2-4, y:Y(v)+4, "text-anchor":"end", "font-size":10}, String(v));
+  const p = P[s.i];
+  if (p.meas) el("text", {x:X(s.i), y:Y(p.p[2])-8, "text-anchor":"middle", "font-size":11, "font-weight":"bold"}, p.p.join("/"));
+  if (TWO && s.i >= 5) {
+    status.textContent = p.t + " – HIBÁS KÍSÉRLET: pool_reuse = true ÉS LimitNOFILE = 65536 egyszerre. " + (s.i >= 6 ? "Az after javulás (20/45/90 ms) nem attribútálható egyik változtatáshoz sem: a hatás nem bontható szét." : "Két változó egy lépésben.");
+    el("text", {x:10, y:150, "font-size":12, "font-weight":"bold", fill: css("--hl2")}, "Két változtatás egyszerre: a hatás nem attribútálható.");
+  }
+}
+
+
+// ---- Vezérlés (általában nem kell módosítani) ----
+let k = 0, timer = null;
+const pos = document.getElementById("pos"), status = document.getElementById("status");
+const codeEl = document.getElementById("code");
+if (!CODE.length) codeEl.style.display = "none";
+else codeEl.innerHTML = CODE.map((l, i) => `<span id="L${i}">${l.replace(/&/g,"&amp;").replace(/</g,"&lt;")}</span>`).join("");
+pos.max = STEPS.length - 1;
+// Új lépéssor betöltése (pl. saját bemenetből számolva): setSteps(lista)
+function setSteps(list){ stop(); STEPS = list; pos.max = STEPS.length - 1; show(0); }
+function show(i){
+  k = Math.max(0, Math.min(STEPS.length - 1, i));
+  const s = STEPS[k];
+  pos.value = k;
+  document.getElementById("cnt").textContent = `${k + 1}/${STEPS.length}`;
+  status.textContent = s.msg || "";
+  codeEl.querySelectorAll("span").forEach(x => x.classList.remove("on"));
+  if (s.line !== undefined && s.line >= 0) { const L = document.getElementById("L" + s.line); if (L) L.classList.add("on"); }
+  render(s);
+}
+function stop(){ if (timer) { clearInterval(timer); timer = null; } document.getElementById("play").textContent = "▶ Lejátszás"; }
+document.getElementById("first").onclick = () => { stop(); show(0); };
+document.getElementById("prev").onclick = () => { stop(); show(k - 1); };
+document.getElementById("next").onclick = () => { stop(); show(k + 1); };
+document.getElementById("play").onclick = () => {
+  if (timer) { stop(); return; }
+  if (k >= STEPS.length - 1) show(0);
+  document.getElementById("play").textContent = "⏸ Szünet";
+  timer = setInterval(() => { if (k >= STEPS.length - 1) stop(); else show(k + 1); }, 2000);
+};
+pos.oninput = () => { stop(); show(+pos.value); };
+document.addEventListener("keydown", e => { if (e.key === "ArrowRight") { stop(); show(k + 1); } if (e.key === "ArrowLeft") { stop(); show(k - 1); } });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => show(k));
+show(0);
+</script>
+<script>(function(){function s(){var b=document.body;parent.postMessage({figResize:Math.ceil(b.getBoundingClientRect().height)},"*")}addEventListener("load",s);addEventListener("resize",s);if(window.ResizeObserver)new ResizeObserver(s).observe(document.body);s()})()</script></body>
+</html>
