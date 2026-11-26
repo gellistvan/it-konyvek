@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>read() és mmap() adatútja</title>
+<style>
+:root{--fg:#111;--bg:#fff;--muted:#666;--hl:#1f4e79;--hl2:#c55a11;--cell:#fff;--cellhl:#d9d9d9;--line:#000;--code:#f3f3f3}
+@media (prefers-color-scheme:dark){:root{--fg:#eee;--bg:#1b1b1b;--muted:#aaa;--hl:#8fb8e8;--hl2:#f0a060;--cell:#262626;--cellhl:#4a4a4a;--line:#ddd;--code:#2a2a2a}}
+*{box-sizing:border-box}
+body{margin:0;padding:10px;font:14px/1.45 system-ui,sans-serif;color:var(--fg);background:var(--bg)}
+.ctl{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:6px}
+button{font:inherit;padding:3px 10px;cursor:pointer}
+input[type=range]{flex:1;min-width:120px}
+#status{margin:4px 0 6px;min-height:2.9em}
+/* A pszeudokód a rajz ALATT, teljes szélességben (hosszú sorok ne görgessenek oldalra) */
+.wrap{display:flex;flex-direction:column;gap:10px;align-items:stretch}
+svg{width:100%;height:auto;display:block}
+pre#code{width:100%;margin:0;padding:6px 8px;background:var(--code);font:12.5px/1.5 ui-monospace,monospace;white-space:pre;overflow-x:auto}
+pre#code span{display:block;padding:0 4px}
+pre#code span.on{outline:2px solid var(--hl);font-weight:bold}
+svg text:not([fill]){fill:var(--fg);}
+svg text{font-family:system-ui,sans-serif}
+.small{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="ctl" role="group" aria-label="Lejátszás vezérlői">
+  <button id="first" title="Első lépés">⏮</button>
+  <button id="prev" title="Előző lépés">◀ Lépés</button>
+  <button id="play" title="Lejátszás / szünet">▶ Lejátszás</button>
+  <button id="next" title="Következő lépés">Lépés ▶</button>
+  <input id="pos" type="range" min="0" max="0" value="0" aria-label="Lépés kiválasztása">
+  <span id="cnt" class="small"></span>
+</div>
+<div class="ctl"><label>Mód: <select onchange="mode(this.value)" aria-label="Hozzáférési mód"><option value="read">read()</option><option value="shared">mmap MAP_SHARED</option><option value="private">mmap MAP_PRIVATE</option></select></label></div>
+<div id="status" aria-live="polite"></div>
+<div class="wrap">
+  <svg id="v" viewBox="0 0 560 300" role="img" aria-label="Három sáv: folyamat címtere, page cache, lemez; a read() két másolással, a MAP_SHARED leképezéssel és dirty lappal, a MAP_PRIVATE írás COW-val saját anonim lapra."></svg>
+  <pre id="code" aria-label="Pszeudokód"></pre>
+</div>
+<p class="small">Sematikus modell (nem kernelfutás); mintaadat: a 12.4.7 „Hello” fájlja, első bájt 0x48 → 0x41. A copies számláló a read() útvonal másolásait mutatja (DMA + copy_to_user).</p>
+<script>
+// ---- Adat: lépések (a Python-szkript számolja ki és illeszti be, a könyv példájával egyezően) ----
+// Minden lépés: {msg: "állapotsor szövege", line: kiemelt pszeudokódsor indexe vagy -1, ...saját mezők}
+let STEPS = [{"disk": "0x48", "pc": null, "dirty": false, "buf": null, "anon": null, "pte": null, "pte_ro": false, "hot": [], "copies": 0, "line": -1, "msg": "Kiindulás: a testfile a lemezen, első bájt 0x48 ('H'); a page cache-ben még nincs lap."}, {"disk": "0x48", "pc": "0x48", "dirty": false, "buf": null, "anon": null, "pte": null, "pte_ro": false, "hot": ["dma"], "copies": 1, "line": 0, "msg": "read(): kernelbelépés; page cache miss → a blokk beolvasása a page cache-be (1. másolás, DMA)."}, {"disk": "0x48", "pc": "0x48", "dirty": false, "buf": "0x48", "anon": null, "pte": null, "pte_ro": false, "hot": ["copy"], "copies": 2, "line": 1, "msg": "copy_to_user: a page cache lap tartalma a felhasználói pufferbe (2. másolás); a felhasználó a saját másolatát látja."}, {"disk": "0x48", "pc": "0x48", "dirty": false, "buf": "0x41", "anon": null, "pte": null, "pte_ro": false, "hot": ["wbuf"], "copies": 2, "line": 2, "msg": "buf[0] = 0x41: csak a felhasználói puffer változik; a page cache és a fájl 0x48 marad (a fájlhoz write() kellene)."}];
+const CODE = ["// (a) read(fd, buf, n)    – page cache-be olvasás (DMA), majd copy_to_user", "// (b)/(c) első hozzáférés – laphiba, a lap a page cache-be, PTE beállítva", "byte[0] = 0x41;           // írás", "msync(p, len, MS_SYNC);   // shared: writeback; private: nincs hatás a fájlra"];          // pszeudokód sorai (üres lista: a panel elrejtve)
+
+// ---- Rajzolás: ezt a függvényt kell az ábrához igazítani ----
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, text){const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);if(text!==undefined)e.textContent=text;svg.appendChild(e);return e;}
+const svg = document.getElementById("v");
+function css(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim();}
+function render(s){
+  // Példa: tömb cellákként, s.a = értékek, s.hl = kiemelt indexek
+  svg.innerHTML = "";
+  const a = s.a || [], w = 48, x0 = (560 - a.length * w) / 2, y0 = 110;
+  a.forEach((v, i) => {
+    const on = (s.hl || []).includes(i);
+    el("rect", {x: x0 + i * w, y: y0, width: w, height: w, fill: on ? css("--cellhl") : css("--cell"), stroke: css("--line"), "stroke-width": on ? 3 : 1.2});
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w / 2 + 6, "text-anchor": "middle", "font-size": 18}, String(v));
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w + 18, "text-anchor": "middle", "font-size": 12, fill: css("--muted")}, String(i));
+  });
+}
+
+const MODES = {"read": [{"disk": "0x48", "pc": null, "dirty": false, "buf": null, "anon": null, "pte": null, "pte_ro": false, "hot": [], "copies": 0, "line": -1, "msg": "Kiindulás: a testfile a lemezen, első bájt 0x48 ('H'); a page cache-ben még nincs lap."}, {"disk": "0x48", "pc": "0x48", "dirty": false, "buf": null, "anon": null, "pte": null, "pte_ro": false, "hot": ["dma"], "copies": 1, "line": 0, "msg": "read(): kernelbelépés; page cache miss → a blokk beolvasása a page cache-be (1. másolás, DMA)."}, {"disk": "0x48", "pc": "0x48", "dirty": false, "buf": "0x48", "anon": null, "pte": null, "pte_ro": false, "hot": ["copy"], "copies": 2, "line": 1, "msg": "copy_to_user: a page cache lap tartalma a felhasználói pufferbe (2. másolás); a felhasználó a saját másolatát látja."}, {"disk": "0x48", "pc": "0x48", "dirty": false, "buf": "0x41", "anon": null, "pte": null, "pte_ro": false, "hot": ["wbuf"], "copies": 2, "line": 2, "msg": "buf[0] = 0x41: csak a felhasználói puffer változik; a page cache és a fájl 0x48 marad (a fájlhoz write() kellene)."}], "shared": [{"disk": "0x48", "pc": null, "dirty": false, "buf": null, "anon": null, "pte": null, "pte_ro": false, "hot": [], "copies": 0, "line": -1, "msg": "mmap(MAP_SHARED) után: a VMA létezik, de még nincs PTE; a page cache-ben nincs lap."}, {"disk": "0x48", "pc": "0x48", "dirty": false, "buf": null, "anon": null, "pte": null, "pte_ro": false, "hot": ["dma", "fault"], "copies": 0, "line": 0, "msg": "Első hozzáférés → laphiba → a kernel beolvassa a lapot a page cache-be (DMA); nincs felhasználói másolás."}, {"disk": "0x48", "pc": "0x48", "dirty": false, "buf": null, "anon": null, "pte": "pc", "pte_ro": false, "hot": ["pte"], "copies": 0, "line": 1, "msg": "A PTE közvetlenül a page cache lapra mutat: az olvasás 0x48-at ad, kernelbelépés és copy_to_user nélkül."}, {"disk": "0x48", "pc": "0x41", "dirty": true, "buf": null, "anon": null, "pte": "pc", "pte_ro": false, "hot": ["write"], "copies": 0, "line": 2, "msg": "Írás: byte[0] = 0x41 közvetlenül a page cache lapba → a lap dirty; a lemezen még 0x48."}, {"disk": "0x41", "pc": "0x41", "dirty": false, "buf": null, "anon": null, "pte": "pc", "pte_ro": false, "hot": ["wb"], "copies": 0, "line": 3, "msg": "msync(MS_SYNC) / writeback: a dirty lap kiíródik, a fájl első bájtja 0x41; a lap ismét tiszta."}], "private": [{"disk": "0x48", "pc": null, "dirty": false, "buf": null, "anon": null, "pte": null, "pte_ro": false, "hot": [], "copies": 0, "line": -1, "msg": "mmap(MAP_PRIVATE) után: a VMA létezik, de még nincs PTE; a page cache-ben nincs lap."}, {"disk": "0x48", "pc": "0x48", "dirty": false, "buf": null, "anon": null, "pte": "pc", "pte_ro": true, "hot": ["dma", "fault", "pte"], "copies": 0, "line": 0, "msg": "Első (olvasó) hozzáférés → laphiba → page cache lap; a PTE írásvédetten (ro) a page cache lapra mutat."}, {"disk": "0x48", "pc": "0x48", "dirty": false, "buf": null, "anon": "0x41", "pte": "anon", "pte_ro": false, "hot": ["cow", "write"], "copies": 0, "line": 2, "msg": "MAP_PRIVATE írás: COW → új anonim lap a tartalom másolatával, a PTE átáll rá, byte[0] = 0x41; a page cache lap tiszta, a fájl első bájtja továbbra is 0x48."}, {"disk": "0x48", "pc": "0x48", "dirty": false, "buf": null, "anon": "0x41", "pte": "anon", "pte_ro": false, "hot": ["msync"], "copies": 0, "line": 3, "msg": "msync(): hibamentesen visszatér, de a privát anonim lap nem íródik vissza; a fájlban 0x48 marad."}]};
+function arrow(x1, y1, x2, y2, on, dash, w){ el("line", {x1, y1, x2, y2, stroke: on ? css("--hl2") : css("--line"), "stroke-width": (on ? 1.6 : 1) * (w || 2), "stroke-dasharray": dash ? "6 4" : "", "marker-end": "url(#ah)"}); }
+function render(s){
+  svg.setAttribute("viewBox", "0 0 600 330"); svg.innerHTML = "";
+  const d = el("defs", {}); d.innerHTML = `<marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M0,0L10,5L0,10z" fill="${css("--line")}"/></marker>
+    <pattern id="hat" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="6" height="6" fill="${css("--cellhl")}"/><line x1="0" y1="0" x2="0" y2="6" stroke="${css("--line")}" stroke-width="1"/></pattern>
+    <pattern id="dot" width="6" height="6" patternUnits="userSpaceOnUse"><rect width="6" height="6" fill="${css("--cellhl")}"/><circle cx="3" cy="3" r="1.2" fill="${css("--line")}"/></pattern>`;
+  [["folyamat címtere", 20], ["page cache (kernel)", 125], ["lemez", 225]].forEach(([n, y]) => {
+    el("rect", {x: 5, y, width: 590, height: 85, fill: "none", stroke: css("--muted"), "stroke-dasharray": "2 4"});
+    el("text", {x: 12, y: y + 16, "font-size": 12, fill: css("--muted")}, n); });
+  const H = s.hot;
+  el("rect", {x: 330, y: 255, width: 200, height: 40, fill: css("--cell"), stroke: H.includes("wb") ? css("--hl2") : css("--line"), "stroke-width": H.includes("wb") ? 3 : 1.4});
+  el("text", {x: 430, y: 280, "text-anchor": "middle", "font-size": 14}, "testfile: " + s.disk);
+  if (s.pc) { el("rect", {x: 330, y: 150, width: 200, height: 40, fill: s.dirty ? "url(#hat)" : css("--cell"), stroke: css("--line"), "stroke-width": 1.6});
+    el("rect", {x: 352, y: 158, width: 156, height: 24, fill: css("--cell")});
+    el("text", {x: 430, y: 175, "text-anchor": "middle", "font-size": 14}, "lap: " + s.pc + (s.dirty ? " (dirty)" : " (tiszta)"));
+    arrow(400, 255, 400, 192, H.includes("dma"), false, 2.5); el("text", {x: 408, y: 228, "font-size": 12}, "DMA");
+    if (H.includes("fault")) el("text", {x: 540, y: 175, "font-size": 13, "font-weight": "bold", fill: css("--hl2")}, "⚡ laphiba"); }
+  if (s.buf) { el("rect", {x: 80, y: 45, width: 170, height: 40, fill: css("--cell"), stroke: H.includes("wbuf") ? css("--hl2") : css("--line"), "stroke-width": H.includes("wbuf") ? 3 : 1.6});
+    el("text", {x: 165, y: 70, "text-anchor": "middle", "font-size": 14}, "buf: " + s.buf);
+    arrow(360, 150, 180, 87, H.includes("copy"), false, 2.5); el("text", {x: 230, y: 125, "font-size": 12}, "copy_to_user"); }
+  if (s.pte || s.anon) { el("rect", {x: 330, y: 45, width: 200, height: 40, fill: css("--cell"), stroke: H.includes("write") && s.pte === "pc" ? css("--hl2") : css("--line"), "stroke-width": 1.6});
+    el("text", {x: 430, y: 70, "text-anchor": "middle", "font-size": 13}, "VMA-lap (PTE" + (s.pte_ro ? " ro)" : ")")); }
+  if (s.pte === "pc") { arrow(430, 87, 430, 148, H.includes("pte"), true, 1.5); el("text", {x: 438, y: 122, "font-size": 12}, "PTE"); }
+  if (s.anon) { el("rect", {x: 80, y: 45, width: 170, height: 40, fill: "url(#dot)", stroke: H.includes("cow") ? css("--hl2") : css("--line"), "stroke-width": H.includes("cow") ? 3 : 1.6});
+    el("rect", {x: 98, y: 53, width: 134, height: 24, fill: css("--cell")});
+    el("text", {x: 165, y: 70, "text-anchor": "middle", "font-size": 14}, "anonim: " + s.anon);
+    arrow(330, 65, 252, 65, H.includes("cow"), true, 1.5); el("text", {x: 290, y: 58, "text-anchor": "middle", "font-size": 12}, "PTE");
+    arrow(360, 150, 190, 87, H.includes("cow"), false, 2.5); el("text", {x: 200, y: 125, "font-size": 12}, "COW-másolás"); }
+  if (H.includes("wb") || H.includes("msync")) { const ok = H.includes("wb");
+    arrow(500, 192, 500, 253, true, !ok, 2.5); el("text", {x: 508, y: 228, "font-size": 12}, ok ? "writeback" : "nincs visszaírás"); }
+  el("text", {x: 12, y: 326, "font-size": 12, fill: css("--muted")}, `felhasználói másolások (read): ${s.copies}`);
+}
+function mode(v){ setSteps(MODES[v]); }
+
+
+// ---- Vezérlés (általában nem kell módosítani) ----
+let k = 0, timer = null;
+const pos = document.getElementById("pos"), status = document.getElementById("status");
+const codeEl = document.getElementById("code");
+if (!CODE.length) codeEl.style.display = "none";
+else codeEl.innerHTML = CODE.map((l, i) => `<span id="L${i}">${l.replace(/&/g,"&amp;").replace(/</g,"&lt;")}</span>`).join("");
+pos.max = STEPS.length - 1;
+// Új lépéssor betöltése (pl. saját bemenetből számolva): setSteps(lista)
+function setSteps(list){ stop(); STEPS = list; pos.max = STEPS.length - 1; show(0); }
+function show(i){
+  k = Math.max(0, Math.min(STEPS.length - 1, i));
+  const s = STEPS[k];
+  pos.value = k;
+  document.getElementById("cnt").textContent = `${k + 1}/${STEPS.length}`;
+  status.textContent = s.msg || "";
+  codeEl.querySelectorAll("span").forEach(x => x.classList.remove("on"));
+  if (s.line !== undefined && s.line >= 0) { const L = document.getElementById("L" + s.line); if (L) L.classList.add("on"); }
+  render(s);
+}
+function stop(){ if (timer) { clearInterval(timer); timer = null; } document.getElementById("play").textContent = "▶ Lejátszás"; }
+document.getElementById("first").onclick = () => { stop(); show(0); };
+document.getElementById("prev").onclick = () => { stop(); show(k - 1); };
+document.getElementById("next").onclick = () => { stop(); show(k + 1); };
+document.getElementById("play").onclick = () => {
+  if (timer) { stop(); return; }
+  if (k >= STEPS.length - 1) show(0);
+  document.getElementById("play").textContent = "⏸ Szünet";
+  timer = setInterval(() => { if (k >= STEPS.length - 1) stop(); else show(k + 1); }, 1600);
+};
+pos.oninput = () => { stop(); show(+pos.value); };
+document.addEventListener("keydown", e => { if (e.key === "ArrowRight") { stop(); show(k + 1); } if (e.key === "ArrowLeft") { stop(); show(k - 1); } });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => show(k));
+show(0);
+</script>
+<script>(function(){function s(){var b=document.body;parent.postMessage({figResize:Math.ceil(b.getBoundingClientRect().height)},"*")}addEventListener("load",s);addEventListener("resize",s);if(window.ResizeObserver)new ResizeObserver(s).observe(document.body);s()})()</script></body>
+</html>

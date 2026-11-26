@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A generic KASAN árnyékmemóriája</title>
+<style>
+:root{--fg:#111;--bg:#fff;--muted:#666;--hl:#1f4e79;--hl2:#c55a11;--cell:#fff;--cellhl:#d9d9d9;--line:#000;--code:#f3f3f3}
+@media (prefers-color-scheme:dark){:root{--fg:#eee;--bg:#1b1b1b;--muted:#aaa;--hl:#8fb8e8;--hl2:#f0a060;--cell:#262626;--cellhl:#4a4a4a;--line:#ddd;--code:#2a2a2a}}
+*{box-sizing:border-box}
+body{margin:0;padding:10px;font:14px/1.45 system-ui,sans-serif;color:var(--fg);background:var(--bg)}
+.ctl{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:6px}
+button{font:inherit;padding:3px 10px;cursor:pointer}
+input[type=range]{flex:1;min-width:120px}
+#status{margin:4px 0 6px;min-height:2.9em}
+/* A pszeudokód a rajz ALATT, teljes szélességben (hosszú sorok ne görgessenek oldalra) */
+.wrap{display:flex;flex-direction:column;gap:10px;align-items:stretch}
+svg{width:100%;height:auto;display:block}
+pre#code{width:100%;margin:0;padding:6px 8px;background:var(--code);font:12.5px/1.5 ui-monospace,monospace;white-space:pre;overflow-x:auto}
+pre#code span{display:block;padding:0 4px}
+pre#code span.on{outline:2px solid var(--hl);font-weight:bold}
+svg text:not([fill]){fill:var(--fg);}
+svg text{font-family:system-ui,sans-serif}
+.small{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="ctl" role="group" aria-label="Lejátszás vezérlői">
+  <button id="first" title="Első lépés">⏮</button>
+  <button id="prev" title="Előző lépés">◀ Lépés</button>
+  <button id="play" title="Lejátszás / szünet">▶ Lejátszás</button>
+  <button id="next" title="Következő lépés">Lépés ▶</button>
+  <input id="pos" type="range" min="0" max="0" value="0" aria-label="Lépés kiválasztása">
+  <span id="cnt" class="small"></span>
+</div>
+<div class="ctl"><label>kezdőcím <input type="range" id="offr" min="0" max="23" value="0" style="min-width:160px;flex:0"> <b id="offv">+0</b></label> <label>méret <select id="szs"><option>1</option><option>2</option><option>4</option><option selected>8</option></select></label> <button id="kf">kfree</button> <button id="rs">mintaesetek</button></div>
+<div id="status" aria-live="polite"></div>
+<div class="wrap">
+  <svg id="v" viewBox="0 0 560 300" role="img" aria-label="Egy 13 bájtos kmalloc objektum 24 bájtja három 8 bájtos granulában, alatta az árnyékbájtok 00, 05 és FC; kfree után FB, FB, FC. A kiválasztott hozzáférés bájtjai és a vizsgált árnyékbájt kiemelve, az állapotsor a döntési feltételt és az eredményt írja ki (OK, slab-out-of-bounds, use-after-free)."></svg>
+  <pre id="code" aria-label="Pszeudokód"></pre>
+</div>
+<p class="small">Generic KASAN, x86-64, 8 bájtos granula; az ellenőrzés a Linux mm/kasan/generic.c memory_is_poisoned_1/2_4_8 logikáját követi. A felszabadított objektum árnyékkódja (FB, újabb kernelekben az első granulán FA) és a redzone kódja (FC) a rögzített kernelverzión ellenőrizendő. A SW/HW tag-alapú üzemmódra nem érvényes.</p>
+<script>
+// ---- Adat: lépések (a Python-szkript számolja ki és illeszti be, a könyv példájával egyezően) ----
+// Minden lépés: {msg: "állapotsor szövege", line: kiemelt pszeudokódsor indexe vagy -1, ...saját mezők}
+let STEPS = [{"off": 0, "size": 8, "freed": false, "g": 0, "bad": false, "line": -1, "msg": "read 8 @ +0: árnyék = 00 → mind a 8 hozzáférhető → OK"}, {"off": 12, "size": 1, "freed": false, "g": 1, "bad": false, "line": -1, "msg": "read 1 @ +12: árnyék = 05, vége 4 < 5 → OK"}, {"off": 8, "size": 8, "freed": false, "g": 1, "bad": true, "line": -1, "msg": "read 8 @ +8: árnyék = 05, vége 7 ≥ 5 → slab-out-of-bounds"}, {"off": 14, "size": 2, "freed": false, "g": 1, "bad": true, "line": -1, "msg": "read 2 @ +14: árnyék = 05, vége 7 ≥ 5 → slab-out-of-bounds"}, {"off": 0, "size": 1, "freed": true, "g": 0, "bad": true, "line": -1, "msg": "kfree, read 1 @ +0: árnyék = FB (negatív) → tiltott granula → use-after-free"}];
+const CODE = [];          // pszeudokód sorai (üres lista: a panel elrejtve)
+
+// ---- Rajzolás: ezt a függvényt kell az ábrához igazítani ----
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, text){const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);if(text!==undefined)e.textContent=text;svg.appendChild(e);return e;}
+const svg = document.getElementById("v");
+function css(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim();}
+function render(s){
+  // Példa: tömb cellákként, s.a = értékek, s.hl = kiemelt indexek
+  svg.innerHTML = "";
+  const a = s.a || [], w = 48, x0 = (560 - a.length * w) / 2, y0 = 110;
+  a.forEach((v, i) => {
+    const on = (s.hl || []).includes(i);
+    el("rect", {x: x0 + i * w, y: y0, width: w, height: w, fill: on ? css("--cellhl") : css("--cell"), stroke: css("--line"), "stroke-width": on ? 3 : 1.2});
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w / 2 + 6, "text-anchor": "middle", "font-size": 18}, String(v));
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w + 18, "text-anchor": "middle", "font-size": 12, fill: css("--muted")}, String(i));
+  });
+}
+const PRE = [{"off": 0, "size": 8, "freed": false, "g": 0, "bad": false, "line": -1, "msg": "read 8 @ +0: árnyék = 00 → mind a 8 hozzáférhető → OK"}, {"off": 12, "size": 1, "freed": false, "g": 1, "bad": false, "line": -1, "msg": "read 1 @ +12: árnyék = 05, vége 4 < 5 → OK"}, {"off": 8, "size": 8, "freed": false, "g": 1, "bad": true, "line": -1, "msg": "read 8 @ +8: árnyék = 05, vége 7 ≥ 5 → slab-out-of-bounds"}, {"off": 14, "size": 2, "freed": false, "g": 1, "bad": true, "line": -1, "msg": "read 2 @ +14: árnyék = 05, vége 7 ≥ 5 → slab-out-of-bounds"}, {"off": 0, "size": 1, "freed": true, "g": 0, "bad": true, "line": -1, "msg": "kfree, read 1 @ +0: árnyék = FB (negatív) → tiltott granula → use-after-free"}];
+
+const BASE_LO = 0x600, REDZONE = 0xFC, FREED = 0xFB, SIZE = 13;
+function shadowJS(freed){ return [freed ? FREED : 0, freed ? FREED : SIZE - 8, REDZONE]; }
+function s8(v){ return v >= 0x80 ? v - 256 : v; }
+function hx(v){ return v.toString(16).toUpperCase().padStart(2, "0"); }
+function checkJS(off, size, freed){
+  const sh = shadowJS(freed), last = off + size - 1; if (last > 23) return null;
+  const gl = last >> 3, s = sh[gl];
+  const bad1 = a => { const v = sh[a >> 3]; return v !== 0 && (a & 7) >= s8(v); };
+  const straddle = size > 1 && (last & 7) < size - 1;
+  let g, bad, cond;
+  if (straddle && sh[off >> 3] !== 0) { g = off >> 3; bad = true; cond = "átnyúló hozzáférés: az első granula árnyéka " + hx(sh[g]) + " ≠ 00"; }
+  else { g = gl; bad = bad1(last);
+    if (s === 0) cond = "árnyék = 00 → mind a 8 hozzáférhető";
+    else if (s >= 0x80) cond = "árnyék = " + hx(s) + " (negatív) → tiltott granula";
+    else cond = "árnyék = " + hx(s) + ", vége " + (last & 7) + ((last & 7) >= s ? " ≥ " : " < ") + s;
+    if (straddle) cond = "átnyúló, első granula 00; " + cond; }
+  const v = sh[g], res = !bad ? "OK" : (v === FREED || v === 0xFA ? "use-after-free" : "slab-out-of-bounds");
+  return {g, bad, cond, res};
+}
+function render(s){
+  svg.setAttribute("viewBox", "0 0 760 250"); svg.innerHTML = "";
+  const line = css("--line"), mut = css("--muted"), hl = css("--hl"), hl2 = css("--hl2"), cell = css("--cell"), cellhl = css("--cellhl");
+  document.getElementById("offr").value = s.off; document.getElementById("offv").textContent = "+" + s.off;
+  document.getElementById("szs").value = s.size; document.getElementById("kf").textContent = s.freed ? "kmalloc(13) újra" : "kfree";
+  const sh = shadowJS(s.freed), W = 28, X0 = 50;
+  el("text", {x: 10, y: 20, "font-size": 12.5, "font-weight": "bold"}, "memória (0x…600 + bájt), " + (s.freed ? "kfree után" : "kmalloc(13) után"));
+  for (let b = 0; b < 24; b++) { const x = X0 + b * W + Math.floor(b / 8) * 6, inAcc = b >= s.off && b < s.off + s.size;
+    const kind = (b < 16 && s.freed) ? "free" : (b < SIZE ? "ok" : "rz");
+    el("rect", {x, y: 32, width: W - 2, height: 40, fill: kind === "ok" ? cell : cellhl, stroke: inAcc ? (s.bad ? hl2 : hl) : line, "stroke-width": inAcc ? 3 : 0.8, "stroke-dasharray": kind === "free" ? "2 2" : (kind === "rz" ? "6 2" : "")});
+    el("text", {x: x + W / 2 - 1, y: 57, "text-anchor": "middle", "font-size": 10.5, fill: mut}, String(b)); }
+  for (let g = 0; g < 3; g++) { const x = X0 + g * (8 * W + 6);
+    el("text", {x: x + 4 * W, y: 92, "text-anchor": "middle", "font-size": 11, fill: mut}, "granula " + g + ": 0x…" + (BASE_LO + 8 * g).toString(16));
+    el("line", {x1: x + 4 * W, y1: 98, x2: x + 4 * W, y2: 118, stroke: line, "stroke-dasharray": "2 2"});
+    el("rect", {x: x + 4 * W - 30, y: 118, width: 60, height: 36, fill: sh[g] === 0 ? cell : cellhl, stroke: s.g === g ? (s.bad ? hl2 : hl) : line, "stroke-width": s.g === g ? 4 : 1});
+    el("text", {x: x + 4 * W, y: 142, "text-anchor": "middle", "font-size": 15, "font-weight": "bold"}, hx(sh[g])); }
+  el("text", {x: 10, y: 142, "font-size": 12, "font-weight": "bold"}, "árnyék");
+  el("text", {x: 10, y: 186, "font-size": 12}, "shadow(addr) = (addr >> 3) + 0xdffffc0000000000;  shadow(0x…600) = 0xffffed1002468ac0");
+  el("text", {x: 10, y: 214, "font-size": 14, "font-weight": "bold", fill: s.bad ? hl2 : hl}, "read " + s.size + " @ +" + s.off + ": " + (s.cond || "") + " → " + (s.res || ""));
+  el("text", {x: 10, y: 240, "font-size": 11, fill: mut}, "szürke, szaggatott = redzone (FC); pontozott = felszabadított (FB); vastag keret = a hozzáférés bájtjai és a vizsgált árnyékbájt");
+}
+function mk(off, size, freed){ const r = checkJS(off, size, freed);
+  if (!r) return {off, size, freed, g: -1, bad: true, cond: "a hozzáférés túlnyúlik a rajzolt 24 bájton", res: "–", line: -1, msg: "read " + size + " @ +" + off + ": túlnyúlik a rajzolt tartományon"};
+  return {off, size, freed, g: r.g, bad: r.bad, cond: r.cond, res: r.res, line: -1, msg: "read " + size + " @ +" + off + (freed ? " (kfree után)" : "") + ": " + r.cond + " → " + r.res}; }
+STEPS = STEPS.map(s => mk(s.off, s.size, s.freed));
+function ctl(){ const c = STEPS[k]; setSteps([mk(+document.getElementById("offr").value, +document.getElementById("szs").value, c.freed)]); }
+document.getElementById("offr").addEventListener("input", ctl);
+document.getElementById("szs").addEventListener("change", ctl);
+document.getElementById("kf").addEventListener("click", () => { const c = STEPS[k]; setSteps([mk(c.off, c.size, !c.freed)]); });
+document.getElementById("rs").addEventListener("click", () => setSteps(PRE.map(s => mk(s.off, s.size, s.freed))));
+
+
+// ---- Vezérlés (általában nem kell módosítani) ----
+let k = 0, timer = null;
+const pos = document.getElementById("pos"), status = document.getElementById("status");
+const codeEl = document.getElementById("code");
+if (!CODE.length) codeEl.style.display = "none";
+else codeEl.innerHTML = CODE.map((l, i) => `<span id="L${i}">${l.replace(/&/g,"&amp;").replace(/</g,"&lt;")}</span>`).join("");
+pos.max = STEPS.length - 1;
+// Új lépéssor betöltése (pl. saját bemenetből számolva): setSteps(lista)
+function setSteps(list){ stop(); STEPS = list; pos.max = STEPS.length - 1; show(0); }
+function show(i){
+  k = Math.max(0, Math.min(STEPS.length - 1, i));
+  const s = STEPS[k];
+  pos.value = k;
+  document.getElementById("cnt").textContent = `${k + 1}/${STEPS.length}`;
+  status.textContent = s.msg || "";
+  codeEl.querySelectorAll("span").forEach(x => x.classList.remove("on"));
+  if (s.line !== undefined && s.line >= 0) { const L = document.getElementById("L" + s.line); if (L) L.classList.add("on"); }
+  render(s);
+}
+function stop(){ if (timer) { clearInterval(timer); timer = null; } document.getElementById("play").textContent = "▶ Lejátszás"; }
+document.getElementById("first").onclick = () => { stop(); show(0); };
+document.getElementById("prev").onclick = () => { stop(); show(k - 1); };
+document.getElementById("next").onclick = () => { stop(); show(k + 1); };
+document.getElementById("play").onclick = () => {
+  if (timer) { stop(); return; }
+  if (k >= STEPS.length - 1) show(0);
+  document.getElementById("play").textContent = "⏸ Szünet";
+  timer = setInterval(() => { if (k >= STEPS.length - 1) stop(); else show(k + 1); }, 1800);
+};
+pos.oninput = () => { stop(); show(+pos.value); };
+document.addEventListener("keydown", e => { if (e.key === "ArrowRight") { stop(); show(k + 1); } if (e.key === "ArrowLeft") { stop(); show(k - 1); } });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => show(k));
+show(0);
+</script>
+<script>(function(){function s(){var b=document.body;parent.postMessage({figResize:Math.ceil(b.getBoundingClientRect().height)},"*")}addEventListener("load",s);addEventListener("resize",s);if(window.ResizeObserver)new ResizeObserver(s).observe(document.body);s()})()</script></body>
+</html>

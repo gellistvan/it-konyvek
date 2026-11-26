@@ -1,0 +1,953 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>14.3 Eszközmeghajtók és driver modell – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz3">III. RÉSZ – Memória és I/O</a> › <a href="index.html#osch13">14 I/O és eszközkezelés</a></p>
+<div class="links"><a class="prev" rel="prev" href="os051.html">← 14.2 Interruptok, DMA és pollozás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os053.html">14.4 Tárolóeszközök: HDD, SSD, NVMe és buffering →</a></div>
+</nav>
+<h2 data-number="14.3" id="os052"><span
+class="header-section-number">14.3</span> Eszközmeghajtók és driver
+modell</h2>
+<p>Az eszközmeghajtók és a driver modell célja, hogy a kernelben lévő
+eszközkezelés ne eseti illesztések halmaza legyen, hanem egységes,
+ellenőrizhető életciklus-szerződés mentén szerveződjön. Az előző
+alfejezetben megismertük a megszakításokat, a DMA-t és a lekérdezést;
+most azt vizsgáljuk meg, hogyan csatlakozik egy konkrét meghajtó a
+kernel eszközkezelő rétegéhez, és milyen szabályok garantálják, hogy a
+meghajtó betöltése, inicializálása, eltávolítása és a user-space felé
+való láthatósága konzisztens maradjon. A fejezet a Linux-kernel
+eszközmodelljének fogalmait használja, de az itt bemutatott minta –
+busz, eszköz, meghajtó, probe/remove – más monolitikus és hibrid
+kernelekben is megjelenik; a konkrét struktúratagok és API-nevek
+verziófüggők, ezért minden kernelverziónál ellenőrizni kell őket a
+hivatalos fejlécekben és dokumentációban.</p>
+<h3 data-number="14.3.1" id="a-kernel-eszközmodellje"><span
+class="header-section-number">14.3.1</span> A kernel eszközmodellje</h3>
+<p>A kernel eszközmodelljének három alapvető szereplője van:</p>
+<ul>
+<li><strong>busz (bus):</strong> az a kapcsolódási felület, amelyen az
+eszközök és a meghajtók találkoznak; például PCI, USB, platform, I²C,
+SPI vagy egy teljesen virtuális busz.</li>
+<li><strong>eszköz (device):</strong> a hardver vagy virtuális erőforrás
+egy konkrét példánya, amelyet a kernel az adott buszon lát.</li>
+<li><strong>meghajtó (driver):</strong> az a kód és adat, amely egy
+adott eszköztípus kezelését végzi, és amely a busz illesztési szabályai
+szerint hozzárendelhető egy eszközhöz.</li>
+</ul>
+<p>Ezeket a szereplőket a kernel közös objektummodellje fogja össze. A
+<code>kobject</code> minden eszközmodellbeli objektum alapja:
+hivatkozásszámlálást, szülő-gyermek hierarchiát és egy
+<code>sysfs</code>-beli megjelenést biztosít. A <code>sysfs</code>
+(általában <code>/sys</code> alatt) a kernel belső eszközmodelljének
+user-space nézete; itt jelennek meg a buszok, eszközök, meghajtók és
+osztályok mint könyvtárak és szimbolikus linkek. A <code>class</code>
+fogalom a funkció szerinti csoportosítást adja: például minden blokkos
+eszköz a <code>block</code> osztályba, minden hálózati interfész a
+<code>net</code> osztályba tartozhat, függetlenül attól, hogy milyen
+buszon ül.</p>
+<p>A modell a következő célokat szolgálja:</p>
+<ol type="1">
+<li><strong>Egységes életciklus:</strong> az eszköz megjelenése,
+eltávolítása, felfüggesztése és felébresztése ugyanazzal a szerződéssel
+kezelhető, függetlenül a hardver típusától.</li>
+<li><strong>Helyes hivatkozáskezelés:</strong> a refcountolt
+<code>kobject</code>-ök megakadályozzák, hogy egy meghajtó vagy eszköz
+adatai akkor szabaduljanak fel, amikor még hivatkozik rájuk valaki.</li>
+<li><strong>Dinamikus illesztés:</strong> a rendszer futás közben
+fedezhet fel eszközöket, és a megfelelő meghajtó betöltésével azonnal
+összekapcsolhatja őket.</li>
+<li><strong>User-space értesítés:</strong> az <code>uevent</code>
+mechanizmus értesíti a user-space-t (például <code>udev</code>,
+<code>systemd-udevd</code>), hogy eszköz jelent meg vagy tűnt el, így a
+user-space szabályok automatikusan létrehozhatnak eszközcsomópontokat,
+betölthetnek firmware-t vagy elindíthatnak szolgáltatásokat.</li>
+</ol>
+<p>A következő szakaszban az illesztés folyamatát bontjuk ki lépésről
+lépésre, mert a gyakorlati hibák nagy része ezen a szinten
+keletkezik.</p>
+<h3 data-number="14.3.2" id="busz-eszköz-és-meghajtó-illesztése"><span
+class="header-section-number">14.3.2</span> Busz, eszköz és meghajtó
+illesztése</h3>
+<p>A kernelben egy busz típusát a <code>bus_type</code> struktúra írja
+le. Ennek fontosabb részei közé tartoznak a busz neve, a root
+<code>kobject</code>, valamint az illesztést végző függvények. A Linux
+6.x-ben a <code>bus_type</code> lényegi tagjai a következők (a pontos
+ABI-t az adott kernelverzióhoz ellenőrizni kell):</p>
+<ul>
+<li><code>name</code>: a busz neve, például
+<code>"demo_bus"</code>.</li>
+<li><code>match</code>: ez a függvény dönti el, hogy egy adott
+<code>device</code> és egy adott <code>driver</code>
+összetartozik-e.</li>
+<li><code>uevent</code>: opcionálisan testreszabhatja a user-space-nek
+küldött környezeti változókat.</li>
+<li><code>probe</code> és <code>remove</code>: buszszintű horgok, ha a
+busznak közös erőforrás-kezelésre van szüksége; a tényleges
+eszközspecifikus munka általában a driver <code>probe</code> és
+<code>remove</code> függvényében történik.</li>
+<li><code>pm</code>: energia- és felfüggesztési műveletek.</li>
+</ul>
+<p>Egy eszközt a <code>device</code> struktúra reprezentál. Fontosabb
+mezői közé tartozik az eszköz neve, a szülő <code>device</code> mutató,
+a buszra mutató <code>bus</code>, egy <code>driver_data</code> mutató,
+valamint a hivatkozásszámláló. A meghajtót a <code>device_driver</code>
+struktúra írja le, amely tartalmazza a nevet, a buszra mutató
+<code>bus</code> pointert, a <code>probe</code> és <code>remove</code>
+függvénymutatókat, valamint opcionálisan az
+<code>of_match_table</code>-t vagy más azonosítótáblát.</p>
+<p>Az illesztés algoritmusa a következő lépésekből áll:</p>
+<ol type="1">
+<li><strong>Eszköz regisztrálása:</strong> a rendszer valamelyik rétege
+(például a PCI-busz felderítése, a platformkód vagy egy virtuális
+tesztmodul) létrehoz egy <code>device</code> objektumot, beállítja a
+buszát, nevét és erőforrásait, majd meghívja a
+<code>device_register</code>-t. A kernel elhelyezi az eszközt a busz
+eszközlistáján, és megjeleníti a <code>sysfs</code>-ben.</li>
+<li><strong>Meghajtó regisztrálása:</strong> egy meghajtó modul
+betöltésekor a <code>driver_register</code> hatására a driver bekerül a
+busz driverlistájára.</li>
+<li><strong>Illesztési keresés:</strong> a busz <code>match</code>
+függvénye minden regisztrált driverre és eszközre lefut, amikor új
+eszköz vagy új driver jelenik meg. Ha a függvény igazat ad vissza, a
+kernel megkísérli a hozzárendelést.</li>
+<li><strong>Probe hívás:</strong> a kernel meghívja a driver
+<code>probe</code> függvényét, átadva neki az eszköz mutatóját. A
+<code>probe</code> visszatérési értéke dönt a sikerességről. Ha
+<code>0</code>, az illesztés létrejött; ha negatív hibakód, a kernel
+elengedi az eszközt, és megpróbálhat másik drivert keresni.</li>
+<li><strong>Remove hívás:</strong> amikor az eszközt eltávolítják, vagy
+a drivert ki akarják tölteni, a kernel meghívja a driver
+<code>remove</code> függvényét, hogy a meghajtó minden erőforrást
+felszabadítson és leállítsa az eszközt.</li>
+</ol>
+<p>Az alábbi ábra a lépéseket a fejezet <code>demo_bus</code>
+laborpéldáján és a <code>sysfs</code>-ben megfigyelhető változáson
+mutatja be.</p>
+<figure id="fig-os052-demo-bus-sysfs">
+<div class="fig-interactive"><iframe src="figures/html/os052-demo-bus-sysfs.html" title="Busz, eszköz és meghajtó dobozai számozott regisztrációs, match, probe és remove nyilakkal, mellette a sysfs könyvtárfa három állapota." loading="lazy" style="width:100%;border:0;height:640px"></iframe><noscript><img src="figures/img/os052-demo-bus-sysfs.png" style="width:100.0%"
+alt="Busz, eszköz és meghajtó dobozai számozott regisztrációs, match, probe és remove nyilakkal, mellette a sysfs könyvtárfa három állapota." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/os052-demo-bus-sysfs.png" style="width:100.0%"
+alt="Busz, eszköz és meghajtó dobozai számozott regisztrációs, match, probe és remove nyilakkal, mellette a sysfs könyvtárfa három állapota." /></details></div>
+<figcaption>A <code>demo_bus</code> illesztése és a
+<code>sysfs</code>-fa változása: a <code>probe</code> után jelenik meg a
+<code>drivers/demo0/demo0</code> link, az <code>rmmod demo_drv</code>
+után eltűnik (sematikus).</figcaption>
+</figure>
+<p>Fontos, hogy a <code>probe</code> és a <code>remove</code> ugyanazon
+a buszon párhuzamosan is meghívódhat, ezért a meghajtónak saját magának
+kell kezelnie a konkurenciát, ha több eszköz egyidejűleg is
+csatlakozhat.</p>
+<h3 data-number="14.3.3" id="egy-virtuális-busz-és-driver-példa"><span
+class="header-section-number">14.3.3</span> Egy virtuális busz és driver
+példa</h3>
+<p>A következő kód egy leegyszerűsített, szemléltető virtuális buszt,
+eszközt és drivert mutat be. A célkernel Linux 6.8 LTS: a
+<code>struct device_driver</code> <code>probe</code>/<code>remove</code>
+prototípusait és a <code>bus_type</code> mezőit ehhez ellenőriztük. Más
+kernelverzióknál – különösen a 6.1 előttieknél – ezek eltérhetnek, ezért
+a fejléceket mindig a célkernelhez kell nézni. A példa két külön
+modulból áll (<code>demo_bus.ko</code>, <code>demo_drv.ko</code>),
+amelyek egy közös fejlécen (<code>demo_bus.h</code>) keresztül érik el
+egymást: a busz objektumot a <code>demo_bus</code> modul definiálja és
+exportálja, a meghajtó modul pedig ezt az exportált szimbólumot
+használja. A kód nem éles rendszerhez készült, hanem a minta megértését
+szolgálja.</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* demo_bus.h – a két modul közös deklarációja. */</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#ifndef DEMO_BUS_H</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define DEMO_BUS_H</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/device.h&gt;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="co">/* A busz objektumot a demo_bus modul definiálja és exportálja;</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="co"> * a demo_drv modul ezen a deklaráción keresztül éri el.</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="co"> */</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="kw">extern</span> <span class="kw">struct</span> bus_type demo_bus<span class="op">;</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="pp">#endif </span><span class="co">/* DEMO_BUS_H */</span></span></code></pre></div>
+<div class="sourceCode" id="cb2"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* demo_bus.c – a busz és az eszköz modulja.</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="co"> * A buszszimbólumot exportálja, hogy a külön modulként fordított</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="co"> * demo_drv.c hivatkozhasson rá. Szemléltető kód, nem éles rendszerhez.</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="co"> */</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;demo_bus.h&quot;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/module.h&gt;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/slab.h&gt;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/string.h&gt;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> demo_device <span class="op">{</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> device dev<span class="op">;</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>name<span class="op">;</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="co">/* Az eszköz és a driver neve alapján illesztünk. */</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> demo_match<span class="op">(</span><span class="kw">struct</span> device <span class="op">*</span>dev<span class="op">,</span> <span class="kw">struct</span> device_driver <span class="op">*</span>drv<span class="op">)</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> demo_device <span class="op">*</span>ddev <span class="op">=</span> container_of<span class="op">(</span>dev<span class="op">,</span> <span class="kw">struct</span> demo_device<span class="op">,</span> dev<span class="op">);</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> strcmp<span class="op">(</span>ddev<span class="op">-&gt;</span>name<span class="op">,</span> drv<span class="op">-&gt;</span>name<span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a><span class="co">/* A busz objektum nem static: a demo_drv modul is hivatkozik rá. */</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> bus_type demo_bus <span class="op">=</span> <span class="op">{</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>name  <span class="op">=</span> <span class="st">&quot;demo_bus&quot;</span><span class="op">,</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>match <span class="op">=</span> demo_match<span class="op">,</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>EXPORT_SYMBOL_GPL<span class="op">(</span>demo_bus<span class="op">);</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="kw">struct</span> demo_device <span class="op">*</span>demo_dev<span class="op">;</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">ssize_t</span> demo_attr_show<span class="op">(</span><span class="kw">struct</span> device <span class="op">*</span>dev<span class="op">,</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>                              <span class="kw">struct</span> device_attribute <span class="op">*</span>attr<span class="op">,</span></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">char</span> <span class="op">*</span>buf<span class="op">)</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> sysfs_emit<span class="op">(</span>buf<span class="op">,</span> <span class="st">&quot;demo device</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> DEVICE_ATTR_RO<span class="op">(</span>demo_attr<span class="op">);</span></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> demo_device_release<span class="op">(</span><span class="kw">struct</span> device <span class="op">*</span>dev<span class="op">)</span></span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Itt szabadul fel a demo_device. */</span></span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true" tabindex="-1"></a>    kfree<span class="op">(</span>container_of<span class="op">(</span>dev<span class="op">,</span> <span class="kw">struct</span> demo_device<span class="op">,</span> dev<span class="op">));</span></span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-45"><a href="#cb2-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-46"><a href="#cb2-46" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> __init demo_init<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb2-47"><a href="#cb2-47" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb2-48"><a href="#cb2-48" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> ret<span class="op">;</span></span>
+<span id="cb2-49"><a href="#cb2-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-50"><a href="#cb2-50" aria-hidden="true" tabindex="-1"></a>    ret <span class="op">=</span> bus_register<span class="op">(&amp;</span>demo_bus<span class="op">);</span></span>
+<span id="cb2-51"><a href="#cb2-51" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret<span class="op">)</span></span>
+<span id="cb2-52"><a href="#cb2-52" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb2-53"><a href="#cb2-53" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-54"><a href="#cb2-54" aria-hidden="true" tabindex="-1"></a>    demo_dev <span class="op">=</span> kzalloc<span class="op">(</span><span class="kw">sizeof</span><span class="op">(*</span>demo_dev<span class="op">),</span> GFP_KERNEL<span class="op">);</span></span>
+<span id="cb2-55"><a href="#cb2-55" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>demo_dev<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-56"><a href="#cb2-56" aria-hidden="true" tabindex="-1"></a>        bus_unregister<span class="op">(&amp;</span>demo_bus<span class="op">);</span></span>
+<span id="cb2-57"><a href="#cb2-57" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>ENOMEM<span class="op">;</span></span>
+<span id="cb2-58"><a href="#cb2-58" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-59"><a href="#cb2-59" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-60"><a href="#cb2-60" aria-hidden="true" tabindex="-1"></a>    demo_dev<span class="op">-&gt;</span>name <span class="op">=</span> <span class="st">&quot;demo0&quot;</span><span class="op">;</span></span>
+<span id="cb2-61"><a href="#cb2-61" aria-hidden="true" tabindex="-1"></a>    demo_dev<span class="op">-&gt;</span>dev<span class="op">.</span>bus <span class="op">=</span> <span class="op">&amp;</span>demo_bus<span class="op">;</span></span>
+<span id="cb2-62"><a href="#cb2-62" aria-hidden="true" tabindex="-1"></a>    demo_dev<span class="op">-&gt;</span>dev<span class="op">.</span>parent <span class="op">=</span> NULL<span class="op">;</span></span>
+<span id="cb2-63"><a href="#cb2-63" aria-hidden="true" tabindex="-1"></a>    demo_dev<span class="op">-&gt;</span>dev<span class="op">.</span>release <span class="op">=</span> demo_device_release<span class="op">;</span></span>
+<span id="cb2-64"><a href="#cb2-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-65"><a href="#cb2-65" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* device_initialize után az objektumot put_device zárja le;</span></span>
+<span id="cb2-66"><a href="#cb2-66" aria-hidden="true" tabindex="-1"></a><span class="co">     * a device_add végzi a sysfs-beli megjelenítést.</span></span>
+<span id="cb2-67"><a href="#cb2-67" aria-hidden="true" tabindex="-1"></a><span class="co">     */</span></span>
+<span id="cb2-68"><a href="#cb2-68" aria-hidden="true" tabindex="-1"></a>    device_initialize<span class="op">(&amp;</span>demo_dev<span class="op">-&gt;</span>dev<span class="op">);</span></span>
+<span id="cb2-69"><a href="#cb2-69" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-70"><a href="#cb2-70" aria-hidden="true" tabindex="-1"></a>    ret <span class="op">=</span> dev_set_name<span class="op">(&amp;</span>demo_dev<span class="op">-&gt;</span>dev<span class="op">,</span> <span class="st">&quot;demo0&quot;</span><span class="op">);</span></span>
+<span id="cb2-71"><a href="#cb2-71" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-72"><a href="#cb2-72" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* A név lefoglalása sikertelen: az inicializált eszközt</span></span>
+<span id="cb2-73"><a href="#cb2-73" aria-hidden="true" tabindex="-1"></a><span class="co">         * put_device zárja le (release -&gt; kfree), majd a busz megy.</span></span>
+<span id="cb2-74"><a href="#cb2-74" aria-hidden="true" tabindex="-1"></a><span class="co">         */</span></span>
+<span id="cb2-75"><a href="#cb2-75" aria-hidden="true" tabindex="-1"></a>        put_device<span class="op">(&amp;</span>demo_dev<span class="op">-&gt;</span>dev<span class="op">);</span></span>
+<span id="cb2-76"><a href="#cb2-76" aria-hidden="true" tabindex="-1"></a>        bus_unregister<span class="op">(&amp;</span>demo_bus<span class="op">);</span></span>
+<span id="cb2-77"><a href="#cb2-77" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb2-78"><a href="#cb2-78" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-79"><a href="#cb2-79" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-80"><a href="#cb2-80" aria-hidden="true" tabindex="-1"></a>    ret <span class="op">=</span> device_add<span class="op">(&amp;</span>demo_dev<span class="op">-&gt;</span>dev<span class="op">);</span></span>
+<span id="cb2-81"><a href="#cb2-81" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-82"><a href="#cb2-82" aria-hidden="true" tabindex="-1"></a>        put_device<span class="op">(&amp;</span>demo_dev<span class="op">-&gt;</span>dev<span class="op">);</span></span>
+<span id="cb2-83"><a href="#cb2-83" aria-hidden="true" tabindex="-1"></a>        bus_unregister<span class="op">(&amp;</span>demo_bus<span class="op">);</span></span>
+<span id="cb2-84"><a href="#cb2-84" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb2-85"><a href="#cb2-85" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-86"><a href="#cb2-86" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-87"><a href="#cb2-87" aria-hidden="true" tabindex="-1"></a>    ret <span class="op">=</span> device_create_file<span class="op">(&amp;</span>demo_dev<span class="op">-&gt;</span>dev<span class="op">,</span> <span class="op">&amp;</span>dev_attr_demo_attr<span class="op">);</span></span>
+<span id="cb2-88"><a href="#cb2-88" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-89"><a href="#cb2-89" aria-hidden="true" tabindex="-1"></a>        device_unregister<span class="op">(&amp;</span>demo_dev<span class="op">-&gt;</span>dev<span class="op">);</span></span>
+<span id="cb2-90"><a href="#cb2-90" aria-hidden="true" tabindex="-1"></a>        bus_unregister<span class="op">(&amp;</span>demo_bus<span class="op">);</span></span>
+<span id="cb2-91"><a href="#cb2-91" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb2-92"><a href="#cb2-92" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-93"><a href="#cb2-93" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-94"><a href="#cb2-94" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-95"><a href="#cb2-95" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-96"><a href="#cb2-96" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-97"><a href="#cb2-97" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> __exit demo_exit<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb2-98"><a href="#cb2-98" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb2-99"><a href="#cb2-99" aria-hidden="true" tabindex="-1"></a>    device_remove_file<span class="op">(&amp;</span>demo_dev<span class="op">-&gt;</span>dev<span class="op">,</span> <span class="op">&amp;</span>dev_attr_demo_attr<span class="op">);</span></span>
+<span id="cb2-100"><a href="#cb2-100" aria-hidden="true" tabindex="-1"></a>    device_unregister<span class="op">(&amp;</span>demo_dev<span class="op">-&gt;</span>dev<span class="op">);</span></span>
+<span id="cb2-101"><a href="#cb2-101" aria-hidden="true" tabindex="-1"></a>    bus_unregister<span class="op">(&amp;</span>demo_bus<span class="op">);</span></span>
+<span id="cb2-102"><a href="#cb2-102" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-103"><a href="#cb2-103" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-104"><a href="#cb2-104" aria-hidden="true" tabindex="-1"></a>module_init<span class="op">(</span>demo_init<span class="op">);</span></span>
+<span id="cb2-105"><a href="#cb2-105" aria-hidden="true" tabindex="-1"></a>module_exit<span class="op">(</span>demo_exit<span class="op">);</span></span>
+<span id="cb2-106"><a href="#cb2-106" aria-hidden="true" tabindex="-1"></a>MODULE_LICENSE<span class="op">(</span><span class="st">&quot;GPL&quot;</span><span class="op">);</span></span></code></pre></div>
+<p>A példában a <code>demo_bus</code> buszhoz tartozik egy
+<code>match</code> függvény, amely az eszköz <code>name</code> mezőjét
+hasonlítja a driver nevéhez. A <code>demo_init</code> regisztrál egy
+<code>demo0</code> eszközt, és létrehoz egy
+<code>sysfs</code>-attribútumot. A <code>release</code> függvény hívódik
+meg, amikor az utolsó hivatkozás is megszűnik; a memória felszabadítás
+itt történik.</p>
+<p>A driver oldala a következőképpen nézhet ki:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* demo_drv.c – szemléltető meghajtó a demo_bus-hoz.</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co"> * A busz objektumot a demo_bus.h extern deklarációja adja.</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co"> */</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;demo_bus.h&quot;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/module.h&gt;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/slab.h&gt;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> demo_probe<span class="op">(</span><span class="kw">struct</span> device <span class="op">*</span>dev<span class="op">)</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Itt lehetne hardver-erőforrásokat igényelni,</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="co">     * megszakítást regisztrálni, eszközosztályt létrehozni.</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="co">     */</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    dev_info<span class="op">(</span>dev<span class="op">,</span> <span class="st">&quot;demo_probe: device </span><span class="sc">%s</span><span class="st"> matched</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> dev_name<span class="op">(</span>dev<span class="op">));</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Példa: driver-specifikus adat tárolása. */</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>    dev_set_drvdata<span class="op">(</span>dev<span class="op">,</span> <span class="op">(</span><span class="dt">void</span> <span class="op">*)</span><span class="bn">0x1</span><span class="op">);</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> demo_remove<span class="op">(</span><span class="kw">struct</span> device <span class="op">*</span>dev<span class="op">)</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>    dev_info<span class="op">(</span>dev<span class="op">,</span> <span class="st">&quot;demo_remove: device </span><span class="sc">%s</span><span class="st"> removed</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> dev_name<span class="op">(</span>dev<span class="op">));</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Itt kell felszabadítani a probe által lefoglalt erőforrásokat. */</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>    dev_set_drvdata<span class="op">(</span>dev<span class="op">,</span> NULL<span class="op">);</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="kw">struct</span> device_driver demo_driver <span class="op">=</span> <span class="op">{</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>name   <span class="op">=</span> <span class="st">&quot;demo0&quot;</span><span class="op">,</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>bus    <span class="op">=</span> <span class="op">&amp;</span>demo_bus<span class="op">,</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>probe  <span class="op">=</span> demo_probe<span class="op">,</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>remove <span class="op">=</span> demo_remove<span class="op">,</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> __init demo_drv_init<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> driver_register<span class="op">(&amp;</span>demo_driver<span class="op">);</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> __exit demo_drv_exit<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a>    driver_unregister<span class="op">(&amp;</span>demo_driver<span class="op">);</span></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a>module_init<span class="op">(</span>demo_drv_init<span class="op">);</span></span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a>module_exit<span class="op">(</span>demo_drv_exit<span class="op">);</span></span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a>MODULE_LICENSE<span class="op">(</span><span class="st">&quot;GPL&quot;</span><span class="op">);</span></span></code></pre></div>
+<p>A <code>demo_probe</code> meghívódik, amikor a busz
+<code>match</code> függvénye igazat ad vissza. A
+<code>dev_set_drvdata</code> egy mutatót tárol a
+<code>device</code>-ben, amelyet a meghajtó később bármikor visszakaphat
+a <code>dev_get_drvdata</code> segítségével. A <code>remove</code> ezt
+törli, és ezzel jól mutatja a probe/remove szimmetria elvét. A két modul
+kapcsolatát a <code>demo_bus.h</code> és az
+<code>EXPORT_SYMBOL_GPL(demo_bus)</code> teremti meg: a
+<code>demo_bus</code> szimbólumot a <code>demo_bus.ko</code> exportálja,
+ezért a <code>demo_drv.ko</code> betöltése csak a buszmodul után
+sikerülhet. A <code>struct device_driver</code> <code>remove</code>
+mezőjének típusa célkernelfüggő: a Linux 6.1-től
+<code>void (*remove)(struct device *dev)</code>, a korábbi verziókban
+<code>int</code> volt; a példa a 6.8-as prototípust követi, ezért más
+célkernélnél a fejlécben ellenőrizni kell.</p>
+<h3 data-number="14.3.4" id="az-erőforrás-kezelés-szerepe"><span
+class="header-section-number">14.3.4</span> Az erőforrás-kezelés
+szerepe</h3>
+<p>A meghajtók gyakran igényelnek memóriát, megszakítást, I/O-portokat
+vagy DMA-területeket. A Linux-kernelben a <code>devm_*</code> (managed)
+API család arra való, hogy ezeket az erőforrásokat a <code>device</code>
+életciklusához kösse. Ha a <code>probe</code>
+<code>devm_kzalloc</code>-kal foglal memóriát,
+<code>devm_request_irq</code>-val regisztrál megszakítást, vagy
+<code>devm_ioremap</code>-pal képez le memóriát, akkor a kernel
+automatikusan felszabadítja ezeket a <code>remove</code> után, illetve
+akkor is, ha a <code>probe</code> valamelyik későbbi lépése hibát ad. Ez
+csökkenti a hibás hibakezelési utak számát, de nem helyettesíti a
+<code>remove</code> megírását: minden olyan erőforrást, amelyet nem
+<code>devm_</code> API-val szereztünk, explicit módon kell
+felszabadítani.</p>
+<p>A következő kód a <code>devm_*</code> használatát illusztrálja egy
+<code>probe</code> függvényben:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Töredék: a struct example_dev és az example_isr máshol definiált. */</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co">/* Példa: managed erőforrások a probe-ban (platform driver). */</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> example_probe<span class="op">(</span><span class="kw">struct</span> platform_device <span class="op">*</span>pdev<span class="op">)</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> device <span class="op">*</span>dev <span class="op">=</span> <span class="op">&amp;</span>pdev<span class="op">-&gt;</span>dev<span class="op">;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> __iomem <span class="op">*</span>base<span class="op">;</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> irq<span class="op">,</span> ret<span class="op">;</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> example_dev <span class="op">*</span>priv<span class="op">;</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    priv <span class="op">=</span> devm_kzalloc<span class="op">(</span>dev<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(*</span>priv<span class="op">),</span> GFP_KERNEL<span class="op">);</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>priv<span class="op">)</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>ENOMEM<span class="op">;</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>    base <span class="op">=</span> devm_platform_ioremap_resource<span class="op">(</span>pdev<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>IS_ERR<span class="op">(</span>base<span class="op">))</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> PTR_ERR<span class="op">(</span>base<span class="op">);</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>    irq <span class="op">=</span> platform_get_irq<span class="op">(</span>pdev<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>irq <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> irq<span class="op">;</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>    ret <span class="op">=</span> devm_request_irq<span class="op">(</span>dev<span class="op">,</span> irq<span class="op">,</span> example_isr<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="st">&quot;example&quot;</span><span class="op">,</span> priv<span class="op">);</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret<span class="op">)</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ret<span class="op">;</span>                 <span class="co">/* a tényleges hibakód (pl. -EPROBE_DEFER) megmarad */</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a>    platform_set_drvdata<span class="op">(</span>pdev<span class="op">,</span> priv<span class="op">);</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> example_remove<span class="op">(</span><span class="kw">struct</span> device <span class="op">*</span>dev<span class="op">)</span></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> example_dev <span class="op">*</span>priv <span class="op">=</span> dev_get_drvdata<span class="op">(</span>dev<span class="op">);</span></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* A managed erőforrásokat nem kell külön felszabadítani.</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a><span class="co">     * Itt csak a nem managed erőforrások és a hardver leállítása</span></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a><span class="co">     * szerepel.</span></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a><span class="co">     */</span></span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>priv<span class="op">)</span></span>
+<span id="cb4-39"><a href="#cb4-39" aria-hidden="true" tabindex="-1"></a>        dev_dbg<span class="op">(</span>dev<span class="op">,</span> <span class="st">&quot;device removed</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb4-40"><a href="#cb4-40" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>devm_*</code> függvények használatakor is figyelni kell arra,
+hogy az erőforrások felszabadítási sorrendje a regisztráció fordítottja,
+ezért a <code>probe</code>-ban érdemes a lehető legkorábban regisztrálni
+a managed erőforrásokat, hogy a hibakezelés automatikusan konzisztens
+legyen.</p>
+<h3 data-number="14.3.5"
+id="user-space-driver-és-virtuális-eszköz"><span
+class="header-section-number">14.3.5</span> User-space driver és
+virtuális eszköz</h3>
+<p>Nem minden eszközmeghajtó fut kernelmódban. A user-space driverek a
+felhasználói térben lévő programok, amelyek a kernel által biztosított
+interfészeken keresztül érik el a hardvert. Ez a megközelítés különösen
+hasznos akkor, ha:</p>
+<ul>
+<li>a hardver egyszerű, és a teljesítmény nem kritikus,</li>
+<li>a meghajtó gyors fejlesztése vagy tesztelése a cél,</li>
+<li>a kernel stabilitása fontosabb, mint a minimális késleltetés,</li>
+<li>a hardverhiba izolálása kívánatos.</li>
+</ul>
+<p>A Linux-kernel két fő keretrendszert kínál user-space
+meghajtókhoz:</p>
+<ul>
+<li><strong>UIO (Userspace I/O):</strong> a kernel egy kis, általános
+meghajtóréteget biztosít, amely az eszköz regisztereit
+<code>mmap</code>-pel a user-space-be képezi, a megszakításokat pedig
+egy <code>/dev/uioX</code> karakteres eszközön keresztül teszi
+kezelhetővé. A user-space program a megszakítás érkezésére a
+<code>read</code> hívással blokkol, majd elvégzi a szükséges
+műveleteket. Az általános <code>uio_pdrv_genirq</code> meghajtó a
+megszakítás kiszolgálása után letiltja az IRQ-forrást, és a
+user-space-nek egy 32 bites 1-et kell a <code>/dev/uioX</code>-re írnia
+az újraengedélyezéshez (irqcontrol). Az olyan egyedi UIO-meghajtók,
+amelyek maguk hívják a <code>uio_event_notify()</code>-t, nem igényelnek
+külön újraengedélyező írást.</li>
+<li><strong>VFIO (Virtual Function I/O):</strong> nagyobb teljesítményű
+és biztonságosabb megoldás, amely az IOMMU segítségével közvetlen
+eszközhozzáférést és DMA-t biztosít a user-space számára, miközben a
+memóriavédelmet a hardver garantálja.</li>
+</ul>
+<p>A <code>sysfs</code> és az <code>uevent</code> mechanizmus lehetővé
+teszi, hogy user-space szolgáltatások figyeljék az eszközök megjelenését
+és eltűnését. A <code>udev</code> szabályok például automatikusan
+létrehozzák a <code>/dev</code> alatti csomópontokat, betölthetnek
+firmware-t, vagy elindíthatnak egy user-space drivert.</p>
+<p>A virtuális eszközök olyan kernelben megvalósított eszközök, amelyek
+nem valódi hardvert vezérelnek, hanem valamilyen szoftveres funkciót
+tesznek elérhetővé a szokásos eszközinterfészen keresztül. Példák:</p>
+<ul>
+<li><code>/dev/null</code>, <code>/dev/zero</code>,
+<code>/dev/random</code>: karakteres eszközök, amelyek adatnyelőt,
+nullákat vagy véletlen számokat szolgáltatnak.</li>
+<li><code>loop</code> eszköz: egy fájlt blokk-eszközként jelenít
+meg.</li>
+<li><code>ramdisk</code>, <code>zram</code>: memóriaalapú
+blokk-eszköz.</li>
+<li><code>veth</code>, <code>dummy</code>: virtuális hálózati
+interfészek.</li>
+<li><code>virtio</code> eszközök: virtualizált környezetben a vendég és
+a hoszt közötti kommunikációra.</li>
+</ul>
+<p>Ezek a virtuális eszközök gyakran ugyanazt a busz-driver-modellt
+használják, mint a valódi hardverek, ezért kiválóan alkalmasak a
+driver-életciklus tanulmányozására és tesztelésére.</p>
+<p>A user-space driver tipikus életciklusa a következő:</p>
+<ol type="1">
+<li>A kernelben egy általános UIO-driver (például
+<code>uio_pdrv_genirq</code>) kötődik az eszközhöz, és létrehozza a
+<code>/dev/uioX</code> eszközt (VFIO-nál a <code>/dev/vfio/…</code>
+csomópontot és ioctl-interfészt; az alábbi lépések az UIO-ra
+vonatkoznak).</li>
+<li>A user-space program megnyitja az eszközt (<code>open</code>),
+leképezi a regiszterterületet (<code>mmap</code>), majd blokkoló
+<code>read</code>-del vár a megszakításra.</li>
+<li>A megszakítás után a program elvégzi a hardver kezelését, például
+beolvassa a regisztereket, nyugtázza a megszakítást a hardverben,
+feldolgozza az adatokat, majd – <code>uio_pdrv_genirq</code> esetén –
+újraengedélyezi az IRQ-t, és ismét vár.</li>
+<li>A program bezárásakor a kernel felszabadítja az erőforrásokat.</li>
+</ol>
+<p>A következő szemléltető kód egy <code>uio_pdrv_genirq</code>-alapú
+user-space driver vázát mutatja, a hardver nyugtázásával és az IRQ
+újraengedélyezésével együtt:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* user_demo.c – szemléltető UIO-driver váza (user-space).</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co"> * Feltételezés: uio_pdrv_genirq által kezelt eszköz irqcontrol</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="co"> * támogatással. A regiszteroffszetek hardverspecifikusak.</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="co"> */</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;errno.h&gt;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdint.h&gt;</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdio.h&gt;</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sys/mman.h&gt;</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;unistd.h&gt;</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MAP_SIZE   </span><span class="bn">0x1000</span><span class="bu">u</span><span class="pp">   </span><span class="co">/* szemléltető érték; lásd maps/map0/size */</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="pp">#define REG_STATUS </span><span class="bn">0x00</span><span class="bu">u</span><span class="pp">     </span><span class="co">/* hardverspecifikus regiszteroffszet */</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="pp">#define REG_ACK    </span><span class="bn">0x04</span><span class="bu">u</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;/dev/uio0&quot;</span><span class="op">,</span> O_RDWR <span class="op">|</span> O_SYNC<span class="op">);</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;open&quot;</span><span class="op">);</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* A leképezés méretét a /sys/class/uio/uio0/maps/map0/size</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a><span class="co">     * adja meg (hexadecimális értékkel).</span></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a><span class="co">     */</span></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">*</span>base <span class="op">=</span> mmap<span class="op">(</span>NULL<span class="op">,</span> MAP_SIZE<span class="op">,</span> PROT_READ <span class="op">|</span> PROT_WRITE<span class="op">,</span></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a>                      MAP_SHARED<span class="op">,</span> fd<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>base <span class="op">==</span> MAP_FAILED<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;mmap&quot;</span><span class="op">);</span></span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a>        close<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb5-33"><a href="#cb5-33" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-34"><a href="#cb5-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-35"><a href="#cb5-35" aria-hidden="true" tabindex="-1"></a>    <span class="dt">volatile</span> <span class="dt">uint8_t</span> <span class="op">*</span>regs <span class="op">=</span> <span class="op">(</span><span class="dt">volatile</span> <span class="dt">uint8_t</span> <span class="op">*)</span>base<span class="op">;</span></span>
+<span id="cb5-36"><a href="#cb5-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-37"><a href="#cb5-37" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb5-38"><a href="#cb5-38" aria-hidden="true" tabindex="-1"></a>        <span class="dt">uint32_t</span> irq_count <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb5-39"><a href="#cb5-39" aria-hidden="true" tabindex="-1"></a>        <span class="dt">ssize_t</span> n <span class="op">=</span> read<span class="op">(</span>fd<span class="op">,</span> <span class="op">&amp;</span>irq_count<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>irq_count<span class="op">));</span></span>
+<span id="cb5-40"><a href="#cb5-40" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>n <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-41"><a href="#cb5-41" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>errno <span class="op">==</span> EINTR<span class="op">)</span></span>
+<span id="cb5-42"><a href="#cb5-42" aria-hidden="true" tabindex="-1"></a>                <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb5-43"><a href="#cb5-43" aria-hidden="true" tabindex="-1"></a>            perror<span class="op">(</span><span class="st">&quot;read&quot;</span><span class="op">);</span></span>
+<span id="cb5-44"><a href="#cb5-44" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb5-45"><a href="#cb5-45" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb5-46"><a href="#cb5-46" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>n <span class="op">!=</span> <span class="op">(</span><span class="dt">ssize_t</span><span class="op">)</span><span class="kw">sizeof</span><span class="op">(</span>irq_count<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb5-47"><a href="#cb5-47" aria-hidden="true" tabindex="-1"></a>            fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;rövid read: </span><span class="sc">%zd</span><span class="st"> bájt</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> n<span class="op">);</span></span>
+<span id="cb5-48"><a href="#cb5-48" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb5-49"><a href="#cb5-49" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb5-50"><a href="#cb5-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-51"><a href="#cb5-51" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* 1. A megszakítás okának kiolvasása és nyugtázása a</span></span>
+<span id="cb5-52"><a href="#cb5-52" aria-hidden="true" tabindex="-1"></a><span class="co">         * hardverben, a hardverdokumentáció szerinti módon.</span></span>
+<span id="cb5-53"><a href="#cb5-53" aria-hidden="true" tabindex="-1"></a><span class="co">         */</span></span>
+<span id="cb5-54"><a href="#cb5-54" aria-hidden="true" tabindex="-1"></a>        <span class="dt">uint32_t</span> status <span class="op">=</span> <span class="op">*(</span><span class="dt">volatile</span> <span class="dt">uint32_t</span> <span class="op">*)(</span>regs <span class="op">+</span> REG_STATUS<span class="op">);</span></span>
+<span id="cb5-55"><a href="#cb5-55" aria-hidden="true" tabindex="-1"></a>        <span class="op">*(</span><span class="dt">volatile</span> <span class="dt">uint32_t</span> <span class="op">*)(</span>regs <span class="op">+</span> REG_ACK<span class="op">)</span> <span class="op">=</span> status<span class="op">;</span></span>
+<span id="cb5-56"><a href="#cb5-56" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;IRQ: </span><span class="sc">%u</span><span class="st">, status=0x</span><span class="sc">%x\n</span><span class="st">&quot;</span><span class="op">,</span> irq_count<span class="op">,</span> status<span class="op">);</span></span>
+<span id="cb5-57"><a href="#cb5-57" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-58"><a href="#cb5-58" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* 2. uio_pdrv_genirq: a kernel a kiszolgálás után letiltotta</span></span>
+<span id="cb5-59"><a href="#cb5-59" aria-hidden="true" tabindex="-1"></a><span class="co">         * az IRQ-forrást; a 32 bites 1 kiírása engedélyezi újra.</span></span>
+<span id="cb5-60"><a href="#cb5-60" aria-hidden="true" tabindex="-1"></a><span class="co">         * Egyedi UIO-meghajtónál (uio_event_notify) ez a lépés kimarad.</span></span>
+<span id="cb5-61"><a href="#cb5-61" aria-hidden="true" tabindex="-1"></a><span class="co">         */</span></span>
+<span id="cb5-62"><a href="#cb5-62" aria-hidden="true" tabindex="-1"></a>        <span class="dt">uint32_t</span> one <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb5-63"><a href="#cb5-63" aria-hidden="true" tabindex="-1"></a>        <span class="dt">ssize_t</span> w <span class="op">=</span> write<span class="op">(</span>fd<span class="op">,</span> <span class="op">&amp;</span>one<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>one<span class="op">));</span></span>
+<span id="cb5-64"><a href="#cb5-64" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>w <span class="op">!=</span> <span class="op">(</span><span class="dt">ssize_t</span><span class="op">)</span><span class="kw">sizeof</span><span class="op">(</span>one<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb5-65"><a href="#cb5-65" aria-hidden="true" tabindex="-1"></a>            perror<span class="op">(</span><span class="st">&quot;write (irq újraengedélyezése)&quot;</span><span class="op">);</span></span>
+<span id="cb5-66"><a href="#cb5-66" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb5-67"><a href="#cb5-67" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb5-68"><a href="#cb5-68" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-69"><a href="#cb5-69" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-70"><a href="#cb5-70" aria-hidden="true" tabindex="-1"></a>    munmap<span class="op">(</span>base<span class="op">,</span> MAP_SIZE<span class="op">);</span></span>
+<span id="cb5-71"><a href="#cb5-71" aria-hidden="true" tabindex="-1"></a>    close<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb5-72"><a href="#cb5-72" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb5-73"><a href="#cb5-73" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A kódban a <code>read</code> visszatérési értéke a megszakítás
+sorszáma, ami lehetővé teszi az elveszett megszakítások észlelését. A
+második megszakítás ellenőrzéséhez a hardvernek (vagy az emulált
+eszköznek) újabb eseményt kell generálnia: a ciklus a <code>write</code>
+után ismét a <code>read</code>-nél blokkol, és ha az
+<code>irq_count</code> nő, az újraengedélyezés működött. Ha a program a
+<code>write</code> nélkül az első esemény után örökre blokkol, az éppen
+a letiltott IRQ-forrás tünete. A gyakorlatban a regiszterek értelmezése
+hardverspecifikus, és a <code>mmap</code> méretét a
+<code>sysfs</code>-ben közzétett
+<code>/sys/class/uio/uioX/maps/map0/size</code> attribútumból kell
+kiolvasni.</p>
+<h3 data-number="14.3.6" id="tipikus-hibák-és-helyes-megoldásuk"><span
+class="header-section-number">14.3.6</span> Tipikus hibák és helyes
+megoldásuk</h3>
+<p>A driver-modellben elkövetett hibák gyakran később, nehezen
+reprodukálható körülmények között jelentkeznek. Az alábbi lista a
+leggyakoribb problémákat és a megfelelő megoldási mintákat foglalja
+össze.</p>
+<ol type="1">
+<li><p><strong>Probe/remove aszimmetria.</strong> Ha a
+<code>probe</code> lefoglal egy erőforrást, de a <code>remove</code> nem
+szabadítja fel, memóriaszivárgás vagy eszközhiba keletkezik. A megoldás
+az, hogy minden <code>probe</code>-ban történő erőforrás-allokációhoz
+tartozzon egy explicit vagy <code>devm_*</code> által kezelt
+felszabadítás, és a <code>remove</code> pontosan a <code>probe</code>
+fordított sorrendjében végezze a takarítást.</p></li>
+<li><p><strong>Use-after-free a <code>device</code>-ben.</strong> Ha a
+<code>remove</code> után a meghajtó hozzáfér a
+<code>dev_set_drvdata</code>-val tárolt mutatóhoz, vagy egy későbbi
+eseménykezelő használja a már felszabadított eszközt, a kernel hibát
+jelez. A helyes minta: a <code>remove</code> előtt minden eseményforrást
+le kell állítani (például <code>cancel_work_sync</code>,
+<code>free_irq</code>), és a <code>dev_set_drvdata</code>-t
+<code>NULL</code>-ra kell állítani.</p></li>
+<li><p><strong>Közös globális állapot több eszköz között.</strong> A
+driver core ugyanarra az eszközre nem hív egyszerre két
+<code>probe</code>-ot (az eszköz zárja alatt fut), de különböző eszközök
+<code>probe</code>-ja – aszinkron probe esetén – párhuzamosan futhat. Ha
+a driver globális változóban (például egyetlen <code>static</code>
+mutatóban vagy számlálóban) tárol eszközállapotot, az versenyhelyzetet
+okoz. Megoldás: eszközönkénti állapot <code>dev_set_drvdata</code>-val,
+a valóban globális részhez zár.</p></li>
+<li><p><strong>Nem kezelt hibák a <code>probe</code>-ban.</strong> Ha a
+<code>probe</code> több lépésből áll, és egy lépés hibát ad, a korábban
+lefoglalt erőforrások felszabadításáról gondoskodni kell. A
+<code>devm_*</code> API ezt automatizálja, de ha nem managed
+erőforrásokat használunk, minden hibaleágon explicit takarítást kell
+végezni.</p></li>
+<li><p><strong>Keveredő managed és nem managed erőforrások.</strong> A
+<code>devm_*</code> erőforrásokat a kernel a <code>remove</code>
+visszatérése után, fordított sorrendben szabadítja fel. Ha a
+<code>remove</code> közben kézzel felszabadítunk valamit, amit egy még
+élő managed erőforrás (például a <code>devm_request_irq</code> kezelője)
+használ, use-after-free keletkezik. Megoldás: vagy minden erőforrás
+managed (szükség esetén <code>devm_add_action_or_reset()</code>-tel),
+vagy a managed IRQ-t a kézi takarítás előtt
+<code>devm_free_irq()</code>/<code>disable_irq()</code> állítja
+le.</p></li>
+<li><p><strong>Match függvény hibái.</strong> A <code>match</code>
+gyakran mutatókat hasonlít össze, vagy a <code>device</code> és a
+<code>driver</code> adatait olvassa. Ha a mutató nem a várt típusra
+mutat, a <code>container_of</code> hibás memóriacímet eredményez. A
+megoldás a busz-specifikus adatszerkezetek pontos ismerete és a
+<code>match</code> függvény egyszerűsége.</p></li>
+<li><p><strong>User-space driverben a megszakításkezelés
+hibája.</strong> Az UIO <code>read</code> addig blokkol, amíg új
+megszakítás nem érkezik; ha az IRQ-forrás letiltva maradt (nincs
+újraengedélyező <code>write</code>), vagy a hardverben nincs nyugtázva,
+a <code>read</code> nem tér vissza. Ha a user-space program nem
+nyugtázza a megszakítást a hardverben, az eszköz nem fog újabb
+megszakítást küldeni. A megoldás a hardverdokumentáció szerinti
+nyugtázás és a <code>read</code> visszatérési értékének
+ellenőrzése.</p></li>
+<li><p><strong>Erőforrás-tulajdonjog hiányos dokumentálása.</strong> A
+kernelkódban minden határfelületnél egyértelművé kell tenni, hogy ki
+birtokolja a mutatót, ki felel a felszabadításért, és mikor lehet hívni
+az adott függvényt. A dokumentálatlanság gyakran vezet a fenti
+hibákhoz.</p></li>
+</ol>
+<h3 data-number="14.3.7"
+id="labor-driver-életciklus--és-proberemove-terv"><span
+class="header-section-number">14.3.7</span> Labor: driver életciklus- és
+probe/remove terv</h3>
+<p>Ez a labor egy ellenőrzött, emulált környezetben mutatja be a
+driver-életciklus működését, és rögzíti a mért és várt eredményeket. A
+labor célja, hogy az olvasó saját maga is megfigyelje a
+<code>probe</code> és <code>remove</code> hívásokat, a
+<code>sysfs</code>-beli megjelenést, és a tipikus hibák hatását.</p>
+<h3 data-number="14.3.8" id="kiinduló-állapot"><span
+class="header-section-number">14.3.8</span> Kiinduló állapot</h3>
+<p>A laborhoz a következő környezetet használjuk:</p>
+<ul>
+<li>Hoszt: x86_64, Linux 6.x, QEMU 8.x, gcc és make.</li>
+<li>Vendég: ugyanaz az architektúra, minimális initramfs, amely
+tartalmazza a szükséges modulokat és a <code>sysfs</code>-et. Vázlatos
+recept: <code>make -C linux-6.x defconfig</code>
+(<code>CONFIG_MODULES=y</code>) és
+<code>make -C linux-6.x -j$(nproc) bzImage modules_prepare</code>;
+statikus BusyBox (<code>insmod</code>, <code>rmmod</code>,
+<code>dmesg</code>, <code>ls</code>, <code>cat</code>) az
+<code>initramfs-root/{bin,lab,proc,sys}</code> fába; <code>/init</code>:
+<code>#!/bin/sh</code>, <code>mount -t proc proc /proc</code>,
+<code>mount -t sysfs sysfs /sys</code>, <code>exec /bin/sh</code>;
+csomagolás:
+<code>(cd initramfs-root &amp;&amp; find . | cpio -o -H newc | gzip) &gt; initramfs.cpio.gz</code>
+(a parancsok nem lettek lefuttatva, a verziókat a reprodukciós csomagnak
+kell rögzítenie).</li>
+<li>A kernel forrása helyben elérhető, és a modulok a vendég kernelhez
+fordíthatók.</li>
+<li>A labor nem módosítja a hoszt rendszert, nem érint valódi lemezt
+vagy bootloadert; minden művelet az emulált vendégen belül
+történik.</li>
+</ul>
+<p>A reprodukálhatóság érdekében a konfigurációt rögzíteni kell. Példa a
+<code>qemu</code> indítására:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">qemu-system-x86_64</span> <span class="dt">\</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-kernel</span> /path/to/bzImage <span class="dt">\</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-initrd</span> /path/to/initramfs.cpio.gz <span class="dt">\</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-append</span> <span class="st">&quot;console=ttyS0&quot;</span> <span class="dt">\</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">-nographic</span> <span class="dt">\</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">-smp</span> 1 <span class="dt">\</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">-m</span> 256M</span></code></pre></div>
+<p>A kernel- és initramfs-útvonalak helyőrzők; a tényleges elérési
+utakat a reprodukciós csomagban kell megadni.</p>
+<h3 data-number="14.3.9" id="build--és-futtatási-parancsok"><span
+class="header-section-number">14.3.9</span> Build- és futtatási
+parancsok</h3>
+<p>A modul fordításához a vendég kernelével pontosan egyező fejlécekre
+és buildkörnyezetre van szükség. Két út lehetséges: (a) a vendégen belül
+telepített, a futó kernelhez illő fejlécsomag (disztribúciós vendégnél
+például <code>apt install linux-headers-$(uname -r)</code>), majd a
+fordítás a vendégen; (b) a hoszton a vendég kernelének konfigurált
+forrásfája (<code>make modules_prepare</code>), majd
+<code>make KDIR=/path/to/linux-guest</code>. A minimális initramfs
+vendégben általában nincs fordító, ezért a hosztoldali build az
+ajánlott. A vermagicnek egyeznie kell a futó vendégkernelével, különben
+az <code>insmod</code> „version magic” hibát ad.</p>
+<p>Az alábbi <code>Makefile</code> a <code>KDIR</code> változóval
+mindkét utat támogatja:</p>
+<pre class="make"><code>KDIR ?= /lib/modules/$(shell uname -r)/build
+
+obj-m += demo_bus.o demo_drv.o
+
+all:
+    $(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+    $(MAKE) -C $(KDIR) M=$(PWD) clean</code></pre>
+<p>Hosztoldali build a vendég kernelének fája ellen:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Hoszt: a vendég kernelének konfigurált forrásfája szükséges</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> <span class="at">-C</span> /path/to/linux-guest modules_prepare</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> KDIR=/path/to/linux-guest</span></code></pre></div>
+<p>A kész modulokat a hoszton kell a vendég initramfs-ébe juttatni,
+például a labornak fenntartott <code>/lab</code> könyvtárba, majd az
+initramfs-t újra kell csomagolni a létrehozására használt
+eljárással:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Hoszt: a modulok az initramfs laborkönyvtárába kerülnek</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> demo_bus.ko demo_drv.ko /path/to/initramfs-root/lab/</span></code></pre></div>
+<p>A vendégen belül a betöltés, a megfigyelés és az eltávolítás ebben a
+sorrendben történik; a <code>sysfs</code>-ellenőrzés a betöltött
+állapotban fut, az eltávolítás után pedig a hiányt ellenőrizzük:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Vendég: betöltés a laborkönyvtárból</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="ex">insmod</span> /lab/demo_bus.ko</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="ex">insmod</span> /lab/demo_drv.ko</span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Pozitív ellenőrzés betöltött állapotban</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-l</span> /sys/bus/demo_bus/</span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-l</span> /sys/bus/demo_bus/devices/demo0/</span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/bus/demo_bus/devices/demo0/demo_attr</span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="fu">dmesg</span> <span class="kw">|</span> <span class="fu">tail</span> <span class="at">-20</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="co"># Eltávolítás (a függő modult előbb)</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a><span class="ex">rmmod</span> demo_drv</span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a><span class="ex">rmmod</span> demo_bus</span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a><span class="co"># Hiányellenőrzés eltávolítás után</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="bu">[</span> <span class="ot">-e</span> /sys/bus/demo_bus <span class="bu">]</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;HIBA: a demo_bus könyvtár még létezik&quot;</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a><span class="cf">else</span></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;OK: a demo_bus könyvtár eltűnt&quot;</span></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a><span class="cf">fi</span></span></code></pre></div>
+<p>A <code>cat</code> kimenete a várt <code>demo device</code> szöveg; a
+<code>dmesg</code>-ben a <code>probe</code> naplóbejegyzésének a
+betöltés után, a <code>remove</code> bejegyzésének pedig az
+<code>rmmod</code> után kell megjelennie. A sikeres labor feltétele nem
+a modulbetöltés puszta visszatérési kódja, hanem a
+<code>probe</code>/<code>remove</code> események ellenőrzött sorrendje
+és a <code>sysfs</code>-bejegyzések megjelenése, illetve eltűnése.</p>
+<h3 data-number="14.3.10" id="mérési-napló"><span
+class="header-section-number">14.3.10</span> Mérési napló</h3>
+<p>A labor elsődleges sikerkritériumának nem egy időérték, hanem a
+<code>probe</code>/<code>remove</code> események ellenőrzött sorrendje:
+a betöltés után a <code>probe</code> naplóbejegyzésének és a
+<code>sysfs</code>-bejegyzéseknek meg kell jelenniük, az eltávolítás
+után pedig a <code>remove</code> bejegyzésnek és a
+<code>sysfs</code>-bejegyzések eltűnésének kell következnie. Az időmérés
+csak kiegészítő, leíró adat: a <code>probe</code> és <code>remove</code>
+időtartamát a vendégen belül, a <code>ktime_get_ns()</code> hívásával
+mérjük a függvény elején és végén, és a különbséget
+<code>dev_info</code>-val naplózzuk. A <code>ktime_get_ns()</code> maga
+is tipikusan néhány tíz nanoszekundumos overheadet ad, ezért egyetlen
+minta nem elegendő: legalább 10 ismétlést kell rögzíteni, és a
+minimumot, a mediánt és a maximumot jelenteni. A mért idő függ a vendég
+CPU órajelétől, a kernel konfigurációjától és a QEMU emulációs
+sebességétől, ezért nem használható teljesítményküszöbként.</p>
+<p>A reprodukciós jegyzetfüzetben a következőket kell rögzíteni:</p>
+<ul>
+<li><strong>CPU:</strong> QEMU <code>qemu64</code> modell (TCG) vagy
+<code>-cpu host</code> (KVM); a hoszt CPU típusa és órajele, a
+<code>-accel</code> mód, <code>-smp 1</code>.</li>
+<li><strong>Memória:</strong> 256 MiB.</li>
+<li><strong>Kernel:</strong> 6.x (pontos verzió a csomagban).</li>
+<li><strong>Fordítási beállítások:</strong> <code>gcc</code>
+optimalizálás <code>-O2</code>, <code>CONFIG_DEBUG_FS=y</code>,
+<code>CONFIG_DYNAMIC_DEBUG=y</code> (ha elérhető).</li>
+<li><strong>Időalap:</strong> <code>ktime_get_ns()</code> (monoton), a
+vendégen belül; a mérési pont a <code>probe</code>/<code>remove</code>
+függvény eleje és vége.</li>
+<li><strong>Ismétlésszám:</strong> legalább 10 betöltés/eltávolítás
+ciklus; a nyers <code>dmesg</code> kimenet mentése külön fájlba.</li>
+</ul>
+<p>Az alábbi táblázat kizárólag a kitöltés formáját szemlélteti: a
+„mért” oszlopokban szereplő számok <strong>nem mérések</strong>, hanem
+kitalált illusztratív értékek, ezért nem tekinthetők elvárt
+teljesítménynek vagy küszöbnek.</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Művelet</th>
+<th>Várt esemény</th>
+<th>Illusztratív érték – nem mérés (1. minta)</th>
+<th>Illusztratív érték – nem mérés (2. minta)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>insmod demo_bus.ko</code></td>
+<td>sikeres regisztráció, <code>sysfs</code> könyvtár megjelenik</td>
+<td>sikeres</td>
+<td>sikeres</td>
+</tr>
+<tr>
+<td><code>insmod demo_drv.ko</code></td>
+<td><code>probe</code> hívás, naplóbejegyzés</td>
+<td>sikeres, <code>probe</code> 1,2 µs (illusztráció)</td>
+<td>sikeres, <code>probe</code> 1,1 µs (illusztráció)</td>
+</tr>
+<tr>
+<td><code>cat demo_attr</code></td>
+<td><code>demo device</code> szöveg</td>
+<td><code>demo device</code></td>
+<td><code>demo device</code></td>
+</tr>
+<tr>
+<td><code>rmmod demo_drv</code></td>
+<td><code>remove</code> hívás, naplóbejegyzés</td>
+<td>sikeres, <code>remove</code> 0,8 µs (illusztráció)</td>
+<td>sikeres, <code>remove</code> 0,7 µs (illusztráció)</td>
+</tr>
+<tr>
+<td><code>rmmod demo_bus</code></td>
+<td><code>sysfs</code> könyvtár eltűnik</td>
+<td>sikeres</td>
+<td>sikeres</td>
+</tr>
+</tbody>
+</table>
+<p>A tényleges méréshez használt üres sablon (a sorokat a saját futás
+eredményével kell kitölteni):</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+</colgroup>
+<thead>
+<tr>
+<th>Művelet</th>
+<th>Várt esemény</th>
+<th>Időalap és mérési pont</th>
+<th>Ismétlés (n)</th>
+<th>Mért értékek (min / medián / max)</th>
+<th>Nyers napló</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>insmod demo_bus.ko</code></td>
+<td>busz és eszköz regisztrálva</td>
+<td><code>ktime_get_ns()</code>, init eleje/vége</td>
+<td>10</td>
+<td></td>
+<td><code>dmesg &gt; insmod-bus.log</code></td>
+</tr>
+<tr>
+<td><code>insmod demo_drv.ko</code></td>
+<td><code>probe</code> lefut</td>
+<td><code>ktime_get_ns()</code>, <code>probe</code> eleje/vége</td>
+<td>10</td>
+<td></td>
+<td><code>dmesg &gt; insmod-drv.log</code></td>
+</tr>
+<tr>
+<td><code>rmmod demo_drv</code></td>
+<td><code>remove</code> lefut</td>
+<td><code>ktime_get_ns()</code>, <code>remove</code> eleje/vége</td>
+<td>10</td>
+<td></td>
+<td><code>dmesg &gt; rmmod-drv.log</code></td>
+</tr>
+<tr>
+<td><code>rmmod demo_bus</code></td>
+<td>busz és eszköz eltávolítva</td>
+<td><code>ktime_get_ns()</code>, exit eleje/vége</td>
+<td>10</td>
+<td></td>
+<td><code>dmesg &gt; rmmod-bus.log</code></td>
+</tr>
+</tbody>
+</table>
+<p>A várt és mért eredményeket külön kell választani: a várt oszlop a
+specifikációból következik, a mért oszlop a tényleges futásból. Az
+időméréseknél a hardvert, a fordítási beállításokat és az
+órajelfrekvenciát is fel kell tüntetni, ahogyan azt a könyv konvenciói
+előírják. A labor akkor sikeres, ha a
+<code>probe</code>/<code>remove</code> események sorrendje és a
+<code>sysfs</code>-ellenőrzések eredménye a várt sorrendet mutatja; az
+időadatok ettől független, tájékoztató jellegű melléktermékek.</p>
+<h3 data-number="14.3.11" id="hibaszimuláció"><span
+class="header-section-number">14.3.11</span> Hibaszimuláció</h3>
+<p>A labor második részében szándékosan hibát viszünk a
+<code>probe</code>-ba, hogy megfigyeljük a kernel reakcióját. Például a
+<code>demo_probe</code> visszatérési értékét <code>-ENOMEM</code>-re
+állítjuk, és újra betöltjük a drivert. A várt viselkedés az, hogy a
+kernel hibaüzenetet ír a <code>dmesg</code>-be, és nem hozza létre a
+<code>sysfs</code>-beli kapcsolatot. A mért viselkedést ugyanígy
+rögzíteni kell.</p>
+<p>A labor elvégzése után a vendég leállítható a <code>poweroff</code>
+paranccsal, vagy a QEMU-ból történő kilépéssel; a hoszt rendszer
+állapota változatlan marad.</p>
+<h3 data-number="14.3.12" id="önellenőrző-kérdés"><span
+class="header-section-number">14.3.12</span> Önellenőrző kérdés</h3>
+<p>A fejezet végén ellenőrizze a megértést: mi történik, ha a
+<code>probe</code> függvény hibával tér vissza, de a <code>devm_*</code>
+API-val lefoglalt erőforrások már regisztrálva vannak? Magyarázza el,
+miért nincs szükség explicit takarításra ebben az esetben, és milyen
+kivételek léteznek.</p>
+<p>(A helyes válasz: a kernel a <code>probe</code> hibája esetén
+automatikusan felszabadítja a <code>devm_*</code> erőforrásokat a
+regisztráció fordított sorrendjében. Kivétel a nem managed erőforrás
+(azt a hibaágon kézzel kell felszabadítani), és a sorrendi függés: a
+managed erőforrások csak a <code>probe</code> visszatérése, illetve a
+<code>remove</code> után szabadulnak fel, ezért egy kézzel előbb
+felszabadított erőforrást egy még élő managed kezelő használhat.)</p>
+<h3 data-number="14.3.13" id="összefoglalás"><span
+class="header-section-number">14.3.13</span> Összefoglalás</h3>
+<p>A kernel eszközmodellje a busz, az eszköz és a meghajtó hármasára
+épül. A busz <code>match</code> függvénye dönti el az illesztést, a
+driver <code>probe</code> és <code>remove</code> függvényei pedig az
+életciklus fő állomásait jelentik. A <code>kobject</code>, a
+<code>sysfs</code> és az <code>uevent</code> mechanizmus biztosítja a
+user-space felé való láthatóságot és a dinamikus eszközkezelést. A
+managed erőforrás-kezelés csökkenti a hibalehetőségeket, de a
+probe/remove szimmetriát és a hibatűrő tervezést nem helyettesíti. A
+user-space driverek és a virtuális eszközök ugyanezt a modellt
+használják, és lehetővé teszik az eszközkezelés biztonságosabb vagy
+gyorsabb fejlesztését. A következő alfejezet ezekre a fogalmakra építve
+mutatja be a tárolóeszközök – HDD, SSD, NVMe – kezelését, ahol a
+blokk-eszköz réteg és a driver modell találkozása különösen fontos.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os051.html">← 14.2 Interruptok, DMA és pollozás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os053.html">14.4 Tárolóeszközök: HDD, SSD, NVMe és buffering →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

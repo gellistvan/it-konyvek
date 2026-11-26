@@ -1,0 +1,946 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>13.4 Kernelmemória, vmalloc, kmalloc és biztonság – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz3">III. RÉSZ – Memória és I/O</a> › <a href="index.html#osch12">13 Memóriaallokáció és kernelmemória</a></p>
+<div class="links"><a class="prev" rel="prev" href="os048.html">← 13.3 NUMA, locality és memóriapoolok</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os050.html">14.1 Blokk- és karakteres eszközök →</a></div>
+</nav>
+<h2 data-number="13.4" id="os049"><span
+class="header-section-number">13.4</span> Kernelmemória, vmalloc,
+kmalloc és biztonság</h2>
+<p>A kernel saját memóriakezelése alapvetően különbözik a felhasználói
+tér allokációitól. A kernelnek egyszerre kell kiszolgálnia kis, gyakori
+vezérlőblokkokat, nagy, ritkán kért puffereket és speciális, fizikailag
+összefüggő területeket, miközben sosem feledkezhet meg a védelemről: egy
+rossz felszabadítás vagy egy lejárt pointer nem csak egy folyamatot,
+hanem az egész rendszert veszélyezteti. Ez a fejezet a kernelmemória
+rétegeit, az allokációs döntések szempontjait és a hardening technikákat
+járja körül.</p>
+<h3 data-number="13.4.1" id="a-kernelmemória-sajátos-világa"><span
+class="header-section-number">13.4.1</span> 1. A kernelmemória sajátos
+világa</h3>
+<p>A felhasználói program a <code>malloc</code> mögött általában nem
+látja a lapozást, a töredezettséget vagy a kernel laphibakezelését. A
+kernelben viszont az allokációk közvetlenül a fizikai memóriához, a
+lapkezelőhöz és a virtuális címtartományhoz kötődnek. A legfontosabb
+eltérések:</p>
+<ul>
+<li><strong>Nincs automatikus laphiba-kezelés minden
+kernelcímre.</strong> A kernel saját adatai jellemzően nem lapozhatók
+ki; egy <code>NULL</code> pointer vagy egy felszabadított terület
+elérése gyakran <code>panic</code>-kel vagy azonnali leállással
+végződik.</li>
+<li><strong>A kernel többféle memóriát igényel.</strong> Van, ami csak
+néhány bájt, van, ami több MiB, és van, ami fizikailag összefüggő kell
+legyen egy DMA-vezérlő számára.</li>
+<li><strong>A kernel kontextusfüggő.</strong> Bizonyos kódok
+megszakításban vagy spinlock alatt futnak, ahol tilos aludni, ezért az
+allokációnak nem szabad lassú lapvisszaadást vagy ütemezést
+igényelnie.</li>
+<li><strong>A hibák hatása nagyobb.</strong> A dupla felszabadítás, a
+use-after-free, a túlcsordulás vagy a rossz tulajdonos általi
+<code>kfree</code> az egész kernel integritását rombolhatja.</li>
+</ul>
+<p>Ezek a tulajdonságok indokolják, hogy a kernelmemória-kezelés réteges
+legyen: a lapallokátor ad fizikai lapokat, a slab/slub réteg hatékony
+gyorsítótárat épít a kis objektumokhoz, a <code>kmalloc</code> általános
+célú bájtméret-alapú allokációt nyújt, a <code>vmalloc</code> pedig
+nagy, virtuálisan összefüggő területeket biztosít. Minden réteg más
+kompromisszumot jelent a sebesség, a töredezettség és a védelem
+között.</p>
+<h3 data-number="13.4.2"
+id="a-page-allocator-a-kernel-fizikaialap-allokációja"><span
+class="header-section-number">13.4.2</span> 2. A page allocator: a
+kernel fizikaialap-allokációja</h3>
+<p>A kernel legalacsonyabb általános allokációs rétege a buddy
+allocator. Ez az előző fejezetben megismert elven fizikai lapokat ad
+vissza, ahol egy lap mérete általában 4 KiB x86-on, de architektúrától
+függően 16 KiB vagy 64 KiB is lehet. A kernelben a lapok
+<code>struct page</code> objektumokkal reprezentáltak, és az allokáció
+rendje (<code>order</code>) 2 hatványú lapszámot ad meg. Egy
+<code>order=0</code> kérés 1 lapot, egy <code>order=3</code> kérés 8
+lapot, azaz 32 KiB-ot jelent 4 KiB-os lapok esetén.</p>
+<p>A page allocator a kernel memóriatípusait zónákba és migrációs
+típusokba szervezi. Zónák például a <code>ZONE_DMA</code>,
+<code>ZONE_NORMAL</code> és <code>ZONE_HIGHMEM</code> (32 bites
+rendszereken), valamint a <code>ZONE_MOVABLE</code>. Az allokációs
+jelzők ezeket a követelményeket fejezik ki. A leggyakoribb jelzők a
+<code>GFP_KERNEL</code>, a <code>GFP_ATOMIC</code> és a
+<code>GFP_DMA</code>. A <code>GFP_KERNEL</code> normál kernelkódban
+használható, mert az allokáció aludhat; a <code>GFP_ATOMIC</code>
+megszakítás vagy spinlock alatt használható, de nem aludhat, ezért a
+rendszer a sürgősségi tartalékokhoz nyúlhat; a <code>GFP_DMA</code>
+pedig a DMA szempontjából elérhető memóriát kérheti.</p>
+<p>Egy egyszerű lapallokáció:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/gfp.h&gt;</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/mm.h&gt;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> page <span class="op">*</span>pg<span class="op">;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> <span class="op">*</span>virt<span class="op">;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> order <span class="op">=</span> <span class="dv">2</span><span class="op">;</span> <span class="co">/* 4 lap, 4 KiB-os lap mellett 16 KiB */</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>pg <span class="op">=</span> alloc_pages<span class="op">(</span>GFP_KERNEL <span class="op">|</span> __GFP_ZERO<span class="op">,</span> order<span class="op">);</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(!</span>pg<span class="op">)</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">-</span>ENOMEM<span class="op">;</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>virt <span class="op">=</span> page_address<span class="op">(</span>pg<span class="op">);</span> <span class="co">/* lineáris/közvetlen leképezés esetén */</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(!</span>virt<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    __free_pages<span class="op">(</span>pg<span class="op">,</span> order<span class="op">);</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">-</span>ENOMEM<span class="op">;</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="co">/* ... használat ... */</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>__free_pages<span class="op">(</span>pg<span class="op">,</span> order<span class="op">);</span></span></code></pre></div>
+<p>A <code>page_address</code> csak akkor ad stabil virtuális címet, ha
+a lap a kernel közvetlen leképezésében van. Architektúra- és
+konfigurációfüggő, hogy minden lapra elérhető-e közvetlenül; a Linux
+kernel a <code>kmalloc</code> és a slab mögött is ezt a leképezést
+használja. A page allocator erőssége a pontos fizikai lapkezelés, a
+hátránya pedig az, hogy néhány bájtos kérést nem tud gazdaságosan
+kiszolgálni, és az <code>order</code> növelésével a fizikai
+töredezettség drámaian nőhet.</p>
+<h3 data-number="13.4.3" id="slab-slub-és-a-kmalloc"><span
+class="header-section-number">13.4.3</span> 3. Slab, SLUB és a
+kmalloc</h3>
+<p>A kernel tele van kisméretű, gyakran létrehozott és felszabadított
+objektummal: inode-ok, dentry-k, task_struct-ok, net sk_buff-ok. A
+lapallokátor önmagában rossz választás lenne erre, mert minden egyes
+inode-hoz 4 KiB lapot rendelve óriási pazarlás keletkezne. A slab
+allocator ezt gyorsítótárakkal oldja meg: egy adott típusú objektumhoz
+előre lefoglal lapokat, azokat azonos méretű mezőkre osztja, és a
+felszabadított objektumokat gyors listában tartja.</p>
+<p>A modern Linux kernelben a SLUB a leggyakoribb slab-változat, de a
+fogalom neve gyakran maradt „slab cache”. A SLUB nem tart fenn annyi
+metaadatot, mint a klasszikus slab, hanem a szabad objektumok listáját
+az objektumon belüli, egyébként üres területen tárolja. Ez kisebb
+overheadet és jobb cache-viselkedést eredményez.</p>
+<p>A <code>kmalloc</code> egy általános célú API a bájtméret alapú
+allokációra. A kernel konfigurációjától függően egy vagy több slab
+cache-hez fordul, és a kért méretet felkerekíti a legközelebbi
+gyorsítótárméretre. A tipikus méretosztályok 8, 16, 32, 64, 96, 128,
+192, 256, 512, 1024, 2048, 4096 bájt, és így tovább. A pontos osztályok
+kernelverziótól és konfigurációtól függenek, ezért a mérésnél érdemes a
+<code>/proc/slabinfo</code> tartalmát is rögzíteni.</p>
+<p>A <code>kmalloc</code> legfontosabb tulajdonságai:</p>
+<ul>
+<li><strong>Fizikailag összefüggő</strong> memóriát ad, amit a
+DMA-vezérlők is használhatnak, ha a megfelelő jelzőket alkalmazzuk.</li>
+<li><strong>Gyors</strong>, mert a szabad objektumok listája állandóan
+rendelkezésre áll.</li>
+<li><strong>Méretkorlátos</strong>. A gyakorlatban a
+<code>kmalloc</code> nagy méreteknél egyre töredezettebbé válik; a
+kernelverziótól függően a felső határ általában néhány MiB (például 4
+MiB körül), de ezt a konkrét kernelverzióhoz ellenőrizni kell. Nagyobb
+méret esetén a page allocator vagy a <code>vmalloc</code> a helyes
+választás.</li>
+</ul>
+<p>Példa <code>kmalloc</code>-ra:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/slab.h&gt;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> sensor_sample <span class="op">{</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">long</span> timestamp_ns<span class="op">;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> value<span class="op">;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> flags<span class="op">;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> sensor_sample <span class="op">*</span>s<span class="op">;</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>s <span class="op">=</span> kmalloc<span class="op">(</span><span class="kw">sizeof</span><span class="op">(*</span>s<span class="op">),</span> GFP_KERNEL<span class="op">);</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(!</span>s<span class="op">)</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">-</span>ENOMEM<span class="op">;</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>s<span class="op">-&gt;</span>timestamp_ns <span class="op">=</span> ktime_get_ns<span class="op">();</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>s<span class="op">-&gt;</span>value <span class="op">=</span> <span class="dv">42</span><span class="op">;</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>s<span class="op">-&gt;</span>flags <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="co">/* ... */</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>kfree<span class="op">(</span>s<span class="op">);</span></span></code></pre></div>
+<p>A kernel API több kényelmi változatot is ad:</p>
+<ul>
+<li><code>kzalloc(size, flags)</code> nulla töltésű allokáció.</li>
+<li><code>kmalloc_array(n, size, flags)</code> túlcsordulás-ellenőrzött
+tömb allokáció; ha <code>n * size</code> túlcsordulna,
+<code>NULL</code>-t ad.</li>
+<li><code>krealloc(p, new_size, flags)</code> meglévő terület
+átméretezése.</li>
+</ul>
+<p>A <code>kzalloc</code> különösen fontos biztonsági szempontból, mert
+a nem inicializált kernelmemória adatszivárgást okozhat a felhasználói
+tér felé. A kernel ezért egyes konfigurációi alapból nullázzák a
+<code>GFP_KERNEL</code> allokációkat, de erre nem szabad építeni: a kód
+legyen explicit.</p>
+<p>A slab cache-eket nem csak a <code>kmalloc</code> használja; a kernel
+alrendszer saját gyorsítótárat is létrehozhat, ha egy adott
+objektumtípusból nagyon sok példányt tart nyilván. Ez csökkenti a
+felkerekítési veszteséget, és lehetővé teszi a konstruktort vagy a
+speciális igazítást.</p>
+<p>Példa saját cache-re:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/slab.h&gt;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> fsm_event <span class="op">{</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">long</span> sequence<span class="op">;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    u64 payload<span class="op">[</span><span class="dv">4</span><span class="op">];</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="kw">struct</span> kmem_cache <span class="op">*</span>fsm_event_cache<span class="op">;</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> __init fsm_init<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    fsm_event_cache <span class="op">=</span> kmem_cache_create<span class="op">(</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;fsm_event&quot;</span><span class="op">,</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>        <span class="kw">sizeof</span><span class="op">(</span><span class="kw">struct</span> fsm_event<span class="op">),</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>        __alignof__<span class="op">(</span><span class="kw">struct</span> fsm_event<span class="op">),</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>        <span class="dv">0</span><span class="op">,</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>        NULL<span class="op">);</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>fsm_event_cache<span class="op">)</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>ENOMEM<span class="op">;</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> fsm_event_free<span class="op">(</span><span class="kw">struct</span> fsm_event <span class="op">*</span>e<span class="op">)</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>    kmem_cache_free<span class="op">(</span>fsm_event_cache<span class="op">,</span> e<span class="op">);</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> fsm_event <span class="op">*</span>fsm_event_alloc<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> kmem_cache_alloc<span class="op">(</span>fsm_event_cache<span class="op">,</span> GFP_KERNEL<span class="op">);</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> __exit fsm_exit<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a>    kmem_cache_destroy<span class="op">(</span>fsm_event_cache<span class="op">);</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>kmem_cache_create</code> a <code>0</code> jelzővel
+alapértelmezett viselkedést használ. A SLUB debug bekapcsolásakor a
+cache kaphat vörös zónát, mérgezést és más ellenőrzést, de ezt a kernel
+konfigurációja szabályozza.</p>
+<h3 data-number="13.4.4"
+id="a-vmalloc-nagy-virtuálisan-összefüggő-terület"><span
+class="header-section-number">13.4.4</span> 4. A vmalloc: nagy,
+virtuálisan összefüggő terület</h3>
+<p>A <code>vmalloc</code> akkor hasznos, ha a kernelnek nagy, lineárisan
+címezhető memóriára van szüksége, de a fizikai lapoknak nem kell
+összefüggőnek lenniük. A <code>vmalloc</code> a kernel virtuális
+címtartományából egy összefüggő tartományt foglal le, majd a lapokat a
+page allocatorból egyenként vagy kisebb csoportokban szerzi be, és
+felépíti a laphozzárendelést.</p>
+<p>A <code>vmalloc</code> jellemzői:</p>
+<ul>
+<li><strong>Virtuálisan összefüggő</strong>, ezért egyszerű
+pointer-aritmetikával és memóriafüggvényekkel használható.</li>
+<li><strong>Fizikailag nem feltétlenül összefüggő</strong>, ezért
+közvetlenül nem adható DMA-ra olyan vezérlőnek, amely fizikai lapcímeket
+vár.</li>
+<li><strong>Jelentősebb TLB-nyomás</strong>, mert minden egyes lap
+bejegyzést igényel, és a leképezés felépítése drágább, mint a
+<code>kmalloc</code>.</li>
+<li><strong>Használható nagyobb méretekre</strong>, ahol a
+<code>kmalloc</code> vagy a page allocator már töredezett vagy nem
+elérhető.</li>
+</ul>
+<p>A tipikus <code>vmalloc</code> használat:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/vmalloc.h&gt;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> <span class="op">*</span>buf<span class="op">;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="dt">const</span> <span class="dt">size_t</span> size <span class="op">=</span> <span class="dv">2</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span> <span class="co">/* 2 MiB */</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>buf <span class="op">=</span> vmalloc<span class="op">(</span>size<span class="op">);</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(!</span>buf<span class="op">)</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">-</span>ENOMEM<span class="op">;</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="co">/* ... használat ... */</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>vfree<span class="op">(</span>buf<span class="op">);</span></span></code></pre></div>
+<p>A <code>vmalloc</code> a kernel logikai címtartományán kívül, a
+<code>vmalloc</code> tartományban helyezkedik el. Ezért a
+<code>virt_to_phys</code> vagy a <code>virt_to_page</code> nem
+garantált, vagy csak a leképezés feloldásával működik. A
+<code>vmalloc</code> nem alkalmas DMA-puffernek: a
+<code>vm_map_ram</code> legfeljebb CPU-virtuális leképezést ad a
+lapokhoz, de nem hoz létre eszköz által használható DMA-címet, és a
+lapok nem feltétlenül fizikailag folytonosak. DMA-hoz a
+<code>dma_alloc_coherent()</code> vagy a
+<code>dma_map_single()</code>/<code>dma_map_sg()</code> API-t kell
+használni, a megfelelő
+<code>dma_free_coherent()</code>/<code>dma_unmap_*()</code>
+hívással.</p>
+<p>A <code>vmalloc</code> és a <code>kmalloc</code> közötti választás
+elsősorban méret és fizikai folytonosság kérdése. Nagy, logikai
+pufferhez a <code>vmalloc</code>, kis, gyakori vezérlőblokkhoz a
+<code>kmalloc</code> vagy saját slab cache a megfelelő.</p>
+<h3 data-number="13.4.5"
+id="döntési-szempontok-mikor-melyik-allokátort"><span
+class="header-section-number">13.4.5</span> 5. Döntési szempontok: mikor
+melyik allokátort?</h3>
+<p>A kernelben minden allokációs helyen egyértelmű tulajdonost és
+élettartamot kell rögzíteni. A következő szempontok segítenek:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Szempont</th>
+<th>Javasolt választás</th>
+<th>Indoklás</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Néhány bájt–néhány KiB, gyakori alloc/free</td>
+<td><code>kmalloc</code> / <code>kzalloc</code> vagy saját slab
+cache</td>
+<td>Gyors, fizikailag összefüggő, low overhead</td>
+</tr>
+<tr>
+<td>Sok azonos típusú objektum</td>
+<td>saját <code>kmem_cache_create</code></td>
+<td>Nincs méretkerekítési veszteség, debugolható</td>
+</tr>
+<tr>
+<td>Nagy összefüggő logikai puffer, nem DMA</td>
+<td><code>vmalloc</code></td>
+<td>Virtuálisan összefüggő, nagyobb méretben is jó</td>
+</tr>
+<tr>
+<td>Nagy, fizikailag összefüggő, nem DMA</td>
+<td><code>alloc_pages</code> magasabb <code>order</code>-rel</td>
+<td>A fizikai folytonosság itt még követelmény, de nincs eszközoldali
+DMA-cím</td>
+</tr>
+<tr>
+<td>DMA-puffer, a CPU és az eszköz is használja (coherent)</td>
+<td><code>dma_alloc_coherent()</code> /
+<code>dma_free_coherent()</code></td>
+<td>CPU-virtuális címet és eszköz-DMA-címet ad; a kettő nem azonos</td>
+</tr>
+<tr>
+<td>DMA-puffer, streaming (egyirányú vagy rövid élettartamú)</td>
+<td><code>dma_map_single()</code> / <code>dma_unmap_single()</code> vagy
+<code>dma_map_sg()</code> / <code>dma_unmap_sg()</code></td>
+<td>A CPU-virtuális címből DMA-címet készít; szükség esetén
+<code>dma_sync_*</code> a CPU/device hozzáféréshez</td>
+</tr>
+<tr>
+<td>Atomi kontextus, nem alhat</td>
+<td><code>kmalloc</code>/<code>kzalloc</code>
+<code>GFP_ATOMIC</code></td>
+<td>Nem alszik, gyors</td>
+</tr>
+<tr>
+<td>Belső metaadat, amit nem adunk ki user space-be</td>
+<td><code>kzalloc</code></td>
+<td>Elkerüli a nem inicializált adatok szivárgását</td>
+</tr>
+</tbody>
+</table>
+<p>A <code>kmalloc</code> és a <code>vmalloc</code> közötti választásnál
+a gyakorlatban a méret a leggyakoribb indikátor. Ha a kért méret
+bizonytalan vagy felhasználói bemenettől függ, akkor a
+<code>kmalloc_array</code> és a méretkorlát ellenőrzése kötelező. A
+kernel nem engedheti meg, hogy egy felhasználói kérés óriási allokációt
+váltson ki, vagy hogy a méret számítása túlcsorduljon.</p>
+<p>A DMA-hoz nem elég a fizikai folytonosság, és a három címfogalmat
+külön kell tartani:</p>
+<ul>
+<li><strong>CPU-virtuális cím</strong> (<code>void *</code>): ezen éri
+el a processzor a puffert; <code>kmalloc</code>, <code>vmalloc</code> és
+<code>dma_alloc_coherent</code> egyaránt ilyet ad.</li>
+<li><strong>CPU-fizikai cím</strong> (<code>phys_addr_t</code>): a
+CPU-oldali fizikai cím; a <code>virt_to_phys()</code> csak a közvetlen
+leképezésű kernelcímekre ad helyes eredményt, <code>vmalloc</code>-ra
+nem.</li>
+<li><strong>DMA-cím</strong> (<code>dma_addr_t</code>): az eszköz
+nézőpontjából érvényes cím, amelyet az IOMMU vagy a busz átalakíthat; ez
+nem feltétlenül egyezik a CPU-fizikai címmel.</li>
+</ul>
+<figure id="fig-os049-kernel-cimek">
+<div class="fig-interactive"><iframe src="figures/html/os049-kernel-cimek.html" title="Felül három sáv: közvetlen leképezés a kmalloc pufferrel, az alloc_pages lapjaival és a dma_alloc_coherent CPU-címével; vmalloc-tartomány négy virtuális lappal; eszköz-címtér két dma_addr_t címmel. Középen IOMMU. Alul tizenhat fizikai lapkeret buddy order-blokkokkal; a vmalloc négy lapja nem szomszédos keretekre mutat, a DMA-címek pont-vonalas nyíllal az IOMMU-n át a kmalloc, illetve a coherent keretére." loading="lazy" style="width:100%;border:0;height:640px"></iframe><noscript><img src="figures/img/os049-kernel-cimek.png" style="width:95.0%"
+alt="Felül három sáv: közvetlen leképezés a kmalloc pufferrel, az alloc_pages lapjaival és a dma_alloc_coherent CPU-címével; vmalloc-tartomány négy virtuális lappal; eszköz-címtér két dma_addr_t címmel. Középen IOMMU. Alul tizenhat fizikai lapkeret buddy order-blokkokkal; a vmalloc négy lapja nem szomszédos keretekre mutat, a DMA-címek pont-vonalas nyíllal az IOMMU-n át a kmalloc, illetve a coherent keretére." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/os049-kernel-cimek.png" style="width:95.0%"
+alt="Felül három sáv: közvetlen leképezés a kmalloc pufferrel, az alloc_pages lapjaival és a dma_alloc_coherent CPU-címével; vmalloc-tartomány négy virtuális lappal; eszköz-címtér két dma_addr_t címmel. Középen IOMMU. Alul tizenhat fizikai lapkeret buddy order-blokkokkal; a vmalloc négy lapja nem szomszédos keretekre mutat, a DMA-címek pont-vonalas nyíllal az IOMMU-n át a kmalloc, illetve a coherent keretére." /></details></div>
+<figcaption>Kernelallokátorok és címfogalmak (illusztratív címek): a
+<code>kmalloc</code>/SLUB és az <code>alloc_pages</code> a közvetlen
+leképezésen át fizikailag folytonos keretekre mutat
+(<code>virt_to_phys</code> helyes), a <code>vmalloc</code> virtuálisan
+folytonos tartománya szétszórt keretekre (<code>virt_to_phys</code> nem,
+<code>vmalloc_to_page</code> igen; DMA-ra nem alkalmas), az eszköz pedig
+az IOMMU-n átalakított <code>dma_addr_t</code> címet használja; a
+<code>dma_alloc_coherent</code> két különböző címet ad.</figcaption>
+</figure>
+<p>A DMA-API-t a <code>struct device *dev</code> és az eszköz
+DMA-maszkja köti össze (<code>&lt;linux/dma-mapping.h&gt;</code>). A
+maszkot a vezérlő képességeihez kell beállítani; ha a visszaadott cím
+nem fér bele, a leképezés hibára fut. Coherent pufferhez:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a>dma_addr_t dma<span class="op">;</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> <span class="op">*</span>cpu<span class="op">;</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>dma_set_mask_and_coherent<span class="op">(</span>dev<span class="op">,</span> DMA_BIT_MASK<span class="op">(</span><span class="dv">64</span><span class="op">)))</span> <span class="op">{</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    dev_err<span class="op">(</span>dev<span class="op">,</span> <span class="st">&quot;a device nem kepes 64 bites DMA-ra</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">-</span>EIO<span class="op">;</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>cpu <span class="op">=</span> dma_alloc_coherent<span class="op">(</span>dev<span class="op">,</span> size<span class="op">,</span> <span class="op">&amp;</span>dma<span class="op">,</span> GFP_KERNEL<span class="op">);</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(!</span>cpu<span class="op">)</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">-</span>ENOMEM<span class="op">;</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="co">/* cpu: CPU-virtualis cim; dma: az eszkoz DMA cime */</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="co">/* ... az eszkoz a dma cimet kapja, a CPU a cpu pointert hasznalja ... */</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>dma_free_coherent<span class="op">(</span>dev<span class="op">,</span> size<span class="op">,</span> cpu<span class="op">,</span> dma<span class="op">);</span></span></code></pre></div>
+<p>Streaming pufferhez a leképezés és a visszafejtés párban kötelező; a
+<code>dma_mapping_error()</code> ellenőrzés nem hagyható el:</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a>dma_addr_t dma <span class="op">=</span> dma_map_single<span class="op">(</span>dev<span class="op">,</span> cpu_buf<span class="op">,</span> len<span class="op">,</span> DMA_TO_DEVICE<span class="op">);</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>dma_mapping_error<span class="op">(</span>dev<span class="op">,</span> dma<span class="op">))</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">-</span>EIO<span class="op">;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="co">/* ... az eszkoz olvassa a puffert ... */</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>dma_unmap_single<span class="op">(</span>dev<span class="op">,</span> dma<span class="op">,</span> len<span class="op">,</span> DMA_TO_DEVICE<span class="op">);</span></span></code></pre></div>
+<p>Ha a CPU és az eszköz ugyanazt a streaming puffert felváltva
+használja, a <code>dma_sync_single_for_device()</code> és
+<code>dma_sync_single_for_cpu()</code> hívásokkal kell a tulajdonjogot
+átadni; a <code>dma_alloc_coherent()</code> pufferénél erre nincs
+szükség, mert a leképezés coherent. Scatter-gather esetén a
+<code>dma_map_sg()</code>/<code>dma_unmap_sg()</code> párost kell
+használni, és a <code>dma_map_sg()</code> visszatérési értéke a
+leképezett elemek száma, nem a bemeneti <code>nents</code>. A
+<code>vmalloc</code> és a <code>vm_map_ram</code> által adott cím ebből
+a szempontból CPU-virtuális cím marad; DMA-címként nem használható.</p>
+<h3 data-number="13.4.6"
+id="tipikus-hibák-use-after-free-double-free-és-társaik"><span
+class="header-section-number">13.4.6</span> 6. Tipikus hibák:
+use-after-free, double free és társaik</h3>
+<p>A kernelmemória hibái különösen veszélyesek, mert a támadó gyakran
+nem egy folyamatot, hanem a teljes rendszert fenyegeti. A három
+leggyakoribb hibacsalád:</p>
+<h3 data-number="13.4.7" id="use-after-free"><span
+class="header-section-number">13.4.7</span> 6.1. Use-after-free</h3>
+<p>Use-after-free (UAF) történik, ha egy objektumot felszabadítunk, de
+egy másik kódrész még mindig hivatkozik rá, és a felszabadítás után
+olvas vagy ír. A SLUB gyorsítótár gyakran újra kiadja ugyanazt a
+memóriát egy másik allokációnak, így a lejárt pointer egyszer csak az új
+objektum mezőit módosítja. Ez adatsérülést, jogosultság-emelkedést vagy
+kernel <code>panic</code>-et okozhat.</p>
+<p>Példa hibás kódvázlatra:</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> request <span class="op">*</span>req <span class="op">=</span> get_request<span class="op">();</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="co">/* ... */</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>kfree<span class="op">(</span>req<span class="op">);</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="co">/* hiba: a kfree után is hivatkozunk a lejárt pointerre */</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>req<span class="op">-&gt;</span>status <span class="op">=</span> STATUS_DONE<span class="op">;</span></span></code></pre></div>
+<p>A helyes megoldás a pointer érvénytelenítése és a hivatkozások
+tulajdonosi követésének egyértelműsítése. Ha a pointert több kódrész
+használja, referencia-számlálást kell alkalmazni (például
+<code>kref</code>), vagy gondoskodni kell arról, hogy a felszabadítás
+előtt minden hivatkozás megszűnjön.</p>
+<h3 data-number="13.4.8" id="double-free"><span
+class="header-section-number">13.4.8</span> 6.2. Double free</h3>
+<p>A double free ugyanannak a memóriaterületnek kétszeri felszabadítása.
+A SLUB szabad listájában így ugyanaz a slot kétszer jelenik meg, ami
+később ugyanannak a memóriának két különböző allokációhoz való kiadását
+okozhatja. A kernel ezt gyakran már a második <code>kfree</code> során
+észleli, ha a debugvédelem be van kapcsolva, de éles rendszerben a hiba
+hosszú ideig rejtve maradhat.</p>
+<p>Példa:</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> <span class="op">*</span>p <span class="op">=</span> kmalloc<span class="op">(</span><span class="dv">64</span><span class="op">,</span> GFP_KERNEL<span class="op">);</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="co">/* ... */</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>kfree<span class="op">(</span>p<span class="op">);</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="co">/* ... */</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>kfree<span class="op">(</span>p<span class="op">);</span> <span class="co">/* double free */</span></span></code></pre></div>
+<p>A megoldás a tulajdonos-szabály pontos betartása: minden allokációhoz
+pontosan egy felszabadítási felelőst kell rendelni. A <code>kfree</code>
+után a pointert célszerű <code>NULL</code>-ra állítani, bár ez önmagában
+nem véd meg a másolatban tárolt pointerek ellen.</p>
+<h3 data-number="13.4.9" id="egyéb-hibák"><span
+class="header-section-number">13.4.9</span> 6.3. Egyéb hibák</h3>
+<ul>
+<li><strong>Nulla méretű allokáció</strong>: a
+<code>kmalloc(0, ...)</code> nem <code>NULL</code>-t, hanem a speciális
+<code>ZERO_SIZE_PTR</code>-t adja (ellenőrzendő a kernelfejlécben),
+amely nem dereferálható; a <code>!p</code> ellenőrzés ezt nem szűri,
+ezért a nulla méretet a hívónak kell kizárnia.</li>
+<li><strong>Túlcsorduló méretszámítás</strong>:
+<code>n * sizeof(...)</code> túlcsordulhat, ezért kell a
+<code>kmalloc_array</code>.</li>
+<li><strong>Rossz jelző atomi kontextusban</strong>: ha spinlock alatt
+<code>GFP_KERNEL</code>-t használunk, a kernel aludhat, ami deadlock-hoz
+vezethet.</li>
+<li><strong>Fizikai cím elvárása <code>vmalloc</code>-nál</strong>:
+DMA-hoz <code>vmalloc</code> területet átadni hibás, mert a fizikai
+lapok nem összefüggőek.</li>
+<li><strong>Memóriaszivárgás</strong>: a lefoglalt terület nem kerül
+felszabadításra. A kernelben a szivárgás csak rendszerleálláskor tűnik
+el, és folyamatosan degradálja a teljesítményt.</li>
+</ul>
+<h3 data-number="13.4.10" id="hardening-a-kernelmemória-védelme"><span
+class="header-section-number">13.4.10</span> 7. Hardening: a
+kernelmemória védelme</h3>
+<p>A kernelmemória védelme három szinten értelmezhető: az allokátor
+belső ellenőrzése, a fordító- és konfigurációs védelem, valamint a
+futtatókörnyezeti izoláció. A modern Linux kernelben ezek a technikák
+együttesen csökkentik a kihasználhatóságot.</p>
+<h3 data-number="13.4.11" id="allokátor-szintű-védelem"><span
+class="header-section-number">13.4.11</span> 7.1. Allokátor-szintű
+védelem</h3>
+<p>A SLUB debug (<code>CONFIG_SLUB_DEBUG</code>; bekapcsolás:
+<code>slub_debug=FZPU</code> bootparaméter vagy
+<code>CONFIG_SLUB_DEBUG_ON</code>) több ellenőrzést tesz lehetővé:</p>
+<ul>
+<li><strong>Red zone</strong>: az objektum köré írt őrfal, amely a
+túlcsordulást a felszabadításkor észleli.</li>
+<li><strong>Poisoning</strong>: a felszabadított memóriát egy ismert
+mintával tölti fel, hogy a use-after-free hamarabb láthatóvá
+váljon.</li>
+<li><strong>Konzisztencia-ellenőrzés és tulajdonoskövetés</strong>: a
+<code>kfree</code> ellenőrzi, hogy a pointer egy ismert slab-hez
+tartozik-e, és nyilvántartja a foglalás/felszabadítás helyét.</li>
+</ul>
+<p>A SLUB debug fejlesztői és tesztelői kernelekben gyakran be van
+kapcsolva, éles rendszeren a teljesítményköltsége miatt általában
+korlátozott. (A klasszikus SLAB <code>CONFIG_DEBUG_SLAB</code> opciója a
+SLAB-bal együtt megszűnt; a konkrét verzió ellenőrzendő.)</p>
+<p>Külön, éles kernelekben is jellemzően bekapcsolt
+<strong>hardening</strong> opciók:</p>
+<ul>
+<li><strong>Freelist randomizáció</strong>
+(<code>CONFIG_SLAB_FREELIST_RANDOM</code>): a szabad listát
+véletlenszerű sorrendbe szervezi, hogy a támadó ne tudja megjósolni,
+melyik objektumot kapja meg legközelebb.</li>
+<li><strong>Szabadlista-védelem</strong>
+(<code>CONFIG_SLAB_FREELIST_HARDENED</code>): a szabadlista-mutatókat
+kódolja és ellenőrzi.</li>
+</ul>
+<h3 data-number="13.4.12" id="memória-hardening-a-konfigurációban"><span
+class="header-section-number">13.4.12</span> 7.2. Memória-hardening a
+konfigurációban</h3>
+<p>A kernel számos olyan védelmet ismer, amely a memóriakezelés
+biztonságát növeli:</p>
+<ul>
+<li><strong>KASLR</strong>: a kernel betöltési címének
+véletlenszerűsítése megnehezíti a támadók számára a célcímek
+meghatározását.</li>
+<li><strong>SMEP/SMAP</strong>: a felhasználói kód futtatását vagy
+olvasását tilthatja kernel módban, ami a memória-hibák kihasználását
+nehezíti.</li>
+<li><strong>W^X (write xor execute)</strong>: a kernel szöveges része
+nem írható, az adatterületek nem futtathatók.</li>
+<li><strong>Stack protector</strong>: a kernel verem a
+függvényhívásoknál kanárit kap, amely a veremtúlcsordulást a visszatérés
+előtt észleli.</li>
+<li><strong>Structleak</strong>: a struktúrák paddingjait és a nem
+inicializált mezőket a kernel nullázza, így azok nem szivárognak user
+space-be.</li>
+</ul>
+<p>Ezek a védelmek nem helyettesítik a helyes kódot, de jelentősen
+csökkentik a hibák kihasználhatóságát.</p>
+<h3 data-number="13.4.13" id="kfence-és-kasan"><span
+class="header-section-number">13.4.13</span> 7.3. KFENCE és KASAN</h3>
+<p>A kernel speciális fejlesztőeszközöket is biztosít:</p>
+<ul>
+<li><strong>KFENCE</strong> egy kis overheaddel járó, véletlenszerű
+mintavételű UAF- és túlcsordulásdetektor. A memória egyes allokációit
+védett „kerítés” lapok közé helyezi, és ha a kód átlépi a határt,
+azonnali hibát vált ki.</li>
+<li><strong>KASAN</strong> a kernel AddressSanitizer megfelelője, amely
+pontos UAF- és out-of-bounds detektálást ad, de nagy memória- és
+CPU-költséggel.</li>
+</ul>
+<p>Fejlesztés közben a <code>CONFIG_KFENCE</code> és a
+<code>CONFIG_KASAN</code> bekapcsolása sokkal hamarabb felszínre hozza a
+hibákat, mint a hagyományos tesztelés.</p>
+<h3 data-number="13.4.14"
+id="referencia-számlálás-és-típusbiztonság"><span
+class="header-section-number">13.4.14</span> 7.4. Referencia-számlálás
+és típusbiztonság</h3>
+<p>A kernel a <code>kref</code> és a <code>refcount_t</code> típusokkal
+védi a referencia-számlálót túlcsordulás és underflow ellen. A
+<code>refcount_t</code> nem engedi, hogy a számláló nulláról tovább
+csökkenjen, és a túlcsordulást is jelzi. Az UAF tipikus kiváltó oka a
+hibás referencia-számlálás, ezért a <code>kref_put</code> és a
+<code>refcount_dec_and_test</code> használata a helyes minta.</p>
+<p>A <code>kmalloc</code> és a <code>kfree</code> típusbiztonsága C-ben
+nem automatikus, de a kód áttekintésekor mindig ellenőrizni kell, hogy a
+felszabadított pointer valóban a lefoglalt típusnak felel meg. A
+<code>kmem_cache_free</code> egy cache-hez kötött, ezért kevésbé
+hajlamos a típuskeveredésre, mint a nyers <code>kfree</code>.</p>
+<h3 data-number="13.4.15"
+id="labor-kernelallokációs-döntési-táblázat"><span
+class="header-section-number">13.4.15</span> 8. Labor: kernelallokációs
+döntési táblázat</h3>
+<p>A labor célja, hogy az allokációs döntéseket szisztematikusan,
+reprodukálható módon rögzítsük, és egy emulált kernelmodullal megmérjük
+a különböző API-k alapköltségét. A feladat nem éles kernel módosítása:
+QEMU-ban, eldobható virtuális gépen fut.</p>
+<h3 data-number="13.4.16" id="környezet-és-konfiguráció"><span
+class="header-section-number">13.4.16</span> 8.1. Környezet és
+konfiguráció</h3>
+<p>A reprodukálhatóság érdekében a következő paramétereket rögzíteni
+kell a jegyzőkönyvben:</p>
+<ul>
+<li>QEMU verzió: <code>&lt;mérendő&gt;</code></li>
+<li>kernel verzió:
+<code>&lt;mérendő, például 6.12 LTS, ellenőrizendő&gt;</code></li>
+<li>CPU: <code>&lt;mérendő, például QEMU x86_64, 4 vCPU&gt;</code></li>
+<li>RAM: <code>&lt;mérendő, például 2 GiB&gt;</code></li>
+<li>kernel konfiguráció: <code>CONFIG_SLUB_DEBUG</code>,
+<code>CONFIG_KFENCE</code>, <code>CONFIG_KASAN</code> állapota
+<code>&lt;mérendő&gt;</code></li>
+<li>mérési módszer: <code>local_clock()</code> vagy
+<code>ktime_get_ns()</code> a modulban, kívülről <code>perf</code> vagy
+<code>trace-cmd</code></li>
+</ul>
+<p>A mérési jegyzőkönyvben a „mért” oszlopba csak a ténylegesen
+lefuttatott, naplózott értékek kerülhetnek; a „várt” oszlop a tervezési
+modellből származó becslés. A kettőt minden táblázatban külön kell
+jelölni.</p>
+<h3 data-number="13.4.17" id="a-döntési-táblázat-felépítése"><span
+class="header-section-number">13.4.17</span> 8.2. A döntési táblázat
+felépítése</h3>
+<p>Készítsen táblázatot, amely legalább a következő oszlopokat
+tartalmazza:</p>
+<ol type="1">
+<li><strong>Használati eset</strong> – rövid leírás.</li>
+<li><strong>Mérettartomány</strong> – bájtban.</li>
+<li><strong>Kontextus</strong> – alhat-e az allokáció (normál /
+atomi).</li>
+<li><strong>DMA-szükséglet</strong> – kell-e eszköz által használható
+DMA-cím (DMA-API).</li>
+<li><strong>Élettartam</strong> – hosszú / rövid / azonos objektumtípus
+sok példánya.</li>
+<li><strong>Javasolt API</strong> – <code>kmalloc</code>,
+<code>kzalloc</code>, <code>kmem_cache</code>, <code>vmalloc</code>,
+<code>alloc_pages</code>, <code>dma_alloc_coherent</code>,
+<code>dma_map_single</code>/<code>dma_map_sg</code>.</li>
+<li><strong>Jelzők</strong> – <code>GFP_KERNEL</code>,
+<code>GFP_ATOMIC</code>, <code>GFP_DMA</code> stb.</li>
+<li><strong>Indoklás</strong> – a választás rövid magyarázata.</li>
+</ol>
+<p>Példa a kitöltött táblázatra (illusztráció, nem mért eredmény):</p>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+</colgroup>
+<thead>
+<tr>
+<th>Használati eset</th>
+<th>Méret</th>
+<th>Kontextus</th>
+<th>DMA</th>
+<th>Élettartam</th>
+<th>Javasolt API</th>
+<th>Jelzők</th>
+<th>Indoklás</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hálózati csomag fejléce</td>
+<td>64 B</td>
+<td>normál</td>
+<td>nem</td>
+<td>rövid</td>
+<td><code>kmalloc</code></td>
+<td><code>GFP_KERNEL</code></td>
+<td>Gyors, fizikailag összefüggő, kis méret</td>
+</tr>
+<tr>
+<td>FSM-állapot esemény</td>
+<td>40 B</td>
+<td>atomi</td>
+<td>nem</td>
+<td>rövid</td>
+<td>saját <code>kmem_cache</code></td>
+<td><code>GFP_ATOMIC</code></td>
+<td>Sok példány; <code>kmalloc</code>-kal a 64 bájtos osztályba kerülne
+(24 B veszteség), saját cache-ben nincs kerekítési veszteség; atomi
+kontextus</td>
+</tr>
+<tr>
+<td>Eszköz DMA-puffer (coherent)</td>
+<td>64 KiB</td>
+<td>normál</td>
+<td>igen</td>
+<td>rövid</td>
+<td><code>dma_alloc_coherent()</code> /
+<code>dma_free_coherent()</code></td>
+<td><code>GFP_KERNEL</code></td>
+<td>CPU-cím és eszköz-DMA-cím külön; a maszkot
+<code>dma_set_mask_and_coherent()</code> állítja</td>
+</tr>
+<tr>
+<td>Titkosítási munkapuffer</td>
+<td>2 MiB</td>
+<td>normál</td>
+<td>nem</td>
+<td>hosszú</td>
+<td><code>vmalloc</code></td>
+<td><code>GFP_KERNEL</code></td>
+<td>Nagy méret, nem kell fizikai összefüggőség</td>
+</tr>
+<tr>
+<td>Topológiai leíró</td>
+<td>12 B</td>
+<td>normál</td>
+<td>nem</td>
+<td>hosszú</td>
+<td><code>kzalloc</code></td>
+<td><code>GFP_KERNEL</code></td>
+<td>Nulla init user space-be szivárgás ellen</td>
+</tr>
+</tbody>
+</table>
+<p>A táblázatot a saját modul igényeihez kell igazítani, és minden sort
+a forráskódban meg kell tudni feleltetni.</p>
+<h3 data-number="13.4.18" id="mérési-modul"><span
+class="header-section-number">13.4.18</span> 8.3. Mérési modul</h3>
+<p>Írjon egy egyszerű kernelmodult, amely minden API-t azonos méretű
+objektumok ciklikus allokálásával és felszabadításával mér. A modul ne
+férjen hozzá a hoszt valódi lemezéhez; csak emulált QEMU-ban fut.</p>
+<p>Példa a mérési vázlatra:</p>
+<div class="sourceCode" id="cb9"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* alloc_measure.c – teljes, illusztratív mérőmodul.</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="co"> * A vendég kernelének headers/build fájára kell fordítani, nem a hosztéra. */</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/module.h&gt;</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/init.h&gt;</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/kernel.h&gt;</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/slab.h&gt;</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/vmalloc.h&gt;</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/timekeeping.h&gt;</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/errno.h&gt;</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a><span class="pp">#define ALLOC_COUNT </span><span class="dv">10000</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a><span class="pp">#define ALLOC_SIZE  </span><span class="dv">64</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> noinline <span class="dt">int</span> measure_kmalloc<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a>    u64 start<span class="op">,</span> end<span class="op">;</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> i<span class="op">;</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>    u8 <span class="op">*</span>ptr<span class="op">;</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a>    start <span class="op">=</span> ktime_get_ns<span class="op">();</span></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span>i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> ALLOC_COUNT<span class="op">;</span> i<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a>        ptr <span class="op">=</span> kmalloc<span class="op">(</span>ALLOC_SIZE<span class="op">,</span> GFP_KERNEL<span class="op">);</span></span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(!</span>ptr<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a>            end <span class="op">=</span> ktime_get_ns<span class="op">();</span></span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a>            pr_err<span class="op">(</span><span class="st">&quot;kmalloc</span><span class="sc">%d</span><span class="st">: hiba a(z) </span><span class="sc">%d</span><span class="st">. ciklusban; reszido: </span><span class="sc">%llu</span><span class="st"> ns</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb9-26"><a href="#cb9-26" aria-hidden="true" tabindex="-1"></a>                   ALLOC_SIZE<span class="op">,</span> i<span class="op">,</span> <span class="op">(</span><span class="dt">unsigned</span> <span class="dt">long</span> <span class="dt">long</span><span class="op">)(</span>end <span class="op">-</span> start<span class="op">));</span></span>
+<span id="cb9-27"><a href="#cb9-27" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="op">-</span>ENOMEM<span class="op">;</span></span>
+<span id="cb9-28"><a href="#cb9-28" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb9-29"><a href="#cb9-29" aria-hidden="true" tabindex="-1"></a>        ptr<span class="op">[</span><span class="dv">0</span><span class="op">]</span> <span class="op">=</span> <span class="bn">0x5a</span><span class="op">;</span>          <span class="co">/* azonos érintési minta mindkét ágban */</span></span>
+<span id="cb9-30"><a href="#cb9-30" aria-hidden="true" tabindex="-1"></a>        kfree<span class="op">(</span>ptr<span class="op">);</span></span>
+<span id="cb9-31"><a href="#cb9-31" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-32"><a href="#cb9-32" aria-hidden="true" tabindex="-1"></a>    end <span class="op">=</span> ktime_get_ns<span class="op">();</span></span>
+<span id="cb9-33"><a href="#cb9-33" aria-hidden="true" tabindex="-1"></a>    pr_info<span class="op">(</span><span class="st">&quot;kmalloc</span><span class="sc">%d</span><span class="st">: </span><span class="sc">%d</span><span class="st"> ciklus, </span><span class="sc">%llu</span><span class="st"> ns osszesen, </span><span class="sc">%llu</span><span class="st"> ns/ciklus</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb9-34"><a href="#cb9-34" aria-hidden="true" tabindex="-1"></a>            ALLOC_SIZE<span class="op">,</span> ALLOC_COUNT<span class="op">,</span> <span class="op">(</span><span class="dt">unsigned</span> <span class="dt">long</span> <span class="dt">long</span><span class="op">)(</span>end <span class="op">-</span> start<span class="op">),</span></span>
+<span id="cb9-35"><a href="#cb9-35" aria-hidden="true" tabindex="-1"></a>            <span class="op">(</span><span class="dt">unsigned</span> <span class="dt">long</span> <span class="dt">long</span><span class="op">)((</span>end <span class="op">-</span> start<span class="op">)</span> <span class="op">/</span> ALLOC_COUNT<span class="op">));</span></span>
+<span id="cb9-36"><a href="#cb9-36" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb9-37"><a href="#cb9-37" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb9-38"><a href="#cb9-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-39"><a href="#cb9-39" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> noinline <span class="dt">int</span> measure_vmalloc<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb9-40"><a href="#cb9-40" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb9-41"><a href="#cb9-41" aria-hidden="true" tabindex="-1"></a>    u64 start<span class="op">,</span> end<span class="op">;</span></span>
+<span id="cb9-42"><a href="#cb9-42" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> i<span class="op">;</span></span>
+<span id="cb9-43"><a href="#cb9-43" aria-hidden="true" tabindex="-1"></a>    u8 <span class="op">*</span>ptr<span class="op">;</span></span>
+<span id="cb9-44"><a href="#cb9-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-45"><a href="#cb9-45" aria-hidden="true" tabindex="-1"></a>    start <span class="op">=</span> ktime_get_ns<span class="op">();</span></span>
+<span id="cb9-46"><a href="#cb9-46" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span>i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> ALLOC_COUNT<span class="op">;</span> i<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb9-47"><a href="#cb9-47" aria-hidden="true" tabindex="-1"></a>        ptr <span class="op">=</span> vmalloc<span class="op">(</span>ALLOC_SIZE<span class="op">);</span></span>
+<span id="cb9-48"><a href="#cb9-48" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(!</span>ptr<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-49"><a href="#cb9-49" aria-hidden="true" tabindex="-1"></a>            end <span class="op">=</span> ktime_get_ns<span class="op">();</span></span>
+<span id="cb9-50"><a href="#cb9-50" aria-hidden="true" tabindex="-1"></a>            pr_err<span class="op">(</span><span class="st">&quot;vmalloc</span><span class="sc">%d</span><span class="st">: hiba a(z) </span><span class="sc">%d</span><span class="st">. ciklusban; reszido: </span><span class="sc">%llu</span><span class="st"> ns</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb9-51"><a href="#cb9-51" aria-hidden="true" tabindex="-1"></a>                   ALLOC_SIZE<span class="op">,</span> i<span class="op">,</span> <span class="op">(</span><span class="dt">unsigned</span> <span class="dt">long</span> <span class="dt">long</span><span class="op">)(</span>end <span class="op">-</span> start<span class="op">));</span></span>
+<span id="cb9-52"><a href="#cb9-52" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="op">-</span>ENOMEM<span class="op">;</span></span>
+<span id="cb9-53"><a href="#cb9-53" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb9-54"><a href="#cb9-54" aria-hidden="true" tabindex="-1"></a>        ptr<span class="op">[</span><span class="dv">0</span><span class="op">]</span> <span class="op">=</span> <span class="bn">0x5a</span><span class="op">;</span>          <span class="co">/* azonos érintési minta; a lap már le van képezve */</span></span>
+<span id="cb9-55"><a href="#cb9-55" aria-hidden="true" tabindex="-1"></a>        vfree<span class="op">(</span>ptr<span class="op">);</span></span>
+<span id="cb9-56"><a href="#cb9-56" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-57"><a href="#cb9-57" aria-hidden="true" tabindex="-1"></a>    end <span class="op">=</span> ktime_get_ns<span class="op">();</span></span>
+<span id="cb9-58"><a href="#cb9-58" aria-hidden="true" tabindex="-1"></a>    pr_info<span class="op">(</span><span class="st">&quot;vmalloc</span><span class="sc">%d</span><span class="st">: </span><span class="sc">%d</span><span class="st"> ciklus, </span><span class="sc">%llu</span><span class="st"> ns osszesen, </span><span class="sc">%llu</span><span class="st"> ns/ciklus</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb9-59"><a href="#cb9-59" aria-hidden="true" tabindex="-1"></a>            ALLOC_SIZE<span class="op">,</span> ALLOC_COUNT<span class="op">,</span> <span class="op">(</span><span class="dt">unsigned</span> <span class="dt">long</span> <span class="dt">long</span><span class="op">)(</span>end <span class="op">-</span> start<span class="op">),</span></span>
+<span id="cb9-60"><a href="#cb9-60" aria-hidden="true" tabindex="-1"></a>            <span class="op">(</span><span class="dt">unsigned</span> <span class="dt">long</span> <span class="dt">long</span><span class="op">)((</span>end <span class="op">-</span> start<span class="op">)</span> <span class="op">/</span> ALLOC_COUNT<span class="op">));</span></span>
+<span id="cb9-61"><a href="#cb9-61" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb9-62"><a href="#cb9-62" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb9-63"><a href="#cb9-63" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-64"><a href="#cb9-64" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> __init alloc_measure_init<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb9-65"><a href="#cb9-65" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb9-66"><a href="#cb9-66" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> ret<span class="op">;</span></span>
+<span id="cb9-67"><a href="#cb9-67" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-68"><a href="#cb9-68" aria-hidden="true" tabindex="-1"></a>    ret <span class="op">=</span> measure_kmalloc<span class="op">();</span></span>
+<span id="cb9-69"><a href="#cb9-69" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret<span class="op">)</span></span>
+<span id="cb9-70"><a href="#cb9-70" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb9-71"><a href="#cb9-71" aria-hidden="true" tabindex="-1"></a>    ret <span class="op">=</span> measure_vmalloc<span class="op">();</span></span>
+<span id="cb9-72"><a href="#cb9-72" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret<span class="op">)</span></span>
+<span id="cb9-73"><a href="#cb9-73" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb9-74"><a href="#cb9-74" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb9-75"><a href="#cb9-75" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb9-76"><a href="#cb9-76" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-77"><a href="#cb9-77" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> __exit alloc_measure_exit<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb9-78"><a href="#cb9-78" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb9-79"><a href="#cb9-79" aria-hidden="true" tabindex="-1"></a>    pr_info<span class="op">(</span><span class="st">&quot;alloc_measure: modul eltavolitva</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb9-80"><a href="#cb9-80" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb9-81"><a href="#cb9-81" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-82"><a href="#cb9-82" aria-hidden="true" tabindex="-1"></a>module_init<span class="op">(</span>alloc_measure_init<span class="op">);</span></span>
+<span id="cb9-83"><a href="#cb9-83" aria-hidden="true" tabindex="-1"></a>module_exit<span class="op">(</span>alloc_measure_exit<span class="op">);</span></span>
+<span id="cb9-84"><a href="#cb9-84" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-85"><a href="#cb9-85" aria-hidden="true" tabindex="-1"></a>MODULE_LICENSE<span class="op">(</span><span class="st">&quot;GPL&quot;</span><span class="op">);</span></span>
+<span id="cb9-86"><a href="#cb9-86" aria-hidden="true" tabindex="-1"></a>MODULE_AUTHOR<span class="op">(</span><span class="st">&quot;Tananyag labor&quot;</span><span class="op">);</span></span>
+<span id="cb9-87"><a href="#cb9-87" aria-hidden="true" tabindex="-1"></a>MODULE_DESCRIPTION<span class="op">(</span><span class="st">&quot;Allokacios API-k alapkoltsegenek merese&quot;</span><span class="op">);</span></span></code></pre></div>
+<p>A mérésnél a CPU órajelét és a cachelépítményt is rögzíteni kell. Az
+időalap a <code>ktime_get_ns()</code>, amely a kernel monoton
+<strong>clocksource</strong>-át használja: x86-on ez jellemzően a
+<code>tsc</code>, de a QEMU <code>-cpu</code> modelljétől és az emulátor
+verziójától függően más clocksource is lehet. A <code>CONFIG_HZ</code> a
+tick ütemét adja meg, nem a <code>ktime_get_ns()</code> felbontását; a
+tényleges felbontás a clocksource <code>resolution</code> mezője (ns). A
+vendégben a
+<code>cat /sys/devices/system/clocksource/clocksource0/current_clocksource</code>
+és a <code>.../available_clocksource</code> mutatja az aktív és elérhető
+clocksource-okat; a mérési naplóban ezt, a QEMU verziót, a
+<code>-cpu</code> modellt és a felbontást rögzíteni kell. A
+<code>ktime_get_ns()</code> két hívása közötti különbség felbontása nem
+jobb a clocksource felbontásánál, ezért a mért időnek jóval a felbontás
+felett kell lennie; ezt a tényleges mérésből kell ellenőrizni, nem
+feltételezni.</p>
+<p><strong>Fordítás és betöltés.</strong> A modult a vendég kernelének
+headers/build fájára kell fordítani, nem a hosztéra. Ha a hoszton
+fordítunk, a <code>KDIR</code> a vendég kernel build könyvtárára
+mutasson; a <code>uname -r</code> a hoszt kernelét adná, és a modul
+vermagic-je nem egyezne a vendégével, ezért a betöltés
+<code>invalid module format</code> hibával meghiúsulna. A
+legbiztonságosabb a vendégen belül fordítani a vendég headers
+csomagjával. Példa <code>Makefile</code>:</p>
+<pre class="make"><code>obj-m += alloc_measure.o
+KDIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+    $(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+    $(MAKE) -C $(KDIR) M=$(PWD) clean</code></pre>
+<p>A vendégben, rootként:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">insmod</span> alloc_measure.ko</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="fu">dmesg</span> <span class="kw">|</span> <span class="fu">tail</span> <span class="at">-n</span> 20</span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="ex">rmmod</span> alloc_measure</span></code></pre></div>
+<p>A <code>module_init</code> a két mérést egymás után futtatja; ha
+valamelyik allokáció <code>-ENOMEM</code>-mel elbukik, a modul betöltése
+is hibával tér vissza, és a <code>pr_err</code> megadja a sikertelen
+ciklus sorszámát, valamint az addig eltelt időt. A sikeres ág a
+<code>pr_info</code>-ban a tényleges ciklusszámot és a ciklusonkénti
+átlagot írja ki; nem feltételezi, hogy minden ciklus lefutott.</p>
+<p><strong>A két ág értelmezése.</strong> A <code>kmalloc(64)</code> a
+slab gyorsítótárból ad egy 64 bájtos objektumot; a
+<code>vmalloc(64)</code> legalább egy lapot rendel és virtuális
+leképezést hoz létre, ezért jóval drágább. A két ág csak azonos érintési
+minta mellett hasonlítható össze: mindkettő a puffer első bájtját írja.
+A <code>vmalloc</code> a lapokat a hívás során foglalja le és képezi le
+(nem demand paging), ezért az első bájt írása nem okoz laphibát; az
+érintés csak azt biztosítja, hogy a fordító ne hagyja el a hozzáférést.
+A <code>vmalloc</code> többletköltsége a lapfoglalásból, a
+laptábla-bejegyzésekből és a <code>vfree</code> utáni (lusta)
+TLB-ürítésből adódik; ha csak az allokátor metadata-költségét akarjuk,
+mindkét ágból ki kell hagyni az érintést, és ezt a jegyzőkönyvben
+jelezni kell. A 64 bájtos <code>vmalloc</code> nem ajánlott éles minta:
+a mérés az API fix költségét mutatja, nem azt, hogy ekkora objektumhoz
+<code>vmalloc</code>-ot kellene használni. A méret és a felhasználási
+cél dönt: kis, gyakori, fizikailag folytonos objektumhoz
+<code>kmalloc</code>/slab; nagy, virtuálisan folytonos, nem DMA
+pufferhez <code>vmalloc</code>; DMA-hoz az 5. szakasz DMA-API-ja.</p>
+<h3 data-number="13.4.19" id="eredmények-és-kiértékelés"><span
+class="header-section-number">13.4.19</span> 8.4. Eredmények és
+kiértékelés</h3>
+<p>A mérési jegyzőkönyvben a következőket kell elkülöníteni:</p>
+<ul>
+<li><strong>Várt eredmény</strong>: a <code>kmalloc</code> gyors, mert a
+slab gyorsítótárból veszi az objektumot; a <code>vmalloc</code> lassabb,
+mert laphozzárendelést épít, és TLB-flush is előfordulhat; a saját slab
+cache közel áll a <code>kmalloc</code>-hoz, de kisebb a kerekítési
+vesztesége.</li>
+<li><strong>Mért eredmény</strong>: <code>&lt;kitöltendő&gt;</code> – a
+tényleges futtatásból származó értékek.</li>
+</ul>
+<p>A mérési naplóhoz csatolni kell a <code>dmesg</code> kivonatát és a
+QEMU indítási parancsát, például:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">qemu-system-x86_64</span> <span class="dt">\</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-kernel</span> arch/x86/boot/bzImage <span class="dt">\</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-append</span> <span class="st">&quot;console=ttyS0 root=/dev/sda rw&quot;</span> <span class="dt">\</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-drive</span> file=lab-rootfs.qcow2,format=qcow2 <span class="dt">\</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">-smp</span> 4 <span class="at">-m</span> 2048 <span class="dt">\</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">-nographic</span></span></code></pre></div>
+<p>Visszaállítási út: a labor a hoszt lemezét nem érinti; a QEMU
+lemezkép eldobható, a labor után a snapshot törölhető.</p>
+<h3 data-number="13.4.20" id="önellenőrző-kérdések"><span
+class="header-section-number">13.4.20</span> 8.5. Önellenőrző
+kérdések</h3>
+<ol type="1">
+<li>Miért nem lehet <code>vmalloc</code> területet közvetlenül átadni
+egy DMA-vezérlőnek?</li>
+<li>Milyen <code>kmalloc</code> jelzőt használjunk spinlock alatt, és
+miért?</li>
+<li>Hogyan észleli a SLUB debug a use-after-free hibát?</li>
+<li>Mi a különbség a <code>kmalloc</code> és a saját
+<code>kmem_cache_create</code> között?</li>
+<li>Miért kell a <code>kfree</code> után a pointert <code>NULL</code>-ra
+állítani, és miért nem elégséges ez a védelem?</li>
+</ol>
+<p><strong>Válaszok röviden:</strong></p>
+<ol type="1">
+<li>A <code>vmalloc</code> terület fizikailag nem összefüggő lapokból
+áll, és a DMA-vezérlő nem a CPU-virtuális címet használja; a
+<code>vmalloc</code> virtuális címéből nem számítható összefüggő
+eszköz-DMA-cím. DMA-hoz a DMA-API kell (<code>dma_alloc_coherent</code>,
+<code>dma_map_*</code>).</li>
+<li><code>GFP_ATOMIC</code>-ot, mert spinlock alatt a kód nem alhat, a
+<code>GFP_KERNEL</code> pedig alhat (visszanyerést/várakozást
+indíthat).</li>
+<li>A felszabadításkor a SLUB debug (poisoning) ismert mintával tölti
+fel a memóriát, és a következő használatkor (újrafoglalás vagy free)
+ellenőrzi a mintát; ha megváltozott, hibát jelez. Azonnali észleléshez
+KASAN kell.</li>
+<li>A <code>kmalloc</code> általános méretosztályokból ad (kerekít,
+például 40 B → 64 B); a <code>kmem_cache_create</code> egy
+objektumtípushoz saját cache-t ad pontos mérettel, igazítással,
+opcionális konstruktorral és külön statisztikával.</li>
+<li>A <code>NULL</code>-ra állítás után egy későbbi hibás elérés
+determinisztikus NULL-dereferálássá válik, és a dupla
+<code>kfree(NULL)</code> ártalmatlan; de más pointerek (másolatok)
+továbbra is a felszabadított területre mutatnak, ezeket ez nem érinti,
+ezért önmagában nem elég.</li>
+</ol>
+<h3 data-number="13.4.21" id="összefoglalás"><span
+class="header-section-number">13.4.21</span> 8.6. Összefoglalás</h3>
+<p>A kernelmemória-kezelés rétegei közül a lapallokátor a fizikai lapok
+forrása, a slab/SLUB a kis objektumok gyors gyorsítótára, a
+<code>kmalloc</code> az általános célú, fizikailag összefüggő allokáció,
+a <code>vmalloc</code> pedig a nagy, virtuálisan összefüggő területek
+eszköze. A döntés mindig a méret, a kontextus, a DMA-igény és az
+élettartam függvénye. A kernelmemória biztonsága a helyes tulajdonosi
+fegyelmen és a hardening technikák együttesén múlik. A labor célja, hogy
+a döntéseket ne megérzésből, hanem mérésekkel és dokumentált táblázattal
+hozzuk meg.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os048.html">← 13.3 NUMA, locality és memóriapoolok</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os050.html">14.1 Blokk- és karakteres eszközök →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

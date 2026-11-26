@@ -1,0 +1,818 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>19.4 Zero-copy, offload és hálózati teljesítmény – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – Hálózat, biztonság és virtualizáció</a> › <a href="index.html#osch18">19 Hálózati stack</a></p>
+<div class="links"><a class="prev" rel="prev" href="os072.html">← 19.3 Csomagfeldolgozás, netfilter és eBPF</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os074.html">20.1 DNS, DHCP és konfiguráció →</a></div>
+</nav>
+<h2 data-number="19.4" id="os073"><span
+class="header-section-number">19.4</span> Zero-copy, offload és hálózati
+teljesítmény</h2>
+<h3 data-number="19.4.1"
+id="a-hálózati-adatút-optimalizálása-a-csomag-útja-és-a-másolások-problémája"><span
+class="header-section-number">19.4.1</span> 1. A hálózati adatút
+optimalizálása: a csomag útja és a másolások problémája</h3>
+<p>Az előző alfejezetben (<a href="os072.html">Csomagfeldolgozás,
+netfilter és eBPF</a>) láttuk, hogy egy beérkező csomag a hálózati
+kártyától (NIC) a megszakításon, a DMA-n és a kernel hálózati veremén
+(TCP/IP stack) keresztül jut el a felhasználói alkalmazásig. Ez az
+útvonal az általános célú operációs rendszerekben hagyományosan
+többszöri memóriamásolással és kontextusváltással jár, ami a modern,
+nagy sebességű hálózatokon (10 Gbit/s, 25 Gbit/s, 100 Gbit/s) komoly
+szűk keresztmetszetté válik.</p>
+<p>A naiv adatút a következőképpen néz ki egy csomag fogadásakor:</p>
+<ol type="1">
+<li>A NIC DMA-val az előre lefoglalt RX-pufferbe írja a keretet; a
+meghajtó ehhez <code>sk_buff</code>-ot rendel (másolás nélkül).</li>
+<li>A protokollverem feldolgozza a fejléceket, és az
+<code>sk_buff</code>-ot a socket fogadósorába fűzi (másolás
+nélkül).</li>
+<li>Az alkalmazás meghívja a <code>read()</code> rendszerhívást,
+amelynek során a CPU a kernelpufferből a felhasználói térben lévő
+pufferbe másolja az adatot (<code>copy_to_user</code>).</li>
+</ol>
+<p>Fogadáskor így egy CPU-másolás (kernel → felhasználói tér) és két
+kontextusváltás jut egy <code>read()</code>-re; nagy sebességnél ezt a
+másolást és a csomagonkénti feldolgozást kell csökkenteni, mert
+jelentősen terheli a CPU-t, rontja a cache kihasználtságát, növeli a
+késleltetést, és csökkenti az elérhető maximális sávszélességet.</p>
+<p><strong>A hálózati adatút optimalizálásának célja
+kettős:</strong></p>
+<ul>
+<li><strong>CPU-teher csökkentése:</strong> A CPU-nak a csomagok
+másolgatása helyett az alkalmazáslogikával kellene foglalkoznia.</li>
+<li><strong>Késleltetés és áteresztőképesség javítása:</strong> Kevesebb
+másolás és kontextusváltás közvetlenül jobb latency-t és nagyobb
+throughputot eredményez.</li>
+</ul>
+<p>Az optimalizálás három fő pilléren nyugszik: a <strong>zero-copy
+technikák</strong>, a <strong>hardveres offload</strong> és a
+<strong>CPU-affinitás / NUMA-tudatos elhelyezés</strong>.</p>
+<hr />
+<h3 data-number="19.4.2"
+id="zero-copy-technikák-a-rendszerhívásokban"><span
+class="header-section-number">19.4.2</span> 2. Zero-copy technikák a
+rendszerhívásokban</h3>
+<p>A “zero-copy” kifejezés némileg félrevezető: nem azt jelenti, hogy
+egyáltalán nincs másolás a memóriában, hanem azt, hogy a <strong>CPU nem
+végez felesleges másolást</strong> a felhasználói és a kernelcímterek
+között. A cél, hogy a memóriabuszon és a CPU L1/L2/L3 cache-én keresztül
+történő adatmozgatások száma minimális legyen.</p>
+<p>Az alábbi ábra a négy küldési technikát hasonlítja össze egy blokkra:
+melyik átvitelt végzi DMA, melyiket a CPU, és hol marad csak
+hivatkozás.</p>
+<figure id="fig-os073-zero-copy-paths">
+<div class="fig-interactive"><iframe src="figures/html/os073-zero-copy-paths.html" title="Négy oszlop, mindegyikben felül a felhasználói puffer a user térben, alatta a kernelben page cache és socketpuffer, legalul lemez és NIC. read+write: szaggatott DMA a lemezről a page cache-be, folytonos CPU-másolás a felhasználói pufferbe, majd onnan a socketpufferbe, szaggatott DMA a NIC-re. sendfile: DMA, CPU-másolás a page cache-ből a socketpufferbe, DMA; szürke pontozott nyíl a page cache-ből a NIC-re a scatter-gather esetre. splice: DMA, pontozott hivatkozás a page cache-ből a pipe-on át a socketpufferbe, DMA a page cache lapjairól a NIC-re. MSG_ZEROCOPY: pontozott hivatkozás a felhasználói pufferből a socketpufferbe és DMA a felhasználói pufferből közvetlenül a NIC-re." loading="lazy" style="width:100%;border:0;height:520px"></iframe><noscript><img src="figures/img/os073-zero-copy-paths.png" style="width:95.0%"
+alt="Négy oszlop, mindegyikben felül a felhasználói puffer a user térben, alatta a kernelben page cache és socketpuffer, legalul lemez és NIC. read+write: szaggatott DMA a lemezről a page cache-be, folytonos CPU-másolás a felhasználói pufferbe, majd onnan a socketpufferbe, szaggatott DMA a NIC-re. sendfile: DMA, CPU-másolás a page cache-ből a socketpufferbe, DMA; szürke pontozott nyíl a page cache-ből a NIC-re a scatter-gather esetre. splice: DMA, pontozott hivatkozás a page cache-ből a pipe-on át a socketpufferbe, DMA a page cache lapjairól a NIC-re. MSG_ZEROCOPY: pontozott hivatkozás a felhasználói pufferből a socketpufferbe és DMA a felhasználói pufferből közvetlenül a NIC-re." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/os073-zero-copy-paths.png" style="width:95.0%"
+alt="Négy oszlop, mindegyikben felül a felhasználói puffer a user térben, alatta a kernelben page cache és socketpuffer, legalul lemez és NIC. read+write: szaggatott DMA a lemezről a page cache-be, folytonos CPU-másolás a felhasználói pufferbe, majd onnan a socketpufferbe, szaggatott DMA a NIC-re. sendfile: DMA, CPU-másolás a page cache-ből a socketpufferbe, DMA; szürke pontozott nyíl a page cache-ből a NIC-re a scatter-gather esetre. splice: DMA, pontozott hivatkozás a page cache-ből a pipe-on át a socketpufferbe, DMA a page cache lapjairól a NIC-re. MSG_ZEROCOPY: pontozott hivatkozás a felhasználói pufferből a socketpufferbe és DMA a felhasználói pufferből közvetlenül a NIC-re." /></details></div>
+<figcaption>Négy küldési adatút: másolások, DMA és rendszerhívások (egy
+16 KiB-os blokkra, sematikusan). read+write: 2 DMA és 2 CPU-másolás, 2
+rendszerhívás; sendfile: 2 DMA és 1 CPU-másolás (scatter-gather NIC-kel
+0), 1 rendszerhívás; splice: 2 DMA, a csövön át csak laphivatkozás, 0
+CPU-másolás, 2 rendszerhívás; MSG_ZEROCOPY: 1 DMA a rögzített
+felhasználói lapokról, 0 CPU-másolás, a befejezésről értesítés az
+errqueue-n (loopbacken a kernel mégis másol).</figcaption>
+</figure>
+<h4 data-number="19.4.2.1"
+id="sendfile-és-a-kernel-belső-másolása"><span
+class="header-section-number">19.4.2.1</span> 2.1
+<code>sendfile()</code> és a kernel belső másolása</h4>
+<p>A legegyszerűbb és legelterjedtebb zero-copy minta a fájlok
+kiszolgálása a hálózaton (pl. webkiszolgáló). A hagyományos megoldás a
+<code>read()</code> majd <code>write()</code>:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Hagyományos, nem hatékony másolás – ellenőrzött socketkapcsolattal */</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> in_fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;fajl.bin&quot;</span><span class="op">,</span> O_RDONLY<span class="op">);</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>in_fd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span> perror<span class="op">(</span><span class="st">&quot;open&quot;</span><span class="op">);</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> out_fd <span class="op">=</span> socket<span class="op">(</span>AF_INET<span class="op">,</span> SOCK_STREAM<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>out_fd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span> perror<span class="op">(</span><span class="st">&quot;socket&quot;</span><span class="op">);</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> sockaddr_in sa <span class="op">=</span> <span class="op">{</span> <span class="op">.</span>sin_family <span class="op">=</span> AF_INET<span class="op">,</span> <span class="op">.</span>sin_port <span class="op">=</span> htons<span class="op">(</span>PORT<span class="op">)</span> <span class="op">};</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>inet_pton<span class="op">(</span>AF_INET<span class="op">,</span> <span class="st">&quot;127.0.0.1&quot;</span><span class="op">,</span> <span class="op">&amp;</span>sa<span class="op">.</span>sin_addr<span class="op">)</span> <span class="op">!=</span> <span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;inet_pton</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="co">/* A küldő csak egy létrehozott, fogadó oldalon listen()-elő</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="co"> * kapcsolathoz csatlakozhat; enélkül a write() hibára futna. */</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>connect<span class="op">(</span>out_fd<span class="op">,</span> <span class="op">(</span><span class="kw">struct</span> sockaddr <span class="op">*)&amp;</span>sa<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>sa<span class="op">))</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>    perror<span class="op">(</span><span class="st">&quot;connect&quot;</span><span class="op">);</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a><span class="dt">char</span> buffer<span class="op">[</span><span class="dv">16384</span><span class="op">];</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a><span class="dt">ssize_t</span> n<span class="op">;</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a><span class="cf">while</span> <span class="op">((</span>n <span class="op">=</span> read<span class="op">(</span>in_fd<span class="op">,</span> buffer<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>buffer<span class="op">)))</span> <span class="op">&gt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ssize_t</span> off <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>off <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">{</span>                 <span class="co">/* rövid write() is lehet */</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>        <span class="dt">ssize_t</span> w <span class="op">=</span> write<span class="op">(</span>out_fd<span class="op">,</span> buffer <span class="op">+</span> off<span class="op">,</span> <span class="op">(</span><span class="dt">size_t</span><span class="op">)(</span>n <span class="op">-</span> off<span class="op">));</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>w <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>errno <span class="op">==</span> EINTR<span class="op">)</span> <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>            perror<span class="op">(</span><span class="st">&quot;write&quot;</span><span class="op">);</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a>        off <span class="op">+=</span> w<span class="op">;</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>n <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span> perror<span class="op">(</span><span class="st">&quot;read&quot;</span><span class="op">);</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span> <span class="op">}</span>   <span class="co">/* a 0 az EOF, a negatív hiba */</span></span></code></pre></div>
+<p>Itt az adat négyszer mozog: kétszer DMA-val (lemez → page cache,
+socketpuffer → NIC), kétszer a CPU másolja (page cache → felhasználói
+puffer → socketpuffer), és két rendszerhívás jut minden blokkra. A
+<code>sendfile()</code> rendszerhívás ezt a műveletet egyetlen hívássá
+olvasztja össze, de a hívás rövid is lehet, ezért ciklusban kell
+futtatni:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Zero-copy adatküldés a kernelben maradva; a rövid átvitelt</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="co"> * a ciklus kezeli, a visszatérési érték ellenőrzött. */</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>off_t offset <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="dt">size_t</span> total <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="cf">while</span> <span class="op">(</span>total <span class="op">&lt;</span> file_size<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ssize_t</span> sent <span class="op">=</span> sendfile<span class="op">(</span>out_fd<span class="op">,</span> in_fd<span class="op">,</span> <span class="op">&amp;</span>offset<span class="op">,</span> file_size <span class="op">-</span> total<span class="op">);</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>sent <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>errno <span class="op">==</span> EINTR<span class="op">)</span> <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;sendfile&quot;</span><span class="op">);</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>sent <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span>                  <span class="co">/* nem várt EOF a fájlon */</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>        fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;sendfile: váratlan EOF</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    total <span class="op">+=</span> <span class="op">(</span><span class="dt">size_t</span><span class="op">)</span>sent<span class="op">;</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>sendfile</code> működése során a kernel közvetlenül a
+<strong>page cache</strong>-ből tölti be a fájl adatait, és azt a socket
+pufferbe helyezi. Habár ez még mindig egy memóriamásolás a kernel
+címtartományán belül (page cache -&gt; socket buffer), a CPU-nak nem
+kell átlépnie a kernel/user határt kétszer, és nem kell a felhasználói
+pufferbe másolnia. A modern Linux kernelekben a <code>sendfile</code>
+képes arra is, hogy a socket bufferbe ne a teljes adatot másolja, hanem
+csak egy leírót (descriptor) illesszen be, ami a háttérben a page cache
+lapjaira mutat (ez a <code>splice</code> és a hálózati alrendszer
+együttműködése).</p>
+<h4 data-number="19.4.2.2" id="splice"><span
+class="header-section-number">19.4.2.2</span> 2.2
+<code>splice()</code></h4>
+<p>A <code>splice()</code> rendszerhívás egy általánosabb kernel-belső
+adatmozgató mechanizmus. Két fájlleíró között mozgat adatot anélkül,
+hogy az elhagyná a kernelteret. A két leíró közül az egyiknek pipe-nak
+kell lennie (különben <code>EINVAL</code>).</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* adat mozgatása fájlból socketbe splice-szal; a pipe kapacitása véges */</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> pipefd<span class="op">[</span><span class="dv">2</span><span class="op">];</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>pipe<span class="op">(</span>pipefd<span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span> perror<span class="op">(</span><span class="st">&quot;pipe&quot;</span><span class="op">);</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="dt">const</span> <span class="dt">size_t</span> MAX_SPLICE <span class="op">=</span> <span class="dv">64</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>   <span class="co">/* az alapértelmezett csőkapacitás felső korlátja */</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>off_t offset <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="dt">size_t</span> total <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> want <span class="op">=</span> file_size <span class="op">-</span> total<span class="op">;</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>want <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>want <span class="op">&gt;</span> MAX_SPLICE<span class="op">)</span> want <span class="op">=</span> MAX_SPLICE<span class="op">;</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Fájl -&gt; pipe. A betöltött részt azonnal el kell fogyasztani,</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="co">     * különben a cső megtelik, és a hívás elakad vagy rövidül. */</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ssize_t</span> n <span class="op">=</span> splice<span class="op">(</span>in_fd<span class="op">,</span> <span class="op">&amp;</span>offset<span class="op">,</span> pipefd<span class="op">[</span><span class="dv">1</span><span class="op">],</span> NULL<span class="op">,</span> want<span class="op">,</span> SPLICE_F_MOVE<span class="op">);</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>n <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>errno <span class="op">==</span> EINTR<span class="op">)</span> <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;splice fájl-&gt;pipe&quot;</span><span class="op">);</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>n <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">break</span><span class="op">;</span>                 <span class="co">/* EOF */</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Pipe -&gt; socket, a ténylegesen betöltött bájtszámmal. */</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ssize_t</span> marad <span class="op">=</span> n<span class="op">;</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>marad <span class="op">&gt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>        <span class="dt">ssize_t</span> m <span class="op">=</span> splice<span class="op">(</span>pipefd<span class="op">[</span><span class="dv">0</span><span class="op">],</span> NULL<span class="op">,</span> out_fd<span class="op">,</span> NULL<span class="op">,</span> <span class="op">(</span><span class="dt">size_t</span><span class="op">)</span>marad<span class="op">,</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>                           SPLICE_F_MOVE <span class="op">|</span> SPLICE_F_MORE<span class="op">);</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>m <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>errno <span class="op">==</span> EINTR<span class="op">)</span> <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>            perror<span class="op">(</span><span class="st">&quot;splice pipe-&gt;socket&quot;</span><span class="op">);</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>m <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span>                  <span class="co">/* nem várható: a cső nem üres */</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>            fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;splice: váratlan 0</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a>        marad <span class="op">-=</span> m<span class="op">;</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a>    total <span class="op">+=</span> <span class="op">(</span><span class="dt">size_t</span><span class="op">)</span>n<span class="op">;</span></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A negatív visszatérési értéket nem szabad <code>size_t</code>
+méreteként továbbadni: hiba esetén a hívás nem részleges átvitelt jelöl,
+hanem sikertelenséget, ezért külön ágban kell kezelni. A rövid átvitel
+(a kértnél kisebb <code>n</code>) viszont normális, ezt a ciklus
+folytatásával kell kezelni; az <code>n == 0</code> a fájl végének
+jele.</p>
+<p>Itt a kernel a page cache lapjaira mutató hivatkozásokat adja át a
+csövön keresztül a socketnek (a <code>SPLICE_F_MOVE</code> csak tipp, a
+mai kernelek figyelmen kívül hagyják), nem pedig másolja a lapokat,
+amennyiben a hardver és a kernel támogatja a scatter-gather DMA-t. A
+küldés helyességét a fogadó oldal ellenőrzi: a beérkezett bájtok száma
+egyezik-e a fájl méretével, és a teljes tartalom SHA-256 hash-e
+megegyezik-e a forrásfájléval. Csak egyező bájtszám és hash mellett
+értékelhető a mért átviteli sebesség és CPU-terhelés.</p>
+<h4 data-number="19.4.2.3" id="msg_zerocopy-linux-specifikus"><span
+class="header-section-number">19.4.2.3</span> 2.3
+<code>MSG_ZEROCOPY</code> (Linux-specifikus)</h4>
+<p>A fenti példák fájlból (page cache-ből) küldenek. Ha az alkalmazás a
+saját memóriájából generált adatot akar küldeni, hagyományosan a
+<code>send()</code> rendszerhívás bemásolja a felhasználói puffert a
+kernel socket pufferébe. A Linux 4.14 óta elérhető
+<code>MSG_ZEROCOPY</code> flag ezt kerüli meg:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Verziófüggő API: a célkernel támogatását és a szükséges fejlécet</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co"> * (linux/errqueue.h) a fordítás előtt ellenőrizni kell. */</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define </span><span class="ot">_GNU_SOURCE</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;errno.h&gt;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;time.h&gt;</span><span class="pp">           </span><span class="co">/* a linux/errqueue.h előtt: struct timespec */</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/errqueue.h&gt;</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;netinet/in.h&gt;</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;poll.h&gt;</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdio.h&gt;</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdlib.h&gt;</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string.h&gt;</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sys/mman.h&gt;</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sys/socket.h&gt;</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> one <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>setsockopt<span class="op">(</span>fd<span class="op">,</span> SOL_SOCKET<span class="op">,</span> SO_ZEROCOPY<span class="op">,</span> <span class="op">&amp;</span>one<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>one<span class="op">))</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Régi kernel vagy nem támogató socket: essünk vissza a másoló</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a><span class="co">     * send() útra, és a mérésben jelöljük, hogy nem zero-copy futott. */</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>    perror<span class="op">(</span><span class="st">&quot;SO_ZEROCOPY&quot;</span><span class="op">);</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a><span class="dt">char</span> <span class="op">*</span>buf <span class="op">=</span> mmap<span class="op">(</span>NULL<span class="op">,</span> size<span class="op">,</span> PROT_READ <span class="op">|</span> PROT_WRITE<span class="op">,</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>                 MAP_PRIVATE <span class="op">|</span> MAP_ANONYMOUS<span class="op">,</span> <span class="op">-</span><span class="dv">1</span><span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>buf <span class="op">==</span> MAP_FAILED<span class="op">)</span> <span class="op">{</span> perror<span class="op">(</span><span class="st">&quot;mmap&quot;</span><span class="op">);</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a><span class="co">/* ... adat feltöltése a buf-ba ... */</span></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a><span class="co">/* A küldés rövid is lehet, ezért ciklus kell; a visszatérési érték</span></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a><span class="co"> * ellenőrzött, a negatív érték hibát, nem méretet jelent. */</span></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a><span class="dt">size_t</span> off <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a><span class="dt">unsigned</span> <span class="dt">int</span> elkuldott_darab <span class="op">=</span> <span class="dv">0</span><span class="op">;</span>      <span class="co">/* a MSG_ZEROCOPY-s sendmsg hívások száma */</span></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a><span class="cf">while</span> <span class="op">(</span>off <span class="op">&lt;</span> size<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> iovec iov <span class="op">=</span> <span class="op">{</span> <span class="op">.</span>iov_base <span class="op">=</span> buf <span class="op">+</span> off<span class="op">,</span> <span class="op">.</span>iov_len <span class="op">=</span> size <span class="op">-</span> off <span class="op">};</span></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> msghdr msg <span class="op">=</span> <span class="op">{</span> <span class="dv">0</span> <span class="op">};</span></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a>    msg<span class="op">.</span>msg_iov <span class="op">=</span> <span class="op">&amp;</span>iov<span class="op">;</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a>    msg<span class="op">.</span>msg_iovlen <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ssize_t</span> sent <span class="op">=</span> sendmsg<span class="op">(</span>fd<span class="op">,</span> <span class="op">&amp;</span>msg<span class="op">,</span> MSG_ZEROCOPY<span class="op">);</span></span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>sent <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-39"><a href="#cb4-39" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>errno <span class="op">==</span> EINTR<span class="op">)</span> <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb4-40"><a href="#cb4-40" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>errno <span class="op">==</span> ENOBUFS<span class="op">)</span> <span class="op">{</span>       <span class="co">/* optmem/zárolt-lap korlát: csak a befejezési</span></span>
+<span id="cb4-41"><a href="#cb4-41" aria-hidden="true" tabindex="-1"></a><span class="co">                                       * értesítések kiolvasása szabadítja fel */</span></span>
+<span id="cb4-42"><a href="#cb4-42" aria-hidden="true" tabindex="-1"></a>            olvasd_ki_az_ertesiteseket<span class="op">(</span>fd<span class="op">,</span> <span class="op">&amp;</span>befejezve<span class="op">);</span>   <span class="co">/* lásd alább: nem blokkoló MSG_ERRQUEUE-olvasás */</span></span>
+<span id="cb4-43"><a href="#cb4-43" aria-hidden="true" tabindex="-1"></a>            <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb4-44"><a href="#cb4-44" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb4-45"><a href="#cb4-45" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;sendmsg&quot;</span><span class="op">);</span></span>
+<span id="cb4-46"><a href="#cb4-46" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb4-47"><a href="#cb4-47" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-48"><a href="#cb4-48" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>sent <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb4-49"><a href="#cb4-49" aria-hidden="true" tabindex="-1"></a>    off <span class="op">+=</span> <span class="op">(</span><span class="dt">size_t</span><span class="op">)</span>sent<span class="op">;</span></span>
+<span id="cb4-50"><a href="#cb4-50" aria-hidden="true" tabindex="-1"></a>    elkuldott_darab<span class="op">++;</span></span>
+<span id="cb4-51"><a href="#cb4-51" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A fenti vázlatban az <code>olvasd_ki_az_ertesiteseket</code> és a
+<code>befejezve</code> számláló az alábbi, második blokk ciklusmagjának
+függvénybe emelt, nem blokkoló változata (vázlat, nincs lefordítva).</p>
+<p>A <code>sendmsg()</code> sikeres visszatérése csak azt jelenti, hogy
+a kernel átvette az adatleírót; a <strong>puffer tulajdonjoga nem kerül
+vissza</strong> azonnal. Az alábbi kódban <code>elkuldott_darab</code> a
+<code>MSG_ZEROCOPY</code> jelzővel elindított <code>sendmsg</code>
+hívások száma (a fenti küldő ciklus minden sikeres hívás után eggyel
+növeli). Amíg a befejezési értesítés meg nem érkezik, a kernel (vagy a
+hálózati kártya DMA-ja) még hivatkozhat a felhasználói lapokra, ezért a
+puffer tartalma nem módosítható, és a memória nem szabadítható fel. A
+befejezéseket a socket <strong>error queue</strong>-jából kell kiolvasni
+<code>MSG_ERRQUEUE</code> jelzővel, és a kapott azonosítókat párosítani
+kell az elindított küldésekkel:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* A befejezési értesítések olvasása. Az azonosítók a MSG_ZEROCOPY-s</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co"> * sendmsg hívásokhoz rendelt, egyesével növekvő értékek; az</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="co"> * ee_info/ee_data a befejezett tartomány első és utolsó azonosítója. */</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="dt">unsigned</span> <span class="dt">int</span> befejezve <span class="op">=</span> <span class="dv">0</span><span class="op">;</span>            <span class="co">/* az eddig befejezett küldések száma */</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="cf">while</span> <span class="op">(</span>befejezve <span class="op">&lt;</span> elkuldott_darab<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span> control<span class="op">[</span><span class="dv">512</span><span class="op">];</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> msghdr msg <span class="op">=</span> <span class="op">{</span> <span class="op">.</span>msg_control <span class="op">=</span> control<span class="op">,</span> <span class="op">.</span>msg_controllen <span class="op">=</span> <span class="kw">sizeof</span><span class="op">(</span>control<span class="op">)</span> <span class="op">};</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ssize_t</span> n <span class="op">=</span> recvmsg<span class="op">(</span>fd<span class="op">,</span> <span class="op">&amp;</span>msg<span class="op">,</span> MSG_ERRQUEUE<span class="op">);</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>n <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>errno <span class="op">==</span> EINTR<span class="op">)</span> <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>errno <span class="op">==</span> EAGAIN<span class="op">)</span> <span class="op">{</span>         <span class="co">/* még nincs értesítés: várakozás */</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>            <span class="kw">struct</span> pollfd p <span class="op">=</span> <span class="op">{</span> <span class="op">.</span>fd <span class="op">=</span> fd<span class="op">,</span> <span class="op">.</span>events <span class="op">=</span> POLLERR <span class="op">};</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>poll<span class="op">(&amp;</span>p<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="dv">1000</span><span class="op">)</span> <span class="op">&lt;=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span> perror<span class="op">(</span><span class="st">&quot;poll&quot;</span><span class="op">);</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>            <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;recvmsg(MSG_ERRQUEUE)&quot;</span><span class="op">);</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="kw">struct</span> cmsghdr <span class="op">*</span>c <span class="op">=</span> CMSG_FIRSTHDR<span class="op">(&amp;</span>msg<span class="op">);</span> c <span class="op">!=</span> NULL<span class="op">;</span> c <span class="op">=</span> CMSG_NXTHDR<span class="op">(&amp;</span>msg<span class="op">,</span> c<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>c<span class="op">-&gt;</span>cmsg_level <span class="op">!=</span> SOL_IP<span class="op">)</span> <span class="cf">continue</span><span class="op">;</span>   <span class="co">/* IPv6 esetén SOL_IPV6 */</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>        <span class="kw">struct</span> sock_extended_err <span class="op">*</span>ee <span class="op">=</span> <span class="op">(</span><span class="kw">struct</span> sock_extended_err <span class="op">*)</span>CMSG_DATA<span class="op">(</span>c<span class="op">);</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>ee<span class="op">-&gt;</span>ee_origin <span class="op">!=</span> SO_EE_ORIGIN_ZEROCOPY<span class="op">)</span> <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>ee<span class="op">-&gt;</span>ee_errno <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a>            <span class="co">/* a tartomány elküldése hibára futott: a puffer visszanyerhető,</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a><span class="co">             * de az adatot újra kell küldeni */</span></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a>            fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;zerocopy hiba: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> strerror<span class="op">(</span>ee<span class="op">-&gt;</span>ee_errno<span class="op">));</span></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>ee<span class="op">-&gt;</span>ee_code <span class="op">==</span> SO_EE_CODE_ZEROCOPY_COPIED<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a>            <span class="co">/* a kernel másolásra esett vissza: a puffer szabad, de ez a</span></span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a><span class="co">             * küldés nem zero-copy volt, ezért a mérésből ki kell zárni</span></span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a><span class="co">             * vagy külön kell jelölni */</span></span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true" tabindex="-1"></a>            fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;figyelmeztetés: a kernel másolt (fallback)</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb5-33"><a href="#cb5-33" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb5-34"><a href="#cb5-34" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>ee<span class="op">-&gt;</span>ee_data <span class="op">+</span> <span class="dv">1</span> <span class="op">&gt;</span> befejezve<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-35"><a href="#cb5-35" aria-hidden="true" tabindex="-1"></a>            befejezve <span class="op">=</span> ee<span class="op">-&gt;</span>ee_data <span class="op">+</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb5-36"><a href="#cb5-36" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb5-37"><a href="#cb5-37" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-38"><a href="#cb5-38" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb5-39"><a href="#cb5-39" aria-hidden="true" tabindex="-1"></a><span class="co">/* Innen a buf tartalma újra írható, a memória felszabadítható. */</span></span></code></pre></div>
+<p>Ebben az esetben a kernel a hálózati kártya DMA-képességét használva
+közvetlenül a felhasználói térben lévő lapokról olvassa be az adatot, ha
+a hardveres scatter-gather ezt lehetővé teszi. A MSG_ZEROCOPY a
+laprögzítés és a befejezési értesítések kezelése miatt kis írásoknál
+drágább a másolásnál; a kernel dokumentációja (msg_zerocopy) szerint
+általában kb. 10 KB fölötti írásoknál térül meg (a küszöb hardver- és
+kernelfüggő, mérni kell). A mérés értelmezésénél figyelembe kell venni,
+hogy a másoló fallback esetén a küldés nem zero-copy, hanem a
+hagyományos úton történt; ezt a <code>SO_EE_CODE_ZEROCOPY_COPIED</code>
+kód jelzi.</p>
+<p><strong>Tipikus hiba és helyes megoldás:</strong> A kezdő fejlesztők
+gyakran alkalmaznak zero-copy megoldásokat kicsi, pár száz bájtos
+üzenetekre. Ebben az esetben a rendszer a lapok lefoglalásával és
+rögzítésével (page pinning) több munkát végez, mintha egyszerűen
+átmásolná a néhány száz bájtot (<code>copy_from_user</code>). A helyes
+megoldás a <strong>döntési táblázat</strong> használata: zero-copy csak
+akkor, ha a payload mérete meghalad egy mérésből meghatározott
+küszöbértéket (a kernel dokumentációja szerint nagyságrendileg 10 KB),
+vagy ha a CPU a szűk keresztmetszet.</p>
+<hr />
+<h3 data-number="19.4.3"
+id="hardveres-offload-dma-stateless-offload-és-toe"><span
+class="header-section-number">19.4.3</span> 3. Hardveres offload: DMA,
+stateless offload és TOE</h3>
+<p>Az operációs rendszernek nem kell minden feladatot szoftveresen
+elvégeznie. A hálózati kártyák (NIC-ek) egyre több intelligens
+funkcióval rendelkeznek. Az offload célja, hogy a CPU helyett a hardver
+végezze el az ismétlődő, alacsony szintű munkát.</p>
+<h4 data-number="19.4.3.1"
+id="dma-direct-memory-access-és-descriptor-gyűrűk"><span
+class="header-section-number">19.4.3.1</span> 3.1 DMA (Direct Memory
+Access) és Descriptor gyűrűk</h4>
+<p>A DMA a hálózati adatút legalapvetőbb offload mechanizmusa.
+Programozott I/O (PIO) esetén a CPU minden bájtot egyesével olvasna ki a
+kártyáról. A DMA lehetővé teszi, hogy a kártya közvetlenül a
+rendszermemóriába írjon (RX) és onnan olvasson (TX).</p>
+<p>A kernel és a NIC közötti együttműködés <strong>descriptor
+gyűrűkkel</strong> (ring buffer) történik:</p>
+<ul>
+<li><strong>TX Ring:</strong> A kernel lefoglal egy gyűrűt, amelyben a
+memóriacímeket és hosszakat adja meg. A kernel létrehoz egy
+<code>sk_buff</code>-ot, majd a fizikai címét beírja a TX ring következő
+elemébe. A NIC DMA-val elolvassa ezt a mutatót, kiolvassa az adatot a
+RAM-ból, és elküldi a hálózatra.</li>
+<li><strong>RX Ring:</strong> A kernel előre lefoglal üres puffereket,
+és azok címeit beírja az RX ringbe. Amikor csomag érkezik, a NIC DMA-val
+beleír a megadott memóriacímre, majd megszakítást (IRQ) küld.</li>
+</ul>
+<p>A <strong>scatter-gather DMA</strong> az a hardveres képesség, amely
+a zero-copy technikák alapja. Ha a TCP stream adatai nem folytonos
+fizikai memóriában vannak, a CPU-nak külön be kellene másolnia őket egy
+folytonos pufferbe, hogy a hálózati kártya el tudja küldeni. Ha a NIC
+támogatja a scatter-gather-t, a kernel egyszerűen átad egy láncolt
+listát (iovec) a fizikai címekről, és a NIC hardvere szétszórva olvassa
+be azokat, összerakva a keretet a hálózaton.</p>
+<h4 data-number="19.4.3.2"
+id="stateless-offload-checksum-tso-lrogro"><span
+class="header-section-number">19.4.3.2</span> 3.2 Stateless offload:
+Checksum, TSO, LRO/GRO</h4>
+<p>A TCP/IP protokoll több ellenőrző összeget és szegmentálási feladatot
+ír elő, amelyeket hagyományosan a CPU számolt ki.</p>
+<ul>
+<li><strong>Checksum Offload (CSUM):</strong> Az IP és TCP fejléc
+ellenőrző összegének kiszámítása nagy CPU-terhelést jelent nagy
+sávszélességnél. Ha a NIC hardvere támogatja, a kernel beírja a fejlécbe
+a pszeudo-fejléc adatait, és a kártya kiszámítja a végleges checksumot.
+Ez tipikusan mindig bekapcsolt állapotban marad, mert a nyereség
+hatalmas, a kockázat pedig alacsony.</li>
+<li><strong>TCP Segmentation Offload (TSO):</strong> A kernel hálózati
+verme és az alkalmazás gyakran nagy (akár 64 KiB-os) pufferekkel
+dolgozik, de a fizikai hálózat MTU-ja 1500 bájt. Ha a CPU-nak kellene
+feldarabolnia a nagy TCP szegmenseket, az rengeteg apró művelet lenne.
+TSO esetén a kernel átadja a nagy puffert a kártyának, és a
+<strong>hálózati hardver</strong> végzi el a szegmentálást a kicsi
+IP-csomagokra. Ez drámaian csökkenti a per-bájt CPU-költséget.</li>
+<li><strong>Large/Generic Receive Offload (LRO/GRO):</strong> A TSO
+ellentéte. A hálózaton sok kicsi, egymáshoz tartozó szegmens érkezik. Ha
+a kernel mindegyiket külön dolgozná fel, óriási overhead lenne. A GRO a
+szoftveres, de az alsóbb rétegben (NAPI) elvégzett aggregáció: a NAPI
+poll (NET_RX softirq) összegyűjti az egymáshoz tartozó szegmenseket, és
+egyetlen nagy <code>sk_buff</code>-ként adja fel a TCP veremnek. (Az LRO
+hardveres vagy régi szoftveres összevonás; az összevont csomag
+továbbításkor (routing/bridge) nem állítható vissza pontosan, ezért
+routeren és bridge-en tiltani kell, és a Linux inkább a GRO-t
+preferálja.)</li>
+</ul>
+<h4 data-number="19.4.3.3" id="toe-tcp-offload-engine"><span
+class="header-section-number">19.4.3.3</span> 3.3 TOE (TCP Offload
+Engine)</h4>
+<p>A TOE a “teljes” offload megvalósítása. Itt a hálózati kártya nem
+csak a checksum-ot számolja, vagy a szegmentálást végzi, hanem a
+<strong>teljes TCP state machine-t</strong> lefuttatja a hardverben
+(háromfázisú handshake, torlódásvezérlés, nyugtázás,
+retransmission).</p>
+<p><strong>Előny:</strong> Az elméleti CPU-teher a nullához közelíthet,
+hiszen a hoszt CPU-ja szinte nem vesz részt a TCP feldolgozásában.
+<strong>Hátrány és jelenlegi helyzet:</strong> A modern, nagysebességű
+hálózatokban az általános célú operációs rendszerek (különösen a Linux)
+<strong>nem használnak teljes TOE-t</strong>. Ennek okai:</p>
+<ol type="1">
+<li><strong>Biztonság és tűzfal (<code>netfilter</code>, eBPF):</strong>
+Ha a TCP handshake és a kapcsolatállapot a hardverben él, akkor a kernel
+tűzfala (pl. iptables, nftables) és az eBPF programok nem látják a
+kapcsolat állapotát, így nem tudnak beavatkozni (pl. SYN cookie, DDoS
+védelem).</li>
+<li><strong>Rugalmasság és debuggolás:</strong> A kernel TCP verme (pl.
+CUBIC, BBR torlódásvezérlés) folyamatosan fejlődik. A hardverbe égetett
+implementációk elavulnak, nem frissíthetők, és nehezen
+debuggolhatók.</li>
+<li><strong>Virtualizáció és live migration:</strong> Ha a TCP állapot a
+hardverben van, lehetetlen egy virtuális gépet élőben átköltöztetni
+(live migration) egy másik szerverre, mert a kapcsolat állapota nem
+exportálható.</li>
+</ol>
+<p>Ezért a gyakorlatban a <strong>stateless offload (TSO, CSUM,
+RSS)</strong> és az intelligens DMA a nyerő stratégia, a teljes TOE-t
+pedig főleg speciális beágyazott környezetekben vagy régebbi eszközökön
+találjuk.</p>
+<hr />
+<h3 data-number="19.4.4" id="latency-throughput-és-cpu-affinitás"><span
+class="header-section-number">19.4.4</span> 4. Latency, Throughput és
+CPU-affinitás</h3>
+<p>Az optimalizálás célja a mérőszámok javítása, tehát meg kell értenünk
+a hálózati teljesítmény metrikáit és a CPU-architektúra hatását.</p>
+<ul>
+<li><strong>Throughput (Áteresztőképesség):</strong> Az időegység alatt
+átvitt hasznos adat mennyisége (Mbit/s vagy csomag/s). A throughput
+növelése főként a nagy másolások kiküszöbölésén (zero-copy) és az
+offload-on (TSO/LRO) múlik.</li>
+<li><strong>Latency (Késleltetés):</strong> Az az idő, ami alatt egy
+csomag eljut a forrástól a célig (vagy a végponttól a végpontig az
+alkalmazásban). A latency csökkentése gyakran a megszakítások
+késleltetésének csökkentésén és az ütemezés optimalizálásán múlik.</li>
+</ul>
+<h4 data-number="19.4.4.1"
+id="cpu-affinitás-és-rss-receive-side-scaling"><span
+class="header-section-number">19.4.4.1</span> 4.1 CPU-affinitás és RSS
+(Receive Side Scaling)</h4>
+<p>A többmagos rendszerekben a hálózati adatút egyik legnagyobb
+ellensége a <strong>cache thrashing</strong> és a <strong>lock
+contention</strong>. Ha egy csomag megszakítása a 0. CPU-n fut le, a
+felhasználói alkalmazás pedig a 4. CPU-n, akkor az adatot a
+cache-koherencia protokollnak (MESI) át kell mozgatnia a processzorok
+között, ami jelentős késleltetést ad hozzá.</p>
+<p><strong>Receive Side Scaling (RSS):</strong> A hálózati kártyák
+támogatják a hardveres terheléselosztást. Az RSS a TCP/IP fejléc
+(IP-címek és portok) hash-e alapján a bejövő csomagokat több RX ringbe
+osztja szét. Minden RX ringhez külön megszakítási vektor tartozhat,
+amelyet a kernel egy adott CPU-hoz köthet.</p>
+<p><strong>Interrupt Coalescing és Busy Polling:</strong> A nagy
+sebességű hálózatoknál a megszakítások áradata (interrupt storm) miatt a
+CPU soha nem jut el az alkalmazás futtatásáig. Két stratégia
+létezik:</p>
+<ol type="1">
+<li><strong>Interrupt Coalescing (Adaptive RX/TX):</strong> A kártya nem
+küld megszakítást minden csomag után, hanem vár egy kicsit (néhány
+mikroszekundum), vagy vár, amíg N csomag összegyűlik. Ez növeli a batch
+méretet és növeli a throughputot, de növeli a késleltetést is! Ez a
+klasszikus latency vs. throughput trade-off.</li>
+<li><strong>Busy Polling (<code>SO_BUSY_POLL</code>):</strong> Alacsony
+késleltetésű környezetekben az alkalmazás nem alszik el a
+<code>recv</code> hívásra várva, hanem a kernel aktívan pörög egy CPU
+magon, és pollozza a hálózati kártya RX gyűrűjét. Ez drasztikusan
+csökkenti a latency-t (akár 10-20 mikroszekundumra), de 100%-os
+CPU-terhelést jelent.</li>
+</ol>
+<p><strong>CPU-affinitás beállítása a laborban:</strong> A
+<code>taskset</code> vagy a <code>cpuset</code> cgroup segítségével az
+alkalmazást ugyanarra a NUMA node-ra és CPU magra kötjük, mint ahol a
+NIC megszakítása fut.</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Példa: IRQ affinity beállítása (emulált labor kontextusban)</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="co"># A NIC megszakításszámát a /proc/interrupts mutatja, a NUMA-csomópontját a</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="co"># /sys/class/net/&lt;iface&gt;/device/numa_node (-1: nincs NUMA-információ).</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="va">IRQ</span><span class="op">=&lt;</span>irq-szám<span class="op">&gt;</span>        <span class="co"># helyőrző</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="va">NODE</span><span class="op">=&lt;</span>numa-csomópont<span class="op">&gt;</span> <span class="co"># helyőrző</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Az IRQ-t a 2-es CPU-hoz kötjük (a 2-es CPU-nak a $NODE csomóponthoz kell tartoznia: numactl -H)</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 2 <span class="op">&gt;</span> /proc/irq/<span class="va">$IRQ</span>/smp_affinity_list</span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="co"># Az alkalmazást ugyanahhoz a CPU-hoz és NUMA-csomóponthoz kötjük</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="ex">numactl</span> <span class="at">--cpunodebind</span><span class="op">=</span><span class="va">$NODE</span> <span class="at">--membind</span><span class="op">=</span><span class="va">$NODE</span> taskset <span class="at">-c</span> 2 ./halozati_app</span></code></pre></div>
+<p>A CPU-affinitás csökkenti a lock contention-t, biztosítja, hogy az
+adat az L2/L3 cache-ben marad, és kiszámíthatóbbá teszi a
+késleltetést.</p>
+<hr />
+<h3 data-number="19.4.5"
+id="labor-zero-copy-és-offload-döntési-táblázat"><span
+class="header-section-number">19.4.5</span> 5. Labor: Zero-copy és
+offload döntési táblázat</h3>
+<p><em>Környezet:</em> Emulált labor QEMU-ban, <code>virtio-net</code>
+hálózati kártyával. Rögzített konfiguráció: 4 vCPU, 8 GiB RAM, Linux
+kernel 6.x (a pontos verzió a reprodukciós naplóban rögzítendő, mert az
+API-k verziófüggőek lehetnek).</p>
+<h4 data-number="19.4.5.1" id="cél"><span
+class="header-section-number">19.4.5.1</span> 5.1 Cél</h4>
+<p>Megmérni és összehasonlítani a hagyományos másolás és a
+zero-copy/offload technikák hatását a latency-re, throughputra és
+CPU-terhelésre. A mérések alapján létrehozni egy <strong>döntési
+táblázatot</strong>.</p>
+<h4 data-number="19.4.5.2" id="eszközök-és-mérési-módszer"><span
+class="header-section-number">19.4.5.2</span> 5.2 Eszközök és mérési
+módszer</h4>
+<ul>
+<li><strong>Források:</strong> egyetlen közös küldő és fogadó programpár
+(<code>sender.c</code>, <code>receiver.c</code>); a könyv csak a küldő
+vázlatát közli (az <code>atut_*</code> függvények a 2. szakasz
+mintáiból, a <code>receiver.c</code> és a <code>connect_receiver</code>
+az olvasó saját megvalósítása), kész forráscsomag nincs mellékelve. Az
+adatutat a küldő <code>--mod</code> kapcsolója választja ki:
+<code>copy</code> (read+write), <code>sendfile</code>,
+<code>splice</code> (és opcionálisan <code>zerocopy</code> a
+<code>MSG_ZEROCOPY</code> méréshez). A fájlméret, a pufferméret, a
+socketbeállítások és a naplóformátum minden módban azonos; a
+<code>receiver.c</code> a fogadott bájtok számát és a tartalom SHA-256
+hash-ét ellenőrzi, és csak egyezés esetén ad sikeres kilépési kódot.
+Minden futás a szabványos hibakimenetre kiírja a választott módot, a
+fájlméretet és a verziókat, így a naplóból utólag megállapítható, melyik
+adatút futott.</li>
+<li><strong>Topológia:</strong> a küldő és a fogadó a virtio-net
+interfész két oldalán fut (például a vendég és a hoszt tap-interfésze,
+vagy két QEMU-vendég közös <code>-netdev socket</code>/bridge-en); a
+kliens a fogadó <em>nem loopback</em> címére
+(<code>&lt;receiver-ip&gt;</code> helyőrző) csatlakozik, és az
+<code>ethtool -K</code> a ténylegesen használt interfészre vonatkozik.
+Loopbacken (<code>127.0.0.1</code>) az offload-beállítások hatástalanok,
+és a MSG_ZEROCOPY mindig másol
+(<code>SO_EE_CODE_ZEROCOPY_COPIED</code>); ezért a mérés a virtio-net
+interfészen át fut.</li>
+<li><strong>Hálózati konfiguráció:</strong>
+<code>ethtool -K &lt;iface&gt; tx on rx on tso on gro on</code> (offload
+be), majd ugyanazon a kapcsolaton kikapcsolt állapot mérése. Az
+<code>ethtool -k &lt;iface&gt;</code> kimenetét minden méréshez naplózni
+kell, mert a virtuális <code>virtio-net</code> offload-képessége a hoszt
+beállításaitól is függ.</li>
+<li><strong>Mérés:</strong> <code>iperf3</code> a TCP throughputra,
+<code>qperf</code> vagy <code>ping -f</code> a latency-re és
+csomagvesztésre. <code>perf stat</code> a CPU-ciklusok és cache-miss
+mérésére. A <strong>hálózati kapacitás felső korlátja külön
+kontrollmérés</strong>: az <code>iperf3</code> eredménye a labor
+hálózatának elérhető sávszélességét adja, ehhez képest kell a másolási
+módok hatását értékelni. Minden kísérletben egyszerre csak egy tényező
+változzon (másolási mód, offload, affinitás); a többi beállítás
+rögzített.</li>
+</ul>
+<p>A közös küldő vázlata, amelyben az adatút egyetlen kapcsolóval
+választható:</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* sender.c – közös küldő, választható adatúttal (vázlat) */</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> atut_copy<span class="op">(</span><span class="dt">int</span> out_fd<span class="op">,</span> <span class="dt">int</span> in_fd<span class="op">,</span> <span class="dt">size_t</span> meret<span class="op">);</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> atut_sendfile<span class="op">(</span><span class="dt">int</span> out_fd<span class="op">,</span> <span class="dt">int</span> in_fd<span class="op">,</span> <span class="dt">size_t</span> meret<span class="op">);</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> atut_splice<span class="op">(</span><span class="dt">int</span> out_fd<span class="op">,</span> <span class="dt">int</span> in_fd<span class="op">,</span> <span class="dt">size_t</span> meret<span class="op">);</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">int</span> argc<span class="op">,</span> <span class="dt">char</span> <span class="op">**</span>argv<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>mod <span class="op">=</span> <span class="st">&quot;copy&quot;</span><span class="op">;</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>fajl <span class="op">=</span> <span class="st">&quot;adat.bin&quot;</span><span class="op">;</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">1</span><span class="op">;</span> i <span class="op">&lt;</span> argc<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>strcmp<span class="op">(</span>argv<span class="op">[</span>i<span class="op">],</span> <span class="st">&quot;--mod&quot;</span><span class="op">)</span> <span class="op">==</span> <span class="dv">0</span> <span class="op">&amp;&amp;</span> i <span class="op">+</span> <span class="dv">1</span> <span class="op">&lt;</span> argc<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>            mod <span class="op">=</span> argv<span class="op">[++</span>i<span class="op">];</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>strcmp<span class="op">(</span>argv<span class="op">[</span>i<span class="op">],</span> <span class="st">&quot;--fajl&quot;</span><span class="op">)</span> <span class="op">==</span> <span class="dv">0</span> <span class="op">&amp;&amp;</span> i <span class="op">+</span> <span class="dv">1</span> <span class="op">&lt;</span> argc<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>            fajl <span class="op">=</span> argv<span class="op">[++</span>i<span class="op">];</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* A kapcsolatot a receiver.c fogadja (listen/accept), a küldő connect()-ál;</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a><span class="co">     * a fájlméret és a pufferméret minden módban ugyanaz. */</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> in_fd <span class="op">=</span> open<span class="op">(</span>fajl<span class="op">,</span> O_RDONLY<span class="op">);</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> out_fd <span class="op">=</span> connect_receiver<span class="op">(</span><span class="st">&quot;&lt;receiver-ip&gt;&quot;</span><span class="op">,</span> PORT<span class="op">);</span>   <span class="co">/* helyőrző: nem loopback cím */</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>in_fd <span class="op">&lt;</span> <span class="dv">0</span> <span class="op">||</span> out_fd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> meret <span class="op">=</span> <span class="op">(</span><span class="dt">size_t</span><span class="op">)</span>lseek<span class="op">(</span>in_fd<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> SEEK_END<span class="op">);</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>    lseek<span class="op">(</span>in_fd<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> SEEK_SET<span class="op">);</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* A választott mód a naplóból minden futásnál azonosítható. */</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a>    fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;MOD=</span><span class="sc">%s</span><span class="st"> FAJL=</span><span class="sc">%s</span><span class="st"> MERET=</span><span class="sc">%zu\n</span><span class="st">&quot;</span><span class="op">,</span> mod<span class="op">,</span> fajl<span class="op">,</span> meret<span class="op">);</span></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>strcmp<span class="op">(</span>mod<span class="op">,</span> <span class="st">&quot;copy&quot;</span><span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span>     <span class="cf">return</span> atut_copy<span class="op">(</span>out_fd<span class="op">,</span> in_fd<span class="op">,</span> meret<span class="op">);</span></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>strcmp<span class="op">(</span>mod<span class="op">,</span> <span class="st">&quot;sendfile&quot;</span><span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">return</span> atut_sendfile<span class="op">(</span>out_fd<span class="op">,</span> in_fd<span class="op">,</span> meret<span class="op">);</span></span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>strcmp<span class="op">(</span>mod<span class="op">,</span> <span class="st">&quot;splice&quot;</span><span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span>   <span class="cf">return</span> atut_splice<span class="op">(</span>out_fd<span class="op">,</span> in_fd<span class="op">,</span> meret<span class="op">);</span></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a>    fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;ismeretlen mod: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> mod<span class="op">);</span></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>connect_receiver</code> a <code>receiver.c</code>
+listen/accept oldalához csatlakozó segédfüggvény; a <code>lseek</code>
+visszatérési értékét a teljes programban ellenőrizni kell, mert
+<code>-1</code> esetén a méret érvénytelen. A nehéz mérési logika az
+<code>atut_*</code> függvényekben van, amelyek a 2. szakasz mintái
+szerint, ciklusban és ellenőrzött visszatérési értékekkel dolgoznak.</p>
+<h4 data-number="19.4.5.3"
+id="elvárt-levezetett-vs.-mért-eredmények"><span
+class="header-section-number">19.4.5.3</span> 5.3 Elvárt (levezetett)
+vs. Mért eredmények</h4>
+<p>A mérés előtt rögzítsük az <strong>elvárt viselkedést</strong>: -
+<em>Elvárt:</em> A <code>sendfile</code> nagy fájloknál kevesebb
+CPU-ciklus/bájt értéket ad, mert a felhasználói másolat és a
+rendszerhívások fele elmarad; a nyereség mértéke mérendő (nem levezetett
+szám). - <em>Elvárt:</em> A TSO bekapcsolása a virtio-net interfészen
+csökkenti a küldő CPU-ciklus/bájt értékét; az abszolút sávszélesség a
+hoszt beállításaitól függ (a hálózat felső korlátját az
+<code>iperf3</code> kontrollmérés adja). - <em>Elvárt:</em> A latency a
+legjobb akkor lesz, ha Busy Polling (<code>SO_BUSY_POLL</code>) van, a
+legrosszabb pedig Interrupt Coalescing bekapcsolásával.</p>
+<p><em>(A mérési naplóba a mért értékeket ide kell beilleszteni, és az
+eltéréseket elemezni.)</em></p>
+<h4 data-number="19.4.5.4" id="döntési-táblázat-sablon"><span
+class="header-section-number">19.4.5.4</span> 5.4 Döntési táblázat
+(Sablon)</h4>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr>
+<th style="text-align: left;">Felhasználási mód / Munkaterhelés</th>
+<th style="text-align: left;">Zero-copy ajánlott?</th>
+<th style="text-align: left;">Offload ajánlott (TSO/GRO)?</th>
+<th style="text-align: left;">CPU-affinitás fontos?</th>
+<th style="text-align: left;">Indoklás</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><strong>HTTP fájlkiszolgáló (nagy
+fájlok)</strong></td>
+<td style="text-align: left;"><strong>Igen</strong>
+(<code>sendfile</code>)</td>
+<td style="text-align: left;"><strong>Igen</strong></td>
+<td style="text-align: left;"><strong>Közepes</strong></td>
+<td style="text-align: left;">A CPU a másolásokkal lesz telítve, offload
+nélkül nem éri el a sávszélességet.</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>DNS/DHCP szerver (kis
+csomagok)</strong></td>
+<td style="text-align: left;"><strong>Nem</strong></td>
+<td style="text-align: left;"><strong>Nem</strong></td>
+<td style="text-align: left;"><strong>Igen</strong></td>
+<td style="text-align: left;">A kis (max 512 B) csomagoknál a
+laprögzítés drágább, mint a másolás. A latency a kritikus, az affinity
+csökkenti a cache-miss-t.</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Adatbázis replikáció (közepes
+csomagok)</strong></td>
+<td style="text-align: left;"><strong>Talán</strong>
+(<code>MSG_ZEROCOPY</code>)</td>
+<td style="text-align: left;"><strong>Igen</strong></td>
+<td style="text-align: left;"><strong>Igen</strong></td>
+<td style="text-align: left;">A nagy batch-ek hatékonyak, de a
+tranzakciós integritás miatt a kernelben tartás lehet
+biztonságosabb.</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Valós idejű
+játék/streaming</strong></td>
+<td style="text-align: left;"><strong>Nem</strong></td>
+<td style="text-align: left;"><strong>Ki</strong> (TSO növeli a
+latency-t)</td>
+<td style="text-align: left;"><strong>Igen</strong></td>
+<td style="text-align: left;">A kis keretek gyors továbbítása a cél, a
+batchesítés (Interrupt Coalescing, TSO) rontja a válaszidőt.</td>
+</tr>
+</tbody>
+</table>
+<h4 data-number="19.4.5.5"
+id="tipikus-hibák-és-megoldások-a-labor-során"><span
+class="header-section-number">19.4.5.5</span> 5.5 Tipikus hibák és
+megoldások a labor során</h4>
+<ol type="1">
+<li><strong>Hiba:</strong> Az offload-ot kikapcsolják, mert “az hamis
+képet ad”. <strong>Megoldás:</strong> Ez téves. A modern virtuális
+környezetek (VirtIO) szoftveresen emulálják a TSO/GRO-t; letiltása a
+host CPU-t terheli, és nem méri a valós elérhető teljesítményt. Mindig
+dokumentálni kell az <code>ethtool</code> állapotát.</li>
+<li><strong>Hiba:</strong> A CPU-affinitást nem ellenőrzik, és a mérési
+eredmények nagy szórást mutatnak. <strong>Megoldás:</strong> A QEMU vCPU
+szálait is rögzíteni kell (<code>taskset</code> a QEMU szálakra), mert a
+virtuális környezetben a hoszt ütemezője felülírhatja a vendég affinity
+beállításokat.</li>
+<li><strong>Hiba:</strong> A <code>sendfile</code>-t kisméretű,
+interaktív üzenetekre használják. <strong>Megoldás:</strong> Ilyenkor a
+hívás overheadje és a kontextusváltás a domináns, nem a másolás. Ilyen
+esetekben a batch feldolgozás vagy az io_uring a helyes válasz.</li>
+</ol>
+<h3 data-number="19.4.6" id="összegzés"><span
+class="header-section-number">19.4.6</span> 6. Összegzés</h3>
+<p>Ebben az alfejezetben láthattuk, hogy a hálózati teljesítmény nem
+csak a CPU órajelétől függ, hanem attól, hogyan szervezzük meg az adatok
+útját. A zero-copy technikák (<code>sendfile</code>,
+<code>splice</code>, <code>MSG_ZEROCOPY</code>) megszüntetik a
+felesleges CPU-másolásokat. A hardveres offload (Checksum, TSO, GRO)
+kiveszi a per-packet terhelést a CPU-ból. Végül a CPU-affinitás és a
+modern interrupt kezelés (RSS, Busy Polling) biztosítja, hogy a
+megfelelő adat a megfelelő cache-ben legyen a megfelelő időben.</p>
+<p><strong>Két terhelési eset és értékelési rubrika.</strong> A döntési
+táblázat önmagában nem elég: a választást két, egymástól lényegesen
+eltérő terhelésen kell ellenőrizni, és a döntést a mérés előtt rögzíteni
+kell. A rubrika három dolgot kér számon:</p>
+<ol type="1">
+<li><strong>A választott optimalizáció</strong> (másolási mód, offload,
+affinitás) és annak indoklása a munkaterhelés profilja alapján.</li>
+<li><strong>A mérőszám</strong>, amellyel a döntés igazolható (például
+CPU-ciklus/bájt, elért throughput, p95 latency, cache-miss arány), a
+mérési módszerrel együtt.</li>
+<li><strong>Egy lehetséges negatív mellékhatás</strong> és annak
+ellenőrzése (például megnövekedett memóriafoglalás, romló latency kis
+csomagokon, hoszt CPU-terhelés emulált offload mellett).</li>
+</ol>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr>
+<th>Eset</th>
+<th>Terhelés</th>
+<th>Elvárt döntés</th>
+<th>Mit kell mérni</th>
+<th>Lehetséges negatív mellékhatás</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>A: nagy, folyamatos átvitel</strong></td>
+<td>több GiB-os fájl, hosszú életű TCP kapcsolat</td>
+<td><code>sendfile</code>/<code>splice</code>, TSO/GRO be, rögzített
+CPU-affinitás</td>
+<td>CPU-ciklus/bájt, elért Mbps, <code>perf stat</code> cache-miss</td>
+<td>a zero-copy a page cache memóriáját foglalja; a TSO növeli az egy
+csomagra jutó késleltetést</td>
+</tr>
+<tr>
+<td><strong>B: kis interaktív üzenetek</strong></td>
+<td>néhány száz bájtos kérések, nagy másodpercenkénti darabszám</td>
+<td>hagyományos <code>send</code>/<code>recv</code>, az offload célzott
+beállítása, alacsony latency</td>
+<td>p50/p95/p99 válaszidő, csomagvesztés, <code>perf stat</code>
+context-switch</td>
+<td>a zero-copy laprögzítése drágább a másolásnál; az agresszív
+offload/coalescing rontja a válaszidőt</td>
+</tr>
+</tbody>
+</table>
+<p>Az olvasónak a mérés előtt ki kell töltenie a választott
+optimalizációt, a mérőszámot és a várt mellékhatást, majd a mérés után a
+rubrika alapján kell eldöntenie, hogy a döntés helyes volt-e. A kisebb
+CPU-terhelés nem azonos a kisebb másolási költséggel és a kisebb
+késleltetéssel: ezeket külön mérőszámmal kell igazolni.</p>
+<p><strong>Önellenőrző kérdések:</strong></p>
+<ol type="1">
+<li>Az A esetben a <code>sendfile</code> 30%-kal kevesebb CPU-ciklust
+használ, mint a <code>read</code>+<code>write</code>, de a p95 latency
+5%-kal nő. Hogyan döntöd el, melyik szempont élvez elsőbbséget, és
+milyen további méréssel támasztod alá a döntést?</li>
+<li>A B esetben a <code>MSG_ZEROCOPY</code> kisebb CPU-terhelést mutat,
+mint a <code>send</code>, de a kis üzeneteknél a mért átviteli idő nem
+javul. Mi lehet ennek az oka, és hogyan ellenőriznéd, hogy a kernel nem
+másoló fallbacket hajtott-e végre?</li>
+</ol>
+<p><strong>Válaszok röviden:</strong> (1) A döntés az üzleti célhoz
+igazodik: nagy átvitelnél a CPU-ciklus/bájt a fő mérőszám, interaktívnál
+a p95 latency; további mérés: a p95/p99 és a CPU-ciklus/bájt azonos
+terhelésen, több futásból (szórással). (2) Kis üzeneteknél a laprögzítés
+és a befejezési értesítések költsége meghaladja a másolásét, és a kernel
+gyakran másol (fallback); ellenőrzés: az <code>MSG_ERRQUEUE</code>
+értesítések <code>ee_code</code> mezője
+<code>SO_EE_CODE_ZEROCOPY_COPIED</code> értékű-e.</p>
+<p>Fontos megérteni, hogy a hálózati verem optimalizálása mindig
+kompromisszum. Nincs “egy jó beállítás” mindenre: a nagy
+áteresztőképességet igénylő fájltranszfer más konfigurációt igényel,
+mint az alacsony késleltetést igénylő valós idejű alkalmazás. A mérnök
+feladata a munkaterhelés profilozása és a bemutatott döntési táblázat
+alapján a helyes kernel- és hardverparaméterek kiválasztása. A következő
+alfejezetben (<a href="os074.html">DNS, DHCP és konfiguráció</a>) ezt a
+tudást alkalmazzuk a hálózati szolgáltatások (DNS, DHCP) építésekor,
+ahol a kis csomagok miatt a latency és az affinity kiemelt szerepet
+kap.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os072.html">← 19.3 Csomagfeldolgozás, netfilter és eBPF</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os074.html">20.1 DNS, DHCP és konfiguráció →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

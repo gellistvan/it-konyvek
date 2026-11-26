@@ -1,0 +1,1152 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>29.3 VFS integráció és fájlleírók – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz7">VII. RÉSZ – Tervezés, implementáció és záróprojekt</a> › <a href="index.html#osch28">29 Fájlrendszer és eszközmeghajtó</a></p>
+<div class="links"><a class="prev" rel="prev" href="os111.html">← 29.2 Blokk-eszköz és driver implementáció</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os113.html">29.4 Shell és alapszolgáltatások →</a></div>
+</nav>
+<h2 data-number="29.3" id="os112"><span
+class="header-section-number">29.3</span> VFS integráció és
+fájlleírók</h2>
+<p>A VFS-integráció akkor válik hasznos réteggé, amikor a fájlrendszer
+már nem a saját, belső hívásaival dolgozik, hanem beilleszkedik a
+rendszer közös, hierarchikus névterébe. Ebben a fejezetben azt
+vizsgáljuk meg, hogyan lehet egy egyszerű fájlrendszert csatlakoztatni a
+virtuális fájlrendszerhez (VFS), milyen adatszerkezetek és művelettáblák
+szükségesek ehhez, és miként kapcsolódik a mount, a dentry, az inode és
+a file object a folyamatok fájlleíró-táblájához. A cél nem egy teljes
+értékű kernel VFS felépítése, hanem egy ellenőrizhető, tanulható
+minimális minta, amelyen a fontos fogalmak mérhetők és
+reprodukálhatók.</p>
+<h3 data-number="29.3.1" id="miért-közös-névtér"><span
+class="header-section-number">29.3.1</span> 1. Miért közös névtér?</h3>
+<p>A UNIX-szerű rendszerek egyik alapgondolata, hogy a felhasználói
+programok számára a tárolóeszközök nem külön betűjelekkel vagy külön
+API-val jelennek meg, hanem egyetlen hierarchikus fában. A
+merevlemez-partíció, az initrd, a hálózati fájlrendszer és a RAM-ban
+lévő ideiglenes tároló egyaránt ugyanazzal az <code>open</code>,
+<code>read</code>, <code>write</code>, <code>close</code> felülettel
+érhető el. A VFS ezt az egységesítést valósítja meg: a felső réteg egy
+közös rendszerhívás-felületet és közös adatszerkezeteket ad, az alsó
+réteg pedig az egyes fájlrendszerek specifikus műveleteit.</p>
+<p>A réteges szerkezet a következőképpen ábrázolható:</p>
+<pre class="text"><code>felhasználói program
+        |
+      sys_open / sys_read / sys_write
+        |
+ +------+-------------------------+
+ | VFS réteg: path feloldás, mount |
+ | dentry, inode, file object      |
+ +------+-------------------------+
+        |
+ +------+------------+------------+
+ | memfs | ext4-szerű | ...       |
+ | (RAM) | blokkfs    |            |
+ +------+------------+------------+
+        |
+    blokk-eszköz driver (os111)</code></pre>
+<p><em>Jelmagyarázat:</em> a függőleges vonal a hívás irányát (fentről
+lefelé), a keretek az alrendszerek határait jelölik. A VFS rétegnek nem
+szabad az alsó fájlrendszer belső lemezszerkezetéről tudnia.</p>
+<h3 data-number="29.3.2" id="a-mount-mint-névtérkapcsoló"><span
+class="header-section-number">29.3.2</span> 2. A mount mint
+névtérkapcsoló</h3>
+<p>A mount művelet az a pillanat, amikor egy fájlrendszer gyökere
+bekerül a közös fába. A VFS ezért megkülönbözteti a fájlrendszer saját
+gyökerét (<code>root dentry</code>) és a beillesztési pontot
+(<code>mountpoint dentry</code>). A <code>struct mount</code> a kettő
+közötti kapcsolatot rögzíti. Egy egyszerűsített kernelbeli ábrázolás így
+nézhet ki:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> mount <span class="op">{</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> mount <span class="op">*</span>next<span class="op">;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> dentry <span class="op">*</span>mountpoint<span class="op">;</span>   <span class="co">/* a közös fában lévő pont */</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> dentry <span class="op">*</span>root<span class="op">;</span>         <span class="co">/* a csatolt fs gyökere */</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> super_block <span class="op">*</span>sb<span class="op">;</span>      <span class="co">/* a csatolt fs szuperblokkja */</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span> flags<span class="op">;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A mount folyamata lépésenként a következő:</p>
+<ol type="1">
+<li>Ellenőrizzük, hogy a <code>target</code> útvonal létező könyvtárra
+mutat, és a dentry <code>inode</code>-ja valóban könyvtár.</li>
+<li>Az <code>fstype</code> alapján meghívjuk a fájlrendszer
+<code>fill_super</code> vagy <code>mount</code> metódusát, amely
+beolvassa a szuperblokkot, felépíti a gyökér-inode-ot és a root
+dentry-t.</li>
+<li>Lefoglalunk egy <code>struct mount</code>-ot, beállítjuk a
+<code>mountpoint</code>-ot és a <code>root</code>-ot.</li>
+<li>A mount-ot beillesztjük a processz mount-névterébe (egyszerű esetben
+egy globális listába).</li>
+<li>A path feloldás során a VFS ügyel arra, hogy ha a bejárás eléri a
+<code>mountpoint</code>-ot, átlépjen a hozzá tartozó
+<code>root</code>-ra.</li>
+</ol>
+<p>Ezt a lépést egy szándékosan egyszerű függvényben így lehet
+összefoglalni:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> vfs_mount<span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>source<span class="op">,</span> <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>target<span class="op">,</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>              <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>fstype<span class="op">,</span> <span class="dt">unsigned</span> <span class="dt">long</span> flags<span class="op">)</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> dentry <span class="op">*</span>d <span class="op">=</span> path_resolve<span class="op">(</span>target<span class="op">);</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>IS_ERR<span class="op">(</span>d<span class="op">))</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> PTR_ERR<span class="op">(</span>d<span class="op">);</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>S_ISDIR<span class="op">(</span>d<span class="op">-&gt;</span>d_inode<span class="op">-&gt;</span>i_mode<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>        dput<span class="op">(</span>d<span class="op">);</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>ENOTDIR<span class="op">;</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> file_system_type <span class="op">*</span>fs <span class="op">=</span> lookup_fs<span class="op">(</span>fstype<span class="op">);</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>fs<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>        dput<span class="op">(</span>d<span class="op">);</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>ENODEV<span class="op">;</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> super_block <span class="op">*</span>sb <span class="op">=</span> fs<span class="op">-&gt;</span>mount<span class="op">(</span>source<span class="op">,</span> flags<span class="op">);</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>IS_ERR<span class="op">(</span>sb<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>        dput<span class="op">(</span>d<span class="op">);</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> PTR_ERR<span class="op">(</span>sb<span class="op">);</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> mount <span class="op">*</span>mnt <span class="op">=</span> kzalloc<span class="op">(</span><span class="kw">sizeof</span><span class="op">(*</span>mnt<span class="op">));</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>mnt<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>        sb<span class="op">-&gt;</span>s_op<span class="op">-&gt;</span>put_super<span class="op">(</span>sb<span class="op">);</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>        dput<span class="op">(</span>d<span class="op">);</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>ENOMEM<span class="op">;</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>    mnt<span class="op">-&gt;</span>mountpoint <span class="op">=</span> d<span class="op">;</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>    mnt<span class="op">-&gt;</span>root <span class="op">=</span> sb<span class="op">-&gt;</span>s_root<span class="op">;</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>    mnt<span class="op">-&gt;</span>sb <span class="op">=</span> sb<span class="op">;</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>    mnt<span class="op">-&gt;</span>flags <span class="op">=</span> flags<span class="op">;</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a>    mount_list_insert<span class="op">(</span>mnt<span class="op">);</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A példa adatszerkezetei szándékosan egyszerűsítettek; valós kernelben
+a mount névtér per processz, a lockolás finomabb, és a mount pontok
+referencia-számlálása is részletesebb. A lényeg az, hogy a
+<code>source</code>, <code>target</code>, <code>fstype</code> fogalmak
+már ebben a minimális modellben is szétválnak. A <code>source</code>
+lehet blokk-eszköz (<code>/dev/vdb1</code>) vagy virtuális forrás
+(<code>"none"</code> memfs esetén); a <code>target</code> mindig egy már
+létező könyvtár a közös fában.</p>
+<p>A referencia-szerződés ebben a modellben is explicit: a
+<code>path_resolve</code> egy referenciát ad a hívónak, a
+<code>vfs_mount</code> ezt sikeres csatolás esetén átadja a
+<code>struct mount</code>-nak (<code>mnt-&gt;mountpoint</code>),
+hibaágon pedig <code>dput</code>-tal elengedi. A
+<code>mnt-&gt;root</code> a szuperblokk saját <code>s_root</code>
+dentry-je, amelyet a szuperblokk életciklusa tart életben; a mount
+leválasztásakor mindkét referencia felszabadul.</p>
+<p>A mount pont alatti korábbi tartalom nem vész el, csak átmenetileg
+eltűnik a path feloldás elől. Ha a mount-ot leválasztjuk, az eredeti
+dentry-inode pár ismét láthatóvá válik. Ezt a tulajdonságot a VFS-nek
+úgy kell kezelnie, hogy a path bejárás közben minden komponensnél
+megvizsgálja, van-e aktív mount az adott dentry-n.</p>
+<h3 data-number="29.3.3" id="dentry-a-névtér-komponense"><span
+class="header-section-number">29.3.3</span> 3. Dentry: a névtér
+komponense</h3>
+<p>A dentry (directory entry) a VFS memóriabeli névtér-eleme. Nem
+feltétlenül egyezik meg a lemezen tárolt könyvtárbejegyzéssel; a VFS
+dentry-ket gyorsítótárként is használ. Egy dentry jellemzően a következő
+mezőket tartalmazza:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> qstr <span class="op">{</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>name<span class="op">;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span> len<span class="op">;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> dentry <span class="op">{</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> qstr d_name<span class="op">;</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> inode <span class="op">*</span>d_inode<span class="op">;</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> dentry <span class="op">*</span>d_parent<span class="op">;</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> list_head d_hash<span class="op">;</span>    <span class="co">/* a dentry cache hash-láncának eleme */</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    atomic_t d_count<span class="op">;</span>           <span class="co">/* hivatkozások száma */</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A <code>d_count</code> referencia-számláló. A VFS szabály: amíg egy
+kód dentry-mutatót tart, a számlálót növelnie kell (<code>dget</code>),
+és ha már nincs szüksége rá, csökkentenie kell (<code>dput</code>). Ez
+megakadályozza, hogy a dentry-t felszabadítsuk, miközben egy másik
+útvonal-feloldás még használja. A <code>d_parent</code> a szülőre mutat,
+így a felfelé haladás és a relatív útvonalak is kezelhetők.</p>
+<p>A dentry cache célja, hogy ugyanazon név feloldását ne kelljen minden
+<code>open</code>-nél a lemezen kezdeni. A VFS egy hash-táblában tárolja
+a <code>(parent, name)</code> párokat. A lookup nagyjából így
+működik:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> dentry <span class="op">*</span>d_lookup<span class="op">(</span><span class="kw">struct</span> dentry <span class="op">*</span>parent<span class="op">,</span> <span class="kw">struct</span> qstr <span class="op">*</span>name<span class="op">)</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span> hash <span class="op">=</span> dentry_hash<span class="op">(</span>parent<span class="op">,</span> name<span class="op">)</span> <span class="op">&amp;</span> <span class="op">(</span>DHASH_SIZE <span class="op">-</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> dentry <span class="op">*</span>d<span class="op">;</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    list_for_each_entry<span class="op">(</span>d<span class="op">,</span> <span class="op">&amp;</span>dentry_hashtable<span class="op">[</span>hash<span class="op">],</span> d_hash<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>d<span class="op">-&gt;</span>d_parent <span class="op">==</span> parent <span class="op">&amp;&amp;</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>            qstr_equal<span class="op">(&amp;</span>d<span class="op">-&gt;</span>d_name<span class="op">,</span> name<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>            dget<span class="op">(</span>d<span class="op">);</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> d<span class="op">;</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> NULL<span class="op">;</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ha nincs találat, a VFS a szülő inode <code>lookup</code> műveletét
+hívja, amely a fájlrendszer-specifikus könyvtárbeolvasást végzi. A
+lookup ABI:
+<code>int lookup(struct inode *dir, struct dentry *child)</code>, ahol a
+<code>child</code> a <code>path_resolve</code> által lefoglalt
+(<code>d_alloc</code>), a szülőhöz kötött, elnevezett
+(<code>d_name</code>, <code>d_parent</code>), de a hash-be még be nem
+tett dentry; a fájlrendszer a megtalált inode-ot
+<code>d_add(child, inode)</code>-dal köti be a cache-be
+(<code>d_add</code> = <code>d_instantiate</code> + hash-be szúrás),
+hiány esetén <code>d_add(child, NULL)</code>-lal negatív dentry-t hoz
+létre. Negatív dentry-ket is érdemes cache-elni: ha egy név nem létezik,
+a negatív bejegyzés gyors <code>ENOENT</code> választ ad a következő
+keresésnél.</p>
+<p>Az útvonal-feloldás (<code>path_resolve</code>) komponensenként
+halad. Az alábbi ábra a <code>/mnt/demo.txt</code> feloldását
+lépésenként mutatja, a kód utána következik.</p>
+<figure id="fig-os112-path-walk">
+<div class="fig-interactive"><iframe src="figures/html/os112-path-walk.html" title="Hat kis panel a gyökér-fs (/, mnt, etc) és a memfs (memfs root, demo.txt) fájával. 1: dget(root), tartott [/]. 2: mnt cache-találat, tartott [mnt], hits 1. 3: mount-átlépés, tartott [memfs root]. 4: demo.txt miss, lookup, új dentry a cache-be, tartott [demo.txt], misses 1. 5: return demo.txt. 6: a második futás végén hits 2, misses 0." loading="lazy" style="width:100%;border:0;height:640px"></iframe><noscript><img src="figures/img/os112-path-walk.png" style="width:100.0%"
+alt="Hat kis panel a gyökér-fs (/, mnt, etc) és a memfs (memfs root, demo.txt) fájával. 1: dget(root), tartott [/]. 2: mnt cache-találat, tartott [mnt], hits 1. 3: mount-átlépés, tartott [memfs root]. 4: demo.txt miss, lookup, új dentry a cache-be, tartott [demo.txt], misses 1. 5: return demo.txt. 6: a második futás végén hits 2, misses 0." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/os112-path-walk.png" style="width:100.0%"
+alt="Hat kis panel a gyökér-fs (/, mnt, etc) és a memfs (memfs root, demo.txt) fájával. 1: dget(root), tartott [/]. 2: mnt cache-találat, tartott [mnt], hits 1. 3: mount-átlépés, tartott [memfs root]. 4: demo.txt miss, lookup, új dentry a cache-be, tartott [demo.txt], misses 1. 5: return demo.txt. 6: a második futás végén hits 2, misses 0." /></details></div>
+<figcaption>A <code>/mnt/demo.txt</code> feloldása és a
+dentry-referenciák: minden ciklusiteráció végén pontosan egy referencia
+van érvényben; a mountpontnál a referencia a memfs gyökerére cserélődik,
+a második futásban mindkét komponens cache-találat</figcaption>
+</figure>
+<div class="sourceCode" id="cb6"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* A hívó egy referenciát kap vissza; ezt dput-tal köteles elengedni.</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="co"> * A függvény a kezdő dentry-re maga vesz referenciát, és minden</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="co"> * közbenső dentry-re pontosan egy referencia van érvényben. */</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> dentry <span class="op">*</span>path_resolve<span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>path<span class="op">)</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> dentry <span class="op">*</span>d<span class="op">;</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(*</span>path <span class="op">==</span> <span class="ch">&#39;/&#39;</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>        d <span class="op">=</span> dget<span class="op">(</span>current<span class="op">-&gt;</span>fs<span class="op">-&gt;</span>root<span class="op">);</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="op">(*</span>path <span class="op">==</span> <span class="ch">&#39;/&#39;</span><span class="op">)</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>            path<span class="op">++;</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>        d <span class="op">=</span> dget<span class="op">(</span>current<span class="op">-&gt;</span>fs<span class="op">-&gt;</span>pwd<span class="op">);</span>   <span class="co">/* relatív út a cwd-ből indul */</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(*</span>path<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>        <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>end <span class="op">=</span> strchrnul<span class="op">(</span>path<span class="op">,</span> <span class="ch">&#39;/&#39;</span><span class="op">);</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>        <span class="kw">struct</span> qstr name <span class="op">=</span> <span class="op">{</span> path<span class="op">,</span> end <span class="op">-</span> path <span class="op">};</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>        <span class="kw">struct</span> dentry <span class="op">*</span>child<span class="op">;</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(!</span>d<span class="op">-&gt;</span>d_inode <span class="op">||</span> <span class="op">!</span>S_ISDIR<span class="op">(</span>d<span class="op">-&gt;</span>d_inode<span class="op">-&gt;</span>i_mode<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>            dput<span class="op">(</span>d<span class="op">);</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> ERR_PTR<span class="op">(-</span>ENOTDIR<span class="op">);</span></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>name<span class="op">.</span>len <span class="op">==</span> <span class="dv">1</span> <span class="op">&amp;&amp;</span> name<span class="op">.</span>name<span class="op">[</span><span class="dv">0</span><span class="op">]</span> <span class="op">==</span> <span class="ch">&#39;.&#39;</span><span class="op">)</span></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a>            <span class="cf">goto</span> next<span class="op">;</span>                 <span class="co">/* &quot;.&quot; : ugyanaz a dentry marad */</span></span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>name<span class="op">.</span>len <span class="op">==</span> <span class="dv">2</span> <span class="op">&amp;&amp;</span> <span class="op">!</span>memcmp<span class="op">(</span>name<span class="op">.</span>name<span class="op">,</span> <span class="st">&quot;..&quot;</span><span class="op">,</span> <span class="dv">2</span><span class="op">))</span> <span class="op">{</span></span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a>            <span class="kw">struct</span> dentry <span class="op">*</span>up<span class="op">;</span></span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>d <span class="op">==</span> current<span class="op">-&gt;</span>fs<span class="op">-&gt;</span>root<span class="op">)</span></span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a>                <span class="cf">goto</span> next<span class="op">;</span>             <span class="co">/* a gyökér szülője önmaga */</span></span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a>            <span class="cf">while</span> <span class="op">(</span>is_mount_root<span class="op">(</span>d<span class="op">))</span> <span class="op">{</span> <span class="co">/* mount gyökeréből a mountpontra lépünk vissza */</span></span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a>                up <span class="op">=</span> dget<span class="op">(</span>mountpoint_of<span class="op">(</span>d<span class="op">));</span></span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a>                dput<span class="op">(</span>d<span class="op">);</span></span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a>                d <span class="op">=</span> up<span class="op">;</span></span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a>            up <span class="op">=</span> dget<span class="op">(</span>d<span class="op">-&gt;</span>d_parent<span class="op">);</span></span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a>            dput<span class="op">(</span>d<span class="op">);</span></span>
+<span id="cb6-39"><a href="#cb6-39" aria-hidden="true" tabindex="-1"></a>            d <span class="op">=</span> up<span class="op">;</span></span>
+<span id="cb6-40"><a href="#cb6-40" aria-hidden="true" tabindex="-1"></a>            <span class="cf">goto</span> next<span class="op">;</span></span>
+<span id="cb6-41"><a href="#cb6-41" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-42"><a href="#cb6-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-43"><a href="#cb6-43" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* A d_lookup találat esetén már megnövelt referenciával adja</span></span>
+<span id="cb6-44"><a href="#cb6-44" aria-hidden="true" tabindex="-1"></a><span class="co">         * vissza a gyermeket; a szülő referenciája a hívóé marad. */</span></span>
+<span id="cb6-45"><a href="#cb6-45" aria-hidden="true" tabindex="-1"></a>        child <span class="op">=</span> d_lookup<span class="op">(</span>d<span class="op">,</span> <span class="op">&amp;</span>name<span class="op">);</span></span>
+<span id="cb6-46"><a href="#cb6-46" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(!</span>child<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-47"><a href="#cb6-47" aria-hidden="true" tabindex="-1"></a>            <span class="dt">int</span> err<span class="op">;</span></span>
+<span id="cb6-48"><a href="#cb6-48" aria-hidden="true" tabindex="-1"></a>            <span class="co">/* d_alloc: a szülőhöz kötött, elnevezett, még nem hash-elt dentry */</span></span>
+<span id="cb6-49"><a href="#cb6-49" aria-hidden="true" tabindex="-1"></a>            child <span class="op">=</span> d_alloc<span class="op">(</span>d<span class="op">,</span> <span class="op">&amp;</span>name<span class="op">);</span></span>
+<span id="cb6-50"><a href="#cb6-50" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(!</span>child<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-51"><a href="#cb6-51" aria-hidden="true" tabindex="-1"></a>                dput<span class="op">(</span>d<span class="op">);</span></span>
+<span id="cb6-52"><a href="#cb6-52" aria-hidden="true" tabindex="-1"></a>                <span class="cf">return</span> ERR_PTR<span class="op">(-</span>ENOMEM<span class="op">);</span></span>
+<span id="cb6-53"><a href="#cb6-53" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb6-54"><a href="#cb6-54" aria-hidden="true" tabindex="-1"></a>            <span class="co">/* a lookup d_add(child, inode)-t vagy d_add(child, NULL)-t hív */</span></span>
+<span id="cb6-55"><a href="#cb6-55" aria-hidden="true" tabindex="-1"></a>            err <span class="op">=</span> d<span class="op">-&gt;</span>d_inode<span class="op">-&gt;</span>i_op<span class="op">-&gt;</span>lookup<span class="op">(</span>d<span class="op">-&gt;</span>d_inode<span class="op">,</span> child<span class="op">);</span></span>
+<span id="cb6-56"><a href="#cb6-56" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>err<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-57"><a href="#cb6-57" aria-hidden="true" tabindex="-1"></a>                dput<span class="op">(</span>child<span class="op">);</span></span>
+<span id="cb6-58"><a href="#cb6-58" aria-hidden="true" tabindex="-1"></a>                dput<span class="op">(</span>d<span class="op">);</span></span>
+<span id="cb6-59"><a href="#cb6-59" aria-hidden="true" tabindex="-1"></a>                <span class="cf">return</span> ERR_PTR<span class="op">(</span>err<span class="op">);</span></span>
+<span id="cb6-60"><a href="#cb6-60" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb6-61"><a href="#cb6-61" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-62"><a href="#cb6-62" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(!</span>child<span class="op">-&gt;</span>d_inode<span class="op">)</span> <span class="op">{</span>        <span class="co">/* negatív dentry a cache-ből */</span></span>
+<span id="cb6-63"><a href="#cb6-63" aria-hidden="true" tabindex="-1"></a>            dput<span class="op">(</span>child<span class="op">);</span></span>
+<span id="cb6-64"><a href="#cb6-64" aria-hidden="true" tabindex="-1"></a>            dput<span class="op">(</span>d<span class="op">);</span></span>
+<span id="cb6-65"><a href="#cb6-65" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> ERR_PTR<span class="op">(-</span>ENOENT<span class="op">);</span></span>
+<span id="cb6-66"><a href="#cb6-66" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-67"><a href="#cb6-67" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-68"><a href="#cb6-68" aria-hidden="true" tabindex="-1"></a>        dput<span class="op">(</span>d<span class="op">);</span>                      <span class="co">/* a szülőre már nincs szükség */</span></span>
+<span id="cb6-69"><a href="#cb6-69" aria-hidden="true" tabindex="-1"></a>        d <span class="op">=</span> child<span class="op">;</span></span>
+<span id="cb6-70"><a href="#cb6-70" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-71"><a href="#cb6-71" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="op">(</span>mount_here<span class="op">(</span>d<span class="op">))</span> <span class="op">{</span>       <span class="co">/* egymásra csatolt mountok is lehetnek */</span></span>
+<span id="cb6-72"><a href="#cb6-72" aria-hidden="true" tabindex="-1"></a>            <span class="kw">struct</span> dentry <span class="op">*</span>mroot <span class="op">=</span> mount_root<span class="op">(</span>d<span class="op">);</span></span>
+<span id="cb6-73"><a href="#cb6-73" aria-hidden="true" tabindex="-1"></a>            dput<span class="op">(</span>d<span class="op">);</span>                  <span class="co">/* a mountpont referenciáját elengedjük */</span></span>
+<span id="cb6-74"><a href="#cb6-74" aria-hidden="true" tabindex="-1"></a>            d <span class="op">=</span> dget<span class="op">(</span>mroot<span class="op">);</span>          <span class="co">/* a mount gyökere külön referenciát kap */</span></span>
+<span id="cb6-75"><a href="#cb6-75" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-76"><a href="#cb6-76" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-77"><a href="#cb6-77" aria-hidden="true" tabindex="-1"></a>next<span class="op">:</span></span>
+<span id="cb6-78"><a href="#cb6-78" aria-hidden="true" tabindex="-1"></a>        path <span class="op">=</span> end<span class="op">;</span></span>
+<span id="cb6-79"><a href="#cb6-79" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="op">(*</span>path <span class="op">==</span> <span class="ch">&#39;/&#39;</span><span class="op">)</span></span>
+<span id="cb6-80"><a href="#cb6-80" aria-hidden="true" tabindex="-1"></a>            path<span class="op">++;</span></span>
+<span id="cb6-81"><a href="#cb6-81" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-82"><a href="#cb6-82" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-83"><a href="#cb6-83" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> d<span class="op">;</span></span>
+<span id="cb6-84"><a href="#cb6-84" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>.</code> komponens a dentry-t változatlanul hagyja; a
+<code>..</code> komponenst a VFS maga oldja fel a <code>d_parent</code>
+alapján, a mount gyökerénél előbb a mountpontra lép vissza, a folyamat
+gyökerénél pedig helyben marad. A példa három további dolgot rögzít,
+amit a naiv változat elrontott. Először: a cache-találat és a
+<code>lookup</code> eredménye külön <code>child</code> változóba kerül,
+így a <code>d_lookup</code> utáni <code>NULL</code> esetén nem történik
+<code>NULL</code>-dereferálás (<code>d-&gt;d_inode</code>). Másodszor:
+abszolút út a <code>fs-&gt;root</code>-ból, relatív út a
+<code>fs-&gt;pwd</code>-ből indul, és a kezdő dentry-re a függvény maga
+vesz referenciát. Harmadszor: a mount-átlépésnél a mountpont
+referenciáját elengedjük, a mount gyökerére pedig újat veszünk, így a
+bejárás végén a hívó pontosan egy referenciát kap. A <code>lookup</code>
+sikeres visszatérése is referenciával adja vissza a dentry-t (ezt a
+<code>d_splice_alias</code> biztosítja), hiba esetén pedig
+<code>ERR_PTR</code>-t ad; a <code>path_resolve</code> mindkét esetet
+kezeli. A fejezet <code>lookup</code> ABI-ja egységesen
+<code>(struct inode *dir, const char *name, size_t len)</code>; a valódi
+Linux VFS ezzel szemben
+<code>(struct inode *dir, struct dentry *dentry, unsigned int flags)</code>
+szignatúrát használ, tehát a tanuló modell és a valódi kernel ABI-ja nem
+azonos.</p>
+<h3 data-number="29.3.4" id="inode-és-inode-operations"><span
+class="header-section-number">29.3.4</span> 4. Inode és inode
+operations</h3>
+<p>Az inode az objektumot (fájlt, könyvtárat, eszközt) írja le a
+fájlrendszer szempontjából. A VFS inode nem a lemezes inode, hanem annak
+memóriabeli reprezentációja. A közös mezők mellett a
+fájlrendszer-specifikus adatok egy privát mutatóban élnek:</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> inode <span class="op">{</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">long</span> i_ino<span class="op">;</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> i_mode<span class="op">;</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> i_size<span class="op">;</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> super_block <span class="op">*</span>i_sb<span class="op">;</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="kw">struct</span> inode_operations <span class="op">*</span>i_op<span class="op">;</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="kw">struct</span> file_operations <span class="op">*</span>i_fop<span class="op">;</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">*</span>i_private<span class="op">;</span>       <span class="co">/* fs-specifikus adat */</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>    spinlock_t i_lock<span class="op">;</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A <code>i_mode</code> a típust és a jogosultságokat hordozza; a
+<code>S_ISDIR</code> és <code>S_ISREG</code> makrókkal vizsgálható. A
+<code>i_private</code> például egy memfs esetén a RAM-beli inode-ra
+mutató pointer lehet.</p>
+<p>Az inode-műveletek a névtér-műveletek egy részét fedik le:</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> inode_operations <span class="op">{</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>lookup<span class="op">)(</span><span class="kw">struct</span> inode <span class="op">*</span>dir<span class="op">,</span> <span class="kw">struct</span> dentry <span class="op">*</span>child<span class="op">);</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>create<span class="op">)(</span><span class="kw">struct</span> inode <span class="op">*</span>dir<span class="op">,</span> <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>name<span class="op">,</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>                  <span class="dt">size_t</span> len<span class="op">,</span> mode_t mode<span class="op">);</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>unlink<span class="op">)(</span><span class="kw">struct</span> inode <span class="op">*</span>dir<span class="op">,</span> <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>name<span class="op">,</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>                  <span class="dt">size_t</span> len<span class="op">);</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>mkdir<span class="op">)(</span><span class="kw">struct</span> inode <span class="op">*</span>dir<span class="op">,</span> <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>name<span class="op">,</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>                 <span class="dt">size_t</span> len<span class="op">,</span> mode_t mode<span class="op">);</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>rmdir<span class="op">)(</span><span class="kw">struct</span> inode <span class="op">*</span>dir<span class="op">,</span> <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>name<span class="op">,</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>                 <span class="dt">size_t</span> len<span class="op">);</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>setattr<span class="op">)(</span><span class="kw">struct</span> dentry <span class="op">*</span>d<span class="op">,</span> <span class="kw">struct</span> iattr <span class="op">*</span>attr<span class="op">);</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>getattr<span class="op">)(</span><span class="dt">const</span> <span class="kw">struct</span> path <span class="op">*</span>p<span class="op">,</span> <span class="kw">struct</span> kstat <span class="op">*</span>stat<span class="op">);</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A <code>lookup</code> feladata a könyvtárbejegyzés megkeresése. A
+memfs példában egy láncolt listát vagy tömböt járunk be:</p>
+<div class="sourceCode" id="cb9"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> memfs_inode <span class="op">{</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span> ino<span class="op">;</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> mode<span class="op">;</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> size<span class="op">;</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">char</span> <span class="op">*</span>data<span class="op">;</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> list_head children<span class="op">;</span> <span class="co">/* könyvtár bejegyzések */</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> mutex lock<span class="op">;</span>         <span class="co">/* a data, size és children védelme */</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A <code>lookup</code> implementáció például:</p>
+<div class="sourceCode" id="cb10"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> memfs_lookup<span class="op">(</span><span class="kw">struct</span> inode <span class="op">*</span>dir<span class="op">,</span> <span class="kw">struct</span> dentry <span class="op">*</span>child<span class="op">)</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> memfs_inode <span class="op">*</span>m <span class="op">=</span> dir<span class="op">-&gt;</span>i_private<span class="op">;</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> memfs_entry <span class="op">*</span>e<span class="op">;</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> inode <span class="op">*</span>ino <span class="op">=</span> NULL<span class="op">;</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>    mutex_lock<span class="op">(&amp;</span>m<span class="op">-&gt;</span>lock<span class="op">);</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>    list_for_each_entry<span class="op">(</span>e<span class="op">,</span> <span class="op">&amp;</span>m<span class="op">-&gt;</span>children<span class="op">,</span> list<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>strlen<span class="op">(</span>e<span class="op">-&gt;</span>name<span class="op">)</span> <span class="op">==</span> child<span class="op">-&gt;</span>d_name<span class="op">.</span>len <span class="op">&amp;&amp;</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>            memcmp<span class="op">(</span>e<span class="op">-&gt;</span>name<span class="op">,</span> child<span class="op">-&gt;</span>d_name<span class="op">.</span>name<span class="op">,</span> child<span class="op">-&gt;</span>d_name<span class="op">.</span>len<span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a>            ino <span class="op">=</span> memfs_iget<span class="op">(</span>e<span class="op">-&gt;</span>ino<span class="op">);</span>   <span class="co">/* referenciát vesz a zár elengedése előtt */</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a>    mutex_unlock<span class="op">(&amp;</span>m<span class="op">-&gt;</span>lock<span class="op">);</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>    d_add<span class="op">(</span>child<span class="op">,</span> ino<span class="op">);</span>                  <span class="co">/* ino == NULL: negatív dentry */</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>d_add</code> a dentry-t és az inode-ot összekapcsolja, és
+felviszi a dentry cache-be. A példa itt leegyszerűsített; a tanulási
+szempontból fontos, hogy a <code>lookup</code> nem hoz létre új fájlt,
+csak meglévőt keres (hiány esetén negatív dentry-t hagy). A létrehozás
+külön <code>create</code> művelet. A <code>memfs_lookup</code>
+szignatúrája pontosan az <code>inode_operations</code> fenti ABI-ját
+követi: <code>(struct inode *dir, struct dentry *child)</code>; a
+<code>path_resolve</code> a <code>d_alloc</code>-kal elkészített
+<code>child</code> dentry-vel hívja.</p>
+<h3 data-number="29.3.5" id="file-operations-és-file-object"><span
+class="header-section-number">29.3.5</span> 5. File operations és file
+object</h3>
+<p>Az inode a fájlrendszerben tárolt objektumot írja le, de a megnyitott
+fájlhoz tartozó állapotot a <code>struct file</code> tárolja. Ez a
+különválasztás az egyik leggyakoribb félreértés forrása: az inode nem
+tartalmaz fájlleíró-tulajdonságot, mint az aktuális eltolás (offset), a
+nyitási mód vagy a legutóbbi pozíció.</p>
+<div class="sourceCode" id="cb11"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> file <span class="op">{</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> mutex f_lock<span class="op">;</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> inode <span class="op">*</span>f_inode<span class="op">;</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> f_flags<span class="op">;</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>    loff_t f_pos<span class="op">;</span>                 <span class="co">/* aktuális offset */</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span> f_mode<span class="op">;</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="kw">struct</span> file_operations <span class="op">*</span>f_op<span class="op">;</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">*</span>f_private<span class="op">;</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>    atomic_t f_count<span class="op">;</span>             <span class="co">/* hivatkozások száma: fd-táblák, dup, fork */</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A <code>f_flags</code> az <code>open(2)</code> nyers flagjeit őrzi
+(például <code>O_RDWR</code>), a <code>f_mode</code> pedig a kernel
+belső, származtatott hozzáférési bitjeit (<code>FMODE_READ</code>,
+<code>FMODE_WRITE</code>) tartalmazza. A két mező nem keverendő: az
+<code>O_RDONLY</code> értéke 0, ezért az
+<code>f_mode &amp; O_RDONLY</code> alakú ellenőrzés mindig hamis, és a
+jó szándékú <code>!(f_mode &amp; O_RDONLY)</code> feltétel minden
+olvasást elutasítana. A hozzáférési módot mindig
+<code>f_mode &amp; FMODE_READ</code>/<code>FMODE_WRITE</code> vagy
+<code>f_flags &amp; O_ACCMODE</code> vizsgálja.</p>
+<p>A <code>f_count</code> számláló a <code>dup</code>/<code>fork</code>
+miatt kell: a <code>close</code>/<code>fput</code> csökkenti, és csak
+nullánál hívja a <code>release</code>-t, majd szabadítja fel a
+<code>struct file</code>-t.</p>
+<p>A <code>f_pos</code> a következő olvasási vagy írási pozíció. A
+<code>read</code> és <code>write</code> rendszerhívás ezt a mezőt
+automatikusan növeli. A <code>lseek</code> rendszerhívás ezt a mezőt
+módosítja. A <code>pread</code> és <code>pwrite</code> ezzel szemben nem
+módosítják a <code>f_pos</code>-t.</p>
+<p>A <code>file_operations</code> tábla a megnyitott fájlra vonatkozó
+műveleteket tartalmazza:</p>
+<div class="sourceCode" id="cb12"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> file_operations <span class="op">{</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>open<span class="op">)(</span><span class="kw">struct</span> inode <span class="op">*</span>ino<span class="op">,</span> <span class="kw">struct</span> file <span class="op">*</span>f<span class="op">);</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ssize_t</span> <span class="op">(*</span>read<span class="op">)(</span><span class="kw">struct</span> file <span class="op">*</span>f<span class="op">,</span> <span class="dt">char</span> __user <span class="op">*</span>buf<span class="op">,</span> <span class="dt">size_t</span> count<span class="op">,</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>                    loff_t <span class="op">*</span>pos<span class="op">);</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ssize_t</span> <span class="op">(*</span>write<span class="op">)(</span><span class="kw">struct</span> file <span class="op">*</span>f<span class="op">,</span> <span class="dt">const</span> <span class="dt">char</span> __user <span class="op">*</span>buf<span class="op">,</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>                     <span class="dt">size_t</span> count<span class="op">,</span> loff_t <span class="op">*</span>pos<span class="op">);</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a>    loff_t <span class="op">(*</span>llseek<span class="op">)(</span><span class="kw">struct</span> file <span class="op">*</span>f<span class="op">,</span> loff_t offset<span class="op">,</span> <span class="dt">int</span> whence<span class="op">);</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>release<span class="op">)(</span><span class="kw">struct</span> inode <span class="op">*</span>ino<span class="op">,</span> <span class="kw">struct</span> file <span class="op">*</span>f<span class="op">);</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A <code>__user</code> jelölés dokumentálja, hogy a mutató
+felhasználói címre mutat; a kód csak
+<code>copy_to_user</code>/<code>copy_from_user</code> segítségével
+érheti el, közvetlen <code>memcpy</code>-vel nem. A jelölést a
+<code>sparse</code> ellenőrzi, a fordító önmagában nem kényszeríti
+ki.</p>
+<p>A <code>read</code> és <code>write</code> implementációjának a
+<code>pos</code> mutatón keresztül kell frissítenie az offsetet. Ez a
+VFS-szerződés része, és a fájlrendszer írója nem hivatkozhat közvetlenül
+a <code>f_pos</code> mezőre a <code>file_operations</code>-ön belül. Egy
+példa memfs-olvasás:</p>
+<div class="sourceCode" id="cb13"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="dt">ssize_t</span> memfs_read<span class="op">(</span><span class="kw">struct</span> file <span class="op">*</span>f<span class="op">,</span> <span class="dt">char</span> __user <span class="op">*</span>buf<span class="op">,</span> <span class="dt">size_t</span> count<span class="op">,</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a>                   loff_t <span class="op">*</span>pos<span class="op">)</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> inode <span class="op">*</span>ino <span class="op">=</span> f<span class="op">-&gt;</span>f_inode<span class="op">;</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> memfs_inode <span class="op">*</span>m <span class="op">=</span> ino<span class="op">-&gt;</span>i_private<span class="op">;</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> n<span class="op">;</span></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ssize_t</span> ret<span class="op">;</span></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Zárolási sorrend: először az inode, utána a file object.</span></span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a><span class="co">     * A fordított sorrend más útvonalon holtpontot okozhat. */</span></span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a>    mutex_lock<span class="op">(&amp;</span>m<span class="op">-&gt;</span>lock<span class="op">);</span>     <span class="co">/* data, size: más open is ezt használja */</span></span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a>    mutex_lock<span class="op">(&amp;</span>f<span class="op">-&gt;</span>f_lock<span class="op">);</span>   <span class="co">/* *pos: csak ezt a file objectet védi */</span></span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(*</span>pos <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a>        ret <span class="op">=</span> <span class="op">-</span>EINVAL<span class="op">;</span></span>
+<span id="cb13-16"><a href="#cb13-16" aria-hidden="true" tabindex="-1"></a>        <span class="cf">goto</span> out<span class="op">;</span></span>
+<span id="cb13-17"><a href="#cb13-17" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-18"><a href="#cb13-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">((</span><span class="dt">uint64_t</span><span class="op">)*</span>pos <span class="op">&gt;=</span> m<span class="op">-&gt;</span>size<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-19"><a href="#cb13-19" aria-hidden="true" tabindex="-1"></a>        ret <span class="op">=</span> <span class="dv">0</span><span class="op">;</span>              <span class="co">/* EOF */</span></span>
+<span id="cb13-20"><a href="#cb13-20" aria-hidden="true" tabindex="-1"></a>        <span class="cf">goto</span> out<span class="op">;</span></span>
+<span id="cb13-21"><a href="#cb13-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-22"><a href="#cb13-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-23"><a href="#cb13-23" aria-hidden="true" tabindex="-1"></a>    n <span class="op">=</span> min<span class="op">(</span>count<span class="op">,</span> <span class="op">(</span><span class="dt">size_t</span><span class="op">)(</span>m<span class="op">-&gt;</span>size <span class="op">-</span> <span class="op">*</span>pos<span class="op">));</span></span>
+<span id="cb13-24"><a href="#cb13-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>copy_to_user<span class="op">(</span>buf<span class="op">,</span> m<span class="op">-&gt;</span>data <span class="op">+</span> <span class="op">*</span>pos<span class="op">,</span> n<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb13-25"><a href="#cb13-25" aria-hidden="true" tabindex="-1"></a>        ret <span class="op">=</span> <span class="op">-</span>EFAULT<span class="op">;</span>        <span class="co">/* hibás felhasználói cím, az offset nem nő */</span></span>
+<span id="cb13-26"><a href="#cb13-26" aria-hidden="true" tabindex="-1"></a>        <span class="cf">goto</span> out<span class="op">;</span></span>
+<span id="cb13-27"><a href="#cb13-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-28"><a href="#cb13-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">*</span>pos <span class="op">+=</span> n<span class="op">;</span></span>
+<span id="cb13-29"><a href="#cb13-29" aria-hidden="true" tabindex="-1"></a>    ret <span class="op">=</span> <span class="op">(</span><span class="dt">ssize_t</span><span class="op">)</span>n<span class="op">;</span></span>
+<span id="cb13-30"><a href="#cb13-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-31"><a href="#cb13-31" aria-hidden="true" tabindex="-1"></a>out<span class="op">:</span></span>
+<span id="cb13-32"><a href="#cb13-32" aria-hidden="true" tabindex="-1"></a>    mutex_unlock<span class="op">(&amp;</span>f<span class="op">-&gt;</span>f_lock<span class="op">);</span></span>
+<span id="cb13-33"><a href="#cb13-33" aria-hidden="true" tabindex="-1"></a>    mutex_unlock<span class="op">(&amp;</span>m<span class="op">-&gt;</span>lock<span class="op">);</span></span>
+<span id="cb13-34"><a href="#cb13-34" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb13-35"><a href="#cb13-35" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>f_lock</code> csak az <em>azonos</em> file objectet használó
+hívásokat sorosítja: két külön <code>open</code> két külön
+<code>struct file</code>-t és két külön <code>f_lock</code>-ot kap. Az
+inode adatpufferét (<code>m-&gt;data</code>) és méretét
+(<code>m-&gt;size</code>) ezért külön, inode-szintű zár
+(<code>m-&gt;lock</code>) védi, különben egy másik fd-en végzett
+<code>write</code> vagy <code>truncate</code> átallokálhatja vagy
+felszabadíthatja a puffert, miközben a <code>read</code> még másol
+belőle. A <code>copy_to_user</code> a felhasználói címre ír,
+fault-biztos módon: hibás cím esetén <code>-EFAULT</code>-ot ad, nem
+omlik össze a kernel, és a <code>*pos</code> változatlan marad. A
+zárolási sorrend mindenhol inode-tól a file object felé halad; a
+fordított sorrend (file, majd inode) két párhuzamos műveletnél
+holtpontot okozhat.</p>
+<h3 data-number="29.3.6" id="fájlleírók-és-offset-kezelése"><span
+class="header-section-number">29.3.6</span> 6. Fájlleírók és offset
+kezelése</h3>
+<p>A felhasználói program számára a <code>open</code> visszatérési
+értéke egy kis egész szám, a fájlleíró (fd). A kernel ezt a számot
+indexként használja a folyamat <code>files</code> táblájában:</p>
+<div class="sourceCode" id="cb14"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MAX_FD </span><span class="dv">256</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> task_struct <span class="op">{</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> file <span class="op">*</span>files<span class="op">[</span>MAX_FD<span class="op">];</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A fájlleíró-allokáció a legkisebb szabad indexet adja. A
+<code>open</code> sikeres végrehajtásakor a <code>struct file</code>
+mutató bekerül a táblába. Ettől kezdve a <code>read</code>,
+<code>write</code>, <code>lseek</code>, <code>close</code> mind ezen a
+számon hivatkozik a fájlra.</p>
+<p>Az offset kezelése az egyik legkritikusabb VFS-szerződés. A
+<code>struct file</code> <code>f_pos</code>-a az open file description
+része, nem a fájlé. Ha ugyanazt a fájlt két külön <code>open</code>
+hívással nyitjuk meg, két külön <code>struct file</code> jön létre, és
+az offsetek függetlenek. Ha azonban a fájlleírót <code>dup</code>-pal
+vagy <code>fork</code>-kal másoljuk, a két fd ugyanarra a
+<code>struct file</code>-ra mutat, ezért az offsetet megosztják. Ez a
+POSIX-szemantika fontos oka annak, hogy a <code>struct file</code>
+referencia-számlálást is igényel.</p>
+<figure id="fig-os112-fd-file-inode">
+<div class="fig-interactive"><iframe src="figures/html/os112-fd-file-inode.html" title="Két panel. Az a) panelen a P1 fd-táblájában a 0–2 a terminál, fd3 és fd5 az A struct file-ra mutat (f_pos 16, refcount 2), fd4 a B struct file-ra (f_pos 0, refcount 1); mindkét file objektum ugyanarra a test.txt dentry-re (d_count 2) és memfs inode-ra (i_size 16) mutat. A b) panelen a write(fd5, 4) után az A f_pos-a 20, ezt fd3 is látja, a B f_pos-a 0 marad, az i_size 20." loading="lazy" style="width:100%;border:0;height:600px"></iframe><noscript><img src="figures/img/os112-fd-file-inode.png" style="width:100.0%"
+alt="Két panel. Az a) panelen a P1 fd-táblájában a 0–2 a terminál, fd3 és fd5 az A struct file-ra mutat (f_pos 16, refcount 2), fd4 a B struct file-ra (f_pos 0, refcount 1); mindkét file objektum ugyanarra a test.txt dentry-re (d_count 2) és memfs inode-ra (i_size 16) mutat. A b) panelen a write(fd5, 4) után az A f_pos-a 20, ezt fd3 is látja, a B f_pos-a 0 marad, az i_size 20." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/os112-fd-file-inode.png" style="width:100.0%"
+alt="Két panel. Az a) panelen a P1 fd-táblájában a 0–2 a terminál, fd3 és fd5 az A struct file-ra mutat (f_pos 16, refcount 2), fd4 a B struct file-ra (f_pos 0, refcount 1); mindkét file objektum ugyanarra a test.txt dentry-re (d_count 2) és memfs inode-ra (i_size 16) mutat. A b) panelen a write(fd5, 4) után az A f_pos-a 20, ezt fd3 is látja, a B f_pos-a 0 marad, az i_size 20." /></details></div>
+<figcaption>Fájlleírók, open file description és inode: két
+<code>open</code> és egy <code>dup</code> után fd3 és fd5 ugyanazt a
+<code>struct file</code>-t (közös <code>f_pos</code>) használja, fd4
+külön <code>struct file</code>-on, de ugyanazon a dentry-n és inode-on
+át ér el</figcaption>
+</figure>
+<p>Egy minimális <code>dup</code> implementáció a következő:</p>
+<div class="sourceCode" id="cb15"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> sys_dup<span class="op">(</span><span class="dt">int</span> oldfd<span class="op">)</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> file <span class="op">*</span>f <span class="op">=</span> fd_get<span class="op">(</span>oldfd<span class="op">);</span>   <span class="co">/* referenciát ad a file objectre */</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> newfd<span class="op">;</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>f<span class="op">)</span></span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>EBADF<span class="op">;</span></span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a>    newfd <span class="op">=</span> fd_alloc<span class="op">();</span></span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>newfd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a>        file_put<span class="op">(</span>f<span class="op">);</span>                  <span class="co">/* a sikertelen dup nem tart referenciát */</span></span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> newfd<span class="op">;</span></span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb15-14"><a href="#cb15-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-15"><a href="#cb15-15" aria-hidden="true" tabindex="-1"></a>    fd_set<span class="op">(</span>newfd<span class="op">,</span> f<span class="op">);</span>   <span class="co">/* a fd_get referenciáját az új fd átveszi */</span></span>
+<span id="cb15-16"><a href="#cb15-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> newfd<span class="op">;</span></span>
+<span id="cb15-17"><a href="#cb15-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>fd_get</code> a fájlleíró-táblából kikeresi a
+<code>struct file</code>-t, és referenciát vesz rá; ezt a rendszerhívás
+végén <code>file_put</code>-tal kell elengedni. A <code>dup</code>
+esetében a megszerzett referencia átkerül az új fájlleíróba, így a két
+fd közös életciklusúvá válik. A <code>close</code> csak az egyik fd
+táblabejegyzését szünteti meg; a <code>struct file</code> akkor szabadul
+fel, amikor az utolsó hivatkozás is megszűnik. A táblát a keresés
+idejére rövid kritikus szakaszban kell zárni, de a tényleges I/O már a
+referenciával, a táblazáron kívül fut.</p>
+<p>A fájlleíró-tábla és a <code>struct file</code> kapcsolata a
+rendszerhívások rétegében:</p>
+<div class="sourceCode" id="cb16"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Az open() a nyers flagből belső hozzáférési módot származtat. */</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define FMODE_READ  </span><span class="bn">0x1</span><span class="bu">u</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define FMODE_WRITE </span><span class="bn">0x2</span><span class="bu">u</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> file_set_mode<span class="op">(</span><span class="kw">struct</span> file <span class="op">*</span>f<span class="op">,</span> <span class="dt">unsigned</span> <span class="dt">int</span> flags<span class="op">)</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">switch</span> <span class="op">(</span>flags <span class="op">&amp;</span> O_ACCMODE<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> O_RDONLY<span class="op">:</span> f<span class="op">-&gt;</span>f_mode <span class="op">=</span> FMODE_READ<span class="op">;</span>               <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> O_WRONLY<span class="op">:</span> f<span class="op">-&gt;</span>f_mode <span class="op">=</span> FMODE_WRITE<span class="op">;</span>              <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> O_RDWR<span class="op">:</span>   f<span class="op">-&gt;</span>f_mode <span class="op">=</span> FMODE_READ <span class="op">|</span> FMODE_WRITE<span class="op">;</span> <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb16-11"><a href="#cb16-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">default</span><span class="op">:</span>       f<span class="op">-&gt;</span>f_mode <span class="op">=</span> <span class="dv">0</span><span class="op">;</span>                        <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb16-12"><a href="#cb16-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb16-13"><a href="#cb16-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb16-14"><a href="#cb16-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-15"><a href="#cb16-15" aria-hidden="true" tabindex="-1"></a><span class="dt">ssize_t</span> sys_read<span class="op">(</span><span class="dt">int</span> fd<span class="op">,</span> <span class="dt">char</span> __user <span class="op">*</span>ubuf<span class="op">,</span> <span class="dt">size_t</span> count<span class="op">)</span></span>
+<span id="cb16-16"><a href="#cb16-16" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb16-17"><a href="#cb16-17" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> file <span class="op">*</span>f <span class="op">=</span> fd_get<span class="op">(</span>fd<span class="op">);</span>        <span class="co">/* referenciát ad */</span></span>
+<span id="cb16-18"><a href="#cb16-18" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ssize_t</span> ret<span class="op">;</span></span>
+<span id="cb16-19"><a href="#cb16-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-20"><a href="#cb16-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>f<span class="op">)</span></span>
+<span id="cb16-21"><a href="#cb16-21" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>EBADF<span class="op">;</span></span>
+<span id="cb16-22"><a href="#cb16-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!(</span>f<span class="op">-&gt;</span>f_mode <span class="op">&amp;</span> FMODE_READ<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb16-23"><a href="#cb16-23" aria-hidden="true" tabindex="-1"></a>        ret <span class="op">=</span> <span class="op">-</span>EBADF<span class="op">;</span>                   <span class="co">/* írásra nyitott fd-n nincs olvasás */</span></span>
+<span id="cb16-24"><a href="#cb16-24" aria-hidden="true" tabindex="-1"></a>        <span class="cf">goto</span> out<span class="op">;</span></span>
+<span id="cb16-25"><a href="#cb16-25" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb16-26"><a href="#cb16-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>f<span class="op">-&gt;</span>f_op<span class="op">-&gt;</span>read<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-27"><a href="#cb16-27" aria-hidden="true" tabindex="-1"></a>        ret <span class="op">=</span> <span class="op">-</span>EINVAL<span class="op">;</span>                  <span class="co">/* hiányzó read metódus */</span></span>
+<span id="cb16-28"><a href="#cb16-28" aria-hidden="true" tabindex="-1"></a>        <span class="cf">goto</span> out<span class="op">;</span></span>
+<span id="cb16-29"><a href="#cb16-29" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb16-30"><a href="#cb16-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-31"><a href="#cb16-31" aria-hidden="true" tabindex="-1"></a>    ret <span class="op">=</span> f<span class="op">-&gt;</span>f_op<span class="op">-&gt;</span>read<span class="op">(</span>f<span class="op">,</span> ubuf<span class="op">,</span> count<span class="op">,</span> <span class="op">&amp;</span>f<span class="op">-&gt;</span>f_pos<span class="op">);</span></span>
+<span id="cb16-32"><a href="#cb16-32" aria-hidden="true" tabindex="-1"></a>out<span class="op">:</span></span>
+<span id="cb16-33"><a href="#cb16-33" aria-hidden="true" tabindex="-1"></a>    file_put<span class="op">(</span>f<span class="op">);</span>                        <span class="co">/* a fd_get referenciáját elengedjük */</span></span>
+<span id="cb16-34"><a href="#cb16-34" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb16-35"><a href="#cb16-35" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb16-36"><a href="#cb16-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-37"><a href="#cb16-37" aria-hidden="true" tabindex="-1"></a>loff_t sys_lseek<span class="op">(</span><span class="dt">int</span> fd<span class="op">,</span> loff_t offset<span class="op">,</span> <span class="dt">int</span> whence<span class="op">)</span></span>
+<span id="cb16-38"><a href="#cb16-38" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb16-39"><a href="#cb16-39" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> file <span class="op">*</span>f <span class="op">=</span> fd_get<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb16-40"><a href="#cb16-40" aria-hidden="true" tabindex="-1"></a>    loff_t ret<span class="op">;</span></span>
+<span id="cb16-41"><a href="#cb16-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-42"><a href="#cb16-42" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>f<span class="op">)</span></span>
+<span id="cb16-43"><a href="#cb16-43" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>EBADF<span class="op">;</span></span>
+<span id="cb16-44"><a href="#cb16-44" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>f<span class="op">-&gt;</span>f_op<span class="op">-&gt;</span>llseek<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-45"><a href="#cb16-45" aria-hidden="true" tabindex="-1"></a>        ret <span class="op">=</span> <span class="op">-</span>ESPIPE<span class="op">;</span>                  <span class="co">/* nem seekelhető objektum, pl. pipe */</span></span>
+<span id="cb16-46"><a href="#cb16-46" aria-hidden="true" tabindex="-1"></a>        <span class="cf">goto</span> out<span class="op">;</span></span>
+<span id="cb16-47"><a href="#cb16-47" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb16-48"><a href="#cb16-48" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-49"><a href="#cb16-49" aria-hidden="true" tabindex="-1"></a>    ret <span class="op">=</span> f<span class="op">-&gt;</span>f_op<span class="op">-&gt;</span>llseek<span class="op">(</span>f<span class="op">,</span> offset<span class="op">,</span> whence<span class="op">);</span></span>
+<span id="cb16-50"><a href="#cb16-50" aria-hidden="true" tabindex="-1"></a>out<span class="op">:</span></span>
+<span id="cb16-51"><a href="#cb16-51" aria-hidden="true" tabindex="-1"></a>    file_put<span class="op">(</span>f<span class="op">);</span></span>
+<span id="cb16-52"><a href="#cb16-52" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb16-53"><a href="#cb16-53" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Az <code>O_RDONLY</code> értéke 0, ezért a hozzáférési módot nem
+<code>f_mode &amp; O_RDONLY</code> alakban kell vizsgálni: a
+<code>file_set_mode</code> az <code>O_ACCMODE</code> maszkból
+származtatja a belső <code>FMODE_*</code> biteket, és a rendszerhívás
+ezeket ellenőrzi. A hiányzó <code>read</code> metódus
+<code>-EINVAL</code>, a hiányzó <code>llseek</code> metódus
+<code>-ESPIPE</code> hibát ad; a <code>fd_get</code> által szerzett
+referenciát minden kimeneti ágon <code>file_put</code> engedi el. A
+<code>copy_to_user</code> a <code>memfs_read</code>-ban történik, mert a
+felhasználói címet csak a fájlrendszer-specifikus read metódus ismeri; a
+rendszerhívás rétege nem dereferálja közvetlenül a <code>ubuf</code>
+pointert.</p>
+<p>Az <code>llseek</code> tipikus megvalósítása ellenőrzi a
+<code>whence</code> értéket, ellenőrzött összeadással számolja az új
+offsetet, és ugyanazzal a <code>f_lock</code> zárral sorosít, mint a
+<code>read</code>/<code>write</code>:</p>
+<div class="sourceCode" id="cb17"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a>loff_t generic_file_llseek<span class="op">(</span><span class="kw">struct</span> file <span class="op">*</span>f<span class="op">,</span> loff_t offset<span class="op">,</span> <span class="dt">int</span> whence<span class="op">)</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a>    loff_t newpos<span class="op">;</span></span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> ok<span class="op">;</span></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a>    mutex_lock<span class="op">(&amp;</span>f<span class="op">-&gt;</span>f_lock<span class="op">);</span>   <span class="co">/* közös offset: ugyanaz a zár, mint read/write-nál */</span></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">switch</span> <span class="op">(</span>whence<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> SEEK_SET<span class="op">:</span></span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a>        newpos <span class="op">=</span> offset<span class="op">;</span></span>
+<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a>        ok <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb17-12"><a href="#cb17-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb17-13"><a href="#cb17-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> SEEK_CUR<span class="op">:</span></span>
+<span id="cb17-14"><a href="#cb17-14" aria-hidden="true" tabindex="-1"></a>        ok <span class="op">=</span> <span class="op">!</span>check_add_overflow<span class="op">(</span>f<span class="op">-&gt;</span>f_pos<span class="op">,</span> offset<span class="op">,</span> <span class="op">&amp;</span>newpos<span class="op">);</span></span>
+<span id="cb17-15"><a href="#cb17-15" aria-hidden="true" tabindex="-1"></a>        <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb17-16"><a href="#cb17-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> SEEK_END<span class="op">:</span></span>
+<span id="cb17-17"><a href="#cb17-17" aria-hidden="true" tabindex="-1"></a>        ok <span class="op">=</span> <span class="op">!</span>check_add_overflow<span class="op">(</span>f<span class="op">-&gt;</span>f_inode<span class="op">-&gt;</span>i_size<span class="op">,</span> offset<span class="op">,</span> <span class="op">&amp;</span>newpos<span class="op">);</span></span>
+<span id="cb17-18"><a href="#cb17-18" aria-hidden="true" tabindex="-1"></a>        <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb17-19"><a href="#cb17-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">default</span><span class="op">:</span></span>
+<span id="cb17-20"><a href="#cb17-20" aria-hidden="true" tabindex="-1"></a>        mutex_unlock<span class="op">(&amp;</span>f<span class="op">-&gt;</span>f_lock<span class="op">);</span></span>
+<span id="cb17-21"><a href="#cb17-21" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>EINVAL<span class="op">;</span></span>
+<span id="cb17-22"><a href="#cb17-22" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-23"><a href="#cb17-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-24"><a href="#cb17-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>ok<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb17-25"><a href="#cb17-25" aria-hidden="true" tabindex="-1"></a>        mutex_unlock<span class="op">(&amp;</span>f<span class="op">-&gt;</span>f_lock<span class="op">);</span></span>
+<span id="cb17-26"><a href="#cb17-26" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>EOVERFLOW<span class="op">;</span>    <span class="co">/* loff_t túlcsordulás */</span></span>
+<span id="cb17-27"><a href="#cb17-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-28"><a href="#cb17-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>newpos <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb17-29"><a href="#cb17-29" aria-hidden="true" tabindex="-1"></a>        mutex_unlock<span class="op">(&amp;</span>f<span class="op">-&gt;</span>f_lock<span class="op">);</span></span>
+<span id="cb17-30"><a href="#cb17-30" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>EINVAL<span class="op">;</span>       <span class="co">/* negatív fájlpozíció nem értelmezett */</span></span>
+<span id="cb17-31"><a href="#cb17-31" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-32"><a href="#cb17-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-33"><a href="#cb17-33" aria-hidden="true" tabindex="-1"></a>    f<span class="op">-&gt;</span>f_pos <span class="op">=</span> newpos<span class="op">;</span></span>
+<span id="cb17-34"><a href="#cb17-34" aria-hidden="true" tabindex="-1"></a>    mutex_unlock<span class="op">(&amp;</span>f<span class="op">-&gt;</span>f_lock<span class="op">);</span></span>
+<span id="cb17-35"><a href="#cb17-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> newpos<span class="op">;</span></span>
+<span id="cb17-36"><a href="#cb17-36" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>check_add_overflow</code>
+(<code>&lt;linux/overflow.h&gt;</code>) túlcsordulás esetén
+<code>true</code>-val tér vissza, és az eredményt nem használjuk; a hívó
+ilyenkor <code>-EOVERFLOW</code>-ot ad. A <code>SEEK_END</code> ág az
+<code>i_size</code> pillanatképét használja, miközben csak a
+<code>f_lock</code>-ot tartja; párhuzamos <code>truncate</code> esetén
+az eredmény közelítő, de nem ad memóriahibát. A valódi kernel ehhez
+<code>i_size_read</code>-ot és finomabb inode-zárolást használ. A
+<code>sys_lseek</code> hiányzó <code>llseek</code> callbackje nem
+dereferálható: ilyenkor <code>-ESPIPE</code> a helyes válasz, amit a
+<code>sys_lseek</code> fenti ellenőrzése ad.</p>
+<p>Hibakódok és <code>errno</code> a VFS rétegben is szigorúan elválik:
+a kernel belső hívásai negatív hibakódot adnak vissza, a rendszerhívás
+ugyanezt a negatív értéket adja vissza a felhasználói térbe (x86-64-en
+<code>rax</code>-ben). A <code>-1</code> + <code>errno</code> alakot a
+felhasználói C-könyvtár csomagolója állítja elő: ha a visszatérési érték
+−4095 és −1 közé esik, <code>errno = -ret</code>, és a függvény
+<code>-1</code>-et ad. A fejezet példáiban a <code>return -ENOENT</code>
+alakot használjuk a kernelbelsőben.</p>
+<h3 data-number="29.3.7"
+id="integrációs-példa-memfs-mount-a-mnt-könyvtárra"><span
+class="header-section-number">29.3.7</span> 7. Integrációs példa: memfs
+mount a <code>/mnt</code> könyvtárra</h3>
+<p>A következő példa egy minimális memfs-t csatlakoztat a közös fába. A
+memfs nem használ blokk-eszközt; minden fájl és könyvtár a RAM-ban él. A
+mount <code>source</code> paramétere ilyenkor lehet <code>"none"</code>,
+a <code>fstype</code> pedig <code>"memfs"</code>.</p>
+<p>A memfs <code>mount</code> metódusa felépíti a szuperblokkot és a
+gyökércsomópontot:</p>
+<div class="sourceCode" id="cb18"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> super_block <span class="op">*</span>memfs_mount<span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>source<span class="op">,</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a>                                <span class="dt">unsigned</span> <span class="dt">long</span> flags<span class="op">)</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> super_block <span class="op">*</span>sb <span class="op">=</span> kzalloc<span class="op">(</span><span class="kw">sizeof</span><span class="op">(*</span>sb<span class="op">));</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>sb<span class="op">)</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ERR_PTR<span class="op">(-</span>ENOMEM<span class="op">);</span></span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a>    sb<span class="op">-&gt;</span>s_blocksize <span class="op">=</span> <span class="dv">4096</span><span class="op">;</span></span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a>    sb<span class="op">-&gt;</span>s_magic <span class="op">=</span> <span class="bn">0x4D454D46</span><span class="op">;</span>   <span class="co">/* &quot;MEMF&quot; */</span></span>
+<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a>    sb<span class="op">-&gt;</span>s_op <span class="op">=</span> <span class="op">&amp;</span>memfs_super_ops<span class="op">;</span></span>
+<span id="cb18-11"><a href="#cb18-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-12"><a href="#cb18-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> inode <span class="op">*</span>root_ino <span class="op">=</span> memfs_new_inode<span class="op">(</span>S_IFDIR <span class="op">|</span> <span class="bn">0755</span><span class="op">);</span></span>
+<span id="cb18-13"><a href="#cb18-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>root_ino<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb18-14"><a href="#cb18-14" aria-hidden="true" tabindex="-1"></a>        kfree<span class="op">(</span>sb<span class="op">);</span></span>
+<span id="cb18-15"><a href="#cb18-15" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ERR_PTR<span class="op">(-</span>ENOMEM<span class="op">);</span></span>
+<span id="cb18-16"><a href="#cb18-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb18-17"><a href="#cb18-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-18"><a href="#cb18-18" aria-hidden="true" tabindex="-1"></a>    sb<span class="op">-&gt;</span>s_root <span class="op">=</span> d_alloc_root<span class="op">(</span>root_ino<span class="op">);</span></span>
+<span id="cb18-19"><a href="#cb18-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>sb<span class="op">-&gt;</span>s_root<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb18-20"><a href="#cb18-20" aria-hidden="true" tabindex="-1"></a>        memfs_free_inode<span class="op">(</span>root_ino<span class="op">);</span></span>
+<span id="cb18-21"><a href="#cb18-21" aria-hidden="true" tabindex="-1"></a>        kfree<span class="op">(</span>sb<span class="op">);</span></span>
+<span id="cb18-22"><a href="#cb18-22" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ERR_PTR<span class="op">(-</span>ENOMEM<span class="op">);</span></span>
+<span id="cb18-23"><a href="#cb18-23" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb18-24"><a href="#cb18-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-25"><a href="#cb18-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> sb<span class="op">;</span></span>
+<span id="cb18-26"><a href="#cb18-26" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A mount után a felhasználói program a szokásos módon hívja az
+<code>open</code>-t:</p>
+<div class="sourceCode" id="cb19"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;/mnt/demo.txt&quot;</span><span class="op">,</span> O_RDWR <span class="op">|</span> O_CREAT<span class="op">,</span> <span class="bn">0600</span><span class="op">);</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>fd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a>    perror<span class="op">(</span><span class="st">&quot;open&quot;</span><span class="op">);</span></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a><span class="dt">ssize_t</span> n <span class="op">=</span> write<span class="op">(</span>fd<span class="op">,</span> <span class="st">&quot;hello</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> <span class="dv">6</span><span class="op">);</span></span>
+<span id="cb19-8"><a href="#cb19-8" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>n <span class="op">!=</span> <span class="dv">6</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb19-9"><a href="#cb19-9" aria-hidden="true" tabindex="-1"></a>    perror<span class="op">(</span><span class="st">&quot;write&quot;</span><span class="op">);</span></span>
+<span id="cb19-10"><a href="#cb19-10" aria-hidden="true" tabindex="-1"></a>    close<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb19-11"><a href="#cb19-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb19-12"><a href="#cb19-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb19-13"><a href="#cb19-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-14"><a href="#cb19-14" aria-hidden="true" tabindex="-1"></a>lseek<span class="op">(</span>fd<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> SEEK_SET<span class="op">);</span></span>
+<span id="cb19-15"><a href="#cb19-15" aria-hidden="true" tabindex="-1"></a><span class="dt">char</span> buf<span class="op">[</span><span class="dv">16</span><span class="op">]</span> <span class="op">=</span> <span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb19-16"><a href="#cb19-16" aria-hidden="true" tabindex="-1"></a>n <span class="op">=</span> read<span class="op">(</span>fd<span class="op">,</span> buf<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>buf<span class="op">));</span></span>
+<span id="cb19-17"><a href="#cb19-17" aria-hidden="true" tabindex="-1"></a>close<span class="op">(</span>fd<span class="op">);</span></span></code></pre></div>
+<p>A kernelben ezek a hívások így kapcsolódnak össze:</p>
+<ol type="1">
+<li>A <code>open</code> átadja a <code>/mnt/demo.txt</code> útvonalat a
+<code>path_resolve</code>-nak.</li>
+<li>A <code>/</code> komponenst a folyamat root dentry-je oldja
+fel.</li>
+<li>A <code>mnt</code> komponensnél a VFS észleli a memfs mount-ot, és
+átlép a memfs root-jára.</li>
+<li>A <code>demo.txt</code> komponenst a memfs <code>lookup</code>
+keresi; ha nincs ilyen fájl, a <code>create</code> művelet
+létrehozza.</li>
+<li>A VFS lefoglal egy <code>struct file</code>-ot, beállítja az
+<code>f_op</code>-ot a memfs <code>file_operations</code>-re, és
+beilleszti a <code>files</code> táblába.</li>
+<li>A <code>read</code> és <code>write</code> a <code>struct file</code>
+<code>f_pos</code> mezőjén keresztül frissíti az offsetet.</li>
+</ol>
+<p>Az <code>open</code> útja vázlatban (a nem létező utolsó komponens
+esetét a <code>path_resolve_parent</code> kezeli, amely a szülő dentry-t
+és az utolsó komponens <code>qstr</code>-ját adja):</p>
+<div class="sourceCode" id="cb20"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> sys_open<span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>path<span class="op">,</span> <span class="dt">int</span> flags<span class="op">,</span> mode_t mode<span class="op">)</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> qstr last<span class="op">;</span></span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> dentry <span class="op">*</span>dir <span class="op">=</span> path_resolve_parent<span class="op">(</span>path<span class="op">,</span> <span class="op">&amp;</span>last<span class="op">);</span>   <span class="co">/* referenciát ad */</span></span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> dentry <span class="op">*</span>d<span class="op">;</span></span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> file <span class="op">*</span>f<span class="op">;</span></span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> fd<span class="op">,</span> err<span class="op">;</span></span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>IS_ERR<span class="op">(</span>dir<span class="op">))</span></span>
+<span id="cb20-10"><a href="#cb20-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> PTR_ERR<span class="op">(</span>dir<span class="op">);</span></span>
+<span id="cb20-11"><a href="#cb20-11" aria-hidden="true" tabindex="-1"></a>    d <span class="op">=</span> d_lookup<span class="op">(</span>dir<span class="op">,</span> <span class="op">&amp;</span>last<span class="op">);</span>                  <span class="co">/* cache; miss esetén d_alloc + lookup */</span></span>
+<span id="cb20-12"><a href="#cb20-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>d <span class="op">||</span> <span class="op">!</span>d<span class="op">-&gt;</span>d_inode<span class="op">)</span> <span class="op">{</span>                   <span class="co">/* nem létezik */</span></span>
+<span id="cb20-13"><a href="#cb20-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(!(</span>flags <span class="op">&amp;</span> O_CREAT<span class="op">))</span> <span class="op">{</span> err <span class="op">=</span> <span class="op">-</span>ENOENT<span class="op">;</span> <span class="cf">goto</span> out_dir<span class="op">;</span> <span class="op">}</span></span>
+<span id="cb20-14"><a href="#cb20-14" aria-hidden="true" tabindex="-1"></a>        err <span class="op">=</span> dir<span class="op">-&gt;</span>d_inode<span class="op">-&gt;</span>i_op<span class="op">-&gt;</span>create<span class="op">(</span>dir<span class="op">-&gt;</span>d_inode<span class="op">,</span> last<span class="op">.</span>name<span class="op">,</span> last<span class="op">.</span>len<span class="op">,</span> mode<span class="op">);</span></span>
+<span id="cb20-15"><a href="#cb20-15" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>err<span class="op">)</span> <span class="cf">goto</span> out_dir<span class="op">;</span></span>
+<span id="cb20-16"><a href="#cb20-16" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>d<span class="op">)</span> dput<span class="op">(</span>d<span class="op">);</span></span>
+<span id="cb20-17"><a href="#cb20-17" aria-hidden="true" tabindex="-1"></a>        d <span class="op">=</span> d_lookup<span class="op">(</span>dir<span class="op">,</span> <span class="op">&amp;</span>last<span class="op">);</span>              <span class="co">/* újra: most már létezik */</span></span>
+<span id="cb20-18"><a href="#cb20-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">((</span>flags <span class="op">&amp;</span> O_CREAT<span class="op">)</span> <span class="op">&amp;&amp;</span> <span class="op">(</span>flags <span class="op">&amp;</span> O_EXCL<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb20-19"><a href="#cb20-19" aria-hidden="true" tabindex="-1"></a>        err <span class="op">=</span> <span class="op">-</span>EEXIST<span class="op">;</span> <span class="cf">goto</span> out_d<span class="op">;</span></span>
+<span id="cb20-20"><a href="#cb20-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb20-21"><a href="#cb20-21" aria-hidden="true" tabindex="-1"></a>    f <span class="op">=</span> file_alloc<span class="op">();</span>                          <span class="co">/* f_count = 1 */</span></span>
+<span id="cb20-22"><a href="#cb20-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>f<span class="op">)</span> <span class="op">{</span> err <span class="op">=</span> <span class="op">-</span>ENOMEM<span class="op">;</span> <span class="cf">goto</span> out_d<span class="op">;</span> <span class="op">}</span></span>
+<span id="cb20-23"><a href="#cb20-23" aria-hidden="true" tabindex="-1"></a>    f<span class="op">-&gt;</span>f_inode <span class="op">=</span> d<span class="op">-&gt;</span>d_inode<span class="op">;</span></span>
+<span id="cb20-24"><a href="#cb20-24" aria-hidden="true" tabindex="-1"></a>    f<span class="op">-&gt;</span>f_op    <span class="op">=</span> d<span class="op">-&gt;</span>d_inode<span class="op">-&gt;</span>i_fop<span class="op">;</span></span>
+<span id="cb20-25"><a href="#cb20-25" aria-hidden="true" tabindex="-1"></a>    f<span class="op">-&gt;</span>f_flags <span class="op">=</span> flags<span class="op">;</span></span>
+<span id="cb20-26"><a href="#cb20-26" aria-hidden="true" tabindex="-1"></a>    f<span class="op">-&gt;</span>f_mode  <span class="op">=</span> file_set_mode<span class="op">(</span>flags<span class="op">);</span>         <span class="co">/* FMODE_READ | FMODE_WRITE */</span></span>
+<span id="cb20-27"><a href="#cb20-27" aria-hidden="true" tabindex="-1"></a>    f<span class="op">-&gt;</span>f_pos   <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb20-28"><a href="#cb20-28" aria-hidden="true" tabindex="-1"></a>    fd <span class="op">=</span> fd_alloc<span class="op">();</span></span>
+<span id="cb20-29"><a href="#cb20-29" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span> fput<span class="op">(</span>f<span class="op">);</span> err <span class="op">=</span> fd<span class="op">;</span> <span class="cf">goto</span> out_d<span class="op">;</span> <span class="op">}</span></span>
+<span id="cb20-30"><a href="#cb20-30" aria-hidden="true" tabindex="-1"></a>    fd_set<span class="op">(</span>fd<span class="op">,</span> f<span class="op">);</span></span>
+<span id="cb20-31"><a href="#cb20-31" aria-hidden="true" tabindex="-1"></a>    dput<span class="op">(</span>d<span class="op">);</span> dput<span class="op">(</span>dir<span class="op">);</span></span>
+<span id="cb20-32"><a href="#cb20-32" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> fd<span class="op">;</span></span>
+<span id="cb20-33"><a href="#cb20-33" aria-hidden="true" tabindex="-1"></a>out_d<span class="op">:</span>   dput<span class="op">(</span>d<span class="op">);</span></span>
+<span id="cb20-34"><a href="#cb20-34" aria-hidden="true" tabindex="-1"></a>out_dir<span class="op">:</span> dput<span class="op">(</span>dir<span class="op">);</span></span>
+<span id="cb20-35"><a href="#cb20-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> err<span class="op">;</span></span>
+<span id="cb20-36"><a href="#cb20-36" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>O_CREAT</code> és a <code>mode</code> paraméter a
+<code>create</code> inode-műveletbe kerül. Az <code>O_RDWR</code> az
+<code>f_mode</code>-ot állítja (<code>FMODE_READ | FMODE_WRITE</code>);
+a <code>file_operations</code> tábla az inode <code>i_fop</code>-jából
+jön. A VFS ezeket a flag-eket már a <code>open</code> rendszerhívás
+rétegében ellenőrzi.</p>
+<h3 data-number="29.3.8" id="tipikus-hibák-és-helyes-kezelésük"><span
+class="header-section-number">29.3.8</span> 8. Tipikus hibák és helyes
+kezelésük</h3>
+<p>A VFS-integráció során a következő hibák fordulnak elő
+leggyakrabban:</p>
+<ol type="1">
+<li><p><strong>Az offset nem a <code>file</code>-ban, hanem az inode-ban
+él.</strong> Ha a fejlesztő az inode-ba teszi a pozíciót, akkor két
+párhuzamos <code>open</code> ugyanazt a pozíciót módosítja, és a
+<code>dup</code> szemantika is elromlik. Helyes megoldás:
+<code>struct file</code> <code>f_pos</code>, és a
+<code>file_operations</code> mindig a kapott <code>pos</code> pointerrel
+dolgozik.</p></li>
+<li><p><strong>A dentry referencia-számláló hiánya.</strong> A
+<code>path_resolve</code> után a dentry <code>d_count</code>-ját növelni
+kell, és a használat után <code>dput</code>-ot hívni. Ha ez elmarad, a
+dentry felszabadítása use-after-free hibát okozhat. A dentry cache
+lookup és a mount átlépés során is meg kell őrizni a
+referenciákat.</p></li>
+<li><p><strong>A mount-átlépés kihagyása.</strong> A
+<code>path_resolve</code>-nak minden komponensnél ellenőriznie kell a
+mount-táblát. Ha ezt kihagyjuk, a <code>/mnt</code> alatt a
+háttér-fájlrendszer könyvtára marad látható, és a csatolt fájlrendszer
+elérhetetlen.</p></li>
+<li><p><strong>A <code>read</code>/<code>write</code>/<code>lseek</code>
+offset-ellenőrzés hiánya.</strong> Az offset lehet negatív (hibás
+<code>lseek</code> után), és a
+<code>SEEK_CUR</code>/<code>SEEK_END</code> számítás túlcsordulhat. A
+<code>memfs_read</code>-ben a <code>*pos &lt; 0</code> és a
+<code>m-&gt;size - *pos</code> ellenőrzés szükséges; a
+<code>generic_file_llseek</code>-ben <code>check_add_overflow</code> és
+<code>-EOVERFLOW</code>, negatív eredménynél <code>-EINVAL</code> a
+helyes válasz. A puszta <code>f_pos + offset</code> összeadás előjeles
+túlcsordulása definiálatlan viselkedés C-ben, ezért tilos.</p></li>
+<li><p><strong>A fájlleíró-tábla túlcsordulása.</strong> A
+<code>fd_alloc</code>-nak ellenőriznie kell a <code>MAX_FD</code>
+határt, és <code>EMFILE</code>-t kell adnia, ha nincs szabad slot. A
+<code>EBADF</code> a nem létező fd-re utal, a kettőt nem szabad
+összekeverni.</p></li>
+<li><p><strong>Versenyhelyzet a <code>file</code> offseten és az inode
+adatán.</strong> Két különböző verseny van. Az azonos file objectet
+használó hívások (például <code>dup</code> után) közös
+<code>f_pos</code>-ját a <code>f_lock</code> védi, különben két szál
+ugyanazt a pozíciót növelné, és adat veszne el. A külön
+<code>open</code>-ből származó, külön <code>f_lock</code>-ú leírók
+viszont ugyanazt az inode-ot és adatpuffert használják: a
+<code>memfs_read</code> másolása közben egy másik fd-en végzett
+<code>write</code> vagy <code>truncate</code> átallokálhatja a puffert,
+ezért kell inode-szintű zár (<code>m-&gt;lock</code>) is. A két zár
+megszerzési sorrendje rögzített: először az inode-zár, utána a file-zár;
+a fordított sorrend holtpontot okozhat.</p></li>
+<li><p><strong>Hibakód-konverzió a user/kernel határon.</strong> A
+kernel negatív hibakódokat ad; a felhasználói tér felé a libc
+csomagolója fordítja <code>-1</code>-re és <code>errno</code>-ra. Ha a
+<code>read</code> <code>-EBADF</code>-et ad vissza, a felhasználó
+<code>-1</code>-et és <code>errno == EBADF</code>-et kap.</p></li>
+</ol>
+<h3 data-number="29.3.9"
+id="labor-vfs-interfész-és-mount-implementáció"><span
+class="header-section-number">29.3.9</span> 9. Labor: VFS-interfész és
+mount implementáció</h3>
+<p>Ez a labor a <a href="os111.html">Blokk-eszköz és driver
+implementáció</a> blokk-eszköz driverére épül, de a tanulási célhoz egy
+RAM-ban tárolt memfs is elegendő. A feladat egy működő
+<code>vfs_mount</code>, <code>path_resolve</code>, <code>open</code>,
+<code>read</code>, <code>write</code>, <code>lseek</code>,
+<code>close</code> lánc implementálása, majd a mount és a fájlműveletek
+reprodukálható mérése emulált környezetben.</p>
+<p><strong>Kiinduló állapot.</strong> A kernelünk a <a
+href="os111.html">Blokk-eszköz és driver implementáció</a> fejezet után
+már rendelkezik egy blokk-eszköz réteggel, a
+<code>blk_sync_read(dev, start, buf, nsectors)</code> és
+<code>dev-&gt;ops-&gt;write(…)</code> hívásokkal (<a
+href="os111.html">Blokk-eszköz és driver implementáció</a>). A
+fájlrendszer most egy memfs, amely a blokk-eszközt nem használja, de a
+mount pontján keresztül ugyanúgy elérhető. A hoszt lemezét nem
+módosítjuk, minden futás a QEMU vendég RAM-jában történik.</p>
+<p><strong>Konfiguráció.</strong> A reprodukciós csomag tartalma:</p>
+<pre class="text"><code>vfs-lab/
+  Makefile
+  qemu-run.sh
+  kernel.ld
+  src/
+    vfs.c
+    memfs.c
+    block.c
+    task.c
+  README.md
+  logs/</code></pre>
+<p>A QEMU alábbi paraméterekkel indul:</p>
+<pre class="text"><code>qemu-system-x86_64 -kernel build/kernel.bin \
+  -m 128M -smp 1 -nographic \
+  -no-reboot -no-shutdown</code></pre>
+<p>A vendég CPU <code>qemu64</code>, a memória 128 MiB, a megszakítások
+engedélyezve vannak a mérés alatt. A kernel a
+<code>-O2 -fno-strict-aliasing</code> kapcsolóval készül. A pontos GCC
+és QEMU verziót a <code>README.md</code>-ben rögzíteni kell, és a mért
+értékekhez csatolni.</p>
+<p><strong>A labor lépései.</strong></p>
+<ol type="1">
+<li>Másold a kiinduló kernel forrását a lab könyvtárába.</li>
+<li>Implementáld a <code>vfs_mount</code> és a mount-léptetés logikáját
+a <code>path_resolve</code>-ban, a fejezet referencia-szerződése szerint
+(minden közbenső dentry-re egy referencia, a mount-átlépésnél
+csere).</li>
+<li>Implementáld a memfs <code>lookup</code>, <code>create</code>,
+<code>read</code>, <code>write</code>, <code>llseek</code> műveleteket,
+valamint a <code>d_lookup</code> találat/miss számlálóit
+(<code>dentry_hits</code>, <code>dentry_misses</code>).</li>
+<li>Indítsd el a kernelt, és hívd a következő tesztet:</li>
+</ol>
+<div class="sourceCode" id="cb23"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> vfs_checks<span class="op">;</span></span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">unsigned</span> <span class="dt">long</span> dentry_hits<span class="op">,</span> dentry_misses<span class="op">;</span></span>
+<span id="cb23-3"><a href="#cb23-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-4"><a href="#cb23-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CHECK</span><span class="op">(</span><span class="pp">cond</span><span class="op">)</span><span class="pp"> </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                          </span><span class="op">\</span></span>
+<span id="cb23-5"><a href="#cb23-5" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">if</span><span class="pp"> </span><span class="op">(!(</span><span class="pp">cond</span><span class="op">))</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                                </span><span class="op">\</span></span>
+<span id="cb23-6"><a href="#cb23-6" aria-hidden="true" tabindex="-1"></a><span class="pp">        printk</span><span class="op">(</span><span class="pp">KERN_ERR </span><span class="st">&quot;vfs_test: </span><span class="sc">%s</span><span class="st"> failed (line </span><span class="sc">%d</span><span class="st">)</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp">        </span><span class="op">\</span></span>
+<span id="cb23-7"><a href="#cb23-7" aria-hidden="true" tabindex="-1"></a><span class="pp">               </span><span class="op">#</span><span class="pp">cond</span><span class="op">,</span><span class="pp"> __LINE__</span><span class="op">);</span><span class="pp">                                  </span><span class="op">\</span></span>
+<span id="cb23-8"><a href="#cb23-8" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="cf">return</span><span class="op">;</span><span class="pp">                                                   </span><span class="op">\</span></span>
+<span id="cb23-9"><a href="#cb23-9" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp">                                                             </span><span class="op">\</span></span>
+<span id="cb23-10"><a href="#cb23-10" aria-hidden="true" tabindex="-1"></a><span class="pp">    vfs_checks</span><span class="op">++;</span><span class="pp">                                                 </span><span class="op">\</span></span>
+<span id="cb23-11"><a href="#cb23-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb23-12"><a href="#cb23-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-13"><a href="#cb23-13" aria-hidden="true" tabindex="-1"></a><span class="co">/* Relatív út: ideiglenesen a memfs gyökerére állítjuk a cwd-t. */</span></span>
+<span id="cb23-14"><a href="#cb23-14" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">bool</span> vfs_relative_test<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb23-15"><a href="#cb23-15" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb23-16"><a href="#cb23-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> dentry <span class="op">*</span>saved <span class="op">=</span> current<span class="op">-&gt;</span>fs<span class="op">-&gt;</span>pwd<span class="op">;</span></span>
+<span id="cb23-17"><a href="#cb23-17" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> dentry <span class="op">*</span>root <span class="op">=</span> path_resolve<span class="op">(</span><span class="st">&quot;/mnt&quot;</span><span class="op">);</span></span>
+<span id="cb23-18"><a href="#cb23-18" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> ok <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb23-19"><a href="#cb23-19" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> fd<span class="op">;</span></span>
+<span id="cb23-20"><a href="#cb23-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-21"><a href="#cb23-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>IS_ERR<span class="op">(</span>root<span class="op">))</span></span>
+<span id="cb23-22"><a href="#cb23-22" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb23-23"><a href="#cb23-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-24"><a href="#cb23-24" aria-hidden="true" tabindex="-1"></a>    current<span class="op">-&gt;</span>fs<span class="op">-&gt;</span>pwd <span class="op">=</span> root<span class="op">;</span>      <span class="co">/* a path_resolve referenciáját átvesszük */</span></span>
+<span id="cb23-25"><a href="#cb23-25" aria-hidden="true" tabindex="-1"></a>    fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;test.txt&quot;</span><span class="op">,</span> O_RDONLY<span class="op">);</span></span>
+<span id="cb23-26"><a href="#cb23-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fd <span class="op">&gt;=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb23-27"><a href="#cb23-27" aria-hidden="true" tabindex="-1"></a>        ok <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb23-28"><a href="#cb23-28" aria-hidden="true" tabindex="-1"></a>        close<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb23-29"><a href="#cb23-29" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb23-30"><a href="#cb23-30" aria-hidden="true" tabindex="-1"></a>    dput<span class="op">(</span>current<span class="op">-&gt;</span>fs<span class="op">-&gt;</span>pwd<span class="op">);</span></span>
+<span id="cb23-31"><a href="#cb23-31" aria-hidden="true" tabindex="-1"></a>    current<span class="op">-&gt;</span>fs<span class="op">-&gt;</span>pwd <span class="op">=</span> saved<span class="op">;</span>     <span class="co">/* a mentett referencia visszakerül */</span></span>
+<span id="cb23-32"><a href="#cb23-32" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> ok<span class="op">;</span></span>
+<span id="cb23-33"><a href="#cb23-33" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb23-34"><a href="#cb23-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-35"><a href="#cb23-35" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> vfs_test<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb23-36"><a href="#cb23-36" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb23-37"><a href="#cb23-37" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>msg <span class="op">=</span> <span class="st">&quot;vfs-integration</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb23-38"><a href="#cb23-38" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span> buf<span class="op">[</span><span class="dv">32</span><span class="op">]</span> <span class="op">=</span> <span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb23-39"><a href="#cb23-39" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ssize_t</span> n<span class="op">;</span></span>
+<span id="cb23-40"><a href="#cb23-40" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> fd<span class="op">;</span></span>
+<span id="cb23-41"><a href="#cb23-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-42"><a href="#cb23-42" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 1. Abszolút út, első feloldás: a dentry cache még üres, tehát</span></span>
+<span id="cb23-43"><a href="#cb23-43" aria-hidden="true" tabindex="-1"></a><span class="co">     *    legalább egy lookup missnek kell történnie. */</span></span>
+<span id="cb23-44"><a href="#cb23-44" aria-hidden="true" tabindex="-1"></a>    dentry_hits <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb23-45"><a href="#cb23-45" aria-hidden="true" tabindex="-1"></a>    dentry_misses <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb23-46"><a href="#cb23-46" aria-hidden="true" tabindex="-1"></a>    fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;/mnt/test.txt&quot;</span><span class="op">,</span> O_RDWR <span class="op">|</span> O_CREAT<span class="op">,</span> <span class="bn">0600</span><span class="op">);</span></span>
+<span id="cb23-47"><a href="#cb23-47" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>fd <span class="op">&gt;=</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb23-48"><a href="#cb23-48" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>dentry_misses <span class="op">&gt;=</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb23-49"><a href="#cb23-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-50"><a href="#cb23-50" aria-hidden="true" tabindex="-1"></a>    n <span class="op">=</span> write<span class="op">(</span>fd<span class="op">,</span> msg<span class="op">,</span> strlen<span class="op">(</span>msg<span class="op">));</span></span>
+<span id="cb23-51"><a href="#cb23-51" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>n <span class="op">==</span> <span class="op">(</span><span class="dt">ssize_t</span><span class="op">)</span>strlen<span class="op">(</span>msg<span class="op">));</span></span>
+<span id="cb23-52"><a href="#cb23-52" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-53"><a href="#cb23-53" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>lseek<span class="op">(</span>fd<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> SEEK_SET<span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb23-54"><a href="#cb23-54" aria-hidden="true" tabindex="-1"></a>    n <span class="op">=</span> read<span class="op">(</span>fd<span class="op">,</span> buf<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>buf<span class="op">));</span></span>
+<span id="cb23-55"><a href="#cb23-55" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>n <span class="op">==</span> <span class="op">(</span><span class="dt">ssize_t</span><span class="op">)</span>strlen<span class="op">(</span>msg<span class="op">));</span></span>
+<span id="cb23-56"><a href="#cb23-56" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>memcmp<span class="op">(</span>buf<span class="op">,</span> msg<span class="op">,</span> <span class="op">(</span><span class="dt">size_t</span><span class="op">)</span>n<span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb23-57"><a href="#cb23-57" aria-hidden="true" tabindex="-1"></a>    close<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb23-58"><a href="#cb23-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-59"><a href="#cb23-59" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 2. Relatív út a cwd-ből, majd egy ismételt open: ez már cache</span></span>
+<span id="cb23-60"><a href="#cb23-60" aria-hidden="true" tabindex="-1"></a><span class="co">     *    találat kell legyen. */</span></span>
+<span id="cb23-61"><a href="#cb23-61" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>vfs_relative_test<span class="op">());</span></span>
+<span id="cb23-62"><a href="#cb23-62" aria-hidden="true" tabindex="-1"></a>    fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;/mnt/test.txt&quot;</span><span class="op">,</span> O_RDONLY<span class="op">);</span></span>
+<span id="cb23-63"><a href="#cb23-63" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>fd <span class="op">&gt;=</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb23-64"><a href="#cb23-64" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>dentry_hits <span class="op">&gt;=</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb23-65"><a href="#cb23-65" aria-hidden="true" tabindex="-1"></a>    close<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb23-66"><a href="#cb23-66" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-67"><a href="#cb23-67" aria-hidden="true" tabindex="-1"></a>    printk<span class="op">(</span>KERN_INFO <span class="st">&quot;vfs_test: OK (</span><span class="sc">%d</span><span class="st"> ellenőrzés)</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> vfs_checks<span class="op">);</span></span>
+<span id="cb23-68"><a href="#cb23-68" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>CHECK</code> makró a hibát a sor számával együtt naplózza, és
+nem hagyja, hogy a teszt tovább fusson hibás állapotban. A relatív út
+tesztje megmutatja, hogy a <code>path_resolve</code> a
+<code>fs-&gt;pwd</code>-ből indul, és a cwd ideiglenes átállítása után a
+referencia-számlálás kiegyensúlyozott marad. A tanulókernelben nincs
+külön felhasználói címtér, ezért a teszt pufferjei kernelcímek, és a
+<code>copy_to_user</code> itt közvetlen másolásként viselkedik; valódi
+user/kernel szeparáció mellett a fault-biztos másolás kötelező.</p>
+<ol start="5" type="1">
+<li>Mérd meg a VFS-műveletek idejét a következő mikrobenchmarkkal. A
+mérés előfeltétele egy pontosan 4096 bájtos <code>/mnt/file</code>,
+amelyet a mérés előtt ellenőrzötten létrehozunk; a hívások sikerét és az
+időbélyegek rendezését minden iterációban ellenőrizzük:</li>
+</ol>
+<div class="sourceCode" id="cb24"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#define ITERS </span><span class="dv">1000</span></span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> sample <span class="op">{</span></span>
+<span id="cb24-4"><a href="#cb24-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> open_cyc<span class="op">,</span> read_cyc<span class="op">,</span> write_cyc<span class="op">,</span> close_cyc<span class="op">,</span> total_cyc<span class="op">;</span></span>
+<span id="cb24-5"><a href="#cb24-5" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb24-6"><a href="#cb24-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-7"><a href="#cb24-7" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="kw">struct</span> sample samples<span class="op">[</span>ITERS<span class="op">];</span></span>
+<span id="cb24-8"><a href="#cb24-8" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">char</span> tmp<span class="op">[</span><span class="dv">64</span><span class="op">];</span></span>
+<span id="cb24-9"><a href="#cb24-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-10"><a href="#cb24-10" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">bool</span> vfs_bench_prepare<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb24-11"><a href="#cb24-11" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb24-12"><a href="#cb24-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span> block<span class="op">[</span><span class="dv">4096</span><span class="op">]</span> <span class="op">=</span> <span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb24-13"><a href="#cb24-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ssize_t</span> n<span class="op">;</span></span>
+<span id="cb24-14"><a href="#cb24-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;/mnt/file&quot;</span><span class="op">,</span> O_RDWR <span class="op">|</span> O_CREAT <span class="op">|</span> O_TRUNC<span class="op">,</span> <span class="bn">0600</span><span class="op">);</span></span>
+<span id="cb24-15"><a href="#cb24-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-16"><a href="#cb24-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb24-17"><a href="#cb24-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb24-18"><a href="#cb24-18" aria-hidden="true" tabindex="-1"></a>    n <span class="op">=</span> write<span class="op">(</span>fd<span class="op">,</span> block<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>block<span class="op">));</span></span>
+<span id="cb24-19"><a href="#cb24-19" aria-hidden="true" tabindex="-1"></a>    close<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb24-20"><a href="#cb24-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> n <span class="op">==</span> <span class="op">(</span><span class="dt">ssize_t</span><span class="op">)</span><span class="kw">sizeof</span><span class="op">(</span>block<span class="op">);</span></span>
+<span id="cb24-21"><a href="#cb24-21" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb24-22"><a href="#cb24-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-23"><a href="#cb24-23" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">bool</span> vfs_bench<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb24-24"><a href="#cb24-24" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb24-25"><a href="#cb24-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> ITERS<span class="op">;</span> i<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb24-26"><a href="#cb24-26" aria-hidden="true" tabindex="-1"></a>        <span class="dt">uint64_t</span> t0<span class="op">,</span> t1<span class="op">,</span> t2<span class="op">,</span> t3<span class="op">,</span> t4<span class="op">;</span></span>
+<span id="cb24-27"><a href="#cb24-27" aria-hidden="true" tabindex="-1"></a>        <span class="dt">ssize_t</span> r<span class="op">,</span> w<span class="op">;</span></span>
+<span id="cb24-28"><a href="#cb24-28" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> fd<span class="op">;</span></span>
+<span id="cb24-29"><a href="#cb24-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-30"><a href="#cb24-30" aria-hidden="true" tabindex="-1"></a>        t0 <span class="op">=</span> rdtsc<span class="op">();</span></span>
+<span id="cb24-31"><a href="#cb24-31" aria-hidden="true" tabindex="-1"></a>        fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;/mnt/file&quot;</span><span class="op">,</span> O_RDWR<span class="op">);</span></span>
+<span id="cb24-32"><a href="#cb24-32" aria-hidden="true" tabindex="-1"></a>        t1 <span class="op">=</span> rdtsc<span class="op">();</span></span>
+<span id="cb24-33"><a href="#cb24-33" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>fd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb24-34"><a href="#cb24-34" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb24-35"><a href="#cb24-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-36"><a href="#cb24-36" aria-hidden="true" tabindex="-1"></a>        r <span class="op">=</span> read<span class="op">(</span>fd<span class="op">,</span> tmp<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>tmp<span class="op">));</span></span>
+<span id="cb24-37"><a href="#cb24-37" aria-hidden="true" tabindex="-1"></a>        t2 <span class="op">=</span> rdtsc<span class="op">();</span></span>
+<span id="cb24-38"><a href="#cb24-38" aria-hidden="true" tabindex="-1"></a>        w <span class="op">=</span> write<span class="op">(</span>fd<span class="op">,</span> tmp<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>tmp<span class="op">));</span></span>
+<span id="cb24-39"><a href="#cb24-39" aria-hidden="true" tabindex="-1"></a>        t3 <span class="op">=</span> rdtsc<span class="op">();</span></span>
+<span id="cb24-40"><a href="#cb24-40" aria-hidden="true" tabindex="-1"></a>        close<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb24-41"><a href="#cb24-41" aria-hidden="true" tabindex="-1"></a>        t4 <span class="op">=</span> rdtsc<span class="op">();</span></span>
+<span id="cb24-42"><a href="#cb24-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-43"><a href="#cb24-43" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>r <span class="op">!=</span> <span class="op">(</span><span class="dt">ssize_t</span><span class="op">)</span><span class="kw">sizeof</span><span class="op">(</span>tmp<span class="op">)</span> <span class="op">||</span></span>
+<span id="cb24-44"><a href="#cb24-44" aria-hidden="true" tabindex="-1"></a>            w <span class="op">!=</span> <span class="op">(</span><span class="dt">ssize_t</span><span class="op">)</span><span class="kw">sizeof</span><span class="op">(</span>tmp<span class="op">))</span></span>
+<span id="cb24-45"><a href="#cb24-45" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb24-46"><a href="#cb24-46" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* Időbélyeg-rendezés: érvénytelen minta nem kerülhet a táblába. */</span></span>
+<span id="cb24-47"><a href="#cb24-47" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(!(</span>t0 <span class="op">&lt;=</span> t1 <span class="op">&amp;&amp;</span> t1 <span class="op">&lt;=</span> t2 <span class="op">&amp;&amp;</span> t2 <span class="op">&lt;=</span> t3 <span class="op">&amp;&amp;</span> t3 <span class="op">&lt;=</span> t4<span class="op">))</span></span>
+<span id="cb24-48"><a href="#cb24-48" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb24-49"><a href="#cb24-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-50"><a href="#cb24-50" aria-hidden="true" tabindex="-1"></a>        samples<span class="op">[</span>i<span class="op">].</span>open_cyc  <span class="op">=</span> t1 <span class="op">-</span> t0<span class="op">;</span></span>
+<span id="cb24-51"><a href="#cb24-51" aria-hidden="true" tabindex="-1"></a>        samples<span class="op">[</span>i<span class="op">].</span>read_cyc  <span class="op">=</span> t2 <span class="op">-</span> t1<span class="op">;</span></span>
+<span id="cb24-52"><a href="#cb24-52" aria-hidden="true" tabindex="-1"></a>        samples<span class="op">[</span>i<span class="op">].</span>write_cyc <span class="op">=</span> t3 <span class="op">-</span> t2<span class="op">;</span></span>
+<span id="cb24-53"><a href="#cb24-53" aria-hidden="true" tabindex="-1"></a>        samples<span class="op">[</span>i<span class="op">].</span>close_cyc <span class="op">=</span> t4 <span class="op">-</span> t3<span class="op">;</span></span>
+<span id="cb24-54"><a href="#cb24-54" aria-hidden="true" tabindex="-1"></a>        samples<span class="op">[</span>i<span class="op">].</span>total_cyc <span class="op">=</span> t4 <span class="op">-</span> t0<span class="op">;</span></span>
+<span id="cb24-55"><a href="#cb24-55" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb24-56"><a href="#cb24-56" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb24-57"><a href="#cb24-57" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Minden iteráció friss <code>open</code>-nal indul, ezért a
+<code>f_pos</code> 0-ról kezd: a <code>read</code> a 0..63, a
+<code>write</code> a 64..127 bájtot érinti, a fájl mérete 4096 bájt
+marad. A négy művelet idejét külön mintaként tároljuk, így műveletenként
+számítható átlag, szórás, minimum és maximum; a teljes ciklus ideje
+külön oszlop, nem a műveleti idők helyett. A <code>rdtsc</code> nem
+sorosító utasítás; a rendezés-ellenőrzés kiszűri az out-of-order
+végrehajtásból adódó inkonzisztens mintákat, és ha megsérül, a mérést
+<code>rdtscp</code>-vel vagy <code>lfence</code>-szel megerősítve meg
+kell ismételni.</p>
+<p>A cikluson belül ugyanazt a 4 KiB-os fájlt nyitjuk meg. A TSC-t
+sorosító párral olvassuk (<code>lfence; rdtsc</code> a kezdetnél és
+<code>rdtscp; lfence</code> a végnél), mert a sima <code>rdtsc</code>
+nem sorosító: a mért kód egy része az ablakon kívülre csúszhat; a
+rendezés-ellenőrzés csak a durva hibát (magváltás, TSC-ugrás) szűri. A
+ciklusszámot rögzítjük; átszámításhoz a vendég TSC-frekvenciáját a
+PIT/HPET-kalibráció adja (a <code>qemu64</code> modell a CPUID 0x15/0x16
+levelet nem adja), és a kalibráció bizonytalanságát is fel kell
+tüntetni. QEMU-ban a TSC virtuális, ezért az eredmény az emulált
+környezetre, nem fizikai hardverre jellemző; ezt a naplóban külön meg
+kell jelölni.</p>
+<p><strong>Kiinduló elvárás és a mért érték elkülönítése.</strong> A
+naplóban a következő táblázatot kell kitölteni; a „várt trend” oszlop
+hipotézis, nem mért eredmény:</p>
+<pre class="text"><code>| művelet        | várt trend                             | mért átlag | szórás | min | max |
+|----------------+----------------------------------------+------------+--------+-----+-----|
+| open           | hash lookup, átlag O(1), első minta miss| ? ciklus  | ?      | ?   | ?   |
+| read 64 B      | 64 bájt másolása, O(n), n = 64 B         | ? ciklus  | ?      | ?   | ?   |
+| write 64 B     | 64 bájt másolása, O(n), n = 64 B         | ? ciklus  | ?      | ?   | ?   |
+| close          | O(1)                                    | ? ciklus  | ?      | ?   | ?   |
+| teljes ciklus  | a négy művelet és a hívási overhead     | ? ciklus  | ?      | ?   | ?   |</code></pre>
+<p>A „várt trend” oszlopban az <code>O(1)</code> átlagos esetre
+vonatkozik: a dentry cache hash-tábla, ütközés esetén a lánc hosszával
+lineáris; ezért a szórás és a maximális érték fontos információ. A
+táblába csak ellenőrzött, rendezett időbélyegű minták kerülhetnek; a
+ciklusszámot, a dentry cache találati arányát és a TSC-kalibráció
+bizonytalanságát a táblázat alatt kell rögzíteni.</p>
+<p><strong>Elvárt működés.</strong> A <code>vfs_test</code> sikeres
+futtatása után a mount-névtér konzisztens: a <code>/mnt/test.txt</code>
+a memfs rootjában jön létre. Az első open legalább egy dentry cache
+miss-t, a második open találatot mutat; a találati arány növekedése
+várható, de az open átlagos idejének csökkenése nem garantált, ezért
+csak mért adattal szabad állítani. A
+<code>read</code>/<code>write</code> idő a másolt 64 bájttal közel
+lineáris, az offset minden érvényes iterációban helyes marad, és a fájl
+mérete nem változik.</p>
+<p><strong>Reprodukciós napló.</strong> A naplóba a következő parancsok
+kimenete tartozik:</p>
+<pre class="text"><code>make -C vfs-lab clean
+make -C vfs-lab build
+./qemu-run.sh | tee logs/boot.log</code></pre>
+<p>A <code>boot.log</code> végén a <code>vfs_test: OK</code> sor, a
+mérési táblázat és a verziók szerepelnek. A labot eldobható QEMU
+környezetben vagy külön vendégképen futtasd; a hoszt rendszerpartícióját
+és bootloaderét tilos módosítani.</p>
+<h3 data-number="29.3.10" id="önellenőrző-kérdések"><span
+class="header-section-number">29.3.10</span> 10. Önellenőrző
+kérdések</h3>
+<ol type="1">
+<li>Mi a különbség a <code>dentry</code>, az <code>inode</code> és a
+<code>struct file</code> szerepe között? Melyik tárolja az offsetet és
+miért?</li>
+<li>Mit kell tennie a <code>path_resolve</code>-nak, amikor egy aktív
+mount point-ot ér el?</li>
+<li>Hogyan osztozik az offset két fájlleíró között <code>dup</code>
+után? Melyik kernelbeli adatszerkezet referencia-számlálóját kell
+növelni?</li>
+<li>Milyen hibát okoz, ha a <code>read</code> művelet közvetlenül az
+<code>inode</code>-ba menti a pozíciót, és miért nem elég az
+<code>inode</code> zára?</li>
+<li>Miért kell a dentry <code>d_count</code> referencia-számlálóját a
+<code>d_lookup</code> után növelni? Milyen hibakódot adunk, ha egy
+útvonalkomponens nem könyvtár?</li>
+</ol>
+<p>Ezek a kérdések a fejezet fő ellenőrzési pontjait fedik le. A
+megoldásuk a 8. szakasz hibakezelési megjegyzéseiből és a példakódból
+levezethető.</p>
+<p>A következő fejezet, <a href="os113.html">Shell és
+alapszolgáltatások</a>, erre a VFS-rétegre építve egy kezdetleges shellt
+és a fájlrendszer alapműveleteit fűzi fel felhasználói szintű
+interfésszé.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os111.html">← 29.2 Blokk-eszköz és driver implementáció</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os113.html">29.4 Shell és alapszolgáltatások →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

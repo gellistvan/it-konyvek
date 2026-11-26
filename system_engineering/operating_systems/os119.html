@@ -1,0 +1,859 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>31.2 Hálózat és biztonsági modulok – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz7">VII. RÉSZ – Tervezés, implementáció és záróprojekt</a> › <a href="index.html#osch30">31 Bővítés és haladó témák</a></p>
+<div class="links"><a class="prev" rel="prev" href="os118.html">← 31.1 SMP, preemption és valós idejű kiterjesztés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os120.html">31.3 Virtualizáció és konténerintegráció →</a></div>
+</nav>
+<h2 data-number="31.2" id="os119"><span
+class="header-section-number">31.2</span> Hálózat és biztonsági
+modulok</h2>
+<p>A hálózati és biztonsági bővítés a minimális operációs rendszerben
+akkor válik szükségessé, amikor a kernel már stabilan kezeli a memóriát,
+a folyamatokat és az alapvető perifériákat. A korábbi fejezetben (<a
+href="os118.html">SMP, preemption és valós idejű kiterjesztés</a>)
+elvégzett SMP- és preemption-támogatás után a következő logikus lépés,
+hogy a rendszer képes legyen adatokat cserélni a külvilággal, és hogy
+ezt a képességet biztonságosan, ellenőrzött módon tegye elérhetővé a
+felhasználói kód számára. Ez a fejezet a hálózati verem és a biztonsági
+modulok bevezetését mutatja be egy saját, egyszerű kernelben, nem
+ismételve a korábbi hálózati alapokat (<a
+href="os070.html">Rétegmodellek és TCP/IP</a>–<a
+href="os073.html">Zero-copy, offload és hálózati teljesítmény</a>),
+hanem a minimális rendszerbe való integrációra, a driver–socket–policy
+illesztésre és a támadási felület csökkentésére fókuszálva.</p>
+<p>A cél nem egy teljes értékű TCP/IP-verem megvalósítása, hanem egy
+olyan, UDP-szintű hálózati útvonal kialakítása, amelyen keresztül a
+folyamatok ellenőrzött módon küldhetnek és fogadhatnak csomagokat. Ezzel
+párhuzamosan egy LSM-szerű (Linux Security Module-jellegű)
+hook-rendszert vezetünk be, amely a rendszerhívások és a hálózati réteg
+döntési pontjain egységes policy-ellenőrzést tesz lehetővé. Minden
+kódrészlet szemléltetés; az itt bemutatott kódot kizárólag emulált
+környezetben, például QEMU-ban szabad futtatni, és a valós gép
+rendszerpartícióját, bootloaderét vagy firmware-ét tilos módosítani.</p>
+<h3 data-number="31.2.1" id="hálózati-bővítés-tervezési-elvei"><span
+class="header-section-number">31.2.1</span> 1. Hálózati bővítés
+tervezési elvei</h3>
+<p>A minimális kernel hálózati bővítésénél a legfontosabb elv a
+<strong>rétegzett, de vékony absztrakció</strong>. A kernelnek nem kell
+minden protokollt azonnal támogatnia; elegendő, ha a következő rétegeket
+választjuk szét:</p>
+<ol type="1">
+<li><strong>Eszközréteg</strong>: a hálózati kártya regisztereit,
+megszakításait és adatpuffereit kezeli; itt valósul meg a tényleges
+adatcsere a hardverrel.</li>
+<li><strong>Csomagkezelő réteg</strong>: egységes pufferformátumot
+(<code>netbuf</code>) és életciklus-szabályokat biztosít a felsőbb
+rétegek számára.</li>
+<li><strong>Protokollréteg</strong>: minimális Ethernet-, ARP-, IPv4- és
+UDP-feldolgozást végez; a TCP-t későbbi bővítésként hagyjuk.</li>
+<li><strong>Socket réteg</strong>: a felhasználói folyamatok számára
+fájlleíró-alapú hozzáférést ad, és összekapcsolja a rendszerhívásokat a
+protokollréteggel.</li>
+<li><strong>Biztonsági modul réteg</strong>: a rendszerhívások és a
+protokollréteg közötti pontokon hook-ok segítségével policy-döntéseket
+hoz.</li>
+</ol>
+<p>A tervezés során törekedni kell arra, hogy a drivert ne terheljük
+protokoll-logikával, a protokollréteget ne terheljük a socket-állapot
+kezelésével, és a biztonsági modulokat ne keverjük a hálózati kódba. Ez
+a szétválasztás teszi lehetővé a későbbi bővítést: újabb protokoll,
+újabb driver vagy újabb policy hozzáadása nem érinti a többi
+réteget.</p>
+<p>A minimális kernelben a hálózati verem
+<strong>eseményvezérelt</strong> és <strong>megszakítás-alapú</strong>
+lehet, de a bonyolult ütemezési követelmények miatt gyakran érdemes
+kettős megközelítést alkalmazni: a fogadási oldal megszakításból csak
+egy félkész állapotba helyezi a csomagot, és egy későbbi feldolgozási
+ponton (softirq, kthread vagy egyszerű poll) történik a
+protokoll-feldolgozás. Ez a mintázat csökkenti a megszakításkontextusban
+eltöltött időt, és lehetővé teszi a zárolások egyszerűbb használatát. A
+küldési oldal általában szinkron hívás, de a driver visszaadhat
+<code>-ENOBUFS</code> hibát, ha a hardveres sor tele van.</p>
+<h3 data-number="31.2.2" id="eszközabsztrakció-és-driver-modell"><span
+class="header-section-number">31.2.2</span> 2. Eszközabsztrakció és
+driver-modell</h3>
+<p>A minimális OS-ben a hálózati eszközöket a <code>net_device</code>
+struktúra reprezentálja. Ez a struktúra nem a hardver allokációjáért
+felel, hanem egy vezérlőfelületet ad a kernel számára.</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> net_device <span class="op">{</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span> name<span class="op">[</span><span class="dv">16</span><span class="op">];</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> flags<span class="op">;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> mtu<span class="op">;</span>        <span class="co">/* L3-payload maximum, IPv4-nél jellemzően 1500 */</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span> mac<span class="op">[</span><span class="dv">6</span><span class="op">];</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">*</span>priv<span class="op">;</span>   <span class="co">/* driver-specifikus adatok */</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>open<span class="op">)(</span><span class="kw">struct</span> net_device <span class="op">*</span>dev<span class="op">);</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>stop<span class="op">)(</span><span class="kw">struct</span> net_device <span class="op">*</span>dev<span class="op">);</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>send<span class="op">)(</span><span class="kw">struct</span> net_device <span class="op">*</span>dev<span class="op">,</span> <span class="kw">struct</span> netbuf <span class="op">*</span>buf<span class="op">,</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>                <span class="dt">uint64_t</span> <span class="op">*</span>cookie<span class="op">);</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>recv<span class="op">)(</span><span class="kw">struct</span> net_device <span class="op">*</span>dev<span class="op">,</span> <span class="kw">struct</span> netbuf <span class="op">**</span>bufp<span class="op">);</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>has_more<span class="op">)(</span><span class="kw">struct</span> net_device <span class="op">*</span>dev<span class="op">);</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>tx_complete<span class="op">)(</span><span class="kw">struct</span> net_device <span class="op">*</span>dev<span class="op">,</span> <span class="dt">uint64_t</span> cookie<span class="op">);</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A driver a <code>priv</code> mezőn keresztül tárolja a
+hardverregiszterek virtuális címét, a DMA-pufferek pointerét és a gyűrűk
+indexeit. A <code>flags</code> mezőben bitenként jelölhetjük az
+állapotot: <code>NETDEV_FLAG_UP</code>,
+<code>NETDEV_FLAG_PROMISC</code>, <code>NETDEV_FLAG_LOOPBACK</code>. A
+<code>mtu</code> a maximális <strong>L3-payload</strong> hossza
+(IPv4-nél jellemzően 1500 bájt), nem a teljes Ethernet kereté: a keret
+hosszához a 14 bájtos Ethernet fejléc (<code>ETH_HLEN</code>) adódik,
+VLAN-burkolás esetén további 4 bájt. A <code>netbuf-&gt;len</code> a
+küldési és fogadási határon a <strong>teljes L2-keret</strong> hossza,
+ezért a küldési útvonalon a <code>mtu</code>-ellenőrzést
+<code>buf-&gt;len &lt; ETH_HLEN || buf-&gt;len &gt; dev-&gt;mtu + ETH_HLEN</code>
+alakban kell elvégezni; a minimális keretmérethez a
+<code>len &lt; ETH_HLEN</code> feltétel tartozik.</p>
+<p>A fogadási oldal tipikus megszakításkezelője nem közvetlenül a
+protokollréteget hívja, hanem a csomagot behelyezi egy per-CPU vagy
+globális fogadási sorba. A következő pszeudokód egy egyszerű
+megszakításkezelőt mutat:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#define NET_RX_BUDGET </span><span class="dv">32</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> net_interrupt_handler<span class="op">(</span><span class="kw">struct</span> irq_context <span class="op">*</span>ctx<span class="op">)</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> net_device <span class="op">*</span>dev <span class="op">=</span> ctx<span class="op">-&gt;</span>dev<span class="op">;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> netbuf <span class="op">*</span>buf <span class="op">=</span> NULL<span class="op">;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span> done <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    irq_ack<span class="op">(</span>ctx<span class="op">-&gt;</span>irq<span class="op">);</span>   <span class="co">/* korai ack: a kezelés alatt ne vesszen el él */</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>done <span class="op">&lt;</span> NET_RX_BUDGET <span class="op">&amp;&amp;</span> dev<span class="op">-&gt;</span>recv<span class="op">(</span>dev<span class="op">,</span> <span class="op">&amp;</span>buf<span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>buf <span class="op">==</span> NULL<span class="op">)</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>netif_rx<span class="op">(</span>dev<span class="op">,</span> buf<span class="op">)</span> <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>            <span class="co">/* a sor tele van: a puffer a hívó tulajdonában maradt */</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>            netbuf_free<span class="op">(</span>buf<span class="op">);</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>            netdev_rx_drop<span class="op">(</span>dev<span class="op">);</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>        buf <span class="op">=</span> NULL<span class="op">;</span>      <span class="co">/* sikeres netif_rx esetén a tulajdonjog átkerült */</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>        done<span class="op">++;</span>          <span class="co">/* a költségkeret a ciklustörzsben fogy, nincs előjel nélküli alulcsordulás */</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>done <span class="op">==</span> NET_RX_BUDGET <span class="op">&amp;&amp;</span> dev<span class="op">-&gt;</span>has_more<span class="op">(</span>dev<span class="op">))</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>        net_rx_schedule<span class="op">(</span>dev<span class="op">);</span>  <span class="co">/* a maradékot kernel-szál pollolja */</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>recv</code> szerződése: siker (<code>0</code>) esetén a
+<code>*bufp</code> érvényes pufferre mutat, és a <strong>tulajdonjog a
+hívóra száll</strong>; hiba esetén a <code>*bufp</code> változatlan
+marad, és a hívó nem szabadítja fel. A <code>netif_rx</code> siker
+(<code>0</code>) esetén átveszi a puffer tulajdonjogát, hibánál viszont
+nem: ilyenkor a hívó felelőssége a <code>netbuf_free</code> és a
+<code>rx_dropped</code> számláló növelése. A <code>has_more</code> csak
+azt jelzi, hogy a hardver gyűrűjében további feldolgozható keret van;
+nem olvas és nem foglal puffert. Ha a költségkeret elfogyott, a
+megszakításkezelő nem folytatja a végtelen ciklust, hanem a
+<code>net_rx_schedule</code> jelzésére a kernel-szál végzi a korlátos
+pollt. A <code>NET_RX_BUDGET</code> értéke konfiguráció; a mérési
+jegyzőkönyvben rögzíteni kell, mert a megszakítás-késleltetést és az
+átviteli sebességet is befolyásolja.</p>
+<p>A <code>netif_rx</code> felelős azért, hogy a csomag a megfelelő
+feldolgozási kontextusba kerüljön. Minimális rendszerben megvalósítható
+egyetlen zárt sorral és egy kernel-szál általi feldolgozással, de
+figyelni kell a sor méretére: korlátlan növekedés esetén a támadó
+memóriatúlcsordulást okozhat. A sor maximális hosszát explicit
+konstansként kell megadni, például <code>NET_RX_QLEN = 256</code>, és ha
+a sor tele van, a csomagot el kell dobni, valamint számlálót kell
+növelni a statisztikai naplóhoz.</p>
+<p>A <code>send</code> műveletnek atomikusnak kell lennie a driver
+szempontjából. A következő példa egy leegyszerűsített virtio-net küldő
+függvényt vázol; a valós virtio implementáció ennél összetettebb, és a
+gyártói specifikációt kell követni (ellenőrzés szükséges az aktuális
+verzióhoz).</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> virtio_net_send<span class="op">(</span><span class="kw">struct</span> net_device <span class="op">*</span>dev<span class="op">,</span> <span class="kw">struct</span> netbuf <span class="op">*</span>buf<span class="op">,</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>                    <span class="dt">uint64_t</span> <span class="op">*</span>cookie<span class="op">)</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> virtio_net_priv <span class="op">*</span>priv <span class="op">=</span> dev<span class="op">-&gt;</span>priv<span class="op">;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> id<span class="op">;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!(</span>dev<span class="op">-&gt;</span>flags <span class="op">&amp;</span> NETDEV_FLAG_UP<span class="op">))</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>ENETDOWN<span class="op">;</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>buf<span class="op">-&gt;</span>len <span class="op">&lt;</span> ETH_HLEN <span class="op">||</span> buf<span class="op">-&gt;</span>len <span class="op">&gt;</span> dev<span class="op">-&gt;</span>mtu <span class="op">+</span> ETH_HLEN<span class="op">)</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>EMSGSIZE<span class="op">;</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>cookie<span class="op">)</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>EINVAL<span class="op">;</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    id <span class="op">=</span> <span class="op">++</span>priv<span class="op">-&gt;</span>next_tx_cookie<span class="op">;</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>virtqueue_add_outbuf<span class="op">(</span>priv<span class="op">-&gt;</span>txq<span class="op">,</span> buf<span class="op">-&gt;</span>data<span class="op">,</span> buf<span class="op">-&gt;</span>len<span class="op">,</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>                             buf<span class="op">,</span> id<span class="op">)</span> <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>ENOBUFS<span class="op">;</span>   <span class="co">/* a puffer tulajdonjoga a hívónál marad */</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>    virtqueue_kick<span class="op">(</span>priv<span class="op">-&gt;</span>txq<span class="op">);</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">*</span>cookie <span class="op">=</span> id<span class="op">;</span>          <span class="co">/* siker: a puffer tulajdonjoga a driverre szállt */</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>send</code> sikeres visszatérése után a <code>netbuf</code> a
+driver tulajdonában van: a hívó a <code>tx_complete</code>
+visszajelzéséig nem módosíthatja és nem szabadíthatja fel, mert a
+hardver DMA-val még olvashatja. A <code>cookie</code> a kérés egyedi
+azonosítója; a <code>tx_complete</code> addig ad <code>0</code>-t, amíg
+a küldés be nem fejeződött, és <code>1</code>-et, amikor a driver már
+nem hivatkozik a pufferre. A completion után a tulajdonjog visszaszáll a
+hívóra, aki felszabadítja a puffert (a fenti példában a
+<code>virtio_net_tx_complete</code> végzi el a
+<code>netbuf_free</code>-ot, de a tulajdonjogot dokumentálni kell). A
+<code>virtqueue_add_outbuf</code> itt leegyszerűsített szignatúra: a
+valós virtio descriptor-láncot használ, és a completion a descriptor
+indexéből vagy a contextből nyeri vissza a puffer címét; a
+<code>cookie</code> ott is lehet descriptor-index vagy monoton számláló.
+Ha a <code>send</code> hibát ad vissza, a puffer tulajdonjoga a hívónál
+marad, és a hívó szabadítja fel. A <code>next_tx_cookie</code> növelését
+és a queue módosítását a TX-útvonal spinlockja védi, mert a
+<code>send</code> több kontextusból is hívható; a 64 bites számláló
+gyakorlatban nem fordul át, de a kimerült azonosítót nem szabad újra
+kiadni egy még függőben lévő kéréshez.</p>
+<h3 data-number="31.2.3" id="csomagbuffer-és-életciklus"><span
+class="header-section-number">31.2.3</span> 3. Csomagbuffer és
+életciklus</h3>
+<p>A hálózati verem központi adatszerkezete a csomagbuffer. A Linux
+<code>sk_buff</code> mintájára a minimális kernelben egy egyszerű
+<code>netbuf</code> struktúrát vezetünk be, amely a csomag adatait,
+hosszát és metaadatait tárolja.</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> netbuf <span class="op">{</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> list_node list<span class="op">;</span>  <span class="co">/* láncolás a sorokhoz */</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span> <span class="op">*</span>data<span class="op">;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> len<span class="op">;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> capacity<span class="op">;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> flags<span class="op">;</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> net_device <span class="op">*</span>dev<span class="op">;</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> socket <span class="op">*</span>sock<span class="op">;</span>    <span class="co">/* fogadáskor a cél socket */</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A <code>data</code> pointer a csomag kezdetére mutat; a
+<code>len</code> az érvényes bájtok számát, a <code>capacity</code>
+pedig a lefoglalt pufferméretet adja meg. A <code>flags</code>
+bitmezőben jelölhetjük például a <code>NETBUF_FLAG_LOOPBACK</code> vagy
+a <code>NETBUF_FLAG_BROADCAST</code> állapotot. A <code>dev</code> az az
+eszköz, amelyről a csomag érkezett vagy amelyre küldik; a
+<code>sock</code> fogadásnál a cél socketre mutat.</p>
+<p>A csomagbuffer életciklusának szabályai kritikusak a biztonság és a
+stabilitás szempontjából:</p>
+<ul>
+<li>A puffert a fogadási oldalon a driver allokálja, általában DMA-képes
+memóriaterületről.</li>
+<li>A feldolgozási sorba kerülés után a tulajdonjog a veremé; a driver
+nem férhet hozzá.</li>
+<li>A protokollréteg feldolgozás után vagy továbbítja a sockethez, vagy
+felszabadítja a puffert.</li>
+<li>A küldési oldalon a felhasználói adatokat a kernel lemásolja egy
+kernel-pufferbe, és a verem hozza létre a <code>netbuf</code>-ot; a
+felhasználói memória soha nem kerül közvetlenül a hardverhez.</li>
+</ul>
+<figure id="fig-os119-netbuf-ut">
+<div class="fig-interactive"><iframe src="figures/html/os119-netbuf-ut.html" title="Két sáv. RX: NIC/virtqueue, IRQ-kezelő (budget 32), netif_rx 256 elemű sor zárral (tele: eldobás), kernel-szál, parser a hosszmezőkkel (eldobás), security_net_rx hook (policy-eldobás), socket-sor 64 elemmel zárral (tele: eldobás), recvfrom és copy_to_user. A tulajdonos-sáv: driver, hívó, verem, socket. TX: sendto, hosszellenőrzés, copy_from_user és netbuf-létrehozás, security_socket_send hook (-EPERM), UDP/IP/Ethernet fejlécek, virtio_net_send (-ENOBUFS), TX-completion és felszabadítás; tulajdonos: hívó, verem, driver." loading="lazy" style="width:100%;border:0;height:640px"></iframe><noscript><img src="figures/img/os119-netbuf-ut.png" style="width:100.0%"
+alt="Két sáv. RX: NIC/virtqueue, IRQ-kezelő (budget 32), netif_rx 256 elemű sor zárral (tele: eldobás), kernel-szál, parser a hosszmezőkkel (eldobás), security_net_rx hook (policy-eldobás), socket-sor 64 elemmel zárral (tele: eldobás), recvfrom és copy_to_user. A tulajdonos-sáv: driver, hívó, verem, socket. TX: sendto, hosszellenőrzés, copy_from_user és netbuf-létrehozás, security_socket_send hook (-EPERM), UDP/IP/Ethernet fejlécek, virtio_net_send (-ENOBUFS), TX-completion és felszabadítás; tulajdonos: hívó, verem, driver." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/os119-netbuf-ut.png" style="width:100.0%"
+alt="Két sáv. RX: NIC/virtqueue, IRQ-kezelő (budget 32), netif_rx 256 elemű sor zárral (tele: eldobás), kernel-szál, parser a hosszmezőkkel (eldobás), security_net_rx hook (policy-eldobás), socket-sor 64 elemmel zárral (tele: eldobás), recvfrom és copy_to_user. A tulajdonos-sáv: driver, hívó, verem, socket. TX: sendto, hosszellenőrzés, copy_from_user és netbuf-létrehozás, security_socket_send hook (-EPERM), UDP/IP/Ethernet fejlécek, virtio_net_send (-ENOBUFS), TX-completion és felszabadítás; tulajdonos: hívó, verem, driver." /></details></div>
+<figcaption>A <code>netbuf</code> útja és tulajdonosai az RX- és a
+TX-útvonalon: a tulajdonjog a driver, a hívó, a verem és a socket között
+cserél gazdát; a hook-pontok rombuszok, az eldobási pontokon az aktuális
+tulajdonos szabadít fel</figcaption>
+</figure>
+<p>A dupla felszabadítás vagy a használat utáni felszabadítás
+elkerülésére a hívó a felszabadítás után nullázza a saját mutatóját
+(például a
+<code>#define NETBUF_FREE(p) do { netbuf_free(p); (p) = NULL; } while (0)</code>
+makróval), és a tulajdonjog-átadási pontokat a kódban kommentárral kell
+jelölni. A minimális kernelben érdemes bevezetni egy egyszerű
+<code>netbuf_alloc</code> és <code>netbuf_free</code> párt, amelyek egy
+fix méretű memóriapoolból gazdálkodnak.</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> netbuf <span class="op">*</span>netbuf_alloc<span class="op">(</span><span class="dt">size_t</span> capacity<span class="op">)</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> netbuf <span class="op">*</span>buf <span class="op">=</span> kzalloc<span class="op">(</span><span class="kw">sizeof</span><span class="op">(*</span>buf<span class="op">));</span>   <span class="co">/* a list, dev, sock mezők nullázva */</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>buf<span class="op">)</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> NULL<span class="op">;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    buf<span class="op">-&gt;</span>data <span class="op">=</span> kmalloc<span class="op">(</span>capacity<span class="op">);</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>buf<span class="op">-&gt;</span>data<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>        kfree<span class="op">(</span>buf<span class="op">);</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> NULL<span class="op">;</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>    buf<span class="op">-&gt;</span>capacity <span class="op">=</span> capacity<span class="op">;</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>    buf<span class="op">-&gt;</span>len <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>    buf<span class="op">-&gt;</span>flags <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> buf<span class="op">;</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> netbuf_free<span class="op">(</span><span class="kw">struct</span> netbuf <span class="op">*</span>buf<span class="op">)</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>buf<span class="op">)</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>    kfree<span class="op">(</span>buf<span class="op">-&gt;</span>data<span class="op">);</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a>    kfree<span class="op">(</span>buf<span class="op">);</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A fenti kód egyszerű
+<code>netbuf_alloc</code>/<code>netbuf_free</code> pár, amely kezdetben
+<code>kmalloc</code>-ot használ; éles változatban fix méretű poolból
+gazdálkodik. A <code>kmalloc</code> és <code>kfree</code> a kernel
+memóriaallokátorát használja, amelyet a korábbi fejezetekben (<a
+href="os046.html">Heapallokátorok: free list, buddy és slab</a>–<a
+href="os049.html">Kernelmemória, vmalloc, kmalloc és biztonság</a>)
+részletesen tárgyaltunk. A <code>netbuf_alloc</code> hibakezelése
+példaértékű: ha a második allokáció sikertelen, az elsőt fel kell
+szabadítani, különben memóriaszivárgás keletkezik.</p>
+<h3 data-number="31.2.4"
+id="socket-réteg-és-hálózati-rendszerhívások"><span
+class="header-section-number">31.2.4</span> 4. Socket réteg és hálózati
+rendszerhívások</h3>
+<p>A felhasználói folyamatok számára a hálózati hozzáférést a socket
+rendszerhívások biztosítják. A minimális kernelben a socketet a folyamat
+fájlleíró-táblájában tárolt objektumként implementáljuk, hasonlóan a
+pipe-hoz vagy a megszokott fájlleírókhoz. A socket létrehozása a
+<code>socket</code> rendszerhívással történik:</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> sys_socket<span class="op">(</span><span class="dt">int</span> family<span class="op">,</span> <span class="dt">int</span> type<span class="op">,</span> <span class="dt">int</span> protocol<span class="op">);</span></span></code></pre></div>
+<p>A paraméterek közül a <code>family</code> az <code>AF_INET</code>
+értéket veheti fel, a <code>type</code> az <code>SOCK_DGRAM</code> (UDP)
+típust támogatja, a <code>protocol</code> pedig általában
+<code>0</code>. A visszatérési érték egy új fájlleíró, hiba esetén
+<code>-1</code>, és az <code>errno</code> a hibatípust jelzi. A
+lehetséges hibakódok: <code>-EAFNOSUPPORT</code> (ismeretlen címcsalád),
+<code>-EPROTONOSUPPORT</code> (nem támogatott protokoll),
+<code>-ENOMEM</code> (nincs memória a socket struktúrához).</p>
+<p>A minimális UDP-kommunikációhoz három további rendszerhívásra van
+szükség:</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> sys_bind<span class="op">(</span><span class="dt">int</span> fd<span class="op">,</span> <span class="dt">const</span> <span class="kw">struct</span> sockaddr <span class="op">*</span>addr<span class="op">,</span> socklen_t addrlen<span class="op">);</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> sys_sendto<span class="op">(</span><span class="dt">int</span> fd<span class="op">,</span> <span class="dt">const</span> <span class="dt">void</span> <span class="op">*</span>buf<span class="op">,</span> <span class="dt">size_t</span> len<span class="op">,</span> <span class="dt">int</span> flags<span class="op">,</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>               <span class="dt">const</span> <span class="kw">struct</span> sockaddr <span class="op">*</span>dest<span class="op">,</span> socklen_t destlen<span class="op">);</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> sys_recvfrom<span class="op">(</span><span class="dt">int</span> fd<span class="op">,</span> <span class="dt">void</span> <span class="op">*</span>buf<span class="op">,</span> <span class="dt">size_t</span> len<span class="op">,</span> <span class="dt">int</span> flags<span class="op">,</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>                 <span class="kw">struct</span> sockaddr <span class="op">*</span>src<span class="op">,</span> socklen_t <span class="op">*</span>srclen<span class="op">);</span></span></code></pre></div>
+<p>A <code>bind</code> egy helyi címhez és porthoz köti a socketet; a
+<code>sendto</code> az adott célcímre küld adatot, a
+<code>recvfrom</code> pedig a fogadott csomag forráscímét is visszaadja.
+A rendszerhívások minden esetben ellenőrzik a felhasználói mutatók
+érvényességét, a hosszmezők konzisztenciáját és az erőforrás-korlátokat.
+A <code>sendto</code> és <code>recvfrom</code> esetében a
+<code>len</code> paraméter nem haladhatja meg a definiált maximális
+UDP-csomagméretet, például <code>UDP_MAX_PAYLOAD = 1472</code> bájtot
+(IPv4 esetén 1500 bájtos MTU mellett). A <code>flags</code> paramétert
+egyelőre figyelmen kívül hagyjuk, de a felületen hagyjuk meg a későbbi
+bővítéshez.</p>
+<p>A socket réteg felelős a csomagok és a folyamatok közötti adatcsere
+lebonyolításáért. Fogadáskor a protokollréteg a <code>sock</code>
+mezőben megadott sockethez rendeli a bejövő <code>netbuf</code>-ot, és a
+socket fogadási sorába helyezi. A <code>recvfrom</code> rendszerhívás
+blokkol, amíg a sor üres, vagy ha <code>O_NONBLOCK</code> flag be van
+állítva, <code>-EAGAIN</code> hibát ad. A küldési oldalon a
+<code>sendto</code> a felhasználói puffer tartalmát kernelmemóriába
+másolja, majd a protokollrétegen keresztül a driverhez továbbítja.</p>
+<p>Az adatmásolásnál alapvető biztonsági szabály, hogy a kernel soha ne
+olvasson közvetlenül a felhasználói mutatóról anélkül, hogy a
+memóriatartományt ellenőrizte volna. A minimális kernelben a
+<code>copy_from_user</code> és <code>copy_to_user</code> függvények
+ellenőrzik, hogy a cél- és forrástartomány a felhasználói címtartományon
+belül van-e, és hogy a hossz nem lépi át a szegmenshatárt. A hibát
+<code>-EFAULT</code> értékkel jelezzük.</p>
+<p>A <code>sendto</code> sorrendje a biztonsági hook szempontjából
+kötelező: először a <code>len</code>-t kell ellenőrizni
+(<code>len &lt;= UDP_MAX_PAYLOAD</code>), majd a <code>destlen</code>-t
+(<code>destlen == sizeof(struct sockaddr_in)</code>), ezután a
+<code>copy_from_user</code>-rel a <code>sockaddr_in</code>-t és az
+adatot kernelpufferbe kell másolni, és csak ezután szabad a hookot
+hívni. A hook a kernelbeli puffert, a tényleges hosszt és a kernelben
+validált célcímet kapja, felhasználói mutatót soha. Ha a
+<code>dest</code> felhasználói pointer <code>NULL</code>, az csak
+kapcsolt socketnél megengedett: ilyenkor a kernel a
+<code>sock-&gt;peer</code> tárolt címet adja át, így a hook mindig
+tényleges célcímet lát; nem kapcsolt socketnél a helyes hiba
+<code>-EDESTADDRREQ</code>. A címcsaládot és a portot a kernel már a
+másolás után ellenőrzi, de a policy-hooknak is látnia kell őket, mert a
+döntés az ő felelőssége.</p>
+<h3 data-number="31.2.5"
+id="biztonsági-modulok-lsm-szerű-hook-rendszer"><span
+class="header-section-number">31.2.5</span> 5. Biztonsági modulok:
+LSM-szerű hook-rendszer</h3>
+<p>A hálózati és egyéb kernel-funkciók biztonságos elérhetőségének
+szabályozására a minimális OS egy <strong>biztonsági modul
+réteget</strong> vezet be. Ez a réteg nem egyetlen policy-implementáció,
+hanem egy hook-mechanizmus, amelyhez különböző policy-modulok
+csatlakozhatnak. A koncepció a Linux Security Modules (LSM) mintáját
+követi, de a minimális kernelben jóval egyszerűbb felülettel.</p>
+<p>A hook-ok olyan függvényhívások, amelyeket a kernel kritikus döntési
+pontjain helyezünk el. A hálózati veremben legalább a következő
+hook-pontokra van szükség:</p>
+<ul>
+<li><code>security_socket_create(family, type, protocol)</code> – socket
+létrehozásakor.</li>
+<li><code>security_socket_bind(sock, addr, addrlen)</code> – cím
+hozzárendelésekor; az <code>addr</code> kernelben validált
+<code>sockaddr_in</code>.</li>
+<li><code>security_socket_send(sock, kbuf, len, dest)</code> – küldés
+előtt; <code>kbuf</code> kernelpuffer, <code>len</code> a tényleges
+adathossz, <code>dest</code> kernelben validált
+<code>sockaddr_in</code>.</li>
+<li><code>security_socket_recv(sock, kbuf, len, src)</code> – fogadás
+előtt; <code>src</code> kernelben validált
+<code>sockaddr_in</code>.</li>
+<li><code>security_net_rx(dev, netbuf)</code> – bejövő csomag
+feldolgozása előtt.</li>
+</ul>
+<p>A hookok egyike sem kap felhasználói pointert: a
+<code>struct sockaddr *</code> felhasználói változatát a rendszerhívás
+másolja és validálja, a hook csak a kernelbeli példányt látja. Ez a
+szabály akkor is érvényes, ha a socket kapcsolt és a célcím a
+<code>sock-&gt;peer</code>-ből származik.</p>
+<p>A hook-ok minden esetben <code>int</code> típussal térnek vissza:
+<code>0</code> jelenti az engedélyezést, negatív érték pedig a hibakódot
+(például <code>-EPERM</code>). A kernel kódja a hook hívása után azonnal
+ellenőrzi a visszatérési értéket, és hiba esetén megszakítja a
+műveletet.</p>
+<p>A minimális kernelben a hook-ok megvalósítása egyszerű
+függvénymutató-táblával történhet:</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> security_ops <span class="op">{</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>socket_create<span class="op">)(</span><span class="dt">int</span> family<span class="op">,</span> <span class="dt">int</span> type<span class="op">,</span> <span class="dt">int</span> protocol<span class="op">);</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>socket_bind<span class="op">)(</span><span class="kw">struct</span> socket <span class="op">*</span>sock<span class="op">,</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>                       <span class="dt">const</span> <span class="kw">struct</span> sockaddr <span class="op">*</span>addr<span class="op">,</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>                       socklen_t addrlen<span class="op">);</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>socket_send<span class="op">)(</span><span class="kw">struct</span> socket <span class="op">*</span>sock<span class="op">,</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>                       <span class="dt">const</span> <span class="dt">void</span> <span class="op">*</span>kbuf<span class="op">,</span> <span class="dt">size_t</span> len<span class="op">,</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>                       <span class="dt">const</span> <span class="kw">struct</span> sockaddr_in <span class="op">*</span>dest<span class="op">);</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>socket_recv<span class="op">)(</span><span class="kw">struct</span> socket <span class="op">*</span>sock<span class="op">,</span> <span class="dt">const</span> <span class="dt">void</span> <span class="op">*</span>kbuf<span class="op">,</span> <span class="dt">size_t</span> len<span class="op">,</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>                       <span class="dt">const</span> <span class="kw">struct</span> sockaddr_in <span class="op">*</span>src<span class="op">);</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>net_rx<span class="op">)(</span><span class="kw">struct</span> net_device <span class="op">*</span>dev<span class="op">,</span> <span class="kw">struct</span> netbuf <span class="op">*</span>buf<span class="op">);</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A kernel indításakor egy alapértelmezett, mindent engedélyező modul
+töltődik be, amely minden hook-ban <code>0</code>-t ad vissza. A
+biztonsági modul a <code>security_set_ops</code> függvénnyel
+regisztrálhatja saját implementációját. A regisztráció csak a rendszer
+indulásakor, a felhasználói folyamatok elindítása előtt megengedett,
+hogy a futás közbeni csere ne okozzon inkonzisztens állapotot.</p>
+<p>A virtio-net minden keret elé 12 bájtos <code>virtio_net_hdr</code>-t
+vár (az OASIS virtio specifikáció szerint, verzióval ellenőrzendő);
+offload nélkül minden mezője 0. A küldési útvonalon a
+<code>netbuf</code>-ban fejléchelyet (<code>headroom</code>) kell
+hagyni:
+<code>struct virtio_net_hdr_v1 *h = netbuf_push(buf, sizeof(*h)); memset(h, 0, sizeof(*h));</code>,
+vagy kétdescriptoros láncot kell használni (fejléc + keret). Szerződés a
+tulajdonjogra: sikeres <code>send</code> után a puffert a driver
+TX-completion kezelője szabadítja fel (<code>netbuf_free</code>), a hívó
+a <code>send</code> után nem nyúl hozzá.</p>
+<p>A hálózati példában egy <strong>hálózati ACL-policy</strong> modult
+mutatunk be. A modul célja, hogy a felhasználói folyamatok csak a
+loopback interfészen, a <code>127.0.0.1</code> címre és a
+<code>8080</code>-as portra küldhessenek UDP-csomagokat. Minden más
+célcímet vagy portot elutasítunk. A <code>security_socket_send</code>
+hook a következő logikát valósítja meg:</p>
+<div class="sourceCode" id="cb9"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> acl_socket_send<span class="op">(</span><span class="kw">struct</span> socket <span class="op">*</span>sock<span class="op">,</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>                    <span class="dt">const</span> <span class="dt">void</span> <span class="op">*</span>kbuf<span class="op">,</span> <span class="dt">size_t</span> len<span class="op">,</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>                    <span class="dt">const</span> <span class="kw">struct</span> sockaddr_in <span class="op">*</span>dest<span class="op">)</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> ip<span class="op">;</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint16_t</span> port<span class="op">;</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>dest <span class="op">==</span> NULL<span class="op">)</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>EDESTADDRREQ<span class="op">;</span>   <span class="co">/* nem kapcsolt socket, nincs célcím */</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>len <span class="op">&gt;</span> UDP_MAX_PAYLOAD<span class="op">)</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>EMSGSIZE<span class="op">;</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>dest<span class="op">-&gt;</span>sin_family <span class="op">!=</span> AF_INET<span class="op">)</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>EAFNOSUPPORT<span class="op">;</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a>    ip <span class="op">=</span> ntohl<span class="op">(</span>dest<span class="op">-&gt;</span>sin_addr<span class="op">.</span>s_addr<span class="op">);</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a>    port <span class="op">=</span> ntohs<span class="op">(</span>dest<span class="op">-&gt;</span>sin_port<span class="op">);</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>acl_mode <span class="op">==</span> ACL_MODE_LOOPBACK_ONLY<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>ip <span class="op">!=</span> <span class="bn">0x7f000001</span><span class="bu">U</span> <span class="op">||</span> port <span class="op">!=</span> <span class="dv">8080</span><span class="op">)</span>   <span class="co">/* 127.0.0.1:8080 */</span></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="op">-</span>EPERM<span class="op">;</span></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>acl_mode <span class="op">==</span> ACL_MODE_HOSTFWD_DEMO<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a>        <span class="co">/*</span></span>
+<span id="cb9-26"><a href="#cb9-26" aria-hidden="true" tabindex="-1"></a><span class="co">         * QEMU user-mode NAT: a vendég a 10.0.2.15:8080 címen fogad,</span></span>
+<span id="cb9-27"><a href="#cb9-27" aria-hidden="true" tabindex="-1"></a><span class="co">         * a hostfwd forgalom forrása 10.0.2.2. A küldési szabály a válasz</span></span>
+<span id="cb9-28"><a href="#cb9-28" aria-hidden="true" tabindex="-1"></a><span class="co">         * a NAT-gatewaynek (10.0.2.2) a kérés forrásportjára; a vendég saját</span></span>
+<span id="cb9-29"><a href="#cb9-29" aria-hidden="true" tabindex="-1"></a><span class="co">         * címére (10.0.2.15) küldés nem kell. Külön, kifejezetten</span></span>
+<span id="cb9-30"><a href="#cb9-30" aria-hidden="true" tabindex="-1"></a><span class="co">         * engedélyezett demó-szabály, nem része az alap policy-nek.</span></span>
+<span id="cb9-31"><a href="#cb9-31" aria-hidden="true" tabindex="-1"></a><span class="co">         */</span></span>
+<span id="cb9-32"><a href="#cb9-32" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>ip <span class="op">!=</span> <span class="bn">0x0a000202</span><span class="bu">U</span> <span class="op">||</span> port <span class="op">!=</span> last_request_src_port<span class="op">)</span>   <span class="co">/* a demó a bejövő kérés forrásportját tárolja */</span></span>
+<span id="cb9-33"><a href="#cb9-33" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="op">-</span>EPERM<span class="op">;</span></span>
+<span id="cb9-34"><a href="#cb9-34" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb9-35"><a href="#cb9-35" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-36"><a href="#cb9-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-37"><a href="#cb9-37" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">-</span>EPERM<span class="op">;</span></span>
+<span id="cb9-38"><a href="#cb9-38" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A fenti példa a <code>send</code> irányú policy. A
+<code>security_net_rx</code> hook ugyanezt a két profilt használja, de a
+forrás- és céloldal szerepe felcserélődik: loopback profilban csak a
+<code>127.0.0.1:8080</code> felé menő, illetve onnan jövő forgalom megy
+át; a hostfwd demóban a vendég a <code>10.0.2.15:8080</code> címen
+fogad, a forrás pedig <code>10.0.2.2</code> (a QEMU user-mode NAT
+gateway-e). A két profil nem keverhető: a demó indításakor a
+jegyzőkönyvben rögzíteni kell, melyik profil aktív, és a tiltott címek
+tesztje nem használhatja a másik profilt. A <code>kbuf</code> és a
+<code>len</code> a kernelben már validált adatot írja le; a hook a
+<code>len</code> alapján dönthet a maximális UDP-terhelésről, de a
+puffert nem módosíthatja.</p>
+<p>A hook a <code>sendto</code> rendszerhívásban, a felhasználói puffer
+kernelbe másolása <strong>után</strong>, de a protokollrétegnek történő
+átadás <strong>előtt</strong> fut. Ez a sorrend fontos: a
+policy-ellenőrzésnek a tényleges hálózati művelet előtt kell
+megtörténnie, hogy a tiltott csomag ne is kerüljön a driverhez.
+Ugyanakkor a hook nem férhet hozzá a felhasználói memóriához, mert az a
+<code>copy_from_user</code> után már kernel-címről érhető el.</p>
+<p>A hook-rendszer naplózási képességet is kaphat. A minimális kernelben
+a <code>klog</code> segítségével rögzítjük az elutasításokat: a folyamat
+PID-jét, a kért célcímet és portot, valamint az időbélyeget. A napló a
+labor során a mérési jegyzőkönyv alapja.</p>
+<h3 data-number="31.2.6" id="támadási-felület-és-tipikus-hibák"><span
+class="header-section-number">31.2.6</span> 6. Támadási felület és
+tipikus hibák</h3>
+<p>A hálózati és biztonsági bővítés bevezetése jelentősen megnöveli a
+kernel támadási felületét. A hálózati csomagok külső, ellenőrizetlen
+adatokat hoznak a rendszerbe, a rendszerhívások pedig újabb, felhasználó
+által vezérelt belépési pontokat jelentenek. A fejezetben bemutatott
+kódban és a laborban a következő hibákat kell kiemelten kezelni.</p>
+<h3 data-number="31.2.7" id="csomagparser-biztonsága"><span
+class="header-section-number">31.2.7</span> 6.1. Csomagparser
+biztonsága</h3>
+<p>A hálózati protokollréteg a bejövő csomag fejléceit értelmezi. A
+legtipikusabb hiba a <strong>hosszmezők ellenőrzés nélküli
+használata</strong>, amely puffertúlcsorduláshoz vezet. Például az
+IP-fejléc <code>total_length</code> mezője nagyobb lehet, mint a
+ténylegesen beolvasott puffer mérete; ha a kód ezt a hosszmezőt
+használja a másolási művelethez, a kernel a puffer határán túlra ír.
+Helyes megoldás, ha minden egyes mező feldolgozása előtt ellenőrizzük,
+hogy a pufferben elegendő bájt áll-e rendelkezésre, és a
+<code>len</code> mezőt a tényleges <code>netbuf-&gt;len</code> értékhez
+viszonyítjuk.</p>
+<div class="sourceCode" id="cb10"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#define ETH_HLEN     </span><span class="dv">14</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define IP_MIN_HLEN  </span><span class="dv">20</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define UDP_HLEN      </span><span class="dv">8</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="kw">inline</span> <span class="dt">uint16_t</span> load_be16<span class="op">(</span><span class="dt">const</span> <span class="dt">void</span> <span class="op">*</span>p<span class="op">)</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">uint8_t</span> <span class="op">*</span>b <span class="op">=</span> p<span class="op">;</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">(</span><span class="dt">uint16_t</span><span class="op">)((</span>b<span class="op">[</span><span class="dv">0</span><span class="op">]</span> <span class="op">&lt;&lt;</span> <span class="dv">8</span><span class="op">)</span> <span class="op">|</span> b<span class="op">[</span><span class="dv">1</span><span class="op">]);</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="co">/* A buf-&gt;len a teljes Ethernet-keret hossza. */</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>buf<span class="op">-&gt;</span>len <span class="op">&lt;</span> ETH_HLEN <span class="op">+</span> IP_MIN_HLEN<span class="op">)</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">goto</span> drop<span class="op">;</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a><span class="co">/* EtherType: bájtszintű, igazítatlan olvasás, hálózati bájtsorrendben */</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>load_be16<span class="op">(</span>buf<span class="op">-&gt;</span>data <span class="op">+</span> <span class="dv">12</span><span class="op">)</span> <span class="op">!=</span> ETH_P_IP<span class="op">)</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">goto</span> drop<span class="op">;</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a><span class="dt">const</span> <span class="dt">uint8_t</span> <span class="op">*</span>p <span class="op">=</span> buf<span class="op">-&gt;</span>data <span class="op">+</span> ETH_HLEN<span class="op">;</span>   <span class="co">/* az IP-fejléc eleje */</span></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a><span class="dt">uint8_t</span> vihl <span class="op">=</span> p<span class="op">[</span><span class="dv">0</span><span class="op">];</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a><span class="dt">uint8_t</span> version <span class="op">=</span> vihl <span class="op">&gt;&gt;</span> <span class="dv">4</span><span class="op">;</span></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a><span class="dt">size_t</span> ihl_bytes <span class="op">=</span> <span class="op">(</span><span class="dt">size_t</span><span class="op">)(</span>vihl <span class="op">&amp;</span> <span class="bn">0x0f</span><span class="op">)</span> <span class="op">*</span> <span class="dv">4</span><span class="op">;</span></span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a><span class="dt">size_t</span> total_len <span class="op">=</span> load_be16<span class="op">(</span>p <span class="op">+</span> <span class="dv">2</span><span class="op">);</span></span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a><span class="dt">size_t</span> avail <span class="op">=</span> buf<span class="op">-&gt;</span>len <span class="op">-</span> ETH_HLEN<span class="op">;</span></span>
+<span id="cb10-25"><a href="#cb10-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-26"><a href="#cb10-26" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>version <span class="op">!=</span> <span class="dv">4</span><span class="op">)</span></span>
+<span id="cb10-27"><a href="#cb10-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">goto</span> drop<span class="op">;</span></span>
+<span id="cb10-28"><a href="#cb10-28" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>ihl_bytes <span class="op">&lt;</span> IP_MIN_HLEN <span class="op">||</span> ihl_bytes <span class="op">&gt;</span> total_len<span class="op">)</span></span>
+<span id="cb10-29"><a href="#cb10-29" aria-hidden="true" tabindex="-1"></a>    <span class="cf">goto</span> drop<span class="op">;</span></span>
+<span id="cb10-30"><a href="#cb10-30" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>total_len <span class="op">&gt;</span> avail<span class="op">)</span></span>
+<span id="cb10-31"><a href="#cb10-31" aria-hidden="true" tabindex="-1"></a>    <span class="cf">goto</span> drop<span class="op">;</span></span>
+<span id="cb10-32"><a href="#cb10-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-33"><a href="#cb10-33" aria-hidden="true" tabindex="-1"></a><span class="co">/* Töredezett csomagot a minimális verem nem támogat. */</span></span>
+<span id="cb10-34"><a href="#cb10-34" aria-hidden="true" tabindex="-1"></a><span class="dt">uint16_t</span> frag <span class="op">=</span> load_be16<span class="op">(</span>p <span class="op">+</span> <span class="dv">6</span><span class="op">);</span></span>
+<span id="cb10-35"><a href="#cb10-35" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>frag <span class="op">&amp;</span> <span class="bn">0x3fff</span><span class="op">)</span>   <span class="co">/* MF vagy nem nulla offset */</span></span>
+<span id="cb10-36"><a href="#cb10-36" aria-hidden="true" tabindex="-1"></a>    <span class="cf">goto</span> drop<span class="op">;</span></span>
+<span id="cb10-37"><a href="#cb10-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-38"><a href="#cb10-38" aria-hidden="true" tabindex="-1"></a><span class="co">/* Az alprotokoll fejlécének és hosszának ellenőrzése. */</span></span>
+<span id="cb10-39"><a href="#cb10-39" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>p<span class="op">[</span><span class="dv">9</span><span class="op">]</span> <span class="op">==</span> IPPROTO_UDP<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-40"><a href="#cb10-40" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>total_len <span class="op">&lt;</span> ihl_bytes <span class="op">+</span> UDP_HLEN<span class="op">)</span></span>
+<span id="cb10-41"><a href="#cb10-41" aria-hidden="true" tabindex="-1"></a>        <span class="cf">goto</span> drop<span class="op">;</span></span>
+<span id="cb10-42"><a href="#cb10-42" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">uint8_t</span> <span class="op">*</span>u <span class="op">=</span> p <span class="op">+</span> ihl_bytes<span class="op">;</span></span>
+<span id="cb10-43"><a href="#cb10-43" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> udp_len <span class="op">=</span> load_be16<span class="op">(</span>u <span class="op">+</span> <span class="dv">4</span><span class="op">);</span></span>
+<span id="cb10-44"><a href="#cb10-44" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>udp_len <span class="op">&lt;</span> UDP_HLEN <span class="op">||</span> udp_len <span class="op">&gt;</span> total_len <span class="op">-</span> ihl_bytes<span class="op">)</span></span>
+<span id="cb10-45"><a href="#cb10-45" aria-hidden="true" tabindex="-1"></a>        <span class="cf">goto</span> drop<span class="op">;</span></span>
+<span id="cb10-46"><a href="#cb10-46" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>drop</code> címke a csomag eldobását és a számláló növelését
+jelenti. A fenti sorrend szándékos: előbb a keret minimális hossza,
+aztán az EtherType, majd a verzió, az IHL-ből számított fejléchossz, a
+<code>total_len</code> alsó és felső korlátja, végül az alprotokoll
+fejléce következik. Az <code>ihl</code> 32 bites szavakban számol, ezért
+a bájtban mért fejléchossz <code>ihl * 4</code>; a
+<code>total_len</code> az IP-fejlécet is tartalmazza, ezért kell
+<code>ihl_bytes &lt;= total_len</code>. A
+<code>total_len &gt; avail</code> ellenőrzés azért fontos, mert a
+hálózati kártya rövid keretet is adhat, és a <code>total_len</code>
+értéke támadó által vezérelt. A <code>p[9]</code> az IP protokollmezője;
+UDP esetén a <code>udp_len</code> legalább 8, és nem haladhatja meg az
+IP-payload hosszát. A <code>load_be16</code> bájtszintű olvasása
+elkerüli az igazítatlan <code>struct</code>-hozzáférést, mert az
+IP-fejléc 14 bájtos Ethernet-fejléc után kezdődik, és a 32 bites mezők
+címe nem garantáltan 4 bájtos többszörös.</p>
+<p>A parszert legalább a következő mintaesetekkel kell tesztelni (a várt
+eredmény minden esetben <code>drop</code>, kivéve az első kettőt):</p>
+<ul>
+<li>érvényes minimális IPv4/UDP: <code>ihl = 5</code>,
+<code>total_len = 28</code>, <code>udp_len = 8</code>;</li>
+<li>érvényes IP-opciós fejléc: <code>ihl = 6</code> (24 bájt), a
+<code>total_len</code> és az UDP-eltolás ehhez igazodik;</li>
+<li>csonka keret: <code>buf-&gt;len = 13</code>, illetve
+<code>total_len &gt; avail</code>;</li>
+<li>ellentmondó hosszak: <code>ihl_bytes &gt; total_len</code>,
+<code>udp_len = 7</code>,
+<code>udp_len &gt; total_len - ihl_bytes</code>;</li>
+<li>hibás bájtsorrend: az EtherType fordított bájtokkal
+(<code>0x0008</code>), illetve a <code>total_len</code> little-endian
+értékként;</li>
+<li>hibás verzió: <code>version = 6</code> az IPv4-ágban;</li>
+<li>töredék: beállított MF bit vagy nem nulla fragment offset.</li>
+</ul>
+<p>A parszert úgy kell megírni, hogy <strong>minden bemeneti mezőt
+bizalmatlanként kezel</strong>, és az aritmetikai műveleteknél figyel az
+integer-túlcsordulásra. A <code>ntohs</code> és <code>ntohl</code>
+függvényeket a bájtsorrend miatt használjuk; a minimális kernelben ezek
+egyszerű makróként implementálhatók, de a fenti bájtszintű
+<code>load_be16</code> akkor is működik, ha a <code>ntohs</code> makró
+nem elérhető.</p>
+<h3 data-number="31.2.8"
+id="rendszerhívás-paraméterek-ellenőrzése"><span
+class="header-section-number">31.2.8</span> 6.2.
+Rendszerhívás-paraméterek ellenőrzése</h3>
+<p>A <code>sendto</code> és <code>recvfrom</code> hívásoknál a
+felhasználói <code>len</code> paraméter akár óriási értéket is kaphat,
+ami a kernel <code>copy_from_user</code> során memória-túllépést
+okozhat. <strong>Minden méretet korlátozni kell a maximális
+UDP-csomagméretre</strong>, és a felhasználói mutatót a
+<code>copy_from_user</code> előtt a címtartomány ellenőrzésével kell
+validálni. A <code>dest</code> és <code>src</code> mutatók esetében a
+<code>socklen_t</code> hossz nem haladhatja meg a
+<code>struct sockaddr_in</code> méretét, és a családmezőnek
+<code>AF_INET</code>-nek kell lennie.</p>
+<p>Tipikus hiba, hogy a kernel a <code>len</code> paramétert közvetlenül
+használja <code>memcpy</code>-hez anélkül, hogy a kapacitást ellenőrizte
+volna. A biztonságos kód mindig a célpuffer tényleges méretét használja,
+és a hosszmezőt csak a másolási művelet felső korlátjaként kezeli.</p>
+<h3 data-number="31.2.9" id="erőforrás-kimerítés-és-izoláció"><span
+class="header-section-number">31.2.9</span> 6.3. Erőforrás-kimerítés és
+izoláció</h3>
+<p>A hálózati fogadási oldalon a bejövő csomagok száma nem áll a kernel
+ellenőrzése alatt. Ha a feldolgozási sor korlátlanul nő, a támadó
+memóriatúlcsordulást idézhet elő. A <code>netif_rx</code> függvénynek
+<strong>fix hosszúságú sort</strong> kell használnia, és a sor
+megtelésekor a csomagot el kell dobni. A dobás tényét számlálni kell, és
+a naplóban megjeleníteni.</p>
+<p>A socket fogadási soraira ugyanez vonatkozik: minden sockethez
+tartozzon egy maximális sorhossz, például
+<code>SOCK_RX_QLEN = 64</code>. Ha a folyamat nem olvassa időben a
+bejövő csomagokat, a sor megtelik, és a további csomagokat eldobjuk. Ez
+a viselkedés a felhasználó számára csomagvesztésként jelentkezik, ami az
+UDP esetében elfogadható.</p>
+<p>A folyamatok közötti izolációt a biztonsági modul biztosítja: a
+policy-ellenőrzés megakadályozza, hogy egy folyamat a neki nem
+engedélyezett hálózati erőforrásokhoz férjen. A hook-rendszernek a
+folyamat kontextusát is ismernie kell; a minimális kernelben ezt a
+<code>current</code> processz-struktúra elérésével érjük el.</p>
+<h3 data-number="31.2.10" id="versenyhelyzetek-a-hálózati-sorban"><span
+class="header-section-number">31.2.10</span> 6.4. Versenyhelyzetek a
+hálózati sorban</h3>
+<p>A socket fogadási sorát a protokollréteg (softirq vagy kernel-szál)
+tölti, a <code>recvfrom</code> üríti. Ha a protokoll-feldolgozás
+kernel-szálban fut, mutex is elég; ha softirq-ban vagy megszakításból,
+spinlock kell
+(<code>spin_lock_bh</code>/<code>spin_lock_irqsave</code>), a
+<code>recvfrom</code> pedig várakozási sorral alszik, nem a zár alatt. A
+hálózati verem több kontextusból is hozzáférhet a csomagsorokhoz:
+megszakításból, kernel-szálból és rendszerhívásból. A zárolás hiánya
+versenyhelyzetet okozhat, például a sor elemeinek elvesztését vagy a
+dupla beszúrást. A minimális kernelben a sorokhoz
+<strong>spinlock</strong> vagy <strong>mutex</strong> tartozik, attól
+függően, hogy a hozzáférés megszakításkontextusban is megtörténhet-e.
+Mivel a <code>netif_rx</code> megszakításból hívódik, a hozzáférés során
+a megszakítást le kell tiltani, vagy spinlock-irqsave mechanizmust kell
+használni. A <code>socket</code> fogadási sorához elegendő egy mutex,
+mert azt csak rendszerhívás-kontextusból módosítjuk.</p>
+<p>A hibakeresés során a versenyhelyzeteket gyakran csak stresszteszttel
+lehet felfedni. A laborban a fogadási oldalt párhuzamos küldőkkel és
+egyidejű olvasóval kell terhelni, hogy a zárolási hiányosságok láthatóvá
+váljanak.</p>
+<h3 data-number="31.2.11"
+id="labor-hálózati-stack-és-lsm-bővítés-terve"><span
+class="header-section-number">31.2.11</span> 7. Labor: hálózati stack és
+LSM-bővítés terve</h3>
+<p>A fejezet laborja a hálózati verem és a biztonsági modul
+<strong>tervezésére</strong> és egy <strong>emulált ellenőrző
+környezetben</strong> való validálására összpontosít. A cél nem a teljes
+implementáció, hanem a döntési pontok, az interfészek és a biztonsági
+követelmények kidolgozása, majd egy QEMU-alapú teszttel a kritikus
+útvonal igazolása.</p>
+<h3 data-number="31.2.12" id="laborfeladat"><span
+class="header-section-number">31.2.12</span> 7.1. Laborfeladat</h3>
+<p>Készítsünk tervet egy minimális UDP-hálózati veremhez és egy
+LSM-modulhoz, amely a következő policy-t érvényesíti:</p>
+<ul>
+<li>A felhasználói folyamatok kizárólag a loopback interfészre
+(<code>127.0.0.1</code>) és a <code>8080</code>-as UDP-portra
+küldhetnek.</li>
+<li>Minden más célcím és port <code>-EPERM</code> hibát eredményez.</li>
+<li>A bejövő csomagokat a kernel feldolgozza, de csak a loopbackről
+érkező, a <code>8080</code>-as portra címzett csomagokat továbbítja a
+socketekhez.</li>
+</ul>
+<p>A tervnek tartalmaznia kell:</p>
+<ol type="1">
+<li>A rétegek és interfészek definícióját (<code>net_device</code>,
+<code>netbuf</code>, socket, LSM-hook).</li>
+<li>A rendszerhívások pontos szignatúráját és hibakódjait.</li>
+<li>A hálózati csomag feldolgozási útvonalát: megszakítás →
+<code>netif_rx</code> → protokoll → socket.</li>
+<li>A biztonsági hook-ok elhelyezését és a policy döntési
+logikáját.</li>
+<li>A tipikus hibák listáját és az ellenőrzési pontokat.</li>
+</ol>
+<p>A tervet <strong>reprodukálható jegyzetfüzetben</strong> (például
+Markdown vagy Jupyter) kell dokumentálni, a QEMU-konfigurációval, a
+build-paranccsal és a mérési naplóval együtt.</p>
+<h3 data-number="31.2.13" id="emulált-környezet-konfigurációja"><span
+class="header-section-number">31.2.13</span> 7.2. Emulált környezet
+konfigurációja</h3>
+<p>A laborhoz QEMU-t használunk, a következő parancssorral indítva egy
+minimális x86-64-es kernelt:</p>
+<pre class="text"><code>qemu-system-x86_64 \
+  -kernel build/kernel.bin \
+  -netdev user,id=n0,hostfwd=udp:127.0.0.1:5555-:8080 \
+  -device virtio-net-pci,netdev=n0 \
+  -nographic</code></pre>
+<p>A <code>-netdev user</code> egy felhasználói hálózati háttér. A
+<code>hostfwd=udp:127.0.0.1:5555-:8080</code> azt jelenti, hogy a hoszt
+<strong>csak a loopback interfészén</strong> figyel egy UDP-portot
+(<code>127.0.0.1:5555</code>), és a beérkező datagramokat a vendég
+<code>8080</code>-as UDP-portjára továbbítja. A protokollt azért
+<code>udp</code>, mert a fejezet minimális vereme csak UDP-t valósít
+meg; a korábbi <code>tcp</code> átirányítás olyan útvonalat kért volna,
+amelyet ez a vendég nem tud kiszolgálni. A <code>virtio-net-pci</code>
+eszköz a vendégben egy virtio hálózati kártyát emulál.</p>
+<p>A hosztoldali elérhetőséget a következő paranccsal lehet ellenőrizni;
+a kimenetnek mutatnia kell a <code>127.0.0.1:5555</code>
+UDP-figyelőt:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Hoszton: a hostfwd figyelője csak a loopbacken</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ss</span> <span class="at">-lun</span> <span class="st">&#39;sport = :5555&#39;</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Opcionális UDP-próba; a vendég oldali napló igazolja a megérkezést</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="bu">printf</span> <span class="st">&#39;probe&#39;</span> <span class="op">&gt;</span> /dev/udp/127.0.0.1/5555</span></code></pre></div>
+<p>A <code>hostfwd</code> forgalma a vendégben nem
+<code>127.0.0.1</code>-ről érkezik: a QEMU user-mode NAT a forrást
+<code>10.0.2.2</code>-nek, a célt a vendég <code>10.0.2.15:8080</code>
+címének láttatja. Ezért a loopbackre szabott alap ACL-policy ezt a demót
+szándékosan blokkolja; a hostfwd-os bemutatóhoz a <code>security</code>
+modul <code>ACL_MODE_HOSTFWD_DEMO</code> profilját kell aktiválni, és a
+jegyzőkönyvben rögzíteni kell, hogy ez külön demó-szabály, nem az
+alapértelmezett loopback-policy. A <code>make kernel.bin</code>
+buildparancsot és a fordítási naplót a labor dokumentációjához kell
+mellékelni.</p>
+<p>A hálózati teszt elvégzéséhez a minimális kernelben egy egyszerű
+felhasználói programot futtatunk, amely a <code>socket</code>,
+<code>bind</code>, <code>sendto</code> és <code>recvfrom</code>
+rendszerhívásokat használja. A program a loopback címre küld egy ismert
+tartalmú UDP-csomagot, majd megpróbál egy tiltott célcímre is küldeni. A
+várt eredmény:</p>
+<ul>
+<li>A loopback küldés sikerül, a <code>sendto</code> visszatérési értéke
+a küldött bájtok száma.</li>
+<li>A <code>recvfrom</code> a fogadó oldalon a csomagot és a forráscímet
+adja vissza.</li>
+<li>A tiltott célcímű <code>sendto</code> <code>-1</code> értékkel tér
+vissza, és az <code>errno</code> <code>EPERM</code>.</li>
+</ul>
+<h3 data-number="31.2.14" id="mérési-napló"><span
+class="header-section-number">31.2.14</span> 7.3. Mérési napló</h3>
+<p>A mérési naplóban a következő adatokat kell rögzíteni:</p>
+<ul>
+<li><strong>Környezet</strong>: QEMU verzió, vendég architektúra,
+CPU-modell, memória, kernel verzió (a saját build hash-e).</li>
+<li><strong>Mért eredmények</strong>:
+<ul>
+<li>A <code>sendto</code> rendszerhívás időtartama loopback esetén
+(ciklusszám vagy időbélyeg).</li>
+<li>A <code>sendto</code> elutasításának időtartama <code>-EPERM</code>
+esetén.</li>
+<li>A csomagfeldolgozás késleltetése a megszakítástól a socket sorba
+kerülésig.</li>
+<li>A csomagvesztési arány 1000 csomag küldésekor.</li>
+</ul></li>
+<li><strong>Várt (levezetett) eredmények</strong>:
+<ul>
+<li>A rendszerhívás időtartama a <code>copy_from_user</code> és a
+protokollfeldolgozás összegének nagyságrendjébe esik.</li>
+<li>Az elutasítás lényegesen gyorsabb, mint a tényleges küldés, mert a
+hardveres művelet elmarad.</li>
+<li>A csomagfeldolgozás késleltetése nem haladja meg a konfigurált
+<code>NET_RX_DELAY</code> értéket.</li>
+</ul></li>
+</ul>
+<p>A mért és a várt értékeket <strong>külön oszlopban</strong> kell
+feltüntetni, és a mérési módszert is le kell írni (például a
+TSC-regiszter olvasása a belépéskor és kilépéskor). A mérést legalább
+10-szer meg kell ismételni, és az átlagot, a minimumot és a maximumot is
+rögzíteni kell. A mérési eredményeket nem szabad a tényleges futás
+nélkül, becslésként bemutatni; minden számnak a laborban futtatott
+kódból kell származnia.</p>
+<h3 data-number="31.2.15" id="értékelési-szempontok"><span
+class="header-section-number">31.2.15</span> 7.4. Értékelési
+szempontok</h3>
+<p>A labor akkor tekinthető teljesítettnek, ha:</p>
+<ul>
+<li>A tervdokumentum tartalmazza az összes előírt interfészt és a policy
+logikáját.</li>
+<li>A QEMU-ban futó tesztprogram a várt eredményeket adja (sikeres
+loopback küldés, <code>-EPERM</code> a tiltott címre).</li>
+<li>A mérési napló elkülöníti a mért és a várt értékeket, és tartalmazza
+a reprodukciós lépéseket.</li>
+<li>A dokumentum azonosít legalább három tipikus hibát, és bemutatja az
+elkerülésükre tett intézkedést.</li>
+</ul>
+<h3 data-number="31.2.16" id="önellenőrző-kérdések"><span
+class="header-section-number">31.2.16</span> 8. Önellenőrző
+kérdések</h3>
+<p>A fejezet tanulási céljainak ellenőrzésére az alábbi kérdések
+szolgálnak:</p>
+<ol type="1">
+<li>Miért fontos a hálózati verem rétegzése a minimális OS-ben? Hogyan
+segíti ez a driver- és policy-bővítést?</li>
+<li>Hová kell helyezni az LSM-hook-ot a <code>sendto</code>
+rendszerhívásban, és miért nem elég csak a socket létrehozásakor
+ellenőrizni?</li>
+<li>Milyen támadási felületet jelent a hálózati csomagparser, és milyen
+konkrét ellenőrzésekkel csökkenthető a kockázat?</li>
+<li>Mi a teendő, ha a <code>netif_rx</code> fogadási sora megtelik?
+Miért nem engedhető meg a korlátlan növekedés?</li>
+<li>A labor konfigurációjában a
+<code>hostfwd=udp:127.0.0.1:5555-:8080</code> beállítás mit csinál,
+miért UDP és miért csak a loopbacken figyel, és hogyan befolyásolja a
+tesztelést?</li>
+</ol>
+<p>A kérdések megválaszolásához a fejezetben bemutatott kód és a
+laborleírás elegendő. A válaszoknak hivatkozniuk kell a konkrét
+ellenőrzési pontokra és a biztonsági követelményekre.</p>
+<h3 data-number="31.2.17" id="összegzés"><span
+class="header-section-number">31.2.17</span> 9. Összegzés</h3>
+<p>A minimális operációs rendszer hálózati bővítése akkor valósul meg
+helyesen, ha a driver, a csomagkezelés, a socket API és a biztonsági
+modulok világosan elválasztott rétegekben működnek. A hálózati verem
+UDP-szintű megvalósítása elegendő a belső kommunikációhoz és a
+biztonsági policy demonstrálásához. Az LSM-szerű hook-rendszer lehetővé
+teszi, hogy a hálózati hozzáférést központilag, a kernel kódjának
+módosítása nélkül szabályozzuk. A támadási felület csökkentése érdekében
+minden bejövő adatot ellenőrizni kell, a méreteket korlátozni, a sorokat
+fix hosszúságúra állítani, és a versenyhelyzeteket zárolással
+kezelni.</p>
+<p>A laborban a hallgató a fejezetben bemutatott eszközöket egy konkrét,
+policy-vezérelt hálózati terv elkészítésére és emulált validálására
+használja. A mért és várt eredmények elkülönítése, valamint a
+reprodukciós csomag összeállítása biztosítja, hogy az eredmények
+ellenőrizhetők és megismételhetők legyenek. A következő fejezet (<a
+href="os120.html">Virtualizáció és konténerintegráció</a>) erre a
+hálózati és biztonsági alapra építve a virtualizáció és a
+konténerintegráció kérdéseit tárgyalja, ahol a izoláció és az
+erőforrás-kezelés még hangsúlyosabb szerepet kap.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os118.html">← 31.1 SMP, preemption és valós idejű kiterjesztés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os120.html">31.3 Virtualizáció és konténerintegráció →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

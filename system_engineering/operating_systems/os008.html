@@ -1,0 +1,895 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>3.3 Kernelkomponensek: ütemező, memóriakezelő, VFS és hálózati
+stack – Operációs rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz1">I. RÉSZ – Alapok és rendszerfelépítés</a> › <a href="index.html#osch02">3 Kernelarchitektúrák és belső struktúrák</a></p>
+<div class="links"><a class="prev" rel="prev" href="os007.html">← 3.2 Réteges, moduláris és exokernel/unikernel felépítés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os009.html">3.4 Kernel és felhasználói tér határa, ABI és driver modell →</a></div>
+</nav>
+<h2 data-number="3.3" id="os008"><span
+class="header-section-number">3.3</span> Kernelkomponensek: ütemező,
+memóriakezelő, VFS és hálózati stack</h2>
+<p>A kernelkomponensek szétválasztása akkor válik igazán érthetővé, ha
+nem állunk meg az architektúranévnél – „monolitikus”, „mikrokernel”,
+„hibrid” –, hanem megnézzük, milyen tényleges alrendszerekből áll egy
+futó kernel, és ezek milyen hívásokkal, adatszerkezetekkel és
+garanciákkal kapcsolódnak egymáshoz. Az <code>os007</code> fejezet
+bemutatta a fő architekturális felépítéseket. Most azokat a belső
+egységeket tárgyaljuk, amelyek szinte mindegyikben megtalálhatók: az
+ütemezőt, a memóriakezelőt, a virtuális fájlrendszert (VFS) és a
+hálózati stacket. A cél kettős: egyrészt pontos fogalmi kép, másrészt
+olyan minta, amelyet egy egyszerű kernelben is ellenőrizni lehet.</p>
+<h3 data-number="3.3.1"
+id="a-kernel-mint-együttműködő-alrendszerek-rendszere"><span
+class="header-section-number">3.3.1</span> 1. A kernel mint együttműködő
+alrendszerek rendszere</h3>
+<p>Egyetlen kernel sem egyetlen hatalmas függvényhalmaz, hanem több,
+eltérő absztrakciós szinten dolgozó komponens együttműködése. A négy
+nagy alrendszer – folyamat- és szálkezelés/ütemezés, memóriakezelés,
+fájlrendszer/VFS, illetve hálózat – más-más erőforrást tulajdonol, más
+időskálán működik, és más meghibásodási módjai vannak.</p>
+<p>A gyakorlatban az együttműködésük a következő elvek mentén írható
+le:</p>
+<ol type="1">
+<li><strong>Erőforrás-tulajdonjog egyértelmű.</strong> Egy
+<code>task_struct</code>-szerű folyamatleírót az ütemező kezel, de a
+memóriatérképet a memóriakezelő birtokolja. A fájlrendszer nem írhat
+közvetlenül a folyamat lapjaiba; a lapkezelő nem dönthet arról, ki fut
+éppen egy CPU-n.</li>
+<li><strong>A hívások iránya rétegzett.</strong> A rendszerhívás a
+felhasználói folyamatból érkezik, a VFS-en keresztül megy a blokkréteg
+felé, onnan az eszközmeghajtóhoz, közben a memóriakezelő puffereket ad,
+az ütemező pedig altatja és felébreszti a hívót.</li>
+<li><strong>A kritikus szakaszokat külön védik.</strong> Az ütemező
+futási sora, a lapallokátor szabadlistája, a VFS inode-gyorsítótára és a
+hálózati socketpufferek mind önálló szinkronizációs objektumokkal
+rendelkeznek. Egyetlen globális kernelzár (például a régi Linux <em>Big
+Kernel Lock</em>) nem tekinthető moduláris megoldásnak.</li>
+<li><strong>Az interfészeket adatszerkezet és függvény-API együtt
+alkotja.</strong> A folyamatleíróban van <code>mm</code>,
+<code>files</code>, <code>sighand</code>, <code>signal</code> pointer; a
+VFS inode-nak <code>i_op</code>, <code>i_fop</code>,
+<code>i_mapping</code> mezője; a hálózati <code>struct sock</code>
+tartalmazza a protokoll-visszahívásokat. A komponenshatár tehát nem
+pusztán a hívási gráfban, hanem a tulajdonolt struktúrákban is
+látható.</li>
+</ol>
+<p>Ez a felépítés teszi lehetővé, hogy egy kisebb kernelben is külön
+lehessen tesztelni az ütemezőt egy listaművelet-teszttel, a
+memóriakezelőt egy allokációs stresszteszttel, a VFS-t pedig egy
+RAM-lemezes fájlrendszerrel.</p>
+<h3 data-number="3.3.2"
+id="ütemező-futásjog-várakozás-és-kontextusváltás"><span
+class="header-section-number">3.3.2</span> 2. Ütemező: futásjog,
+várakozás és kontextusváltás</h3>
+<h3 data-number="3.3.3" id="feladata-és-alapfogalmai"><span
+class="header-section-number">3.3.3</span> 2.1 Feladata és
+alapfogalmai</h3>
+<p>Az ütemező felel azért, hogy a rendelkezésre álló CPU-időt a futásra
+kész folyamatok és szálak között elossza. Ennek alapobjektuma a
+folyamat- vagy szálleíró, amely a következőket tartalmazza:</p>
+<ul>
+<li>regisztermentés és veremmutató a kontextusváltáshoz,</li>
+<li>futási állapot: <code>READY</code>, <code>RUNNING</code>,
+<code>BLOCKED</code>, <code>EXITED</code>,</li>
+<li>prioritás vagy súly,</li>
+<li>CPU-affinitás,</li>
+<li>várakozási ok (<code>wait_queue</code>),</li>
+<li>statisztikák: felhasználói/kernel CPU-idő, futásszám.</li>
+</ul>
+<p>A kernel saját szálai, például a <code>kworker</code> vagy az
+<code>ksoftirqd</code>, ugyanezt az ütemezői infrastruktúrát használják,
+csak éppen nem rendelkeznek teljes felhasználói címterével.</p>
+<h3 data-number="3.3.4" id="futási-sorok-és-osztályok"><span
+class="header-section-number">3.3.4</span> 2.2 Futási sorok és
+osztályok</h3>
+<p>Kezdjük a legegyszerűbb esettel: egy CPU és két szál. Legyen
+<code>A</code> futó, <code>B</code> futtatható (READY), és tegyük fel,
+hogy <code>A</code> blokkoló <code>read</code>-et indít. A három állapot
+egyetlen eseménysorban válik láthatóvá:</p>
+<table>
+<thead>
+<tr>
+<th>Időpont</th>
+<th>CPU 0</th>
+<th>READY sor</th>
+<th>Blokkolt</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>t0</td>
+<td><code>A</code> fut</td>
+<td><code>B</code></td>
+<td>–</td>
+</tr>
+<tr>
+<td>t1</td>
+<td><code>B</code> fut</td>
+<td>–</td>
+<td><code>A</code> (a <code>read</code> adatára vár)</td>
+</tr>
+<tr>
+<td>t2</td>
+<td><code>B</code> fut</td>
+<td><code>A</code></td>
+<td>– (az adat megérkezett, <code>wake_up</code>)</td>
+</tr>
+<tr>
+<td>t3</td>
+<td><code>A</code> fut</td>
+<td><code>B</code></td>
+<td>–</td>
+</tr>
+</tbody>
+</table>
+<p>A sor azt mutatja, hogy a <strong>futó</strong>, a
+<strong>futtatható</strong> és a <strong>blokkolt</strong> állapot
+ugyanannak a <code>read</code> eseménynek a fázisai: a hívó addig fut,
+amíg blokkoló pontra nem ér; onnantól nem futtatható, hanem a
+<code>read</code> várakozási sorában van; az ébresztés után újra
+futtatható lesz, de nem feltétlenül azonnal futó. Az ütemező csak a
+futásjogot osztja, a blokkolás okát nem ismeri.</p>
+<p>Az alábbi osztály- és policy-részletek itt
+<strong>előzetesek</strong>: a módszeres tárgyalásuk a <a
+href="os022.html">Folyamatmodell, PCB és állapotátmenetek</a>, az <a
+href="os026.html">Ütemezési célok és metrikák</a>, az <a
+href="os027.html">Alapvető algoritmusok</a>–<a
+href="os028.html">Többszintű visszacsatolás és fair ütemezés</a>,
+valamint a valós idejű osztályoknál a <a href="os029.html">Valós idejű
+ütemezés: RMS, EDF és deadline</a> alfejezetben következik. Addig csak
+annyit rögzítünk, hogy egy általános célú kernel futási struktúrái nem
+egyetlen FIFO-t alkotnak:</p>
+<ul>
+<li>minden logikai CPU-hoz tartozik futási sor,</li>
+<li>az osztályok (például <code>stop</code>, <code>deadline</code>,
+<code>real-time</code>, <code>fair</code>, <code>idle</code>) prioritási
+sorrendben próbálnak folyamatot adni,</li>
+<li>a valós idejű osztály például fix prioritású FIFO/RR, a fair osztály
+súlyozott időelosztást ad.</li>
+</ul>
+<p>Egy minimális kernelben ennek egyszerű megfelelője lehet egy
+prioritásos FIFO lista és egy round-robin lista. A lényeg a
+<strong>modulhatár</strong> világos megtartása: az ütemezőnek nem kell
+tudnia, miért blokkolt egy folyamat; elég, ha egy
+<code>wait_queue</code> bejegyzés jelzi, hogy a folyamat egy eseményre
+vár, és a felébresztő alrendszer meghívja a <code>wake_up</code>-ot.</p>
+<h3 data-number="3.3.5"
+id="a-blokkolás-mint-alrendszer-együttműködés"><span
+class="header-section-number">3.3.5</span> 2.3 A blokkolás mint
+alrendszer-együttműködés</h3>
+<p>A kernel kódjában a tipikus várakozási minta:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Illusztráció, nem végrehajtandó éles rendszeren. */</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> rc <span class="op">=</span> wait_event_interruptible<span class="op">(</span>wq<span class="op">,</span> condition<span class="op">);</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>rc<span class="op">)</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> rc<span class="op">;</span>              <span class="co">/* -ERESTARTSYS: a hívó rendszerhívás újraindíthatja */</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="co">/* Kézi változat: csak akkor, ha a wait_event makró nem elég. */</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>DEFINE_WAIT<span class="op">(</span>wait<span class="op">);</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> ret <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    prepare_to_wait<span class="op">(&amp;</span>my_queue<span class="op">,</span> <span class="op">&amp;</span>wait<span class="op">,</span> TASK_INTERRUPTIBLE<span class="op">);</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>condition<span class="op">)</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>signal_pending<span class="op">(</span>current<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>        ret <span class="op">=</span> <span class="op">-</span>ERESTARTSYS<span class="op">;</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>        <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>    schedule<span class="op">();</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>finish_wait<span class="op">(&amp;</span>my_queue<span class="op">,</span> <span class="op">&amp;</span>wait<span class="op">);</span>   <span class="co">/* minden kimeneti úton lefut */</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a><span class="cf">return</span> ret<span class="op">;</span></span></code></pre></div>
+<p>A <code>wait_event_interruptible</code> visszatérési értéke
+<code>0</code> sikeres (igazzá vált) feltétel esetén, és negatív
+hibakód, ha a várakozást függő jel szakította meg; ezt a hívónak tovább
+kell adnia, nem eldobnia. A kézi változatban a
+<code>prepare_to_wait</code> már beilleszti a bejegyzést a várakozási
+sorba, ezért külön <code>add_wait_queue</code> nem kell (az redundáns
+lenne). A ciklus a feltétel mellett a függő jelet is vizsgálja, hogy jel
+esetén ne aludjon el újra; a <code>finish_wait</code> pedig minden
+kimeneti úton lefut, és visszaállítja a feladat állapotát.</p>
+<p>A <code>condition</code> nem lehet szinkronizálatlan közönséges
+változó: ugyanaz a zár (vagy atomi változó) védje, amelyet az eseményt
+jelző oldal a <code>wake_up</code> előtt módosít. A
+<code>wait_event_interruptible</code> előbb beilleszti a várakozó
+bejegyzést, majd ellenőrzi a feltételt, így nem veszhet el ébresztés, ha
+a feltétel beállítása és a <code>wake_up</code> a bejegyzés
+sorbakerülése után történik.</p>
+<p>Itt látható a komponensek közötti interfész:</p>
+<ol type="1">
+<li>A hívó bejegyzi magát egy <strong>várakozási sorba</strong>, amelyet
+az az alrendszer birtokol, amelyik az eseményt jelzi.</li>
+<li>A hívó <code>TASK_INTERRUPTIBLE</code> vagy
+<code>TASK_UNINTERRUPTIBLE</code> állapotba kerül.</li>
+<li>A <code>schedule()</code> az ütemezőbe lép; az ütemező kiveszi a
+hívót a futási sorból.</li>
+<li>Amikor az eszköz vagy egy másik folyamat jelzi az eseményt, a
+<code>wake_up()</code> visszahelyezi a folyamatot a futási sorba.</li>
+<li>A futás folytatásakor a ciklus újra ellenőrzi a feltételt és a függő
+jelet.</li>
+</ol>
+<p>Az ütemező tehát nem „találja ki” magától, hogy egy folyamatot fel
+kell-e ébreszteni; csak a futásjogot adja át, amikor a folyamat ismét
+<code>READY</code> lesz.</p>
+<h3 data-number="3.3.6" id="gyakori-hiba"><span
+class="header-section-number">3.3.6</span> 2.4 Gyakori hiba</h3>
+<p>A kezdő kernelhibák közé tartozik, hogy a fejlesztő közvetlenül a
+folyamatlistát módosítja ahelyett, hogy a <code>wait_queue</code> és a
+futási sor szolgáltatásait használná. Ennek tünete elveszett ébresztés
+(<em>lost wakeup</em>) vagy éppen kettős ébresztés. A helyes megoldás
+az, hogy az ütemező egy <strong>meghatározott API</strong>-t ad
+(<code>schedule</code>, <code>wake_up</code>,
+<code>set_current_state</code>), és minden alrendszer ezt használja. A
+folyamatleíró mezőit csak az ütemező listaműveletei módosítják.</p>
+<h3 data-number="3.3.7"
+id="memóriakezelő-tulajdonjog-fordítás-és-izoláció"><span
+class="header-section-number">3.3.7</span> 3. Memóriakezelő:
+tulajdonjog, fordítás és izoláció</h3>
+<h3 data-number="3.3.8" id="feladatmegosztás"><span
+class="header-section-number">3.3.8</span> 3.1 Feladatmegosztás</h3>
+<p>A memóriakezelő három, egymással összefüggő feladatot lát el:</p>
+<ol type="1">
+<li><strong>Folyamat-címterek kezelése:</strong> virtuális címek, lapok,
+védelmi bitek, <code>mmap</code>/<code>munmap</code>.</li>
+<li><strong>Kernelmemória-allokáció:</strong> a kernel saját
+adatszerkezeteinek kiszolgálása (<code>kmalloc</code>,
+<code>vmalloc</code>, slab, buddy).</li>
+<li><strong>Fizikai memória-keretgazdálkodás:</strong> mely fizikai
+lapok szabadok, melyek vannak lefoglalva, és milyen lapozási politika
+érvényesül.</li>
+</ol>
+<p>Egy folyamat címterét leíró <code>mm_struct</code> jellemzően a
+következőket birtokolja:</p>
+<ul>
+<li>lap- vagy szegmensfordítási táblák mutatója,</li>
+<li>virtuális területek listája/fája (<code>vm_area_struct</code>),</li>
+<li>felhasználói verem és <code>brk</code> határok,</li>
+<li>laphiba-statisztikák,</li>
+<li>megosztott memóriaszegmensek leírói.</li>
+</ul>
+<h3 data-number="3.3.9" id="interfész-más-alrendszerek-felé"><span
+class="header-section-number">3.3.9</span> 3.2 Interfész más
+alrendszerek felé</h3>
+<p>A memóriakezelő nem közvetlenül olvassa a lemezt, és a fájlrendszer
+nem közvetlenül allokál fizikai lapokat. A kapcsolat kétirányú:</p>
+<ul>
+<li>A VFS és a többi alrendszer <code>alloc_page</code>,
+<code>kmalloc</code>, <code>kfree</code> hívásokkal kér memóriát.</li>
+<li>A memóriakezelő laphiba esetén visszahívja a fájlrendszert:
+<code>read_folio</code>, <code>readahead</code> vagy swap-beolvasás. Ez
+az <code>address_space_operations</code> interfész; Linux 6.12-ben a
+laphiba-kezelés már a <code>struct folio</code> egységen dolgozik.</li>
+</ul>
+<p>A réteghatárt szemléltető, szándékosan absztrakt pszeudokód (nem
+valós Linux API):</p>
+<pre><code>/* Pszeudokód: a rétegek felelősségét mutatja. */
+puffer = memoriakezelo_alloc(puffer_meret)      /* memóriakezelő */
+if (puffer == hiba)
+    goto out;
+
+eredmeny = fajlrendszer_betolt(fajl, puffer)     /* VFS/fájlrendszer */
+if (eredmeny != siker)
+    goto out_release;</code></pre>
+<p>Itt a memóriakezelő adja a puffert, de a lemezről való betöltés, a
+hibakezelés és a hibajavítás a fájlrendszer vagy a blokkréteg feladata.
+A valós Linux 6.12-es API-ban a fájltámogatott laphiba folyamata
+<code>folio</code>-t allokál, és az
+<code>address_space_operations.read_folio(file, folio)</code> híváson
+keresztül tölti be a tartalmat; a puffer élettartama a folio lezárásáig
+és hivatkozásának elengedéséig (<code>folio_unlock</code>,
+<code>folio_put</code>) tart, ezért a rétegeknek a folio tulajdonjogát
+és zárolását is egyeztetniük kell. A régi
+<code>readpage</code>/<code>page_cache_alloc</code> pár ezzel szemben a
+lapalapú, történeti API-t képviseli, ezért önálló mintaként nem szerepel
+itt.</p>
+<h3 data-number="3.3.10"
+id="felhasználói-memória-elérése-és-másolása"><span
+class="header-section-number">3.3.10</span> 3.3 Felhasználói memória
+elérése és másolása</h3>
+<p>A felhasználói és kernelcím közötti átjárás is memóriakezelői
+szolgáltatás. A <code>copy_from_user</code>, <code>copy_to_user</code>,
+<code>get_user</code> és <code>put_user</code> hívások célja nemcsak a
+másolás, hanem az is, hogy:</p>
+<ul>
+<li>a felhasználói pointer érvényes tartományra mutasson,</li>
+<li>a hozzáférés ne okozzon kerneloopsot rossz címnél,</li>
+<li>a futás közbeni laphiba (például fizikai memória hiánya) kezelhető
+legyen.</li>
+</ul>
+<p>A hiba tipikus oka a <code>memcpy</code> közvetlen használata
+felhasználói pointerrel. Ez azért helytelen, mert megkerüli az
+access-ellenőrzést, és laphiba esetén a kernel kontrollálatlanul oopsba
+futhat. A helyes interfész a memóriakezelő által biztosított
+felhasználói másolófüggvény.</p>
+<h3 data-number="3.3.11" id="laphiba-mintázat"><span
+class="header-section-number">3.3.11</span> 3.4 Laphiba-mintázat</h3>
+<p>Amikor egy folyamat először érint egy <code>mmap</code>-elt
+területet, a következő történik:</p>
+<ol type="1">
+<li>A CPU laphibát vált ki.</li>
+<li>A kernel <code>do_page_fault</code> belépési pontja megvizsgálja a
+hibacím körüli <code>vm_area_struct</code>-ot.</li>
+<li>A memóriakezelő megállapítja a hibatípust: névtelen lap,
+fájltámogatású lap, COW, swap.</li>
+<li>Névtelen lap esetén fizikai lapot allokál, és nullázza.</li>
+<li>Fájl esetén a <code>address_space</code> segítségével elindítja az
+olvasást.</li>
+<li>COW esetén megosztott lapot duplikál.</li>
+</ol>
+<p>Ez a folyamat jól mutatja, miért fontos a komponensek közötti tiszta
+interfész: a laphibakezelő nem ismeri az ext4, a hálózati fájlrendszer
+és a swap részleteit; csak annyit tud, hogy a
+<code>vm_area_struct</code>-ban van egy <code>mapping</code> és egy
+<code>vm_ops</code>, amelyek mögött a megfelelő alrendszer áll.</p>
+<h3 data-number="3.3.12"
+id="virtuális-fájlrendszer-egységes-nézet-a-tárolás-felett"><span
+class="header-section-number">3.3.12</span> 4. Virtuális fájlrendszer:
+egységes nézet a tárolás felett</h3>
+<h3 data-number="3.3.13" id="miért-vfs"><span
+class="header-section-number">3.3.13</span> 4.1 Miért VFS?</h3>
+<p>A VFS a kernel belső rétege, amely a felhasználói rendszerhívások
+(<code>open</code>, <code>read</code>, <code>write</code>,
+<code>stat</code>, <code>ioctl</code>) számára egységes felületet ad a
+különböző fájlrendszerek és speciális fájlok felett. Enélkül minden
+rendszerhívásnak áganként kellene ismernie az összes fájlrendszer
+formátumát.</p>
+<p>A VFS négy fő absztrakciója:</p>
+<ul>
+<li><strong>superblock:</strong> egy csatolt fájlrendszer leírója,</li>
+<li><strong>inode:</strong> egy fájl/könyvtár metaadata és műveleti
+táblája,</li>
+<li><strong>dentry:</strong> útvonal-összetevő és névfeloldási
+gyorsítótár,</li>
+<li><strong>file:</strong> egy nyitott fájl aktuális pozícióval, elérési
+móddal és műveleti táblával.</li>
+</ul>
+<p>A műveleti táblák adják a modulhatárt. Egy <code>struct inode</code>
+például tartalmazza az <code>i_op</code> és <code>i_fop</code>
+pointereket. A VFS nem érti az ext4 extentfát vagy a FAT láncolt
+allokációját; csak a tábla műveleteit hívja.</p>
+<h3 data-number="3.3.14" id="folyamat-fájltábla-inode"><span
+class="header-section-number">3.3.14</span> 4.2 Folyamat, fájltábla,
+inode</h3>
+<p>A <code>open</code> hívás során a következő adatszerkezetek
+kapcsolódnak össze:</p>
+<ol type="1">
+<li>A folyamatleíró <code>files</code> táblája tartalmaz egy egész számú
+fájlleírót.</li>
+<li>A file-leíró egy <code>file</code> objektumra mutat, benne a
+<code>f_pos</code> pozícióval és <code>f_op</code> műveleteivel.</li>
+<li>A <code>file</code> az inode-ra mutat.</li>
+<li>Az inode a superblockra és az <code>address_space</code>-re
+mutat.</li>
+</ol>
+<p>A <code>read(fd, buf, count)</code> útja:</p>
+<ul>
+<li>a libc a <code>read</code> rendszerhívásba lép,</li>
+<li>a kernel megkeresi a <code>file</code> objektumot,</li>
+<li>meghívja a <code>vfs_read</code>-et,</li>
+<li>a <code>file-&gt;f_op-&gt;read_iter</code> vagy <code>read</code>
+hívás következik,</li>
+<li>a fájlrendszer megnézi a page cache-t; ha kell, blokkol, és a
+blokkrétegen keresztül olvas,</li>
+<li>a memóriakezelő <code>copy_to_user</code>-rel átmásol a felhasználói
+pufferbe.</li>
+</ul>
+<p>Ez a lánc jól mutatja az alrendszerek együttműködését: az ütemező a
+blokkolásért, a memóriakezelő a lapokért és a felhasználói másolásért, a
+VFS a fájlleíró-feloldásért, a blokkréteg és a driver a tényleges
+hardver-hozzáférésért felel.</p>
+<h3 data-number="3.3.15" id="vfs-mint-kiterjesztési-pont"><span
+class="header-section-number">3.3.15</span> 4.3 VFS mint kiterjesztési
+pont</h3>
+<p>A VFS nemcsak lemezes fájlrendszereket támogat: a
+<code>procfs</code>, <code>sysfs</code>, <code>devtmpfs</code>,
+<code>pipefs</code>, <code>sockfs</code> mind VFS-felületet ad. Ez a
+tervezés lehetővé teszi, hogy egy pipe ugyanúgy fájlleíróként jelenjen
+meg, mint egy ext4 fájl, vagy hogy a hálózati socket a
+<code>sockfs</code> inode-ján keresztül legyen elérhető.</p>
+<p>A VFS interfész tehát <strong>a kernel belső integrációs
+nyelve</strong>. A hálózati stack egy <code>socket</code> rendszerhívás
+után <code>sockfs</code>-en keresztül ad vissza egy fájlleírót; a
+<code>send</code>, <code>recv</code>, <code>poll</code> hívások
+ugyanazzal a file- és poll-mechanizmussal dolgoznak, mint egy terminál
+vagy egy pipe.</p>
+<h3 data-number="3.3.16" id="gyakori-hiba-1"><span
+class="header-section-number">3.3.16</span> 4.4 Gyakori hiba</h3>
+<p>A kezdő kernelben gyakori, hogy a fejlesztő a fájlrendszer műveletét
+közvetlenül a rendszerhívás belépési pontjába kódolja, például egy
+<code>read</code> hívásban a lemezblokkokat számolja. Ez működhet
+egyetlen fájlrendszernél, de nem skálázódik. A helyes megoldás a
+műveleti táblák bevezetése: a VFS réteg kezeli a fájlleírókat, a
+jogosultságokat és a pozíciót, a fájlrendszer pedig a saját
+<code>read_iter</code>-jét adja.</p>
+<h3 data-number="3.3.17"
+id="hálózati-stack-proto-rendszer-és-socket-réteg"><span
+class="header-section-number">3.3.17</span> 5. Hálózati stack:
+proto-rendszer és socket-réteg</h3>
+<h3 data-number="3.3.18" id="szerkezet"><span
+class="header-section-number">3.3.18</span> 5.1 Szerkezet</h3>
+<p>A hálózati stack a kernel azon része, amely a hálózati protokollokat,
+a socketeket, a csomagfeldolgozást és a hálózati eszközmeghajtókat
+foglalja magában. Főbb rétegei:</p>
+<ul>
+<li><strong>socket-réteg:</strong> a <code>socket</code>,
+<code>bind</code>, <code>listen</code>, <code>accept</code>,
+<code>send</code>, <code>recv</code> rendszerhívások kiszolgálása,</li>
+<li><strong>protokollcsaládok:</strong> <code>AF_INET</code>,
+<code>AF_INET6</code>, <code>AF_UNIX</code>,
+<code>AF_NETLINK</code>,</li>
+<li><strong>transzportréteg:</strong> TCP, UDP, SCTP,</li>
+<li><strong>hálózati réteg:</strong> IPv4, IPv6, ICMP,</li>
+<li><strong>link-réteg:</strong> Ethernet, loopback, bridge,</li>
+<li><strong>eszközmeghajtók:</strong> NIC, hálózati virtuális
+eszközök.</li>
+</ul>
+<p>A Linux kernelben a socket-réteg a <code>struct proto_ops</code> és a
+<code>struct proto</code> interfészekkel kapcsolódik a protokollokhoz. A
+TCP saját állapotgépe a <code>struct tcp_sock</code>-ban, a socket a
+<code>struct sock</code>-ban, a fájlleíró pedig a VFS
+<code>sockfs</code>-én keresztül kapcsolódik.</p>
+<h3 data-number="3.3.19" id="interfész-az-ütemezőhöz"><span
+class="header-section-number">3.3.19</span> 5.2 Interfész az
+ütemezőhöz</h3>
+<p>A hálózati stack erősen aszinkron. A <code>recv</code> hívás gyakran
+blokkol; ilyenkor a socket várakozási sora jelzi az ütemezőnek, hogy a
+folyamatot ki kell venni a futási sorból. Amikor egy csomag megérkezik,
+a hálózati megszakítás vagy softirq feldolgozza, a TCP állapotgép
+frissül, és a socket várakozási sorát felébreszti. A <code>recv</code>
+hívó ezután visszatérhet a felhasználói térbe.</p>
+<p>A hálózati stackben az ütemezővel való kapcsolat tehát nemcsak a
+<code>recv</code> blokkolásakor jelenik meg, hanem a
+<strong>kernel-throttling</strong> és a
+<strong>CPU-terheléselosztás</strong> terén is: a NAPI például nagy
+forgalomnál a csomagonkénti megszakítást letiltja, és a csomagokat a
+NET_RX softirq-ben, költségvetéssel (budget) kötegelt lekérdezéssel
+dolgozza fel; tartós terhelésnél ez a <code>ksoftirqd</code>
+kernelszálba kerül, amelyet már az ütemező ütemez.</p>
+<h3 data-number="3.3.20" id="interfész-a-memóriakezelőhöz"><span
+class="header-section-number">3.3.20</span> 5.3 Interfész a
+memóriakezelőhöz</h3>
+<p>A hálózati stack intenzíven allokál puffereket. A
+<code>sk_buff</code> struktúra a csomagtárolás alapja:</p>
+<ul>
+<li>az <code>skb-&gt;head</code> a puffertérre mutat,</li>
+<li>az <code>skb-&gt;data</code> és <code>skb-&gt;len</code> az aktuális
+csomagszeletet jelöli,</li>
+<li>a <code>skb_shared_info</code> a fragmenteket és a zero-copy
+leírókat tartalmazza.</li>
+</ul>
+<p>A hálózati stack <code>kmalloc</code>, <code>alloc_skb</code>,
+<code>page_frag_alloc</code> és más memóriakezelői interfészeket
+használ. A zero-copy optimalizálásnál felhasználói lapokat is
+lefoglalhat, ilyenkor a memóriakezelő <code>pin_user_pages</code> vagy
+<code>get_user_pages</code> hívásával rögzíti a fizikai lapokat.</p>
+<p>A hálózati stack és a memóriakezelő közötti feszültség klasszikus
+példája a <strong>pufferallokációs nyomás</strong>: nagy hálózati
+forgalom esetén a kernelnek döntenie kell, hogy csomagot ejt-e, vagy a
+memóriakezelőt kényszeríti lap-visszanyerésre. A Linux ezt
+protokollszintű memóriakorlátokkal (<code>net.ipv4.tcp_mem</code>,
+<code>net.ipv4.udp_mem</code>: nyomás alatti viselkedés és csomagejtés),
+socketenkénti pufferkorlátokkal
+(<code>net.core.rmem_default</code>/<code>rmem_max</code>,
+<code>net.ipv4.tcp_rmem</code>) és a lapallokátor tartalékával
+(<code>vm.min_free_kbytes</code>) kezeli (a kulcsnevek a futó kernel
+<code>/proc/sys/net/</code> fájljaival ellenőrizendők).</p>
+<h3 data-number="3.3.21" id="interfész-a-vfs-hez"><span
+class="header-section-number">3.3.21</span> 5.4 Interfész a VFS-hez</h3>
+<p>A hálózati stack és a VFS között két fontos kapcsolat van:</p>
+<ol type="1">
+<li><strong>socket fájlleírók:</strong> a <code>socket()</code> hívás
+egy <code>sockfs</code> inode-on keresztül ad vissza fájlleírót. A
+<code>poll</code>/<code>select</code> a VFS poll-mechanizmusát
+használja.</li>
+<li><strong>AF_UNIX socketek:</strong> ezek a fájlrendszer névtérben nem
+kötelező, de létrehozhatnak fájlbejegyzést; a kernel a
+<code>unix_bind</code> során a VFS-en keresztül hoz létre
+socket-speciális fájlt.</li>
+</ol>
+<p>Ez a kapcsolat kiemeli, hogy a VFS nem egy „lemezes” alrendszer,
+hanem a kernel általános <strong>objektum-névtér</strong> és
+<strong>I/O-multiplexáló</strong> rétege.</p>
+<h3 data-number="3.3.22"
+id="az-alrendszerek-közötti-tipikus-hívási-lánc-read-a-hálózati-socketből"><span
+class="header-section-number">3.3.22</span> 6. Az alrendszerek közötti
+tipikus hívási lánc: <code>read</code> a hálózati socketből</h3>
+<p>A komponensek együttműködésének bemutatására vegyünk egy konkrét
+láncot, amely a négy alrendszer mindegyikét érinti:</p>
+<ol type="1">
+<li>A felhasználói folyamat <code>read(fd, buf, 4096)</code> hívást ad
+ki egy socketre.</li>
+<li>A kernel a fájlleíróból feloldja a <code>file</code> objektumot; ez
+a VFS/sockfs hatásköre.</li>
+<li>A <code>file-&gt;f_op-&gt;read_iter</code> hívás a socket-rétegbe
+vezet.</li>
+<li>A socket-réteg a <code>struct sock</code> <code>recvmsg</code>-ét
+hívja.</li>
+<li>Ha nincs adat, a folyamat bejegyzi magát a socket várakozási sorába,
+és <code>schedule()</code>-t hív. Itt lép be az ütemező.</li>
+<li>Később a hálózati kártya megszakítása és a softirq feldolgozza a
+bejövő csomagot. Az <code>sk_buff</code> allokációja a memóriakezelő
+szolgáltatása.</li>
+<li>A TCP ellenőrzi a csomagot, az adatot a socket fogadó pufferébe
+teszi, és <code>wake_up</code>-pal felébreszti a várakozó
+folyamatot.</li>
+<li>Amikor a folyamat újra fut, a <code>recvmsg</code> kimásolja az
+adatot a felhasználói pufferbe a <code>copy_to_user</code>
+segítségével.</li>
+<li>A rendszerhívás visszatér a beolvasott bájtok számával.</li>
+</ol>
+<figure id="fig-os008-socket-read">
+<div class="fig-interactive"><iframe src="figures/html/os008-socket-read.html" title="Szekvenciadiagram: a folyamat read-hívása a VFS-en és a socket-rétegen át alvásba kerül, a NIC megszakítása és a softirq sk_buff-ot allokál és felébreszti, majd a copy_to_user után a hívás visszatér." loading="lazy" style="width:100%;border:0;height:660px"></iframe><noscript><img src="figures/img/os008-socket-read.png" style="width:100.0%"
+alt="Szekvenciadiagram: a folyamat read-hívása a VFS-en és a socket-rétegen át alvásba kerül, a NIC megszakítása és a softirq sk_buff-ot allokál és felébreszti, majd a copy_to_user után a hívás visszatér." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/os008-socket-read.png" style="width:100.0%"
+alt="Szekvenciadiagram: a folyamat read-hívása a VFS-en és a socket-rétegen át alvásba kerül, a NIC megszakítása és a softirq sk_buff-ot allokál és felébreszti, majd a copy_to_user után a hívás visszatér." /></details></div>
+<figcaption>Blokkoló <code>read</code> egy TCP-socketen: a négy
+alrendszer és a két végrehajtási kontextus</figcaption>
+</figure>
+<p>Ez a lánc a kernel <strong>több komponensű tranzakciója</strong>: az
+ütemező nélkül nincs várakozás, a memóriakezelő nélkül nincs puffer és
+felhasználói másolás, a VFS/sockfs nélkül nincs fájlleíró, a hálózati
+stack nélkül nincs adat.</p>
+<h3 data-number="3.3.23"
+id="labor-kernelkomponens-térkép-készítése"><span
+class="header-section-number">3.3.23</span> 7. Labor:
+kernelkomponens-térkép készítése</h3>
+<h3 data-number="3.3.24" id="cél"><span
+class="header-section-number">3.3.24</span> 7.1 Cél</h3>
+<p>A labor célja, hogy egy emulált környezetben megfigyelje a négy
+alrendszer működését, és készítsen egy
+<strong>komponens-térképet</strong>: melyik rendszerhívás,
+kernelbelépési pont vagy tracepont melyik alrendszerhez tartozik, és
+milyen interfészen keresztül hívja a következőt.</p>
+<h3 data-number="3.3.25" id="eszközök-és-konfiguráció"><span
+class="header-section-number">3.3.25</span> 7.2 Eszközök és
+konfiguráció</h3>
+<p>Az alábbi reprodukciós csomag QEMU-alapú, a hoszt valódi lemezét nem
+érinti. A konkrét értékeket a laborjegyzőkönyvben rögzítsd:</p>
+<pre><code>CPU:    QEMU -cpu max, 4 vCPU (`-smp 4`)
+RAM:    2 GiB (`-m 2048`)
+Kernel: a 2.4.11 szerinti Debian 12 vendégkép 6.1.x kernelje (a pontos verziót a vendégben `uname -r` adja; a 3.2 6.12-es API-leírása, pl. folio-alapú laphiba, ettől eltérhet)
+Rootfs: a labor saját, eldobható képe (buildroot vagy minimális Debian)
+Trace:  ftrace tracefs, root jogosultság a vendégben
+Napló:  trace.txt, dmesg-labor.txt</code></pre>
+<p>A fenti sorok közül a kernelverzió és a rootfs konkrét értéke a saját
+laborodban dől el; a könyv szándékosan nem ad kész
+<code>run.sh</code>-t, mert a vendégkép a 2.4.11. alfejezet mintájára
+készül. A labort csak az izolált vendégben futtasd; a hoszt tracefs-éhez
+ne nyúlj.</p>
+<h3 data-number="3.3.26" id="mérési-lépések"><span
+class="header-section-number">3.3.26</span> 7.3 Mérési lépések</h3>
+<ol type="1">
+<li><p>Indítsd a QEMU-t a saját, a 2.4.11. alfejezet szerint készített
+vendégképeddel, soros konzollal.</p></li>
+<li><p>A vendégben derítsd fel a tracefs helyét és a rendelkezésre álló
+eseményeket:</p></li>
+</ol>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="va">TRACE</span><span class="op">=</span>/sys/kernel/tracing</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="bu">[</span> <span class="ot">-d</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/events&quot;</span> <span class="bu">]</span> <span class="kw">||</span> <span class="va">TRACE</span><span class="op">=</span>/sys/kernel/debug/tracing</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="bu">test</span> <span class="at">-d</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/events&quot;</span> <span class="kw">||</span> <span class="kw">{</span> <span class="bu">echo</span> <span class="st">&quot;tracefs nem erheto el&quot;</span><span class="kw">;</span> <span class="bu">exit</span> 1<span class="kw">;</span> <span class="kw">}</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/available_tracers&quot;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-wE</span> <span class="st">&#39;sys_enter_read|sched_switch|sched_wakeup|kmalloc|kfree_skb&#39;</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/available_events&quot;</span></span></code></pre></div>
+<p>Ha a <code>sys_enter_read</code> nem szerepel a listában, a kernel
+nem <code>CONFIG_FTRACE_SYSCALLS</code> beállítással készült; ilyenkor a
+<code>read</code> megfigyelésére a <code>function_graph</code> tracer
+<code>vfs_read</code> szűrőjét használd.</p>
+<ol start="3" type="1">
+<li>Válassz egyet a két lehetséges <code>read</code>-megfigyelés közül,
+és a választást indokold a jegyzőkönyvben:</li>
+</ol>
+<ul>
+<li><code>syscalls:sys_enter_read</code> – rendszerhívás-esemény; a
+<code>read(fd, buf, count)</code> argumentumait mutatja a belépéskor. A
+VFS-en belüli időtartamot nem méri.</li>
+<li><code>function_graph</code> tracer <code>vfs_read</code> szűrővel –
+a <code>vfs_read</code> kernelbeli függvény futásidejét mutatja. Nem
+rendszerhívás-esemény, ezért a hívó folyamat és a rendszerhívás
+összerendelése külön figyelmet igényel. A szimbólumot előbb ellenőrizni
+kell:</li>
+</ul>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-w</span> vfs_read <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/available_filter_functions&quot;</span> <span class="kw">||</span> <span class="bu">echo</span> <span class="st">&quot;vfs_read nem erheto el&quot;</span></span></code></pre></div>
+<ol start="4" type="1">
+<li>Kapcsold be a kiválasztott megfigyelést és a többi eseményt:</li>
+</ol>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 0 <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/tracing_on&quot;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/trace&quot;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="co"># A) változat: rendszerhívás-esemény</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> nop <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/current_tracer&quot;</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 1 <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/events/syscalls/sys_enter_read/enable&quot;</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="co"># B) változat: függvény-gráf (az A) helyett)</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="co"># echo function_graph &gt; &quot;$TRACE/current_tracer&quot;</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="co"># echo &#39;vfs_read&#39; &gt; &quot;$TRACE/set_graph_function&quot;</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="va">$$</span> <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/set_event_pid&quot;</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 1 <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/options/event-fork&quot;</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&#39;comm == &quot;tcp_pair&quot;&#39;</span> <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/events/kmem/kmalloc/filter&quot;</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 1 <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/events/sched/sched_switch/enable&quot;</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 1 <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/events/sched/sched_wakeup/enable&quot;</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 1 <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/events/kmem/kmalloc/enable&quot;</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 1 <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/events/skb/consume_skb/enable&quot;</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 1 <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/events/skb/kfree_skb/enable&quot;</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 1 <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/events/kmem/kmem_cache_alloc/enable&quot;</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 1 <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/tracing_on&quot;</span></span></code></pre></div>
+<ol start="5" type="1">
+<li>Futtass egy helyi TCP-kliens/szerver párt, amelyben a szerver
+szándékosan késleltetve küld, így a kliens <code>read</code>-je blokkol.
+A példa forrása (<code>tcp_pair.c</code>):</li>
+</ol>
+<div class="sourceCode" id="cb7"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#define </span><span class="ot">_GNU_SOURCE</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;arpa/inet.h&gt;</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;errno.h&gt;</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;netinet/in.h&gt;</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdio.h&gt;</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdlib.h&gt;</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sys/socket.h&gt;</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sys/wait.h&gt;</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;unistd.h&gt;</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> die<span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>what<span class="op">)</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>    perror<span class="op">(</span>what<span class="op">);</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>    exit<span class="op">(</span><span class="dv">1</span><span class="op">);</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> lfd <span class="op">=</span> socket<span class="op">(</span>AF_INET<span class="op">,</span> SOCK_STREAM<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>lfd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a>        die<span class="op">(</span><span class="st">&quot;socket&quot;</span><span class="op">);</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> sockaddr_in addr <span class="op">=</span> <span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a>    addr<span class="op">.</span>sin_family <span class="op">=</span> AF_INET<span class="op">;</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a>    addr<span class="op">.</span>sin_addr<span class="op">.</span>s_addr <span class="op">=</span> htonl<span class="op">(</span>INADDR_LOOPBACK<span class="op">);</span></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a>    addr<span class="op">.</span>sin_port <span class="op">=</span> <span class="dv">0</span><span class="op">;</span>                     <span class="co">/* az OS választ szabad portot */</span></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>bind<span class="op">(</span>lfd<span class="op">,</span> <span class="op">(</span><span class="kw">struct</span> sockaddr <span class="op">*)&amp;</span>addr<span class="op">,</span> <span class="kw">sizeof</span> addr<span class="op">)</span> <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a>        die<span class="op">(</span><span class="st">&quot;bind&quot;</span><span class="op">);</span></span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>listen<span class="op">(</span>lfd<span class="op">,</span> <span class="dv">1</span><span class="op">)</span> <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a>        die<span class="op">(</span><span class="st">&quot;listen&quot;</span><span class="op">);</span></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a>    socklen_t alen <span class="op">=</span> <span class="kw">sizeof</span> addr<span class="op">;</span></span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>getsockname<span class="op">(</span>lfd<span class="op">,</span> <span class="op">(</span><span class="kw">struct</span> sockaddr <span class="op">*)&amp;</span>addr<span class="op">,</span> <span class="op">&amp;</span>alen<span class="op">)</span> <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a>        die<span class="op">(</span><span class="st">&quot;getsockname&quot;</span><span class="op">);</span></span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a>    pid_t child <span class="op">=</span> fork<span class="op">();</span></span>
+<span id="cb7-37"><a href="#cb7-37" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>child <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb7-38"><a href="#cb7-38" aria-hidden="true" tabindex="-1"></a>        die<span class="op">(</span><span class="st">&quot;fork&quot;</span><span class="op">);</span></span>
+<span id="cb7-39"><a href="#cb7-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-40"><a href="#cb7-40" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>child <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-41"><a href="#cb7-41" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* kliens: blokkoló read-del vár a szerver válaszára */</span></span>
+<span id="cb7-42"><a href="#cb7-42" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> cfd <span class="op">=</span> socket<span class="op">(</span>AF_INET<span class="op">,</span> SOCK_STREAM<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb7-43"><a href="#cb7-43" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>cfd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb7-44"><a href="#cb7-44" aria-hidden="true" tabindex="-1"></a>            die<span class="op">(</span><span class="st">&quot;socket (kliens)&quot;</span><span class="op">);</span></span>
+<span id="cb7-45"><a href="#cb7-45" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>connect<span class="op">(</span>cfd<span class="op">,</span> <span class="op">(</span><span class="kw">struct</span> sockaddr <span class="op">*)&amp;</span>addr<span class="op">,</span> <span class="kw">sizeof</span> addr<span class="op">)</span> <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb7-46"><a href="#cb7-46" aria-hidden="true" tabindex="-1"></a>            die<span class="op">(</span><span class="st">&quot;connect&quot;</span><span class="op">);</span></span>
+<span id="cb7-47"><a href="#cb7-47" aria-hidden="true" tabindex="-1"></a>        <span class="dt">char</span> buf<span class="op">[</span><span class="dv">16</span><span class="op">];</span></span>
+<span id="cb7-48"><a href="#cb7-48" aria-hidden="true" tabindex="-1"></a>        <span class="dt">ssize_t</span> n <span class="op">=</span> read<span class="op">(</span>cfd<span class="op">,</span> buf<span class="op">,</span> <span class="kw">sizeof</span> buf<span class="op">);</span></span>
+<span id="cb7-49"><a href="#cb7-49" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>n <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-50"><a href="#cb7-50" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>errno <span class="op">==</span> EINTR<span class="op">)</span></span>
+<span id="cb7-51"><a href="#cb7-51" aria-hidden="true" tabindex="-1"></a>                <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb7-52"><a href="#cb7-52" aria-hidden="true" tabindex="-1"></a>            die<span class="op">(</span><span class="st">&quot;read (kliens)&quot;</span><span class="op">);</span></span>
+<span id="cb7-53"><a href="#cb7-53" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb7-54"><a href="#cb7-54" aria-hidden="true" tabindex="-1"></a>        close<span class="op">(</span>cfd<span class="op">);</span></span>
+<span id="cb7-55"><a href="#cb7-55" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb7-56"><a href="#cb7-56" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-57"><a href="#cb7-57" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-58"><a href="#cb7-58" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> afd <span class="op">=</span> accept<span class="op">(</span>lfd<span class="op">,</span> NULL<span class="op">,</span> NULL<span class="op">);</span></span>
+<span id="cb7-59"><a href="#cb7-59" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>afd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb7-60"><a href="#cb7-60" aria-hidden="true" tabindex="-1"></a>        die<span class="op">(</span><span class="st">&quot;accept&quot;</span><span class="op">);</span></span>
+<span id="cb7-61"><a href="#cb7-61" aria-hidden="true" tabindex="-1"></a>    sleep<span class="op">(</span><span class="dv">1</span><span class="op">);</span>                              <span class="co">/* szándékos késleltetés: a kliens blokkol */</span></span>
+<span id="cb7-62"><a href="#cb7-62" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">char</span> msg<span class="op">[]</span> <span class="op">=</span> <span class="st">&quot;hello</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb7-63"><a href="#cb7-63" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>write<span class="op">(</span>afd<span class="op">,</span> msg<span class="op">,</span> <span class="kw">sizeof</span> msg <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">!=</span> <span class="op">(</span><span class="dt">ssize_t</span><span class="op">)(</span><span class="kw">sizeof</span> msg <span class="op">-</span> <span class="dv">1</span><span class="op">))</span></span>
+<span id="cb7-64"><a href="#cb7-64" aria-hidden="true" tabindex="-1"></a>        die<span class="op">(</span><span class="st">&quot;write (szerver)&quot;</span><span class="op">);</span></span>
+<span id="cb7-65"><a href="#cb7-65" aria-hidden="true" tabindex="-1"></a>    close<span class="op">(</span>afd<span class="op">);</span></span>
+<span id="cb7-66"><a href="#cb7-66" aria-hidden="true" tabindex="-1"></a>    close<span class="op">(</span>lfd<span class="op">);</span></span>
+<span id="cb7-67"><a href="#cb7-67" aria-hidden="true" tabindex="-1"></a>    waitpid<span class="op">(</span>child<span class="op">,</span> NULL<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb7-68"><a href="#cb7-68" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb7-69"><a href="#cb7-69" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Fordítás és futtatás a vendégben:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">gcc</span> <span class="at">-Wall</span> <span class="at">-Wextra</span> <span class="at">-o</span> tcp_pair tcp_pair.c</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./tcp_pair</span></span></code></pre></div>
+<ol start="6" type="1">
+<li>Állítsd le a trace-t, és mentsd a naplót:</li>
+</ol>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 0 <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/tracing_on&quot;</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/trace&quot;</span> trace.txt</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="fu">dmesg</span> <span class="op">&gt;</span> dmesg-labor.txt</span></code></pre></div>
+<ol start="7" type="1">
+<li><strong>Először a mintában</strong> azonosítsd a blokkba kerülést és
+az ébresztést, majd a saját futtatásból építsd fel a komponens-térképet.
+A minta napló formája (szemléltető, nem mért kimenet; a PID-ek,
+időbélyegek és címek helyőrzők):</li>
+</ol>
+<pre><code>(ftrace-előtag: task-PID [CPU] flags időbélyeg)
+sys_enter_read: fd: 0x00000004, buf: 0x00007ffc..., count: 0x00000010
+sched_switch: prev_comm=tcp_pair prev_pid=812 prev_prio=120 prev_state=S ==&gt; next_comm=swapper/1 ...
+sched_wakeup: comm=tcp_pair pid=812 prio=120 target_cpu=001
+sched_switch: prev_comm=swapper/1 ... ==&gt; next_comm=tcp_pair next_pid=812 ...</code></pre>
+<p>A mintában a blokkba kerülés a
+<code>sched_switch ... prev_state=S</code> sor (a
+<code>sys_enter_read</code> után), az ébresztés a
+<code>sched_wakeup</code> sor; a kettő között a kliens nem futtatható. A
+tényleges sorok sorrendje és mezői a kernel verziójától és a trace
+beállításaitól függnek; a fenti négy sor csak a keresendő mintázatot
+mutatja.</p>
+<ol start="8" type="1">
+<li>Készítsd el a komponens-térképet: minden releváns trace-eseményhez
+írd be, hogy az ütemező, a memóriakezelő, a VFS vagy a hálózati stack
+alrendszerhez tartozik, és milyen interfészt használ.</li>
+</ol>
+<h3 data-number="3.3.27" id="elvárt-eredmény"><span
+class="header-section-number">3.3.27</span> 7.4 Elvárt eredmény</h3>
+<p>A naplóban legalább a következő mintázat figyelhető meg:</p>
+<ul>
+<li><code>sched_switch</code>: a <code>read</code> hívó folyamat
+<code>prev_state=S</code> állapotban kerül ki a futási sorból, egy másik
+folyamat fut.</li>
+<li><code>kmem_cache_alloc</code> / <code>kmalloc</code>: az
+<code>sk_buff</code> fejléce és adatterülete (loopbacken a küldő
+oldalon) jön létre.</li>
+<li>a választott read-megfigyelés: <code>sys_enter_read</code> esetén a
+rendszerhívás argumentumai, <code>function_graph</code> esetén a
+<code>vfs_read</code> időtartama jelenik meg.</li>
+<li><code>sched_wakeup</code>: az adat megérkezésekor a várakozó
+folyamat futtathatóvá válik.</li>
+<li><code>consume_skb</code> (vagy drop esetén <code>kfree_skb</code>):
+a puffer felszabadul; ha egyik sem jelenik meg, a jegyzőkönyvben
+rögzítsd a kernelverziót (a <code>kfree_skb</code> az 5.17 óta az
+eldobott csomagokra szól; ellenőrzendő).</li>
+</ul>
+<p>A mérési naplóban a <strong>mért</strong> értékeket külön kell
+jelölni a <strong>várt/levezetett</strong> értéktől. A következő
+táblázat csak a naplósor alakját szemlélteti; a konkrét PID, cím és
+méret a saját futásból származik, értéket nem a könyvből kell
+átvenni:</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Esemény</th>
+<th>Alrendszer</th>
+<th>Várt szerep</th>
+<th>Naplósor alakja (szemléltető)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>sched_switch</code></td>
+<td>ütemező</td>
+<td><code>read</code> blokkol, másik folyamat fut</td>
+<td><code>prev_comm=tcp_pair prev_state=S ==&gt; next_comm=...</code></td>
+</tr>
+<tr>
+<td><code>kmalloc</code> / <code>kmem_cache_alloc</code></td>
+<td>memóriakezelő</td>
+<td><code>sk_buff</code> allokáció</td>
+<td><code>call_site=... bytes_req=... bytes_alloc=...</code></td>
+</tr>
+<tr>
+<td><code>sys_enter_read</code> vagy <code>vfs_read</code></td>
+<td>VFS</td>
+<td>fájlleíró-feloldás, illetve VFS-függvény</td>
+<td><code>fd: 0x... count: 0x...</code>, illetve
+függvénygráf-bejegyzés</td>
+</tr>
+<tr>
+<td><code>sched_wakeup</code></td>
+<td>ütemező</td>
+<td>a blokkolt folyamat futtathatóvá válik</td>
+<td><code>comm=tcp_pair pid=... target_cpu=...</code></td>
+</tr>
+<tr>
+<td><code>consume_skb</code> / <code>kfree_skb</code></td>
+<td>hálózati stack</td>
+<td>csomagpuffer felszabadulása</td>
+<td><code>skbaddr=0x...</code></td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="3.3.28" id="visszaállítás"><span
+class="header-section-number">3.3.28</span> 7.5 Visszaállítás</h3>
+<p>A labor után a QEMU-lemezkép eldobható; a hoszt kernelét,
+bootloaderét és rendszerpartícióját nem módosítjuk. A vendégben a labor
+által módosított trace-beállításokat állítsd vissza:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 0 <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/tracing_on&quot;</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/trace&quot;</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> nop <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/current_tracer&quot;</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/set_graph_function&quot;</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> e <span class="kw">in</span> sched/sched_switch sched/sched_wakeup kmem/kmalloc skb/kfree_skb syscalls/sys_enter_read<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>    <span class="bu">[</span> <span class="ot">-e</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/events/</span><span class="va">$e</span><span class="st">/enable&quot;</span> <span class="bu">]</span> <span class="kw">&amp;&amp;</span> <span class="bu">echo</span> 0 <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$TRACE</span><span class="st">/events/</span><span class="va">$e</span><span class="st">/enable&quot;</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span></code></pre></div>
+<p>A vendég újraindítása szintén alaphelyzetbe állítja a tracefs-t; a
+jegyzőkönyvben azt is rögzítsd, hogy a visszaállítás megtörtént-e.</p>
+<h3 data-number="3.3.29" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">3.3.29</span> 8. Tipikus hibák és helyes
+megoldások</h3>
+<h3 data-number="3.3.30"
+id="az-ütemező-közvetlenül-a-folyamatlistát-használja"><span
+class="header-section-number">3.3.30</span> 8.1 „Az ütemező közvetlenül
+a folyamatlistát használja”</h3>
+<p><strong>Hibás gondolat:</strong> a blokkolás azt jelenti, hogy a
+fejlesztő saját maga láncolja ki a folyamatleírót egy globális
+listából.</p>
+<p><strong>Következmény:</strong> versenyhelyzet, elveszett ébresztés,
+inkonzisztens futási sor.</p>
+<p><strong>Helyes megoldás:</strong> a <code>wait_queue</code> és a
+<code>schedule()</code> hívása. Az ütemező birtokolja a futási sor
+adatszerkezetét; a többi alrendszer csak az állapotot és a várakozási
+okot adja meg.</p>
+<h3 data-number="3.3.31"
+id="a-fájlrendszer-közvetlenül-allokál-felhasználói-lapot"><span
+class="header-section-number">3.3.31</span> 8.2 „A fájlrendszer
+közvetlenül allokál felhasználói lapot”</h3>
+<p><strong>Hibás gondolat:</strong> a fájlrendszer <code>read</code>
+metódusa közvetlenül a felhasználói pufferbe ír, akár
+<code>memcpy</code>-vel.</p>
+<p><strong>Következmény:</strong> access-ellenőrzés megkerülése, laphiba
+a kernelben, izolációs sérülés.</p>
+<p><strong>Helyes megoldás:</strong> a fájlrendszer a page cache-be vagy
+a kernel pufferébe ír; a felhasználói másolást a memóriakezelő
+<code>copy_to_user</code> interfésze végzi, hibaellenőrzéssel.</p>
+<h3 data-number="3.3.32"
+id="a-hálózati-stack-a-vfs-től-függetlenül-kezeli-a-fájlleírókat"><span
+class="header-section-number">3.3.32</span> 8.3 „A hálózati stack a
+VFS-től függetlenül kezeli a fájlleírókat”</h3>
+<p><strong>Hibás gondolat:</strong> a socket fájlleírók külön névtérben
+élnek, és a <code>poll</code>/<code>select</code> felesleges a VFS-hez
+kötni.</p>
+<p><strong>Következmény:</strong> a <code>poll</code> rendszerhívás
+duplikált logikája, a <code>epoll</code> és a fájlleírók közötti
+átjárhatóság elvesztése.</p>
+<p><strong>Helyes megoldás:</strong> a socket fájlleírók a VFS
+<code>sockfs</code> rétegén keresztül jelennek meg, és a
+<code>file_operations</code> poll-mechanizmusát használják.</p>
+<h3 data-number="3.3.33" id="önellenőrző-kérdések"><span
+class="header-section-number">3.3.33</span> 9. Önellenőrző kérdések</h3>
+<ol type="1">
+<li>Egy folyamat blokkoló <code>read</code>-et hív egy pipe-ra. Melyik
+alrendszer tulajdonolja a fájlleírót, melyik a várakozási sort, és
+melyik a felhasználói pufferbe másolás hívását?</li>
+<li>Miért helytelen a kernelben közvetlenül <code>memcpy</code>-t hívni
+felhasználói pointerre?</li>
+<li>Rajzolja fel leegyszerűsítve a <code>read(fd, buf, 4096)</code>
+hívási láncát egy socket esetén, és jelölje be a négy alrendszer
+határait.</li>
+<li>Milyen adatszerkezet köti össze a fájlleírót, az inode-ot és a
+fájlrendszer-műveleteket?</li>
+<li>Hogyan ébred fel egy hálózati <code>recv</code> hívás? Melyik
+alrendszer jelzi az ütemezőnek, hogy a folyamat <code>READY</code>
+lett?</li>
+</ol>
+<h3 data-number="3.3.34" id="összefoglalás"><span
+class="header-section-number">3.3.34</span> 10. Összefoglalás</h3>
+<p>A kernel fő alrendszerei nem egymás mellett létező, elszigetelt
+modulok, hanem meghatározott interfészekkel összekapcsolt komponensek.
+Az ütemező a futásjogot és a várakozást menedzseli, a memóriakezelő a
+címfordítást és az allokációt, a VFS a fájlleírókat és az
+I/O-objektumokat, a hálózati stack a socketeket és a csomagfeldolgozást.
+A helyes kerneltervezés azon múlik, hogy ezek a határok a kódban is
+megjelenjenek: tulajdonjogok, műveleti táblák, várakozási sorok és
+felhasználói másolófüggvények formájában. A következő egység,
+<code>os009</code>, ezekre az interfészekre építve mutatja be a kernel
+és a felhasználói tér határát, az ABI-t és a driver modellt.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os007.html">← 3.2 Réteges, moduláris és exokernel/unikernel felépítés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os009.html">3.4 Kernel és felhasználói tér határa, ABI és driver modell →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

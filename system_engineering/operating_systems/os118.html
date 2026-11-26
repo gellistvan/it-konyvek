@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>31.1 SMP, preemption és valós idejű kiterjesztés – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz7">VII. RÉSZ – Tervezés, implementáció és záróprojekt</a> › <a href="index.html#osch30">31 Bővítés és haladó témák</a></p>
+<div class="links"><a class="prev" rel="prev" href="os117.html">← 30.4 Regresszió és kiadási minőség</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os119.html">31.2 Hálózat és biztonsági modulok →</a></div>
+</nav>
+<h2 data-number="31.1" id="os118"><span
+class="header-section-number">31.1</span> SMP, preemption és valós idejű
+kiterjesztés</h2>
+<p>A <a href="os117.html">Regresszió és kiadási minőség</a> alfejezetben
+stabilizált egyprocesszoros kernel után a következő lépés a párhuzamos
+végrehajtás. Ez a szakasz a szimmetrikus többmagos (SMP) bővítést és a
+preemptív kernel viselkedését járja körül. A cél nem egy gyártásra kész
+SMP kernel, hanem azoknak a mechanizmusoknak a megértése, amelyek a
+többmagos helyes működéshez kellenek: spinlock, per-CPU adat és
+preempt_count. Ehhez kapcsolódik a PREEMPT_RT koncepció és a latency
+mérése is.</p>
+<h3 data-number="31.1.1" id="miért-más-a-többmagos-kernel"><span
+class="header-section-number">31.1.1</span> Miért más a többmagos
+kernel?</h3>
+<p>Az eddigi egyszerű kernelben egyetlen CPU futtatta a kernel kódját,
+így a közös globális adatok védelméhez elegendő volt a megszakítások
+rövid idejű tiltása, vagy egy egyszerű kölcsönös kizárás. Amikor két
+vagy több CPU ugyanazt a kernel kódot futtatja, akkor valódi párhuzamos
+végrehajtás jön létre: két processzor egyszerre írhatja ugyanazt a
+globális változót. A megszakítás tiltása egyetlen CPU-n nem akadályozza
+meg a másik CPU futását. Ezért a közös kernel állapotot explicit, CPU-k
+közötti szinkronizációval kell védeni.</p>
+<p>Az SMP rendszerek legfontosabb tulajdonságai:</p>
+<ul>
+<li><strong>szimmetrikus</strong>: minden CPU azonos jogokkal és azonos
+memóriatérrel rendelkezik, ugyanazt a kernel képet futtatja;</li>
+<li><strong>cache-koherencia</strong>: a hardver biztosítja, hogy a CPU
+cache-ekben lévő másolatok konzisztensek legyenek, de ez nem zárja ki az
+alkalmazás szintű versenyhelyzetet;</li>
+<li><strong>atomi utasítások</strong>: a CPU-k rendelkeznek olyan
+utasításokkal, amelyek olvasnak és írnak egy memóriahelyet úgy, hogy
+közben másik CPU nem férhet hozzá (test-and-set, compare-exchange,
+load-linked/store-conditional).</li>
+</ul>
+<p>A kernel kódjában ezért különbséget kell tennünk a
+<strong>CPU-lokális</strong> és a <strong>globális</strong> állapot
+között. A CPU-lokális állapotot nem kell lezárni, mert csak az adott CPU
+éri el; a globális állapotot viszont minden CPU hozzáférhet, ezért
+zárolni kell.</p>
+<h3 data-number="31.1.2"
+id="spinlock-a-legalapvetőbb-cpu-k-közötti-zár"><span
+class="header-section-number">31.1.2</span> Spinlock: a legalapvetőbb
+CPU-k közötti zár</h3>
+<p>A spinlock olyan kölcsönös kizárási eszköz, amely akkor használható,
+amikor a kritikus szakasz nagyon rövid, és a várakozó CPU-nak nem
+érdemes aludnia. A spinlockot használó CPU aktívan pörög (spin-el), amíg
+a zárat meg nem kapja.</p>
+<h3 data-number="31.1.3" id="működési-elve"><span
+class="header-section-number">31.1.3</span> Működési elve</h3>
+<p>A spinlock egyetlen atomi memóriahelyre épül. A zárolás során a CPU
+atomikusan megkísérli a <code>0</code> értéket <code>1</code>-re
+cserélni. Ha az eredmény <code>0</code>, a zár az övé; ha
+<code>1</code>, akkor a zár foglalt, és a CPU addig pörög, amíg a zár
+fel nem szabadul.</p>
+<p>A következő példa egy TTAS (test-and-test-and-set) spinlockot mutat
+GCC beépített atomi függvényeivel. A kód szemléltetés, nem éles
+kernelhez való:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Egyszerű TTAS spinlock, csak oktatási célra.</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"> * A valós kernelben a lockolás előtt preempt_disable() is szükséges.</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co"> */</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span> locked<span class="op">;</span>   <span class="co">/* 0 = szabad, 1 = foglalt */</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> spinlock_t<span class="op">;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="kw">inline</span> <span class="dt">void</span> cpu_relax<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="pp">#if defined(__x86_64__) || defined(__i386__)</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    __asm__ <span class="dt">volatile</span><span class="op">(</span><span class="st">&quot;pause&quot;</span> <span class="op">:::</span> <span class="st">&quot;memory&quot;</span><span class="op">);</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="pp">#elif defined(__aarch64__)</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>    __asm__ <span class="dt">volatile</span><span class="op">(</span><span class="st">&quot;yield&quot;</span> <span class="op">:::</span> <span class="st">&quot;memory&quot;</span><span class="op">);</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="pp">#else</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>    __asm__ <span class="dt">volatile</span><span class="op">(</span><span class="st">&quot;&quot;</span> <span class="op">:::</span> <span class="st">&quot;memory&quot;</span><span class="op">);</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="pp">#endif</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="kw">inline</span> <span class="dt">void</span> spin_lock<span class="op">(</span>spinlock_t <span class="op">*</span>l<span class="op">)</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* Belső ciklus: relaxált, közönséges betöltés. Ez nem kér</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="co">         * kizárólagos tulajdont a cache-vonalra, ezért nem gerjeszt</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a><span class="co">         * folyamatos cache-vonal vándorlást. */</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="op">(</span>__atomic_load_n<span class="op">(&amp;</span>l<span class="op">-&gt;</span>locked<span class="op">,</span> __ATOMIC_RELAXED<span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a>            cpu_relax<span class="op">();</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* Csak ha szabadnak látszik, próbálunk atomi cserét (RMW).</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a><span class="co">         * Az acquire szemantika a sikeres zár megszerzéséhez tartozik. */</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>__atomic_exchange_n<span class="op">(&amp;</span>l<span class="op">-&gt;</span>locked<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> __ATOMIC_ACQUIRE<span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="kw">inline</span> <span class="dt">void</span> spin_unlock<span class="op">(</span>spinlock_t <span class="op">*</span>l<span class="op">)</span></span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Release szemantika: a kritikus szakasz minden írása látható,</span></span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a><span class="co">     * mielőtt a zár felszabadul. */</span></span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a>    __atomic_store_n<span class="op">(&amp;</span>l<span class="op">-&gt;</span>locked<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> __ATOMIC_RELEASE<span class="op">);</span></span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A példa a <strong>TTAS</strong> sémát követi: a belső ciklus
+<code>__atomic_load_n(..., __ATOMIC_RELAXED)</code> hívása közönséges,
+relaxált betöltés, nem atomi read-modify-write, ezért a várakozó CPU nem
+igényli írásra a zár cache-vonalát. Csak amikor a betöltés szabad zárat
+mutat, akkor hajtunk végre
+<code>__atomic_exchange_n(..., __ATOMIC_ACQUIRE)</code> atomi cserét; a
+sikeres cseréhez tartozó acquire sorrend biztosítja, hogy a kritikus
+szakasz olvasásai ne rendeződjenek a zár megszerzése elé. A
+felszabadítás <code>__atomic_store_n(..., __ATOMIC_RELEASE)</code>, ami
+a kritikus szakasz írásait a zár felszabadítása elé rendeli. A
+<code>pause</code> utasítás x86-on csökkenti a pörgés okozta
+energiafogyasztást és javítja a többi szál haladását; ARM64-en a
+<code>yield</code> utasítás tölti be ugyanezt a szerepet, ezért a példa
+architektúrafüggően választ relaxációs utasítást.</p>
+<figure id="fig-os118-ttas-mesi">
+<div class="fig-interactive"><iframe src="figures/html/os118-ttas-mesi.html" title="Két oszlop, TAS és TTAS, két várakozó CPU-val, négy pillanatkép. Kezdetben CPU0 tartja a zárat, a vonala M, a többi I. TAS: 10 pörgési iteráció alatt a vonal M-ként vándorol, 20 üzenet. TTAS: az első betöltés után mind S, 10 iteráció alatt 0 üzenet. CPU0 felszabadításkor egy invalidálás, CPU0 M. A verseny végén egy CPU vonala M, a zárat CPU1 tartja; a sikertelen csere is kizárólagos kérés." loading="lazy" style="width:100%;border:0;height:520px"></iframe><noscript><img src="figures/img/os118-ttas-mesi.png" style="width:100.0%"
+alt="Két oszlop, TAS és TTAS, két várakozó CPU-val, négy pillanatkép. Kezdetben CPU0 tartja a zárat, a vonala M, a többi I. TAS: 10 pörgési iteráció alatt a vonal M-ként vándorol, 20 üzenet. TTAS: az első betöltés után mind S, 10 iteráció alatt 0 üzenet. CPU0 felszabadításkor egy invalidálás, CPU0 M. A verseny végén egy CPU vonala M, a zárat CPU1 tartja; a sikertelen csere is kizárólagos kérés." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/os118-ttas-mesi.png" style="width:100.0%"
+alt="Két oszlop, TAS és TTAS, két várakozó CPU-val, négy pillanatkép. Kezdetben CPU0 tartja a zárat, a vonala M, a többi I. TAS: 10 pörgési iteráció alatt a vonal M-ként vándorol, 20 üzenet. TTAS: az első betöltés után mind S, 10 iteráció alatt 0 üzenet. CPU0 felszabadításkor egy invalidálás, CPU0 M. A verseny végén egy CPU vonala M, a zárat CPU1 tartja; a sikertelen csere is kizárólagos kérés." /></details></div>
+<figcaption>TAS és TTAS spinlock: a zár cache-vonalának állapotai
+egyszerűsített MESI-modellben; TAS-nál minden pörgési iteráció
+kizárólagos kérés (két várakozónál 10 iteráció alatt 20 buszüzenet),
+TTAS-nál a várakozók S-ben, helyben pörögnek (0 üzenet), és csak a
+felszabadítás indít forgalmat</figcaption>
+</figure>
+<p>Fontos, hogy a spinlock használata előtt le kell tiltani a kernel
+preemptiót is. Ha ugyanis a zár tartóját ugyanazon a CPU-n kiszorítja
+egy taszk, amely ugyanerre a zárra vár, a tartó nem futhat tovább, a
+várakozó pedig sosem kapja meg a zárat: holtpont (egymagos gépen
+biztosan, többmagoson CPU-affinitásnál). Ezen felül a zár hosszú ideig
+foglalt maradhat, és a többi CPU feleslegesen pörög. A helyes minta
+tehát:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> spin_lock_correct<span class="op">(</span>spinlock_t <span class="op">*</span>l<span class="op">)</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    preempt_disable<span class="op">();</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    spin_lock<span class="op">(</span>l<span class="op">);</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> spin_unlock_correct<span class="op">(</span>spinlock_t <span class="op">*</span>l<span class="op">)</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    spin_unlock<span class="op">(</span>l<span class="op">);</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    preempt_enable<span class="op">();</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h3 data-number="31.1.4" id="tipikus-hibák"><span
+class="header-section-number">31.1.4</span> Tipikus hibák</h3>
+<ul>
+<li><strong>Rekurzív spinlock</strong>: ha ugyanaz a CPU megpróbálja
+kétszer felvenni ugyanazt a spinlockot, a második hívás végtelen
+pörgésbe kerül, mert a zár már az adott CPU-é. A spinlock nem
+rekurzív.</li>
+<li><strong>Interrupt kontextusban való zárolás</strong>: ha a kernel
+megszakításkezelője olyan spinlockot próbál felvenni, amelyet ugyanaz a
+CPU már normál kontextusban tart, holtpont alakulhat ki, mert a
+megszakításkezelő nem tudja felszabadítani a zárat. Ezért interruptok
+alatt általában interrupt-tiltó spinlockot használunk.</li>
+<li><strong>Hosszú kritikus szakasz</strong>: a spinlock csak nagyon
+rövid műveletekhez való. Ha a kritikus szakasz memóriát másol vagy
+fájlrendszert jár be, a többi CPU pörgése jelentős késleltetést
+okoz.</li>
+<li><strong>Nincs preempt_disable</strong>: a preemptiós kernelben a zár
+felvétele előtti és utáni preempt állapot megváltoztathatja a CPU
+futását, ezért a lockolásnak mindig preempt tiltással kell együtt
+járnia.</li>
+</ul>
+<h3 data-number="31.1.5"
+id="per-cpu-adat-a-cache-versengés-csökkentése"><span
+class="header-section-number">31.1.5</span> Per-CPU adat: a
+cache-versengés csökkentése</h3>
+<p>A többmagos kernelben a globális számlálók és egyéb gyakran írt
+adatok komoly cache-invalidálást okozhatnak. Ha például minden CPU
+ugyanazt a globális <code>packet_count</code> változót növeli, akkor
+minden növelés során a cache-vonalat át kell mozgatni a CPU-k között.
+Ezt hívjuk cache-line ping-pong-nak.</p>
+<p>A megoldás az, hogy az adatot CPU-nként külön példányban tároljuk, és
+csak akkor férünk hozzá, amikor tényleg szükséges. Ezt nevezzük per-CPU
+adatnak. A tulajdonos CPU a saját példányát spinlock nélkül
+módosíthatja, de az összesítő olvasás már párhuzamosan futhat a
+növelésekkel, ezért ott atomi hozzáférésre (vagy dokumentált olvasási
+szerződésre) van szükség. A gyűjtő művelet (például összegzés) minden
+CPU példányát olvassa, de ez ritkábban történik, mint a növelés.</p>
+<p>A következő egyszerű példa egy per-CPU számlálót mutat. A valós
+kernelben ez makrókkal történik (<code>this_cpu_inc()</code>,
+<code>per_cpu_ptr()</code>), de a lényeg ugyanaz:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MAX_CPUS        </span><span class="dv">8</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CACHE_LINE_SIZE </span><span class="dv">64</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co">/* Az __attribute__((aligned(...))) garantálja a 64 bájtos kezdőcímet,</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="co"> * és azt is, hogy a struct mérete 64 bájt többszöröse legyen. Így a</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="co"> * tömb elemei külön cache-vonalra esnek, és nincs hamis osztás. */</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> per_cpu_counter <span class="op">{</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">long</span> count<span class="op">;</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> __attribute__<span class="op">((</span>aligned<span class="op">(</span>CACHE_LINE_SIZE<span class="op">)));</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="kw">struct</span> per_cpu_counter counters<span class="op">[</span>MAX_CPUS<span class="op">];</span></span></code></pre></div>
+<p>Az APIC ID nem használható közvetlenül indexként: a boot során minden
+felébresztett CPU kap egy 0-tól folytonos logikai számot
+(<code>cpu_id</code>), és az <code>apic_to_cpu[]</code> tábla tárolja a
+megfeleltetést (opcionálisan
+<code>assert(cpu &lt; MAX_CPUS)</code>).</p>
+<p>A növelést csak a tulajdonos CPU végzi, a
+<code>get_cpu()</code>/<code>put_cpu()</code> védelme alatt (azaz
+preemptió és migráció ellen védve). Mivel a növelés és az összesítő
+olvasás különböző CPU-n futhat párhuzamosan, a mezőhöz atomi hozzáférést
+használunk: a növelés relaxált atomi read-modify-write, az összesítés
+relaxált atomi betöltés. A relaxált sorrend itt elegendő, mert a
+számláló értékén kívül nincs más adat, amelyre a sorrend vonatkozna.</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="kw">inline</span> <span class="dt">int</span> get_cpu<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    preempt_disable<span class="op">();</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> read_cpu_id<span class="op">();</span>   <span class="co">/* logikai CPU-szám 0..nr_cpus-1; bootkor az APIC ID → index táblából, vagy a per-CPU területen tárolt cpu mezőből */</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="kw">inline</span> <span class="dt">void</span> put_cpu<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    preempt_enable<span class="op">();</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> increment_this_cpu_counter<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> cpu <span class="op">=</span> get_cpu<span class="op">();</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    __atomic_fetch_add<span class="op">(&amp;</span>counters<span class="op">[</span>cpu<span class="op">].</span>count<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> __ATOMIC_RELAXED<span class="op">);</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    put_cpu<span class="op">();</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a><span class="co">/* Bármely CPU hívhatja; az eredmény pillanatkép, nem lineárisan</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a><span class="co"> * konzisztens metszet: a futó növelések egy része kimaradhat. */</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a><span class="dt">unsigned</span> <span class="dt">long</span> read_total_counter<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">long</span> sum <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> cpu<span class="op">;</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span>cpu <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> cpu <span class="op">&lt;</span> MAX_CPUS<span class="op">;</span> cpu<span class="op">++)</span></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a>        sum <span class="op">+=</span> __atomic_load_n<span class="op">(&amp;</span>counters<span class="op">[</span>cpu<span class="op">].</span>count<span class="op">,</span> __ATOMIC_RELAXED<span class="op">);</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> sum<span class="op">;</span></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>get_cpu()</code> visszaadja az aktuális CPU azonosítót, és
+megnöveli a <code>preempt_count</code>-ot, így a kernel nem válthat
+CPU-t a hozzáférés közben. A <code>put_cpu()</code> csökkenti a
+számlálót, és ha szükséges, ütemezést indít.</p>
+<p><strong>Megszakítási szerződés.</strong> A
+<code>get_cpu()</code>/<code>preempt_disable()</code> csak a preemptiót
+és a CPU-vándorlást zárja ki; a merev (hardveres) megszakítás ugyanazon
+a CPU-n továbbra is félbeszakíthatja a kódot. Ha ugyanazt a per-CPU
+példányt megszakításkezelő is növelné, egy nem atomi
+<code>count++</code> (betöltés–növelés–tárolás) elveszítheti a
+megszakítás közbeni frissítést. Ezt háromféleképpen lehet elkerülni: (1)
+atomi read-modify-write használatával, ahogy a fenti példában; (2)
+<code>local_irq_save()</code>/<code>local_irq_restore()</code> párral a
+növelés körül; (3) a folyamat- és a megszakításkontextus külön per-CPU
+példányával. A választást dokumentálni kell, mert a helyesség ettől a
+szerződéstől függ.</p>
+<p>Tipikus hibák:</p>
+<ul>
+<li><strong>CPU váltás per-CPU mutatóval</strong>: ha valaki elmenti a
+per-CPU adat címét, majd a CPU-t átváltja a kernel, a mutató elavulttá
+válik, és másik CPU adatát írjuk.</li>
+<li><strong>Hamis cache-osztás</strong>: ha két per-CPU változó
+ugyanabba a cache-vonalba kerül, akkor a CPU-k egymás cache-vonalát
+invalidálják, hiába külön adatról van szó. Ezért a per-CPU struktúrákat
+cache-vonal méretre igazítjuk
+(<code>__attribute__((aligned(64)))</code>); a puszta 64 bájtos méret
+még nem garantál 64 bájtos kezdőcímet.</li>
+<li><strong>Túl sok per-CPU memória</strong>: a per-CPU adat a CPU-k
+számával szorozva foglal memóriát. A tervezésnél mérlegelni kell, hogy a
+gyors hozzáférés megéri-e a nagyobb lábnyomot.</li>
+</ul>
+<h3 data-number="31.1.6"
+id="a-preempt-count-és-a-kernel-preemptió"><span
+class="header-section-number">31.1.6</span> A preempt count és a kernel
+preemptió</h3>
+<p>A <strong>preemptió</strong> azt jelenti, hogy a kernel futás közben
+átadhatja a CPU-t egy másik készen álló feladatnak, például egy magasabb
+prioritású folyamatnak. Ez javítja a válaszidőt, de veszélyezteti a
+kernel adatstruktúráinak konzisztenciáját. Ezért a kernelben bizonyos
+szakaszokban tilos a preemptió.</p>
+<p>A <strong>preempt_count</strong> egy per-task számláló, amely
+megmutatja, hogy hány olyan réteg tiltja éppen a preemptiót. Ha a
+számláló értéke nagyobb, mint nulla, a kernel nem válthat kontextust. A
+számlálót a <code>preempt_disable()</code> növeli, a
+<code>preempt_enable()</code> pedig csökkenti. Amikor a számláló nullára
+csökken, a kernel megvizsgálja, hogy van-e függőben lévő ütemezési
+igény, és ha igen, ütemez.</p>
+<p>A következő példa egy egyszerű preempt_count kezelést mutat. A valós
+Linux kernelben a <code>preempt_count</code> egy bitmező, amely a
+hardirq, softirq, preempt és NMI szinteket külön tárolja, de az alapelv
+ugyanez:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> thread_context <span class="op">{</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> preempt_count<span class="op">;</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* ... további mezők ... */</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="kw">inline</span> <span class="dt">void</span> preempt_disable<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    current<span class="op">-&gt;</span>preempt_count<span class="op">++;</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Compiler barrier: az írás nem rendeződhet át a</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="co">     * kritikus szakasz elé. */</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    asm <span class="dt">volatile</span><span class="op">(</span><span class="st">&quot;&quot;</span> <span class="op">:::</span> <span class="st">&quot;memory&quot;</span><span class="op">);</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="kw">inline</span> <span class="dt">void</span> preempt_enable<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>    asm <span class="dt">volatile</span><span class="op">(</span><span class="st">&quot;&quot;</span> <span class="op">:::</span> <span class="st">&quot;memory&quot;</span><span class="op">);</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>    current<span class="op">-&gt;</span>preempt_count<span class="op">--;</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>current<span class="op">-&gt;</span>preempt_count <span class="op">==</span> <span class="dv">0</span> <span class="op">&amp;&amp;</span> need_resched<span class="op">())</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>        schedule<span class="op">();</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>preempt_disable()</code> és <code>preempt_enable()</code>
+hívások párban kell, hogy megjelenjenek. Minden tiltáshoz tartoznia kell
+egy engedélyezésnek. Ha a számláló nem nullára csökken, akkor még mindig
+marad tiltás, ezért nem szabad ütemezni.</p>
+<p>A preempt_count használatával a kernel kódja kijelölheti a nem
+preemptálható szakaszokat anélkül, hogy a megszakításokat teljesen
+letiltaná. Ez fontos az SMP kernelben, mert a megszakítások tiltása csak
+az adott CPU-ra hat, míg a preempt_count a kernel folyamatán belüli
+konzisztenciát védi.</p>
+<p>Tipikus hibák:</p>
+<ul>
+<li><strong>Preempt count szivárgás</strong>: ha a
+<code>preempt_disable()</code> után a függvény hibával visszatér, és nem
+hívja meg a <code>preempt_enable()</code>-t, a számláló nem nullázódik,
+ami a kernel preemptiójának blokkolásához vezet. A kernelben ilyenkor
+<code>BUG()</code> vagy <code>WARN()</code> jelzi a hibát.</li>
+<li><strong>Túlzott preempt tiltás</strong>: hosszú kritikus szakaszok
+alatt a preemptió tiltása késlelteti a magas prioritású feladatokat, és
+rontja a rendszer válaszidejét.</li>
+<li><strong>Preempt tiltás és alvás</strong>: ha a kernel kódja a
+preempt tiltott szakaszban alvó függvényt hív, az hibát okoz, mert a
+processzor nem adhatja át a vezérlést.</li>
+</ul>
+<h3 data-number="31.1.7" id="preempt_rt-és-a-latency-fogalma"><span
+class="header-section-number">31.1.7</span> PREEMPT_RT és a latency
+fogalma</h3>
+<p>A hagyományos Linux kernelben a <code>CONFIG_PREEMPT</code> opció
+teszi lehetővé a kernel preemptióját, de bizonyos szakaszokban továbbra
+is tiltva van, és a spinlockok is tiltják a preemptiót. A
+<strong>PREEMPT_RT</strong> (real-time) patch célja, hogy a kernel minél
+több pontján preemptálható legyen, és a megszakításokat is kernel
+szálakban futtassa. Így a magas prioritású felhasználói feladatok
+rövidebb és determinisztikusabb késleltetéssel kapják meg a CPU-t.</p>
+<p>A PREEMPT_RT legfontosabb átalakításai:</p>
+<ul>
+<li>A <code>spinlock_t</code> típus <strong>preemptálható, alvó
+mutexszé</strong> (rtmutex) alakul: a várakozó feladat elalszik, a CPU
+más feladatot kaphat, és a kritikus szakasz preemptálható. Ezért a
+<code>spinlock_t</code> RT alatt <strong>csak olyan kontextusban
+használható, ahol szabad aludni</strong> – folyamatkontextusban, nem
+merev (hard) megszakításban és nem NMI-ben.</li>
+<li>A <code>raw_spinlock_t</code> megmarad valódi pörgő zárnak, és RT
+alatt is tiltja a preemptiót. Ezt ott kell használni, ahol alvás tilos:
+a merev megszakítások rövid, nem szálasított részében (hard IRQ
+prologue), az NMI-kezelésben és az ütemező legalapvetőbb, alvásmentes
+útjain.</li>
+<li>A hardveres megszakításkezelők nagy részét <strong>kernel
+szálakká</strong> alakítja (threaded IRQ), így azok ütemezhető
+prioritással futnak. A merev megszakítási szakasz (a hardveres nyugtázás
+és a szál felébresztése) azonban változatlanul nem szálasított, nem
+preemptálható, és ott alvó művelet nem hívható.</li>
+<li>Bevezeti a <strong>priority inheritance</strong> (prioritásöröklés)
+mechanizmust az rtmutexekhez. Ez a prioritás inverziót <strong>nem
+szünteti meg általában</strong>: csak arra a konkrét esetre hat, amikor
+egy alacsonyabb prioritású szál tartja a magasabb prioritású szál által
+várt zárat, mert ilyenkor a tartó szál örökli a várakozó prioritását. A
+többlépcsős láncokra csak korlátozottan, a záron kívüli várakozásokra
+(például I/O-ra) pedig egyáltalán nem terjed ki; a worst-case latencyt
+ennek ellenére mérni kell.</li>
+</ul>
+<p>A latency két fontos összetevője:</p>
+<ul>
+<li><strong>Megszakítási késleltetés</strong>
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>L</mi><mrow><mi>i</mi><mi>r</mi><mi>q</mi></mrow></msub><annotation encoding="application/x-tex">L_{irq}</annotation></semantics></math>):
+a hardveres megszakítás érkezésétől a megszakításkezelő első utasításáig
+eltelt idő.</li>
+<li><strong>Ütemezési késleltetés</strong>
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>L</mi><mrow><mi>s</mi><mi>c</mi><mi>h</mi><mi>e</mi><mi>d</mi></mrow></msub><annotation encoding="application/x-tex">L_{sched}</annotation></semantics></math>):
+attól az időponttól, amikor egy feladat számára ébredési esemény
+történik (például egy megszakítás befejeződik), addig, amíg a feladat
+ténylegesen futni kezd.</li>
+</ul>
+<p>A PREEMPT_RT célja ezeknek a késleltetéseknek a csökkentése és a
+maximális érték (worst-case) determinisztikussá tétele. A mérést
+általában <code>cyclictest</code> típusú programmal végzik, amely
+időzítő megszakításokkal ébreszti magát, és méri az ébredés és a futás
+közötti különbséget. A mérés során rögzíteni kell a hardvert, a kernel
+konfigurációt, az órajelfrekvenciát és a mérési módszert, ahogy a könyv
+általános mérési szabályai előírják.</p>
+<p>A PREEMPT_RT állapotáról fontos megjegyezni: a mainline Linux
+különböző verziói eltérő mértékben tartalmazzák a real-time patcheket. A
+PREEMPT_RT a Linux 6.12 óta (2024. november) a mainline kernel része a
+támogatott architektúrákon (x86, arm64, RISC-V); a
+<code>CONFIG_PREEMPT_RT</code> külső patch nélkül választható (a verzió
+és az architektúra-lista a konkrét kiadásnál ellenőrzendő). A laborban
+használt kernelverzió pontos RT-támogatását a reprodukciós csomagban
+rögzíteni kell.</p>
+<h3 data-number="31.1.8"
+id="labor-smp--és-preemption-terv-készítése"><span
+class="header-section-number">31.1.8</span> Labor: SMP- és
+preemption-terv készítése</h3>
+<p>Az átadandó feladat nem egy kész SMP kernel, hanem egy
+<strong>reprodukálható tervdokumentum</strong>, amely a meglévő egyszerű
+kernel (<a href="os117.html">Regresszió és kiadási minőség</a> stabil
+build) SMP-re és preemptív bővítésének lépéseit, konfigurációját és
+mérési tervét tartalmazza. A dokumentum célja, hogy a következő
+fejezetben (<a href="os119.html">Hálózat és biztonsági modulok</a>) a
+hálózati és biztonsági modulok implementálásakor már ismert legyen, hol
+kell spinlock, per-CPU adat és preempt_count.</p>
+<h3 data-number="31.1.9" id="kiinduló-állapot-és-környezet"><span
+class="header-section-number">31.1.9</span> Kiinduló állapot és
+környezet</h3>
+<ul>
+<li><strong>Alap kernel</strong>: a <a href="os117.html">Regresszió és
+kiadási minőség</a> alfejezetben tesztelt, egyprocesszoros, naplózást és
+panic kezelést tartalmazó build. Commit azonosítóval rögzítve a
+reprodukciós csomagban.</li>
+<li><strong>Emulált hardver</strong>: QEMU x86_64, két virtuális CPU
+(<code>-smp 2</code>), 512 MiB RAM, hálózat nélkül, soros
+konzollal.</li>
+<li><strong>Build eszközök</strong>: a korábbi fejezetekben használt
+cross-toolchain, linker script és buildrendszer.</li>
+<li><strong>Fordítási beállítások</strong>: <code>-O2 -g</code>,
+<code>-mno-red-zone</code>, <code>-ffreestanding</code>,
+<code>-fno-stack-protector</code> (a pontos opciókat a buildnapló
+tartalmazza).</li>
+</ul>
+<h3 data-number="31.1.10" id="a-terv-elvárt-tartalma"><span
+class="header-section-number">31.1.10</span> A terv elvárt tartalma</h3>
+<p>A dokumentumnak a következő szakaszokat kell tartalmaznia:</p>
+<ol type="1">
+<li><strong>Célkitűzések</strong>:
+<ul>
+<li>Két vCPU indítása és a kernel adatstruktúrák SMP-biztossá
+tétele.</li>
+<li>Preemptív kernel bekapcsolása <code>CONFIG_PREEMPT</code>
+mintára.</li>
+<li>Mérési terv a megszakítási késleltetés és a jitter
+meghatározására.</li>
+</ul></li>
+<li><strong>Adatstruktúra-terv</strong>:
+<ul>
+<li>A globális kernel állapotok felmérése: melyek lesznek spinlockkal
+védve, melyek per-CPU adatok.</li>
+<li>A <code>spinlock_t</code> mérete és igazítása: például 4 bájt; ha a
+zárat cache-vonalra igazítjuk, a típus 64 bájtos lesz – ezt csak a sokat
+versengett, önálló zárakra érdemes alkalmazni.</li>
+<li>A per-CPU adat blokk mérete és CPU-nkénti elrendezése: a per-CPU
+struktúra mérete 64 bájt cache-vonaligazítással.</li>
+<li>A <code>preempt_count</code> mező elhelyezkedése a
+<code>thread_context</code> struktúrában, mérete és bitbeosztása (ha a
+valós bitmezőt használjuk).</li>
+</ul></li>
+<li><strong>Szinkronizációs terv</strong>:
+<ul>
+<li>Melyik spinlock védi a folyamatkezelő globális listát, az ütemező
+futósorát és a napló puffert.</li>
+<li>Hogyan oldják meg a spinlockok a preempt tiltást:
+<code>spin_lock()</code> belép előtt <code>preempt_disable()</code>,
+kilép után <code>preempt_enable()</code>.</li>
+<li>Per-CPU adatok elérése <code>get_cpu()</code> /
+<code>put_cpu()</code> mintával.</li>
+</ul></li>
+<li><strong>Boot folyamat</strong>:
+<ul>
+<li>A másodlagos CPU-k indítása (x86): (1) a BSP a MADT-ból kiolvassa a
+Local APIC ID-ket; (2) a trampolinkódot egy 1 MiB alatti, 4 KiB-ra
+igazított lapra másolja; (3) minden AP-nak INIT IPI-t, majd két SIPI-t
+küld (vektor = trampolin címe / 4096), a megfelelő várakozásokkal; (4)
+az AP a trampolinban saját vermet és GDT-t tölt, long módba vált,
+beállítja a per-CPU területét, <code>cpu_online</code> bitet állít, és
+az ütemező üresjárati ciklusába lép; (5) a BSP időkorláttal várja az
+online jelzést (a pontos szekvencia és időzítések az Intel SDM vonatkozó
+fejezetében, verzióval hivatkozva – ellenőrzendő). A tervben ezt
+pszeudokóddal kell leírni.</li>
+</ul></li>
+<li><strong>Mérési terv</strong>:
+<ul>
+<li><strong>Mért késleltetés</strong>: a kernel időzítő megszakításának
+kezelője feljegyzi az időbélyeget, amikor a megszakítás beérkezett. A
+<code>cyclictest</code>-hez hasonló kernel folyamat vagy egy egyszerű
+felhasználói program méri, mennyi idő telik el az ébresztés és a futás
+között.</li>
+<li><strong>Várt késleltetés</strong>: levezetett érték a kernel kód
+elemzése alapján. Például a megszakítás belépési út hossza
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mrow><mi>e</mi><mi>n</mi><mi>t</mi><mi>r</mi><mi>y</mi></mrow></msub><annotation encoding="application/x-tex">T_{entry}</annotation></semantics></math>
+ciklusban, a handler
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mrow><mi>h</mi><mi>a</mi><mi>n</mi><mi>d</mi><mi>l</mi><mi>e</mi><mi>r</mi></mrow></msub><annotation encoding="application/x-tex">T_{handler}</annotation></semantics></math>
+ciklusban. QEMU alatt a vCPU-ütemezés overheadje hozzáadódik; ezt a várt
+értéknél külön fel kell tüntetni.</li>
+<li><strong>Ciklusszám mérés</strong>: a megszakítás belépési és
+kilépési szakaszban <code>rdtsc</code> vagy más időbélyeg.</li>
+<li><strong>Mérési napló minta</strong> (szemléltető formátum, nem mért
+adat; a <code>&lt;ts&gt;</code>, <code>&lt;delta&gt;</code> helyén a
+saját futás értékei állnak):</li>
+</ul></li>
+</ol>
+<pre class="text"><code>[ &lt;t&gt;] CPU0: irq entry ts=&lt;ts&gt;, exit ts=&lt;ts&gt;, delta=&lt;delta&gt; cycles
+[ &lt;t&gt;] CPU1: irq entry ts=&lt;ts&gt;, exit ts=&lt;ts&gt;, delta=&lt;delta&gt; cycles
+[ &lt;t&gt;] CPU0: wakeup latency min=&lt;min&gt; cycles, max=&lt;max&gt; cycles, avg=&lt;avg&gt; cycles
+[ &lt;t&gt;] CPU1: wakeup latency min=&lt;min&gt; cycles, max=&lt;max&gt; cycles, avg=&lt;avg&gt; cycles</code></pre>
+<ul>
+<li>A mért és várt értékeket külön táblázatban kell szerepeltetni:</li>
+</ul>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Metrikus</th>
+<th>Várt érték</th>
+<th>Mért érték</th>
+<th>Megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ISR futásideje (belépés → kilépés, <code>rdtsc</code>)</td>
+<td>&lt; 100 ciklus (szoftveres rész; levezetendő a kódból)</td>
+<td><code>&lt;mérendő&gt;</code></td>
+<td>a ciklusszámot a kalibrált TSC-frekvenciával együtt kell
+megadni</td>
+</tr>
+<tr>
+<td>Teljes IRQ késleltetés
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>L</mi><mrow><mi>i</mi><mi>r</mi><mi>q</mi></mrow></msub><annotation encoding="application/x-tex">L_{irq}</annotation></semantics></math></td>
+<td>1–5 µs QEMU alatt (becslés)</td>
+<td><code>&lt;mérendő&gt;</code></td>
+<td>a megszakítást kiváltó esemény időbélyege (például a programozott
+időzítő lejárati ideje) → az ISR első utasítása; a QEMU vCPU
+ütemezésétől függ</td>
+</tr>
+<tr>
+<td>Wakeup latency (preemptív kernel)</td>
+<td>&lt; 50 µs (becslés)</td>
+<td><code>&lt;mérendő&gt;</code></td>
+<td><code>CONFIG_PREEMPT</code> hatása</td>
+</tr>
+</tbody>
+</table>
+<ol start="6" type="1">
+<li><strong>Reprodukciós csomag</strong>:
+<ul>
+<li>A QEMU indító parancs:</li>
+</ul></li>
+</ol>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">qemu-system-x86_64</span> <span class="dt">\</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>    <span class="at">-smp</span> 2 <span class="dt">\</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">-m</span> 512M <span class="dt">\</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">-nographic</span> <span class="dt">\</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">-kernel</span> build/os.bin <span class="dt">\</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">-append</span> <span class="st">&quot;console=ttyS0 loglevel=7&quot;</span> <span class="dt">\</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">-no-reboot</span> <span class="at">-no-shutdown</span></span></code></pre></div>
+<ul>
+<li>A build parancs: <code>make build/os.bin</code> a megadott
+config-gal.</li>
+<li>A kernel config, linker script, a módosított forrásfájlok listája, a
+mérési szkript és a nyers naplók.</li>
+</ul>
+<ol start="7" type="1">
+<li><strong>Visszaállítás</strong>:
+<ul>
+<li>A munkát külön git branch-en kell végezni, a kiinduló commit-ból. A
+labor végén a mérések után a branch visszaállítható, vagy a patch
+sorozat megőrizhető.</li>
+</ul></li>
+</ol>
+<h3 data-number="31.1.11" id="ellenőrzési-pontok-a-laborhoz"><span
+class="header-section-number">31.1.11</span> Ellenőrzési pontok a
+laborhoz</h3>
+<ul>
+<li>A spinlockok minden hozzáférést lefednek a globális adatokhoz?</li>
+<li>A <code>preempt_disable()</code> és <code>preempt_enable()</code>
+hívások párosak-e?</li>
+<li>A per-CPU adatok hozzáférése
+<code>get_cpu()</code>/<code>put_cpu()</code> mellett történik-e?</li>
+<li>A mérési naplóban a mért és várt értékek elkülönülnek-e?</li>
+<li>A reprodukciós csomag tartalmazza-e a kernel konfigurációt, a QEMU
+verziót, a toolchain verziót és a mérési körülményeket?</li>
+</ul>
+<h3 data-number="31.1.12" id="önellenőrző-kérdések"><span
+class="header-section-number">31.1.12</span> Önellenőrző kérdések</h3>
+<ol type="1">
+<li>Miért nem elegendő a megszakítások tiltása a globális kernel adatok
+védelmére SMP rendszerben?</li>
+<li>Magyarázza el, miért kell <code>preempt_disable()</code> a spinlock
+felvétele előtt, és mi történhet, ha elmarad.</li>
+<li>Hogyan csökkenti a cache-versengést a per-CPU adat?</li>
+<li>Mi a különbség a preempt_count és a spinlock között a kernel
+preemptiójának szabályozásában?</li>
+</ol>
+<h3 data-number="31.1.13" id="összefoglalás"><span
+class="header-section-number">31.1.13</span> Összefoglalás</h3>
+<p>Az SMP bővítés a kernelben nem egyszerűen a CPU-k számának növelését
+jelenti. A közös állapotok védelméhez atomi spinlockokra, a gyakran írt
+állapotokhoz per-CPU adatokra, a kernel preemptiójának szabályozásához
+pedig preempt_count-ra van szükség. A PREEMPT_RT ezeket a
+mechanizmusokat fejleszti tovább a determinisztikus válaszidő érdekében.
+A fejezet laborja egy tervdokumentum elkészítése volt, amely a
+mérésekkel együtt megalapozza a következő fejezetben bevezetendő
+hálózati és biztonsági modulok szinkronizációs igényeit. Minden mérésnél
+a várt értéket a hardver, a konfiguráció és a kernel kód elemzése
+alapján le kell vezetni, és a mért értéktől elkülönítve kell
+dokumentálni.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os117.html">← 30.4 Regresszió és kiadási minőség</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os119.html">31.2 Hálózat és biztonsági modulok →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

@@ -1,0 +1,1031 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>16.1 Eseményvezérelt feldolgozás: Kafka és a kézbesítési
+szemantika – IoT-rendszerek és szoftverkomponensek – az eszköztől a
+felhőig, programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – Backend és enterprise integráció</a> › <a href="index.html#ich15">16 Streamfeldolgozás és integrációs minták</a></p>
+<div class="links"><a class="prev" rel="prev" href="i046.html">← 15.3 Megőrzés, ritkítás és tárolási költség</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i048.html">16.2 Enterprise integrációs minták IoT-ban →</a></div>
+</nav>
+<h2 data-number="16.1" id="i047"><span
+class="header-section-number">16.1</span> Eseményvezérelt feldolgozás:
+Kafka és a kézbesítési szemantika</h2>
+<h3 data-number="16.1.1" id="motiváció"><span
+class="header-section-number">16.1.1</span> Motiváció</h3>
+<p>A TerraSense eddigi adatútja lineáris: a <code>ts-node</code>
+BLE/UDP-n küld a <code>ts-gw</code>-nek, a gateway MQTT-n publikál a
+Mosquitto brokerre, a <code>ts-backend</code> pedig feliratkozik a
+<code>terrasense/...</code> topicokra. Ez a felépítés jól működik egy
+üvegház, néhány tíz node és egyetlen backend esetén. A következő igények
+azonban gyorsan szűkössé teszik:</p>
+<ul>
+<li><strong>Visszajátszás:</strong> ha a <code>ts-backend</code> órákra
+leáll, az MQTT retained üzenetek nem tartalmazzák a múltbeli
+adatfolyamot; a leállás alatt elveszett telemetriát nem lehet utólag
+visszaolvasni.</li>
+<li><strong>Több, független fogyasztó:</strong> a riasztási modul (<a
+href="i052.html">Riasztás: szabályok, értesítés, riasztási
+fáradtság</a>), az idősoros betöltő (<a href="i046.html">Megőrzés,
+ritkítás és tárolási költség</a>) és egy későbbi analitikai modul
+ugyanazt az adatfolyamot akarja feldolgozni anélkül, hogy egymást
+zavarnák.</li>
+<li><strong>Tartós puffer:</strong> a gateway store-and-forwardja (<a
+href="i037.html">Store-and-forward: offline működés és visszatöltés</a>)
+megoldja a peremhálózati kiesést, de a felhőben is hasznos, ha a
+fogyasztó sebessége időszakosan elmarad a termeléstől.</li>
+</ul>
+<p>Ezekre a problémákra az MQTT broker nem elosztott napló, hanem
+üzenetközvetítő. A megoldás egy elosztott napló, például Apache Kafka
+bevezetése az MQTT mögé, amely pufferként és újraolvasható
+eseményfolyamként szolgál. Ebben az alfejezetben megtervezzük a hidat,
+és tisztázzuk a kézbesítési szemantikát. <strong>A labor
+szimuláció:</strong> nem indít MQTT-t, Kafkát, partíciót vagy consumer
+groupot, hanem egy JSON-listán modellezi a fogyasztó offset-,
+deduplikálási, ablak- és checkpoint-viselkedését. A valós
+Kafka-infrastruktúra kiépítése külön integrációs feladat, amelyet ez a
+fejezet nem bizonyít.</p>
+<h3 data-number="16.1.2" id="fogalmak-és-működés"><span
+class="header-section-number">16.1.2</span> Fogalmak és működés</h3>
+<h4 data-number="16.1.2.1" id="a-kafka-alapfogalmai"><span
+class="header-section-number">16.1.2.1</span> A Kafka alapfogalmai</h4>
+<p><strong>Definíció.</strong> A <strong>Kafka topic</strong> egy
+elnevezett, append-only log, amelybe a producerek üzeneteket
+(rekordokat) írnak, és amelyből a fogyasztók olvasnak. Minden rekord egy
+kulcs-érték párt, időbélyeget és metaadatokat tartalmaz; a sorrend a
+topic szintjén nem garantált, csak partíción belül.</p>
+<p><strong>Definíció.</strong> A <strong>partíció</strong> a topic
+fizikai felosztása: egy topic egy vagy több partícióból áll. A producer
+által megadott kulcs (vagy annak hiányában a producer particionálója –
+újabb kliensekben batch-enként váltó „sticky” stratégia) határozza meg,
+melyik partícióba kerül a rekord. Azonos kulcsú rekordok mindig
+ugyanabba a partícióba íródnak, így ott a beérkezési sorrend
+megőrződik.</p>
+<p><strong>Definíció.</strong> Az <strong>offset</strong> egy monoton
+növekvő, partíción belüli pozíció azonosító, amely a rekord helyét
+jelöli. A fogyasztó az offset segítségével tudja, hol tart, és
+újrainduláskor a legutóbb elkötelezett (committed) offsettől
+folytathatja.</p>
+<p><strong>Definíció.</strong> A <strong>consumer group</strong>
+fogyasztók halmaza, amely közösen dolgozza fel a topic partícióit. Kafka
+garantálja, hogy egy partíciót egy adott pillanatban a csoporton belül
+legfeljebb egy fogyasztó olvas, így a feldolgozási terhelés
+párhuzamosítható, miközben elkerülhető a duplikált olvasás.</p>
+<p>Az MQTT és a Kafka szerepe gyakran összemosódik, pedig alapvetően
+különbözik:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Szempont</th>
+<th>MQTT (broker)</th>
+<th>Kafka (napló)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Elsődleges cél</td>
+<td>üzenetközvetítés eszközöknek</td>
+<td>tartós, visszajátszható eseményfolyam</td>
+</tr>
+<tr>
+<td>Olvasási modell</td>
+<td>előfizetők push alapon kapják az üzenetet</td>
+<td>fogyasztók pull alapon kérnek rekordokat</td>
+</tr>
+<tr>
+<td>Tárolás</td>
+<td>retained üzenetek kivételével rövid életű</td>
+<td>konfigurálható megőrzés (napok, hetek)</td>
+</tr>
+<tr>
+<td>Sorrend</td>
+<td>topic szinten általában nincs garancia</td>
+<td>partíción belül erős garancia</td>
+</tr>
+<tr>
+<td>Visszajátszás</td>
+<td>nem jellemző</td>
+<td>alapvető képesség offset alapján</td>
+</tr>
+</tbody>
+</table>
+<h4 data-number="16.1.2.2" id="mqtt-kafka-híd"><span
+class="header-section-number">16.1.2.2</span> MQTT → Kafka híd</h4>
+<p>A TerraSense-ben a Mosquitto brokerre érkező telemetriát továbbítani
+kell a Kafka topicba. Erre két általános megoldás létezik:</p>
+<ol type="1">
+<li><strong>Kafka Connect forrás-konnektor:</strong> például egy
+MQTT-forrás konnektor (a pontos elérhetőségét ellenőrizni kell), amely
+feliratkozik az MQTT topicokra, és minden üzenetet a konfigurált Kafka
+topicba ír. Előnye a konfigurációalapú üzemeltetés, hátránya a
+korlátozott rugalmasság.</li>
+<li><strong>Saját híd:</strong> a <code>ts-backend</code> vagy egy külön
+szolgáltatás, például <code>ts-ingest</code>, MQTT-klienssel
+feliratkozik, majd Kafka-producerként publikál. Ez teljes kontrollt ad a
+séma, a particionálási kulcs és a hibakezelés felett; ezt a mintát
+követjük a laborban.</li>
+</ol>
+<p>A híd legfontosabb tervezési döntése a <strong>particionálási
+kulcs</strong>. A TerraSense üzeneteiben a <code>node_id</code> az
+azonosító, amely alapján az összes node-hoz tartozó rekordnak időrendben
+kell feldolgozhatónak lennie. Ha a kulcs a <code>node_id</code>, akkor
+minden node adata ugyanabba a partícióba kerül, és a fogyasztó oldalon a
+<code>seq</code> mező monotonitása ellenőrizhető. Ha nem adnánk meg
+kulcsot, a rekordok a kulcstól függetlenül, nem determinisztikusan
+különböző partíciókba kerülhetnének, és a node-ra vonatkozó sorrend
+felborulna. A valós, több telephelyes rendszerben a kulcs
+<code>site/node_id</code>, hogy két telephely azonos nevű node-jai ne
+ütközzenek.</p>
+<p>A híd az <a href="i044.html">Ingest: MQTT-ből a backendbe,
+idempotensen</a> alfejezet kanonikus telemetria-sémája szerinti JSON-t
+továbbítja változtatás nélkül. A laborban az események egyszerűsített,
+lapos nézetben szerepelnek: a <code>temperature</code> mező a kanonikus
+<code>measurements.temperature.value</code> vetülete, hogy a kód rövid
+és olvasható maradjon. A valós híd nem vetíti el a
+<code>schema_version</code>, <code>site</code>, <code>boot_id</code> és
+<code>measurements</code> mezőket.</p>
+<h4 data-number="16.1.2.3"
+id="at-least-once-és-idempotens-fogyasztó"><span
+class="header-section-number">16.1.2.3</span> At-least-once és
+idempotens fogyasztó</h4>
+<p>A Kafka alapértelmezett feldolgozási szemantikája
+<strong>at-least-once</strong>: a fogyasztó poll-ozza a rekordokat,
+feldolgozza őket, majd elkötelezi az offsetet. Ha a feldolgozás és a
+commit között a fogyasztó összeomlik, akkor újraindulás után a legutóbbi
+commitnál folytatja, így a már feldolgozott, de nem commit-olt
+rekordokat újraolvassa. Ez duplikátumokat eredményezhet.</p>
+<p>A duplikátumok kezelésére <strong>idempotens fogyasztót</strong>
+építünk: a feldolgozás során minden rekordhoz egy egyedi kulcsot
+rendelünk, és egy perzisztens vagy memóriabeli halmazban nyilvántartjuk
+a már feldolgozott kulcsokat. Ha egy kulcs másodszor érkezik, a rekordot
+eldobjuk. A TerraSense-ben erre természetes kulcs a <code>site</code>, a
+<code>node_id</code> és a <code>seq</code> hármas, kiegészítve a
+<code>boot_id</code>-vel, mert újraindulás után a <code>seq</code>
+nulláról indulhat (lásd <a href="i034.html">Idő az IoT-ban: időbélyeg,
+időszinkron, sorrend</a>). Így a deduplikálási kulcs:
+<code>(site, node_id, boot_id, seq)</code>, ahol a hiányzó
+<code>boot_id</code> helyére a 15.1 szerinti <code>boot-0</code> kerül.
+A labor egyetlen telephelyet modellez, ezért ott a kulcs
+<code>(node_id, boot_id, seq)</code>; a <code>site</code> elhagyása csak
+a labor egyszerűsítése, nem a kanonikus séma megváltoztatása.</p>
+<p>Az offset-kezelésnél két hibás stratégia létezik:</p>
+<ul>
+<li><strong>Commit a feldolgozás előtt</strong> → at-most-once: ha a
+feldolgozás meghiúsul, a rekord elveszik, mert a fogyasztó
+újrainduláskor már a következő offsettől olvas.</li>
+<li><strong>Nem commit-olunk</strong> (kikapcsolt
+<code>enable.auto.commit</code> mellett) → újrainduláskor nincs
+elkötelezett offset, és a fogyasztó az <code>auto.offset.reset</code>
+szerint indul: <code>earliest</code> esetén mindent újra feldolgoz, az
+alapértelmezett <code>latest</code> esetén a topic végéről olvas, és a
+kiesés alatt érkezett rekordok kimaradnak (az alapértéket a használt
+kliensverzió dokumentációjában ellenőrizd).</li>
+</ul>
+<p>A helyes stratégia: <strong>feldolgozás után commit</strong>, vagyis
+at-least-once + idempotens feldolgozás. Ez a kombináció gyakorlatilag
+exactly-once hatást ad, ha a feldolgozás mellékhatása (például
+adatbázis-írás) is idempotens, és ha az offset, a deduplikálási állapot
+és az aggregátumállapot egyetlen atomi checkpointba kerül. A laborban
+ezt egy <code>checkpoint.json</code> fájl valósítja meg.</p>
+<h4 data-number="16.1.2.4"
+id="ablakok-watermark-késve-érkező-adat"><span
+class="header-section-number">16.1.2.4</span> Ablakok, watermark, késve
+érkező adat</h4>
+<p>A valós idejű feldolgozásban az <strong>ablak</strong> (window) az
+események időalapú csoportosítása. A <a href="i039.html">Helyi
+feldolgozás: szűrés, aggregálás, eseménydetektálás</a> alfejezetben a
+gateway percenkénti tumbling ablakot állít elő; itt ugyanezt a fogalmat
+a Kafka-fogyasztó oldalán alkalmazzuk. A tumbling ablak rögzített
+hosszúságú (például 60 s), és az ablakok nem fedik át egymást.</p>
+<p><strong>Definíció.</strong> A <strong>watermark</strong> az a
+pillanat az eseményidő-tengelyen, amelynél korábbi időbélyegű
+eseményeket a feldolgozó már nem vár. Ha a legutóbb látott esemény
+időbélyege <code>T</code>, és a watermark késleltetése <code>W</code>,
+akkor a <code>T - W</code>-nél korábbi eseményeket késve érkezettnek
+tekintjük, és vagy eldobjuk, vagy oldalági kimenetre (dead letter queue,
+DLQ) irányítjuk.</p>
+<p><strong>Definíció (ablakazonosító és eszköz szerint kulcsolt
+állapot).</strong> Az ablakállapot nem egyetlen
+<code>current_window_start</code> változó, hanem olyan struktúra,
+amelynek kulcsa az ablak kezdete és az eszköz azonosítója. Így a nem
+teljesen időrendben érkező események is a saját ablakukba kerülnek, és
+egy késői esemény nem zárja le visszafelé az éppen aktuális ablakot.</p>
+<p>A TerraSense-ben a késés forrása lehet a gateway store-and-forward
+üzemmódja: hálózati kiesés után órákkal később érkezik egy köteg régi
+telemetriai üzenet. A fogyasztó ezért:</p>
+<ol type="1">
+<li>Az ablakokat <code>(ablak_kezdet, site, node_id)</code> kulccsal
+tárolja.</li>
+<li>A watermarkot a látott maximális eseményidőből
+(<code>max_seen_ts</code>) és a megengedett késésből számítja:
+<code>watermark = max_seen_ts - W</code>.</li>
+<li>A watermarkot elért ablakokat lezárja és kiírja.</li>
+<li>A watermarknál régebbi eseményt nem tesz be a már lezárt ablakba,
+hanem <code>[késő]</code> jelzéssel a DLQ-ba irányítja, és az offsetjét
+is elkötelezi, hogy ne induljon végtelen újraolvasás.</li>
+<li>A watermarknál nem régebbi, de a legutóbbi maximumnál korábbi
+eseményt (egy még nyitott ablakba tartozó, enyhén késői eseményt)
+elfogad, és a saját ablakába tesz.</li>
+</ol>
+<p>A watermark beállítása kompromisszum: túl kicsi érték adatvesztést
+okoz, túl nagy érték pedig növeli a kimenet késleltetését, mert az ablak
+csak a watermark átlépése után zárul le. A TerraSense-ben a 7 napos
+offline pufferelés miatt a watermarkot nem 5 percben, hanem a mért késés
+percentiliséhez igazítva kell beállítani; a laborban a 10 perces
+alapérték és az 5 perces kísérleti érték csak szemléltetés.</p>
+<p>Az alábbi ábra a labor nyolc eseményén (a 7 alapesemény és a c)
+feladat késő eseménye) mutatja, hogyan halad érkezési sorrendben a
+<code>max_seen_ts</code> és a watermark, és mikor kerül egy esemény
+ablakba, illetve a DLQ-ba.</p>
+<figure id="fig-i047-watermark">
+<div class="fig-interactive"><iframe src="figures/html/i047-watermark.html" title="Két eseményidő-tengely −300 és +120 másodperc között. A 60 másodperces A és B ablakban a labor hét eseménye: n001 átlaga 23,6 és 24,4, n002 átlaga 24,1 és 24,5; az offset 5 duplikátum áthúzva. A max_seen_ts +90 s. Felül 10 perces késleltetésnél a watermark −510 s, a −300 s időbélyegű 8. esemény elfogadva, új C ablakot nyit 21,0 átlaggal. Alul 5 perces késleltetésnél a watermark −210 s, a 8. esemény késő, a DLQ-ba kerül." loading="lazy" style="width:100%;border:0;height:640px"></iframe><noscript><img src="figures/img/i047-watermark.png" style="width:100.0%"
+alt="Két eseményidő-tengely −300 és +120 másodperc között. A 60 másodperces A és B ablakban a labor hét eseménye: n001 átlaga 23,6 és 24,4, n002 átlaga 24,1 és 24,5; az offset 5 duplikátum áthúzva. A max_seen_ts +90 s. Felül 10 perces késleltetésnél a watermark −510 s, a −300 s időbélyegű 8. esemény elfogadva, új C ablakot nyit 21,0 átlaggal. Alul 5 perces késleltetésnél a watermark −210 s, a 8. esemény késő, a DLQ-ba kerül." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/i047-watermark.png" style="width:100.0%"
+alt="Két eseményidő-tengely −300 és +120 másodperc között. A 60 másodperces A és B ablakban a labor hét eseménye: n001 átlaga 23,6 és 24,4, n002 átlaga 24,1 és 24,5; az offset 5 duplikátum áthúzva. A max_seen_ts +90 s. Felül 10 perces késleltetésnél a watermark −510 s, a −300 s időbélyegű 8. esemény elfogadva, új C ablakot nyit 21,0 átlaggal. Alul 5 perces késleltetésnél a watermark −210 s, a 8. esemény késő, a DLQ-ba kerül." /></details></div>
+<figcaption>Eseményidő-ablakok és watermark a labor adataival: 10 perces
+késleltetéssel a 8. esemény új ablakot nyit, 5 percessel a DLQ-ba
+kerül</figcaption>
+</figure>
+<h4 data-number="16.1.2.5" id="mikor-nem-kell-kafka"><span
+class="header-section-number">16.1.2.5</span> Mikor nem kell Kafka</h4>
+<p>Kis rendszerekben, ahol:</p>
+<ul>
+<li>egyetlen backend fogyasztó van,</li>
+<li>az adatmennyiség percenként néhány tíz üzenet,</li>
+<li>a fogyasztó leállásának időtartama alatt keletkező adatok elvesztése
+elfogadható,</li>
+<li>nincs szükség visszajátszásra vagy több, független fogyasztóra,</li>
+</ul>
+<p>a Kafka üzemeltetése (KRaft vagy külön kontrollsík, replikáció,
+monitoring) aránytalan komplexitást jelent. Ilyenkor a Mosquitto
+perzisztens munkamenete (QoS 1, <code>clean start</code> nélkül,
+korlátos sorral) és a gateway store-and-forwardja elegendő puffert ad; a
+retained üzenet csak az utolsó állapotot őrzi. A TerraSense oktatási
+célú, egy üvegházas példájában ez a helyzet, ezért a Kafka bevezetését
+ebben a könyvben csak a nagyobb, több telephelyes kiterjesztésben
+indokoljuk.</p>
+<h3 data-number="16.1.3" id="döntési-szempontok"><span
+class="header-section-number">16.1.3</span> Döntési szempontok</h3>
+<table>
+<thead>
+<tr>
+<th>Kritérium</th>
+<th>MQTT önmagában</th>
+<th>MQTT + Kafka</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fogyasztók száma</td>
+<td>kevés, ismert</td>
+<td>sok, dinamikusan változó</td>
+</tr>
+<tr>
+<td>Visszajátszás igénye</td>
+<td>nincs</td>
+<td>van (hibakeresés, újraindexelés)</td>
+</tr>
+<tr>
+<td>Adatmennyiség</td>
+<td>alacsony</td>
+<td>magas, terhelési csúcsok</td>
+</tr>
+<tr>
+<td>Sorrendi garancia</td>
+<td>topiconként nem garantált</td>
+<td>partíción belül erős</td>
+</tr>
+<tr>
+<td>Üzemeltetési komplexitás</td>
+<td>alacsony</td>
+<td>közepes/magas</td>
+</tr>
+<tr>
+<td>Költség</td>
+<td>broker csak</td>
+<td>broker + Kafka klaszter</td>
+</tr>
+</tbody>
+</table>
+<p>A TerraSense alapváltozatában az MQTT elegendő. Ha a rendszer több
+üvegházra, több ezer node-ra és több backend szolgáltatásra nő, akkor a
+Kafka bevezetése indokolt.</p>
+<h3 data-number="16.1.4" id="kidolgozott-példa-és-labor"><span
+class="header-section-number">16.1.4</span> Kidolgozott példa és
+labor</h3>
+<h4 data-number="16.1.4.1"
+id="példa-particionálási-terv-és-adatmennyiség"><span
+class="header-section-number">16.1.4.1</span> Példa: particionálási terv
+és adatmennyiség</h4>
+<p>Tegyük fel, hogy 1000 node percenként 1 telemetriai üzenetet küld.
+Egy üzenet JSON mérete körülbelül 200 B (a mezők: <code>node_id</code>,
+<code>seq</code>, <code>ts</code>, <code>boot_id</code>,
+<code>schema_version</code>, valamint a hőmérséklet, páratartalom és
+talajnedvesség a <code>measurements</code> objektumban). Napi
+adatmennyiség:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1000</mn><mo>⋅</mo><mn>60</mn><mo>⋅</mo><mn>24</mn><mo>⋅</mo><mn>200</mn><mspace width="0.222em"></mspace><mi mathvariant="normal">B</mi><mo>=</mo><mn>288</mn><mspace width="0.167em"></mspace><mn>000</mn><mspace width="0.167em"></mspace><mn>000</mn><mspace width="0.222em"></mspace><mi mathvariant="normal">B</mi><mo>≈</mo><mn>274</mn><mspace width="0.222em"></mspace><mrow><mi mathvariant="normal">M</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">B</mi></mrow><mi>.</mi></mrow><annotation encoding="application/x-tex">1000 \cdot 60 \cdot 24 \cdot 200\ \mathrm{B} = 288\,000\,000\ \mathrm{B} \approx 274\ \mathrm{MiB}.</annotation></semantics></math></p>
+<p>Ha a Kafka topicot 4 partícióra osztjuk, minden node a
+<code>site/node_id</code> kulcs hash alapján kerül partícióba, így egy
+partícióra naponta körülbelül 69 MiB jut. Ez a mennyiség egyetlen
+fogyasztóval is kezelhető, de a partíciók lehetővé teszik a párhuzamos
+feldolgozást, ha több fogyasztót indítunk ugyanabban a consumer
+groupban.</p>
+<p>A labor egy <strong>szimulált</strong> Kafka-fogyasztót valósít meg
+Pythonban, mert a teljes Kafka-stack telepítése meghaladja ennek az
+alfejezetnek a kereteit, és a lektorálási környezetben tilos telepíteni.
+A szimuláció a következőket mutatja be:</p>
+<ol type="1">
+<li><strong>Offset-kezelés:</strong> a fogyasztó a beolvasott rekordok
+után commit-ol, és ha újraindul, a legutóbb commit-olt pozíciótól
+folytatja.</li>
+<li><strong>Idempotens feldolgozás:</strong> a
+<code>(node_id, boot_id, seq)</code> kulcsot használja a duplikátumok
+eldobására.</li>
+<li><strong>Eseményidő szerinti tumbling ablak:</strong> 60 másodperces
+ablakokat számol, ablakonként és node-onként kulcsolt állapottal.</li>
+<li><strong>Watermark és késő esemény:</strong> a maximális látott
+időbélyegből számított watermarkmal zárja az ablakokat, a túl régi
+eseményeket pedig DLQ-ba irányítja.</li>
+<li><strong>Atomi checkpoint:</strong> az offsetet, a dedup kulcsokat, a
+maximális időbélyeget, a nyitott ablakokat és a késő eseményeket
+egyetlen JSON-fájlba menti.</li>
+</ol>
+<h4 data-number="16.1.4.2" id="labor-mqtt-kafka-híd-szimulációja"><span
+class="header-section-number">16.1.4.2</span> Labor: MQTT → Kafka híd
+szimulációja</h4>
+<p><strong>Munkakönyvtár:</strong></p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> ~/iot-labor/i047 <span class="kw">&amp;&amp;</span> <span class="bu">cd</span> ~/iot-labor/i047</span></code></pre></div>
+<p>Hozd létre az <code>events.json</code> fájlt, amely a bridge-ből a
+Kafka topicba kerülő rekordokat szimulálja:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ot">[</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;node_id&quot;</span><span class="fu">:</span> <span class="st">&quot;n001&quot;</span><span class="fu">,</span> <span class="dt">&quot;boot_id&quot;</span><span class="fu">:</span> <span class="st">&quot;b01&quot;</span><span class="fu">,</span> <span class="dt">&quot;seq&quot;</span><span class="fu">:</span> <span class="dv">1</span><span class="fu">,</span> <span class="dt">&quot;ts&quot;</span><span class="fu">:</span> <span class="dv">1700000000000</span><span class="fu">,</span> <span class="dt">&quot;temperature&quot;</span><span class="fu">:</span> <span class="fl">23.5</span><span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;node_id&quot;</span><span class="fu">:</span> <span class="st">&quot;n002&quot;</span><span class="fu">,</span> <span class="dt">&quot;boot_id&quot;</span><span class="fu">:</span> <span class="st">&quot;b02&quot;</span><span class="fu">,</span> <span class="dt">&quot;seq&quot;</span><span class="fu">:</span> <span class="dv">1</span><span class="fu">,</span> <span class="dt">&quot;ts&quot;</span><span class="fu">:</span> <span class="dv">1700000000000</span><span class="fu">,</span> <span class="dt">&quot;temperature&quot;</span><span class="fu">:</span> <span class="fl">24.1</span><span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;node_id&quot;</span><span class="fu">:</span> <span class="st">&quot;n001&quot;</span><span class="fu">,</span> <span class="dt">&quot;boot_id&quot;</span><span class="fu">:</span> <span class="st">&quot;b01&quot;</span><span class="fu">,</span> <span class="dt">&quot;seq&quot;</span><span class="fu">:</span> <span class="dv">2</span><span class="fu">,</span> <span class="dt">&quot;ts&quot;</span><span class="fu">:</span> <span class="dv">1700000030000</span><span class="fu">,</span> <span class="dt">&quot;temperature&quot;</span><span class="fu">:</span> <span class="fl">23.8</span><span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;node_id&quot;</span><span class="fu">:</span> <span class="st">&quot;n001&quot;</span><span class="fu">,</span> <span class="dt">&quot;boot_id&quot;</span><span class="fu">:</span> <span class="st">&quot;b01&quot;</span><span class="fu">,</span> <span class="dt">&quot;seq&quot;</span><span class="fu">:</span> <span class="dv">3</span><span class="fu">,</span> <span class="dt">&quot;ts&quot;</span><span class="fu">:</span> <span class="dv">1700000060000</span><span class="fu">,</span> <span class="dt">&quot;temperature&quot;</span><span class="fu">:</span> <span class="fl">24.2</span><span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;node_id&quot;</span><span class="fu">:</span> <span class="st">&quot;n002&quot;</span><span class="fu">,</span> <span class="dt">&quot;boot_id&quot;</span><span class="fu">:</span> <span class="st">&quot;b02&quot;</span><span class="fu">,</span> <span class="dt">&quot;seq&quot;</span><span class="fu">:</span> <span class="dv">2</span><span class="fu">,</span> <span class="dt">&quot;ts&quot;</span><span class="fu">:</span> <span class="dv">1700000040000</span><span class="fu">,</span> <span class="dt">&quot;temperature&quot;</span><span class="fu">:</span> <span class="fl">24.5</span><span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;node_id&quot;</span><span class="fu">:</span> <span class="st">&quot;n001&quot;</span><span class="fu">,</span> <span class="dt">&quot;boot_id&quot;</span><span class="fu">:</span> <span class="st">&quot;b01&quot;</span><span class="fu">,</span> <span class="dt">&quot;seq&quot;</span><span class="fu">:</span> <span class="dv">2</span><span class="fu">,</span> <span class="dt">&quot;ts&quot;</span><span class="fu">:</span> <span class="dv">1700000030000</span><span class="fu">,</span> <span class="dt">&quot;temperature&quot;</span><span class="fu">:</span> <span class="fl">23.8</span><span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;node_id&quot;</span><span class="fu">:</span> <span class="st">&quot;n001&quot;</span><span class="fu">,</span> <span class="dt">&quot;boot_id&quot;</span><span class="fu">:</span> <span class="st">&quot;b01&quot;</span><span class="fu">,</span> <span class="dt">&quot;seq&quot;</span><span class="fu">:</span> <span class="dv">4</span><span class="fu">,</span> <span class="dt">&quot;ts&quot;</span><span class="fu">:</span> <span class="dv">1700000090000</span><span class="fu">,</span> <span class="dt">&quot;temperature&quot;</span><span class="fu">:</span> <span class="fl">24.6</span><span class="fu">}</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="ot">]</span></span></code></pre></div>
+<p>A negyedik elemtől kezdve az események <code>ts</code> mezője nem
+monoton: a negyedik esemény 1700000060000, az ötödik 1700000040000
+időbélyegű. Ez szándékos, hogy a feldolgozó ne az érkezési sorrendre,
+hanem az eseményidőre és az ablakazonosítóra támaszkodjon. A hatodik
+elem a harmadik duplikátuma. A <code>boot_id</code> az egyszerűség
+kedvéért állandó.</p>
+<p>Hozd létre a <code>consumer.py</code> fájlt:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> json</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> os</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> tempfile</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>WINDOW_SIZE_MS <span class="op">=</span> <span class="dv">60_000</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>MAX_LATENESS_MS <span class="op">=</span> <span class="dv">600_000</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>CHECKPOINT_FILE <span class="op">=</span> <span class="st">&quot;checkpoint.json&quot;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>CRASH_AFTER_OFFSET <span class="op">=</span> os.environ.get(<span class="st">&quot;I047_CRASH_AFTER_OFFSET&quot;</span>)</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> load_events(path):</span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">with</span> <span class="bu">open</span>(path, encoding<span class="op">=</span><span class="st">&quot;utf-8&quot;</span>) <span class="im">as</span> f:</span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> json.load(f)</span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> empty_state():</span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> {</span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;offset&quot;</span>: <span class="dv">0</span>,</span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;seen&quot;</span>: [],</span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;max_seen_ts&quot;</span>: <span class="va">None</span>,</span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;windows&quot;</span>: {},</span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;late_events&quot;</span>: [],</span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>    }</span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> load_checkpoint():</span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="kw">not</span> os.path.exists(CHECKPOINT_FILE):</span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> empty_state()</span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">try</span>:</span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>        <span class="cf">with</span> <span class="bu">open</span>(CHECKPOINT_FILE, encoding<span class="op">=</span><span class="st">&quot;utf-8&quot;</span>) <span class="im">as</span> f:</span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>            state <span class="op">=</span> json.load(f)</span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>    <span class="cf">except</span> json.JSONDecodeError <span class="im">as</span> exc:</span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>        <span class="cf">raise</span> <span class="pp">SystemExit</span>(<span class="ss">f&quot;Hibás checkpoint: </span><span class="sc">{</span>CHECKPOINT_FILE<span class="sc">}</span><span class="ss">: </span><span class="sc">{</span>exc<span class="sc">}</span><span class="ss">&quot;</span>) <span class="im">from</span> exc</span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>    state.setdefault(<span class="st">&quot;offset&quot;</span>, <span class="dv">0</span>)</span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>    state.setdefault(<span class="st">&quot;seen&quot;</span>, [])</span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>    state.setdefault(<span class="st">&quot;max_seen_ts&quot;</span>, <span class="va">None</span>)</span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>    state.setdefault(<span class="st">&quot;windows&quot;</span>, {})</span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>    state.setdefault(<span class="st">&quot;late_events&quot;</span>, [])</span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> state</span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> save_checkpoint(state):</span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a>    tmp_fd, tmp_path <span class="op">=</span> tempfile.mkstemp(<span class="bu">dir</span><span class="op">=</span><span class="st">&quot;.&quot;</span>, prefix<span class="op">=</span><span class="st">&quot;.checkpoint-&quot;</span>, suffix<span class="op">=</span><span class="st">&quot;.tmp&quot;</span>)</span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a>    <span class="cf">try</span>:</span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a>        <span class="cf">with</span> os.fdopen(tmp_fd, <span class="st">&quot;w&quot;</span>, encoding<span class="op">=</span><span class="st">&quot;utf-8&quot;</span>) <span class="im">as</span> f:</span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a>            json.dump(state, f, ensure_ascii<span class="op">=</span><span class="va">False</span>, sort_keys<span class="op">=</span><span class="va">True</span>)</span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a>            f.flush()</span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a>            os.fsync(f.fileno())</span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a>        os.replace(tmp_path, CHECKPOINT_FILE)</span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a>        <span class="cf">try</span>:</span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a>            dir_fd <span class="op">=</span> os.<span class="bu">open</span>(<span class="st">&quot;.&quot;</span>, os.O_RDONLY)</span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a>            <span class="cf">try</span>:</span>
+<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a>                os.fsync(dir_fd)</span>
+<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a>            <span class="cf">finally</span>:</span>
+<span id="cb3-51"><a href="#cb3-51" aria-hidden="true" tabindex="-1"></a>                os.close(dir_fd)</span>
+<span id="cb3-52"><a href="#cb3-52" aria-hidden="true" tabindex="-1"></a>        <span class="cf">except</span> <span class="pp">OSError</span>:</span>
+<span id="cb3-53"><a href="#cb3-53" aria-hidden="true" tabindex="-1"></a>            <span class="cf">pass</span></span>
+<span id="cb3-54"><a href="#cb3-54" aria-hidden="true" tabindex="-1"></a>    <span class="cf">finally</span>:</span>
+<span id="cb3-55"><a href="#cb3-55" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> os.path.exists(tmp_path):</span>
+<span id="cb3-56"><a href="#cb3-56" aria-hidden="true" tabindex="-1"></a>            os.unlink(tmp_path)</span>
+<span id="cb3-57"><a href="#cb3-57" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-58"><a href="#cb3-58" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> checkpoint_and_maybe_crash(state, i):</span>
+<span id="cb3-59"><a href="#cb3-59" aria-hidden="true" tabindex="-1"></a>    save_checkpoint(state)</span>
+<span id="cb3-60"><a href="#cb3-60" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> CRASH_AFTER_OFFSET <span class="kw">and</span> i <span class="op">==</span> <span class="bu">int</span>(CRASH_AFTER_OFFSET):</span>
+<span id="cb3-61"><a href="#cb3-61" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;  [szimulált összeomlás] offset=</span><span class="sc">{</span>i<span class="sc">}</span><span class="ss"> checkpointja után&quot;</span>)</span>
+<span id="cb3-62"><a href="#cb3-62" aria-hidden="true" tabindex="-1"></a>        <span class="cf">raise</span> <span class="pp">SystemExit</span>(<span class="dv">2</span>)</span>
+<span id="cb3-63"><a href="#cb3-63" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-64"><a href="#cb3-64" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> window_start(ts):</span>
+<span id="cb3-65"><a href="#cb3-65" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> (ts <span class="op">//</span> WINDOW_SIZE_MS) <span class="op">*</span> WINDOW_SIZE_MS</span>
+<span id="cb3-66"><a href="#cb3-66" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-67"><a href="#cb3-67" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> add_to_window(state, event):</span>
+<span id="cb3-68"><a href="#cb3-68" aria-hidden="true" tabindex="-1"></a>    ws_key <span class="op">=</span> <span class="bu">str</span>(window_start(event[<span class="st">&quot;ts&quot;</span>]))</span>
+<span id="cb3-69"><a href="#cb3-69" aria-hidden="true" tabindex="-1"></a>    node <span class="op">=</span> event[<span class="st">&quot;node_id&quot;</span>]</span>
+<span id="cb3-70"><a href="#cb3-70" aria-hidden="true" tabindex="-1"></a>    windows <span class="op">=</span> state[<span class="st">&quot;windows&quot;</span>].setdefault(ws_key, {})</span>
+<span id="cb3-71"><a href="#cb3-71" aria-hidden="true" tabindex="-1"></a>    agg <span class="op">=</span> windows.setdefault(node, {<span class="st">&quot;min&quot;</span>: <span class="va">None</span>, <span class="st">&quot;max&quot;</span>: <span class="va">None</span>, <span class="st">&quot;sum&quot;</span>: <span class="fl">0.0</span>, <span class="st">&quot;count&quot;</span>: <span class="dv">0</span>})</span>
+<span id="cb3-72"><a href="#cb3-72" aria-hidden="true" tabindex="-1"></a>    value <span class="op">=</span> <span class="bu">float</span>(event[<span class="st">&quot;temperature&quot;</span>])</span>
+<span id="cb3-73"><a href="#cb3-73" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> agg[<span class="st">&quot;count&quot;</span>] <span class="op">==</span> <span class="dv">0</span>:</span>
+<span id="cb3-74"><a href="#cb3-74" aria-hidden="true" tabindex="-1"></a>        agg[<span class="st">&quot;min&quot;</span>] <span class="op">=</span> agg[<span class="st">&quot;max&quot;</span>] <span class="op">=</span> value</span>
+<span id="cb3-75"><a href="#cb3-75" aria-hidden="true" tabindex="-1"></a>    <span class="cf">else</span>:</span>
+<span id="cb3-76"><a href="#cb3-76" aria-hidden="true" tabindex="-1"></a>        agg[<span class="st">&quot;min&quot;</span>] <span class="op">=</span> <span class="bu">min</span>(agg[<span class="st">&quot;min&quot;</span>], value)</span>
+<span id="cb3-77"><a href="#cb3-77" aria-hidden="true" tabindex="-1"></a>        agg[<span class="st">&quot;max&quot;</span>] <span class="op">=</span> <span class="bu">max</span>(agg[<span class="st">&quot;max&quot;</span>], value)</span>
+<span id="cb3-78"><a href="#cb3-78" aria-hidden="true" tabindex="-1"></a>    agg[<span class="st">&quot;sum&quot;</span>] <span class="op">+=</span> value</span>
+<span id="cb3-79"><a href="#cb3-79" aria-hidden="true" tabindex="-1"></a>    agg[<span class="st">&quot;count&quot;</span>] <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="cb3-80"><a href="#cb3-80" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-81"><a href="#cb3-81" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> close_windows(state, watermark_ms):</span>
+<span id="cb3-82"><a href="#cb3-82" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> ws_key <span class="kw">in</span> <span class="bu">sorted</span>(<span class="bu">list</span>(state[<span class="st">&quot;windows&quot;</span>]), key<span class="op">=</span><span class="bu">int</span>):</span>
+<span id="cb3-83"><a href="#cb3-83" aria-hidden="true" tabindex="-1"></a>        ws <span class="op">=</span> <span class="bu">int</span>(ws_key)</span>
+<span id="cb3-84"><a href="#cb3-84" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> ws <span class="op">+</span> WINDOW_SIZE_MS <span class="op">&gt;</span> watermark_ms:</span>
+<span id="cb3-85"><a href="#cb3-85" aria-hidden="true" tabindex="-1"></a>            <span class="cf">continue</span></span>
+<span id="cb3-86"><a href="#cb3-86" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> node <span class="kw">in</span> <span class="bu">sorted</span>(state[<span class="st">&quot;windows&quot;</span>][ws_key]):</span>
+<span id="cb3-87"><a href="#cb3-87" aria-hidden="true" tabindex="-1"></a>            agg <span class="op">=</span> state[<span class="st">&quot;windows&quot;</span>][ws_key][node]</span>
+<span id="cb3-88"><a href="#cb3-88" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> agg[<span class="st">&quot;count&quot;</span>] <span class="op">==</span> <span class="dv">0</span>:</span>
+<span id="cb3-89"><a href="#cb3-89" aria-hidden="true" tabindex="-1"></a>                <span class="cf">continue</span></span>
+<span id="cb3-90"><a href="#cb3-90" aria-hidden="true" tabindex="-1"></a>            avg <span class="op">=</span> agg[<span class="st">&quot;sum&quot;</span>] <span class="op">/</span> agg[<span class="st">&quot;count&quot;</span>]</span>
+<span id="cb3-91"><a href="#cb3-91" aria-hidden="true" tabindex="-1"></a>            <span class="bu">print</span>(<span class="ss">f&quot;  [ablak] start=</span><span class="sc">{</span>ws<span class="sc">}</span><span class="ss"> node=</span><span class="sc">{</span>node<span class="sc">}</span><span class="ss"> &quot;</span></span>
+<span id="cb3-92"><a href="#cb3-92" aria-hidden="true" tabindex="-1"></a>                  <span class="ss">f&quot;min=</span><span class="sc">{</span>agg[<span class="st">&#39;min&#39;</span>]<span class="sc">:.1f}</span><span class="ss"> max=</span><span class="sc">{</span>agg[<span class="st">&#39;max&#39;</span>]<span class="sc">:.1f}</span><span class="ss"> avg=</span><span class="sc">{</span>avg<span class="sc">:.1f}</span><span class="ss"> &quot;</span></span>
+<span id="cb3-93"><a href="#cb3-93" aria-hidden="true" tabindex="-1"></a>                  <span class="ss">f&quot;count=</span><span class="sc">{</span>agg[<span class="st">&#39;count&#39;</span>]<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb3-94"><a href="#cb3-94" aria-hidden="true" tabindex="-1"></a>        <span class="kw">del</span> state[<span class="st">&quot;windows&quot;</span>][ws_key]</span>
+<span id="cb3-95"><a href="#cb3-95" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-96"><a href="#cb3-96" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> process(events):</span>
+<span id="cb3-97"><a href="#cb3-97" aria-hidden="true" tabindex="-1"></a>    state <span class="op">=</span> load_checkpoint()</span>
+<span id="cb3-98"><a href="#cb3-98" aria-hidden="true" tabindex="-1"></a>    seen <span class="op">=</span> {<span class="bu">tuple</span>(x) <span class="cf">for</span> x <span class="kw">in</span> state[<span class="st">&quot;seen&quot;</span>]}</span>
+<span id="cb3-99"><a href="#cb3-99" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Indulás offset=</span><span class="sc">{</span>state[<span class="st">&#39;offset&#39;</span>]<span class="sc">}</span><span class="ss">, dedup kulcsok: </span><span class="sc">{</span><span class="bu">len</span>(seen)<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb3-100"><a href="#cb3-100" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-101"><a href="#cb3-101" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> i, event <span class="kw">in</span> <span class="bu">enumerate</span>(events):</span>
+<span id="cb3-102"><a href="#cb3-102" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> i <span class="op">&lt;</span> state[<span class="st">&quot;offset&quot;</span>]:</span>
+<span id="cb3-103"><a href="#cb3-103" aria-hidden="true" tabindex="-1"></a>            <span class="cf">continue</span></span>
+<span id="cb3-104"><a href="#cb3-104" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-105"><a href="#cb3-105" aria-hidden="true" tabindex="-1"></a>        key <span class="op">=</span> (event[<span class="st">&quot;node_id&quot;</span>], event[<span class="st">&quot;boot_id&quot;</span>], <span class="bu">int</span>(event[<span class="st">&quot;seq&quot;</span>]))</span>
+<span id="cb3-106"><a href="#cb3-106" aria-hidden="true" tabindex="-1"></a>        ts <span class="op">=</span> <span class="bu">int</span>(event[<span class="st">&quot;ts&quot;</span>])</span>
+<span id="cb3-107"><a href="#cb3-107" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-108"><a href="#cb3-108" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> key <span class="kw">in</span> seen:</span>
+<span id="cb3-109"><a href="#cb3-109" aria-hidden="true" tabindex="-1"></a>            <span class="bu">print</span>(<span class="ss">f&quot;  [duplikátum] offset=</span><span class="sc">{</span>i<span class="sc">}</span><span class="ss"> key=</span><span class="sc">{</span>key<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb3-110"><a href="#cb3-110" aria-hidden="true" tabindex="-1"></a>            state[<span class="st">&quot;offset&quot;</span>] <span class="op">=</span> i <span class="op">+</span> <span class="dv">1</span></span>
+<span id="cb3-111"><a href="#cb3-111" aria-hidden="true" tabindex="-1"></a>            checkpoint_and_maybe_crash(state, i)</span>
+<span id="cb3-112"><a href="#cb3-112" aria-hidden="true" tabindex="-1"></a>            <span class="cf">continue</span></span>
+<span id="cb3-113"><a href="#cb3-113" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-114"><a href="#cb3-114" aria-hidden="true" tabindex="-1"></a>        max_seen_ts <span class="op">=</span> state[<span class="st">&quot;max_seen_ts&quot;</span>]</span>
+<span id="cb3-115"><a href="#cb3-115" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> max_seen_ts <span class="kw">is</span> <span class="kw">not</span> <span class="va">None</span> <span class="kw">and</span> ts <span class="op">&lt;</span> max_seen_ts <span class="op">-</span> MAX_LATENESS_MS:</span>
+<span id="cb3-116"><a href="#cb3-116" aria-hidden="true" tabindex="-1"></a>            <span class="bu">print</span>(<span class="ss">f&quot;  [késő] offset=</span><span class="sc">{</span>i<span class="sc">}</span><span class="ss"> key=</span><span class="sc">{</span>key<span class="sc">}</span><span class="ss"> ts=</span><span class="sc">{</span>ts<span class="sc">}</span><span class="ss"> (max_ts=</span><span class="sc">{</span>max_seen_ts<span class="sc">}</span><span class="ss">)&quot;</span>)</span>
+<span id="cb3-117"><a href="#cb3-117" aria-hidden="true" tabindex="-1"></a>            seen.add(key)</span>
+<span id="cb3-118"><a href="#cb3-118" aria-hidden="true" tabindex="-1"></a>            state[<span class="st">&quot;seen&quot;</span>] <span class="op">=</span> [<span class="bu">list</span>(k) <span class="cf">for</span> k <span class="kw">in</span> <span class="bu">sorted</span>(seen)]</span>
+<span id="cb3-119"><a href="#cb3-119" aria-hidden="true" tabindex="-1"></a>            state[<span class="st">&quot;late_events&quot;</span>].append({</span>
+<span id="cb3-120"><a href="#cb3-120" aria-hidden="true" tabindex="-1"></a>                <span class="st">&quot;offset&quot;</span>: i,</span>
+<span id="cb3-121"><a href="#cb3-121" aria-hidden="true" tabindex="-1"></a>                <span class="st">&quot;node_id&quot;</span>: key[<span class="dv">0</span>],</span>
+<span id="cb3-122"><a href="#cb3-122" aria-hidden="true" tabindex="-1"></a>                <span class="st">&quot;boot_id&quot;</span>: key[<span class="dv">1</span>],</span>
+<span id="cb3-123"><a href="#cb3-123" aria-hidden="true" tabindex="-1"></a>                <span class="st">&quot;seq&quot;</span>: key[<span class="dv">2</span>],</span>
+<span id="cb3-124"><a href="#cb3-124" aria-hidden="true" tabindex="-1"></a>                <span class="st">&quot;ts&quot;</span>: ts,</span>
+<span id="cb3-125"><a href="#cb3-125" aria-hidden="true" tabindex="-1"></a>                <span class="st">&quot;max_seen_ts&quot;</span>: max_seen_ts,</span>
+<span id="cb3-126"><a href="#cb3-126" aria-hidden="true" tabindex="-1"></a>                <span class="st">&quot;reason&quot;</span>: <span class="st">&quot;late&quot;</span>,</span>
+<span id="cb3-127"><a href="#cb3-127" aria-hidden="true" tabindex="-1"></a>            })</span>
+<span id="cb3-128"><a href="#cb3-128" aria-hidden="true" tabindex="-1"></a>            state[<span class="st">&quot;offset&quot;</span>] <span class="op">=</span> i <span class="op">+</span> <span class="dv">1</span></span>
+<span id="cb3-129"><a href="#cb3-129" aria-hidden="true" tabindex="-1"></a>            checkpoint_and_maybe_crash(state, i)</span>
+<span id="cb3-130"><a href="#cb3-130" aria-hidden="true" tabindex="-1"></a>            <span class="cf">continue</span></span>
+<span id="cb3-131"><a href="#cb3-131" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-132"><a href="#cb3-132" aria-hidden="true" tabindex="-1"></a>        seen.add(key)</span>
+<span id="cb3-133"><a href="#cb3-133" aria-hidden="true" tabindex="-1"></a>        state[<span class="st">&quot;seen&quot;</span>] <span class="op">=</span> [<span class="bu">list</span>(k) <span class="cf">for</span> k <span class="kw">in</span> <span class="bu">sorted</span>(seen)]</span>
+<span id="cb3-134"><a href="#cb3-134" aria-hidden="true" tabindex="-1"></a>        state[<span class="st">&quot;max_seen_ts&quot;</span>] <span class="op">=</span> ts <span class="cf">if</span> max_seen_ts <span class="kw">is</span> <span class="va">None</span> <span class="cf">else</span> <span class="bu">max</span>(max_seen_ts, ts)</span>
+<span id="cb3-135"><a href="#cb3-135" aria-hidden="true" tabindex="-1"></a>        add_to_window(state, event)</span>
+<span id="cb3-136"><a href="#cb3-136" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;  [feldolgozva] offset=</span><span class="sc">{</span>i<span class="sc">}</span><span class="ss"> key=</span><span class="sc">{</span>key<span class="sc">}</span><span class="ss"> ts=</span><span class="sc">{</span>ts<span class="sc">}</span><span class="ss"> temp=</span><span class="sc">{</span>event[<span class="st">&#39;temperature&#39;</span>]<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb3-137"><a href="#cb3-137" aria-hidden="true" tabindex="-1"></a>        state[<span class="st">&quot;offset&quot;</span>] <span class="op">=</span> i <span class="op">+</span> <span class="dv">1</span></span>
+<span id="cb3-138"><a href="#cb3-138" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-139"><a href="#cb3-139" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> state[<span class="st">&quot;max_seen_ts&quot;</span>] <span class="kw">is</span> <span class="kw">not</span> <span class="va">None</span>:</span>
+<span id="cb3-140"><a href="#cb3-140" aria-hidden="true" tabindex="-1"></a>            close_windows(state, state[<span class="st">&quot;max_seen_ts&quot;</span>] <span class="op">-</span> MAX_LATENESS_MS)</span>
+<span id="cb3-141"><a href="#cb3-141" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-142"><a href="#cb3-142" aria-hidden="true" tabindex="-1"></a>        checkpoint_and_maybe_crash(state, i)</span>
+<span id="cb3-143"><a href="#cb3-143" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-144"><a href="#cb3-144" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> state[<span class="st">&quot;max_seen_ts&quot;</span>] <span class="kw">is</span> <span class="kw">not</span> <span class="va">None</span>:</span>
+<span id="cb3-145"><a href="#cb3-145" aria-hidden="true" tabindex="-1"></a>        close_windows(state, state[<span class="st">&quot;max_seen_ts&quot;</span>] <span class="op">+</span> WINDOW_SIZE_MS)</span>
+<span id="cb3-146"><a href="#cb3-146" aria-hidden="true" tabindex="-1"></a>    save_checkpoint(state)</span>
+<span id="cb3-147"><a href="#cb3-147" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Végső commit offset=</span><span class="sc">{</span>state[<span class="st">&#39;offset&#39;</span>]<span class="sc">}</span><span class="ss">, feldolgozott kulcsok: </span><span class="sc">{</span><span class="bu">len</span>(state[<span class="st">&#39;seen&#39;</span>])<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb3-148"><a href="#cb3-148" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-149"><a href="#cb3-149" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="va">__name__</span> <span class="op">==</span> <span class="st">&quot;__main__&quot;</span>:</span>
+<span id="cb3-150"><a href="#cb3-150" aria-hidden="true" tabindex="-1"></a>    process(load_events(<span class="st">&quot;events.json&quot;</span>))</span></code></pre></div>
+<p>Futtatás:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> consumer.py</span></code></pre></div>
+<p>Várt kimenet. A kód ellenőrző futása Python 3-mal, a fenti
+<code>events.json</code> bemenettel és üres checkpointból indítva a
+következő kimenetet adta; ez egyben megfelel az M04 numerikus ellenőrzés
+elvárt értékeinek (végső offset 7, hat egyedi kulcs, első ablak
+1699999980000, első n001 átlag 23.6, utolsó n001 átlag 24.4):</p>
+<pre class="text"><code>Indulás offset=0, dedup kulcsok: 0
+  [feldolgozva] offset=0 key=(&#39;n001&#39;, &#39;b01&#39;, 1) ts=1700000000000 temp=23.5
+  [feldolgozva] offset=1 key=(&#39;n002&#39;, &#39;b02&#39;, 1) ts=1700000000000 temp=24.1
+  [feldolgozva] offset=2 key=(&#39;n001&#39;, &#39;b01&#39;, 2) ts=1700000030000 temp=23.8
+  [feldolgozva] offset=3 key=(&#39;n001&#39;, &#39;b01&#39;, 3) ts=1700000060000 temp=24.2
+  [feldolgozva] offset=4 key=(&#39;n002&#39;, &#39;b02&#39;, 2) ts=1700000040000 temp=24.5
+  [duplikátum] offset=5 key=(&#39;n001&#39;, &#39;b01&#39;, 2)
+  [feldolgozva] offset=6 key=(&#39;n001&#39;, &#39;b01&#39;, 4) ts=1700000090000 temp=24.6
+  [ablak] start=1699999980000 node=n001 min=23.5 max=23.8 avg=23.6 count=2
+  [ablak] start=1699999980000 node=n002 min=24.1 max=24.1 avg=24.1 count=1
+  [ablak] start=1700000040000 node=n001 min=24.2 max=24.6 avg=24.4 count=2
+  [ablak] start=1700000040000 node=n002 min=24.5 max=24.5 avg=24.5 count=1
+Végső commit offset=7, feldolgozott kulcsok: 6</code></pre>
+<p>Az ablakok <code>ts</code> alapján zárulnak, a duplikátumot a
+rendszer eldobta. A két ablak kezdete 1699999980000 és 1700000040000; az
+első ablakba a 1700000000000 és 1700000030000 időbélyegű események, a
+másodikba a 1700000040000, 1700000060000 és 1700000090000 időbélyegűek
+tartoznak. A hatodik (offset=5, duplikált) esemény nem növeli a
+<code>n001</code> darabszámát.</p>
+<p>A <code>checkpoint.json</code> a teljes futás után:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;late_events&quot;</span><span class="fu">:</span> <span class="ot">[]</span><span class="fu">,</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;max_seen_ts&quot;</span><span class="fu">:</span> <span class="dv">1700000090000</span><span class="fu">,</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;offset&quot;</span><span class="fu">:</span> <span class="dv">7</span><span class="fu">,</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;seen&quot;</span><span class="fu">:</span> <span class="ot">[[</span><span class="st">&quot;n001&quot;</span><span class="ot">,</span> <span class="st">&quot;b01&quot;</span><span class="ot">,</span> <span class="dv">1</span><span class="ot">],</span> <span class="ot">[</span><span class="st">&quot;n001&quot;</span><span class="ot">,</span> <span class="st">&quot;b01&quot;</span><span class="ot">,</span> <span class="dv">2</span><span class="ot">],</span> <span class="ot">[</span><span class="st">&quot;n001&quot;</span><span class="ot">,</span> <span class="st">&quot;b01&quot;</span><span class="ot">,</span> <span class="dv">3</span><span class="ot">],</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>           <span class="ot">[</span><span class="st">&quot;n001&quot;</span><span class="ot">,</span> <span class="st">&quot;b01&quot;</span><span class="ot">,</span> <span class="dv">4</span><span class="ot">],</span> <span class="ot">[</span><span class="st">&quot;n002&quot;</span><span class="ot">,</span> <span class="st">&quot;b02&quot;</span><span class="ot">,</span> <span class="dv">1</span><span class="ot">],</span> <span class="ot">[</span><span class="st">&quot;n002&quot;</span><span class="ot">,</span> <span class="st">&quot;b02&quot;</span><span class="ot">,</span> <span class="dv">2</span><span class="ot">]]</span><span class="fu">,</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;windows&quot;</span><span class="fu">:</span> <span class="fu">{}</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>A <code>seen</code> hat kulcsot tartalmaz, mert a hét bemeneti
+rekordból egy duplikátum. A <code>windows</code> a futás végén üres,
+mert az összes ablak lezárult. Ha újraindítod a szkriptet, a checkpoint
+miatt az összes rekordot kihagyja:</p>
+<pre class="text"><code>Indulás offset=7, dedup kulcsok: 6
+Végső commit offset=7, feldolgozott kulcsok: 6</code></pre>
+<p><strong>Újrafuttatás.</strong> A labor nem igényel törlést.
+Újrafuttatáshoz használj új munkakönyvtárat, vagy nevezd át a
+checkpointot: <code>mv checkpoint.json checkpoint.json.bak</code>. A
+<code>checkpoint.json</code> a labor értékes állapota, ezért ne
+töröld.</p>
+<h3 data-number="16.1.5" id="ellenőrzés-és-hibakeresés"><span
+class="header-section-number">16.1.5</span> Ellenőrzés és
+hibakeresés</h3>
+<p>A labor futtatása után ellenőrizd:</p>
+<ul>
+<li>a <code>checkpoint.json</code> <code>offset</code> értéke 7, a
+<code>seen</code> hat egyedi kulcsot tartalmaz;</li>
+<li>a négy <code>[ablak]</code> sor értékei a fenti kimenetnek felelnek
+meg;</li>
+<li>a duplikátum (a hatodik esemény, offset=5) nem jelenik meg a
+<code>[feldolgozva]</code> sorok között, csak a
+<code>[duplikátum]</code> sorban;</li>
+<li>újraindításkor a fogyasztó nem dolgozza fel újra a rekordokat;</li>
+<li>a <code>windows</code> a futás végén üres, a
+<code>late_events</code> pedig üres az eredeti bemeneten.</li>
+</ul>
+<p><strong>Összeomlás-teszt.</strong> A kód tartalmaz egy laboratóriumi
+crash-hookot: az <code>I047_CRASH_AFTER_OFFSET</code> környezeti
+változóval a megadott offset checkpointja után a program szándékosan
+leáll. Ez nem éles funkció, csak a tartósság szemléltetésére szolgál.
+Előbb tedd félre az előző futás checkpointját
+(<code>mv checkpoint.json checkpoint.json.run1</code>), különben a
+fogyasztó az offset 7-ről folytat, és nem következik be összeomlás.
+Futtasd:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="va">I047_CRASH_AFTER_OFFSET</span><span class="op">=</span>3 <span class="ex">python3</span> consumer.py</span></code></pre></div>
+<p>A kimenet a negyedik rekord után megáll, a
+<code>checkpoint.json</code> <code>offset</code> értéke 4, a
+<code>windows</code> pedig tartalmazza az addig feldolgozott két ablak
+részaggregátumait. Indítsd újra a programot:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> consumer.py</span></code></pre></div>
+<p>A folytatás kimenete:</p>
+<pre class="text"><code>Indulás offset=4, dedup kulcsok: 4
+  [feldolgozva] offset=4 key=(&#39;n002&#39;, &#39;b02&#39;, 2) ts=1700000040000 temp=24.5
+  [duplikátum] offset=5 key=(&#39;n001&#39;, &#39;b01&#39;, 2)
+  [feldolgozva] offset=6 key=(&#39;n001&#39;, &#39;b01&#39;, 4) ts=1700000090000 temp=24.6
+  [ablak] start=1699999980000 node=n001 min=23.5 max=23.8 avg=23.6 count=2
+  [ablak] start=1699999980000 node=n002 min=24.1 max=24.1 avg=24.1 count=1
+  [ablak] start=1700000040000 node=n001 min=24.2 max=24.6 avg=24.4 count=2
+  [ablak] start=1700000040000 node=n002 min=24.5 max=24.5 avg=24.5 count=1
+Végső commit offset=7, feldolgozott kulcsok: 6</code></pre>
+<p>Az első ablak <code>n001</code> sorában a 23.5 és 23.8 érték
+megmaradt, holott azokat a megszakítás előtt dolgozta fel a program. Ez
+bizonyítja, hogy az aggregátumállapot a checkpointban van, nem csak a
+memóriában. A folytatás nem dolgozta újra az offset 0–3 rekordjait, mert
+a checkpoint offsetje 4 volt.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Hibatünet</th>
+<th>Ok</th>
+<th>Javítás</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A fogyasztó újrainduláskor mindent újra feldolgoz</td>
+<td>A checkpoint nem jött létre, vagy a commit a feldolgozás előtt
+történt</td>
+<td>Ellenőrizd a <code>save_checkpoint</code> hívás helyét; a commit
+csak a feldolgozás és az ablakfrissítés után menjen</td>
+</tr>
+<tr>
+<td>Duplikátumok jelennek meg az adatbázisban</td>
+<td>A dedup kulcs nem tartalmazza a <code>boot_id</code> mezőt</td>
+<td>Egészítsd ki a kulcsot <code>(node_id, boot_id, seq)</code>, a valós
+rendszerben <code>(site, node_id, boot_id, seq)</code> formátumra</td>
+</tr>
+<tr>
+<td>Az ablakok rossz időponthoz tartoznak</td>
+<td>Az elemzés a feldolgozási időt használja az eseményidő helyett</td>
+<td>Mindig az üzenet <code>ts</code> mezőjét használd az ablakok
+számításához</td>
+</tr>
+<tr>
+<td>Egy késői esemény visszafelé lezárja az aktuális ablakot</td>
+<td>Egyetlen <code>current_window_start</code> változó van</td>
+<td>Kulcsold az állapotot <code>(ablak_kezdete, node_id)</code>
+szerint</td>
+</tr>
+<tr>
+<td>Késve érkező adat beszámít a régi ablakba</td>
+<td>Nincs watermark, vagy a watermarknál régebbi eseményt is elfogad a
+kód</td>
+<td>Vezess be watermarkot, és a watermarknál régebbi eseményeket
+irányítsd DLQ-ba</td>
+</tr>
+<tr>
+<td>Az offset előrehalad, de az aggregátum elveszik</td>
+<td>Az offsetet és a dedup/aggregátum állapotot külön fájlba mented</td>
+<td>Egyetlen atomi checkpointba írd az offsetet, a <code>seen</code>
+halmazt, a <code>max_seen_ts</code>-t, a nyitott ablakokat és a késő
+eseményeket</td>
+</tr>
+<tr>
+<td>A késő esemény végtelen újraolvasást okoz</td>
+<td>A késő eseményt eldobod, de az offsetjét nem commit-olod</td>
+<td>A késő esemény offsetjét is commit-old, és a DLQ-beírást is vedd
+bele a checkpointba</td>
+</tr>
+<tr>
+<td>A checkpoint félkész JSON</td>
+<td>Nem atomikusan írod a fájlt</td>
+<td>Írj ideiglenes fájlba, <code>fsync</code> után
+<code>os.replace</code>-szel nevezd át</td>
+</tr>
+<tr>
+<td>A <code>seen</code> halmaz korlátlanul nő</td>
+<td>A valós fogyasztó minden kulcsot örökké tárol</td>
+<td>Éles rendszerben compacted Kafka topic vagy TTL-es adatbázis-tábla
+kell; a labor checkpointja csak oktatási célú</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="16.1.6" id="tipikus-hibák-és-félreértések"><span
+class="header-section-number">16.1.6</span> Tipikus hibák és
+félreértések</h3>
+<ol type="1">
+<li><p><strong>At-most-once a feldolgozás előtti commit miatt.</strong>
+Ha a fogyasztó azonnal commit-ol a poll után, de a feldolgozás
+meghiúsul, az üzenet végleg elveszik. A TerraSense-ben ez
+elfogadhatatlan, mert a szenzoradatok nem pótolhatók. Mindig a
+feldolgozás után commit-olj, és gondoskodj idempotens
+feldolgozásról.</p></li>
+<li><p><strong>A particionálási kulcs elhagyása.</strong> Ha a híd nem
+ad meg kulcsot, a producer particionálója (újabb kliensekben
+batch-enként váltó „sticky” stratégia) a kulcstól függetlenül, nem
+determinisztikusan osztja el a rekordokat a partíciók között. Ekkor az
+azonos <code>node_id</code>-hez tartozó rekordok sorrendje felborul, és
+a <code>seq</code> mező alapján történő ellenőrzés hamis hibát jelez. A
+kulcs mindig a <code>site/node_id</code> legyen.</p></li>
+<li><p><strong>A watermark túl szorosra állítása.</strong> Ha a
+watermark késleltetése kisebb, mint a valós késés (például 5 perc,
+miközben a gateway offline üzemmódban órákig pufferel), akkor a legtöbb
+késve érkező adat kiesik. A watermarkot a mért késés percentiliséhez
+kell igazítani, nem az átlaghoz. A labor 10 perces alapértéke és 5
+perces kísérleti értéke csak a mechanizmust szemlélteti, nem üzemi
+javaslat.</p></li>
+<li><p><strong>Az MQTT és a Kafka fogalmainak keverése.</strong> Az
+MQTT-ben a topic hierarchikus és joker karakterekkel rendelkezik; a
+Kafka topic lapos, és a partíciók adják a párhuzamosságot. A kettőt nem
+lehet közvetlenül megfeleltetni egymásnak, a hídnak explicit módon kell
+leképeznie az MQTT topicstruktúrát a Kafka topicra és a
+kulcsra.</p></li>
+<li><p><strong>Egyetlen <code>current_window_start</code>
+használata.</strong> A nem teljesen időrendű eseménysor mellett az
+egyetlen aktuális ablakváltozó visszafelé lezárja az éppen nyitott
+ablakot, majd újranyit egy régit. Az eredmény ugyanarra az ablakra több,
+szétesett részeredmény. Az állapotot ablakazonosító és eszköz szerint
+kell kulcsolni.</p></li>
+<li><p><strong>Az offset és a dedup/aggregátum állapot külön
+mentése.</strong> Ha az offsetet az egyik fájlba, a <code>seen</code>
+halmazt a másikba, az aggregátumot pedig sehova nem mented, akkor egy
+összeomlás után az offset már előrébb mutat, de a korábbi kulcsok és
+részaggregátumok hiányoznak. Az eredmény hamis „kész” offset és
+elveszett aggregátum. A megoldás az egyetlen, atomikusan cserélt
+checkpoint.</p></li>
+<li><p><strong>A <code>seen</code> halmaz örök növekedése.</strong> A
+laborban a checkpoint a teljes <code>seen</code> halmazt tárolja, mert
+kevés esemény van. Éles rendszerben ez korlátlanul nő; ott compacted
+Kafka topicot, adatbázis-táblát TTL-lel vagy ablakos deduplikációt kell
+használni. A labor megoldása nem skálázható minta, hanem a szemantika
+bemutatása.</p></li>
+</ol>
+<h3 data-number="16.1.7" id="feladatok"><span
+class="header-section-number">16.1.7</span> Feladatok</h3>
+<h4 data-number="16.1.7.1" id="a-fogalmidöntési-kérdés"><span
+class="header-section-number">16.1.7.1</span> a) Fogalmi/döntési
+kérdés</h4>
+<p>Melyik esetben indokolt Kafkát bevezetni a TerraSense-be, és
+melyikben elegendő a Mosquitto? Válaszodat a visszajátszás, a fogyasztók
+száma és az adatmennyiség szempontjából indokold.</p>
+<h4 data-number="16.1.7.2" id="b-számolásitervezési-feladat"><span
+class="header-section-number">16.1.7.2</span> b) Számolási/tervezési
+feladat</h4>
+<p>Tegyük fel, hogy 1000 node percenként 1 üzenetet küld, egy üzenet 150
+B. Hány partícióra osszuk a <code>ts-telemetry</code> topicot, ha a
+fogyasztói csoport 4 fogyasztót futtat, és a cél, hogy minden fogyasztó
+közel azonos terhelést kapjon? Mekkora a napi tárhelyigény 7 napos
+megőrzés mellett? (A replikációs faktor 2.)</p>
+<h4 data-number="16.1.7.3" id="c-implementációs-feladat"><span
+class="header-section-number">16.1.7.3</span> c) Implementációs
+feladat</h4>
+<p>Az ellenőrző futást üres checkpointból indítsd
+(<code>mv checkpoint.json checkpoint.json.before-c</code>). A labor
+kódja már tartalmazza a watermarkot és a késő események eldobását 10
+perces késleltetéssel. Módosítsd a <code>MAX_LATENESS_MS</code> értékét
+300 000-re (5 perc), egészítsd ki az <code>events.json</code>-t a
+következő eseménnyel, és igazold, hogy a korábbi négy ablak változatlan,
+a késő esemény <code>[késő]</code> jelzést kap, az offset viszont 8-ra
+nő:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;node_id&quot;</span><span class="fu">:</span> <span class="st">&quot;n001&quot;</span><span class="fu">,</span> <span class="dt">&quot;boot_id&quot;</span><span class="fu">:</span> <span class="st">&quot;b01&quot;</span><span class="fu">,</span> <span class="dt">&quot;seq&quot;</span><span class="fu">:</span> <span class="dv">5</span><span class="fu">,</span> <span class="dt">&quot;ts&quot;</span><span class="fu">:</span> <span class="dv">1699999700000</span><span class="fu">,</span> <span class="dt">&quot;temperature&quot;</span><span class="fu">:</span> <span class="fl">21.0</span><span class="fu">}</span></span></code></pre></div>
+<p>A labor futtatásakor ellenőrizd, hogy a késő esemény nem kerül be
+egyik ablakba sem, és hogy a checkpoint <code>late_events</code> listája
+tartalmazza.</p>
+<h4 data-number="16.1.7.4"
+id="d-hibakeresésikiterjesztési-feladat"><span
+class="header-section-number">16.1.7.4</span> d)
+Hibakeresési/kiterjesztési feladat</h4>
+<p>A jelenlegi fogyasztó egyetlen <code>checkpoint.json</code> fájlba
+menti az offsetet, a <code>seen</code> halmazt, a
+<code>max_seen_ts</code>-t, a nyitott ablakokat és a késő eseményeket.
+Tervezd meg, hogyan biztosítja ez az összeomlás utáni helyes folytatást.
+Miért nem elegendő az offsetet és a dedup halmazt külön fájlban tárolni?
+Mit jelent az, hogy a kimenet legalább egyszeres (at-least-once), és
+hogyan tehető idempotenssé a fogadó oldal?</p>
+<h3 data-number="16.1.8" id="megoldások"><span
+class="header-section-number">16.1.8</span> Megoldások</h3>
+<h4 data-number="16.1.8.1" id="a-megoldás"><span
+class="header-section-number">16.1.8.1</span> a) Megoldás</h4>
+<p>Kafka akkor indokolt, ha:</p>
+<ul>
+<li>a <code>ts-backend</code> leállása alatt keletkező adatok utólagos
+visszajátszása követelmény;</li>
+<li>több, független fogyasztó (például riasztás, idősoros tárolás,
+analitika) dolgozza fel ugyanazt az adatfolyamot;</li>
+<li>a bejövő adatmennyiség meghaladja az egyetlen fogyasztó feldolgozási
+sebességét, és a pufferelés elengedhetetlen.</li>
+</ul>
+<p>Egyetlen üvegház, néhány tíz node és egy backend esetén a Kafka
+üzemeltetése felesleges költséggel jár, a Mosquitto perzisztens
+munkamenete (QoS 1) és a gateway store-and-forward elegendő puffert ad;
+a retained üzenet csak az utolsó állapotot őrzi. A döntést a
+visszajátszási igény, a fogyasztók száma és az adatmennyiség együttesen
+határozza meg; egyik tényező önmagában nem elegendő.</p>
+<h4 data-number="16.1.8.2" id="b-megoldás"><span
+class="header-section-number">16.1.8.2</span> b) Megoldás</h4>
+<p>A partíciók számának legalább a fogyasztók számával egyenlőnek kell
+lennie, hogy minden fogyasztó kapjon partíciót. 4 fogyasztó esetén a
+minimális partíciószám 4, de a terhelés kiegyensúlyozásához és a
+jövőbeli skálázhatósághoz érdemes 8 vagy 16 partíciót választani. A
+gyakorlatban a partíciószámot a csúcsterhelés és a fogyasztói
+párhuzamosság alapján választjuk; 8 partíció elegendő. A partíciószámot
+utólag nehéz csökkenteni, ezért érdemes a várható növekedést is
+figyelembe venni.</p>
+<p>Napi üzenetmennyiség:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1000</mn><mo>⋅</mo><mn>60</mn><mo>⋅</mo><mn>24</mn><mo>=</mo><mn>1</mn><mspace width="0.167em"></mspace><mn>440</mn><mspace width="0.167em"></mspace><mn>000</mn></mrow><annotation encoding="application/x-tex">1000 \cdot 60 \cdot 24 = 1\,440\,000</annotation></semantics></math>
+üzenet. Egy üzenet 150 B, tehát napi nyers adat:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mspace width="0.167em"></mspace><mn>440</mn><mspace width="0.167em"></mspace><mn>000</mn><mo>⋅</mo><mn>150</mn><mspace width="0.222em"></mspace><mi mathvariant="normal">B</mi><mo>=</mo><mn>216</mn><mspace width="0.167em"></mspace><mn>000</mn><mspace width="0.167em"></mspace><mn>000</mn><mspace width="0.222em"></mspace><mi mathvariant="normal">B</mi><mo>≈</mo><mn>206</mn><mspace width="0.222em"></mspace><mrow><mi mathvariant="normal">M</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">B</mi></mrow><mi>.</mi></mrow><annotation encoding="application/x-tex">1\,440\,000 \cdot 150\ \mathrm{B} = 216\,000\,000\ \mathrm{B} \approx 206\ \mathrm{MiB}.</annotation></semantics></math></p>
+<p>Replikációs faktor 2 miatt a tényleges tárigény kétszeres:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>412</mn><mspace width="0.222em"></mspace><mrow><mi mathvariant="normal">M</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">B</mi></mrow></mrow><annotation encoding="application/x-tex">412\ \mathrm{MiB}</annotation></semantics></math>.
+7 napos megőrzés:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>412</mn><mspace width="0.222em"></mspace><mrow><mi mathvariant="normal">M</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">B</mi></mrow><mo>⋅</mo><mn>7</mn><mo>≈</mo><mn>2</mn><mo>,</mo><mn>8</mn><mspace width="0.222em"></mspace><mrow><mi mathvariant="normal">G</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">B</mi></mrow><mi>.</mi></mrow><annotation encoding="application/x-tex">412\ \mathrm{MiB} \cdot 7 \approx 2{,}8\ \mathrm{GiB}.</annotation></semantics></math></p>
+<p>Ez nem tartalmazza a Kafka belső indexeit, ezért a valós igény ennél
+10–20%-kal nagyobb lehet, azaz körülbelül 3,1–3,4 GiB.</p>
+<h4 data-number="16.1.8.3" id="c-megoldás"><span
+class="header-section-number">16.1.8.3</span> c) Megoldás</h4>
+<p>Az ellenőrző futást üres checkpointból indítsd
+(<code>mv checkpoint.json checkpoint.json.before-c</code>), különben a
+fogyasztó az offset 7-ről folytat, és a négy ablak nem íródik ki újra. A
+módosítás két részből áll. Először a késleltetési állandó:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a>MAX_LATENESS_MS <span class="op">=</span> <span class="dv">300_000</span></span></code></pre></div>
+<p>Másodszor az <code>events.json</code> kiegészítése. Az utolsó előtti
+elem után vessző kell, az új elem a lista vége:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;node_id&quot;</span><span class="fu">:</span> <span class="st">&quot;n001&quot;</span><span class="fu">,</span> <span class="dt">&quot;boot_id&quot;</span><span class="fu">:</span> <span class="st">&quot;b01&quot;</span><span class="fu">,</span> <span class="dt">&quot;seq&quot;</span><span class="fu">:</span> <span class="dv">4</span><span class="fu">,</span> <span class="dt">&quot;ts&quot;</span><span class="fu">:</span> <span class="dv">1700000090000</span><span class="fu">,</span> <span class="dt">&quot;temperature&quot;</span><span class="fu">:</span> <span class="fl">24.6</span><span class="fu">}</span><span class="er">,</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;node_id&quot;</span><span class="fu">:</span> <span class="st">&quot;n001&quot;</span><span class="fu">,</span> <span class="dt">&quot;boot_id&quot;</span><span class="fu">:</span> <span class="st">&quot;b01&quot;</span><span class="fu">,</span> <span class="dt">&quot;seq&quot;</span><span class="fu">:</span> <span class="dv">5</span><span class="fu">,</span> <span class="dt">&quot;ts&quot;</span><span class="fu">:</span> <span class="dv">1699999700000</span><span class="fu">,</span> <span class="dt">&quot;temperature&quot;</span><span class="fu">:</span> <span class="fl">21.0</span><span class="fu">}</span></span></code></pre></div>
+<p>A kód érintetlen része már tartalmazza a szükséges logikát: a
+<code>max_seen_ts</code> inicializálása <code>None</code>, minden
+elfogadott eseménynél <code>max_seen_ts = max(max_seen_ts, ts)</code>, a
+késő esemény ága pedig a <code>seen</code> halmazba veszi a kulcsot, a
+<code>late_events</code> listába írja a rekordot, majd az offsetet is
+előrelépteti és checkpointol. A késő esemény tehát nem okoz végtelen
+újraolvasást, mert az offsetje commitolódik, és a döntés a checkpointban
+is rögzítődik.</p>
+<p>Az ellenőrző futás kimenete a négy ablakra változatlan, a késő
+eseményre pedig:</p>
+<pre class="text"><code>  [késő] offset=7 key=(&#39;n001&#39;, &#39;b01&#39;, 5) ts=1699999700000 (max_ts=1700000090000)
+  [ablak] start=1699999980000 node=n001 min=23.5 max=23.8 avg=23.6 count=2
+  [ablak] start=1699999980000 node=n002 min=24.1 max=24.1 avg=24.1 count=1
+  [ablak] start=1700000040000 node=n001 min=24.2 max=24.6 avg=24.4 count=2
+  [ablak] start=1700000040000 node=n002 min=24.5 max=24.5 avg=24.5 count=1
+Végső commit offset=8, feldolgozott kulcsok: 7</code></pre>
+<p>A <code>late_events</code> tartalma:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="ot">[</span><span class="fu">{</span><span class="dt">&quot;boot_id&quot;</span><span class="fu">:</span> <span class="st">&quot;b01&quot;</span><span class="fu">,</span> <span class="dt">&quot;max_seen_ts&quot;</span><span class="fu">:</span> <span class="dv">1700000090000</span><span class="fu">,</span> <span class="dt">&quot;node_id&quot;</span><span class="fu">:</span> <span class="st">&quot;n001&quot;</span><span class="fu">,</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;offset&quot;</span><span class="fu">:</span> <span class="dv">7</span><span class="fu">,</span> <span class="dt">&quot;reason&quot;</span><span class="fu">:</span> <span class="st">&quot;late&quot;</span><span class="fu">,</span> <span class="dt">&quot;seq&quot;</span><span class="fu">:</span> <span class="dv">5</span><span class="fu">,</span> <span class="dt">&quot;ts&quot;</span><span class="fu">:</span> <span class="dv">1699999700000</span><span class="fu">}</span><span class="ot">]</span></span></code></pre></div>
+<p>A 10 perces alapértékkel ugyanez az esemény még elfogadható lenne, és
+egy új, 1699999680000 kezdetű ablakot nyitna 21.0 átlaggal; az 5 perces
+értékre váltás mutatja, hogy a watermark szigorítása a késő eseményt
+DLQ-ba irányítja. A négy eredeti ablak egyikében sem változik meg az
+átlag vagy a darabszám, mert a késő esemény nem kerül be egyik már
+lezárt vagy nyitott ablakba sem. A késő esemény kulcsa bekerül a
+<code>seen</code> halmazba, ezért a záró „feldolgozott kulcsok” száma 7;
+ez a deduplikációs állapot darabszáma, nem az ablakokba beszámított
+események száma.</p>
+<h4 data-number="16.1.8.4" id="d-megoldás"><span
+class="header-section-number">16.1.8.4</span> d) Megoldás</h4>
+<p>A <code>checkpoint.json</code> egyetlen dokumentumban tartalmazza
+mindazt az állapotot, amelyre a folytatáshoz szükség van:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Mező</th>
+<th>Jelentés</th>
+<th>Miért kell a checkpointba</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>offset</code></td>
+<td>a következő feldolgozandó rekord sorszáma</td>
+<td>ebből tudja a fogyasztó, hol folytassa</td>
+</tr>
+<tr>
+<td><code>seen</code></td>
+<td>a már látott <code>(node_id, boot_id, seq)</code> kulcsok</td>
+<td>a commit utáni újraolvasás deduplikálásához</td>
+</tr>
+<tr>
+<td><code>max_seen_ts</code></td>
+<td>a látott legnagyobb eseményidő</td>
+<td>a watermark és a késő események küszöbének újraszámításához</td>
+</tr>
+<tr>
+<td><code>windows</code></td>
+<td>a nyitott ablakok részaggregátumai</td>
+<td>a már feldolgozott, de még le nem zárt ablakok megőrzéséhez</td>
+</tr>
+<tr>
+<td><code>late_events</code></td>
+<td>a DLQ-ba irányított késő események</td>
+<td>a döntés naplózásához és az offset előreléptetésének
+igazolásához</td>
+</tr>
+</tbody>
+</table>
+<p>A mentés atomi: a kód először egy ideiglenes fájlba ír,
+<code>flush</code> és <code>fsync</code> után
+<code>os.replace</code>-szel cseréli le a
+<code>checkpoint.json</code>-t, majd a könyvtárat is
+<code>fsync</code>-eli. A <code>os.replace</code> ugyanazon a
+fájlrendszeren atomi, ezért a fogyasztó vagy a régi, vagy az új
+checkpointot látja, félkész állapotot nem. Ha az összeomlás a mentés
+előtt történik, a régi checkpoint marad érvényben, és a rekord újra
+feldolgozódik; ha a mentés után, akkor az új offset és a hozzá tartozó
+ablakállapot együtt érvényes. A kettő nem csúszhat el egymáshoz
+képest.</p>
+<p>Az offset és a dedup halmaz külön fájlban nem elegendő, mert a két
+fájl írása nem atomi együtt: az egyik már az új állapotot
+tartalmazhatja, a másik még a régit. Ha például az offset fájlja előbb
+frissül, majd a fogyasztó összeomlik a <code>seen</code> mentése előtt,
+akkor újrainduláskor az offset már a következő rekordra mutat, de a
+korábbi kulcsok hiányoznak a <code>seen</code> halmazból, így a
+duplikátumok átszivároghatnak. Ugyanez a probléma súlyosabb az
+aggregátumokkal: ha az offset előrébb jár, mint a részaggregátum, a már
+commitolt események hozzájárulása végleg elveszik. A megoldás vagy
+egyetlen atomi állapotfájl, vagy tranzakciós adatbázis-tároló, vagy az
+offset és az állapot együtt írása ugyanabba a tranzakcióba.</p>
+<p>A kimenet at-least-once: összeomlás esetén előfordulhat, hogy egy már
+kiszámított ablakot a folytatás újra kiír, mert a kimenet és a
+checkpoint írása nem egyetlen atomi művelet. Ez nem adatvesztés, hanem
+duplikált kimenet. A fogadó oldal ezért idempotens: az ablakokat
+<code>(ablak_kezdete, site, node_id)</code> kulccsal upserteli, vagy a
+kimeneti rekordot egyedi kulccsal látja el, így az ismételt kiírás nem
+duplikálja az adatot. Ha a fogadó oldal nem idempotens, a kimenet és a
+checkpoint együttes tranzakciója szükséges, például egy
+adatbázisban.</p>
+<p>A crash-teszt ezt szemlélteti: az
+<code>I047_CRASH_AFTER_OFFSET=3</code> futtatás után a checkpoint
+<code>offset</code> értéke 4, a <code>windows</code> pedig tartalmazza
+az első ablak 23.5 és 23.8 értékét. A folytatás az offset 4-től indul,
+nem dolgozza újra a 0–3 rekordokat, és az első ablakot a megszakítás
+előtti értékekkel zárja le. Ha a kimenet újra kiíródik, a fogadó oldal
+idempotens kulcsa gondoskodik arról, hogy ne keletkezzen duplikált
+aggregátum.</p>
+<h3 data-number="16.1.9" id="rövid-összefoglaló"><span
+class="header-section-number">16.1.9</span> Rövid összefoglaló</h3>
+<p>Az MQTT broker üzenetközvetítő, a Kafka pedig elosztott,
+visszajátszható napló. A TerraSense-ben nagyobb rendszer esetén a
+Mosquitto mögé Kafka topic kerül, ahol a particionálási kulcs a
+<code>site/node_id</code>, így minden node üzenetei sorrendben maradnak.
+A híd a <code>ts-ingest</code> vagy a <code>ts-backend</code>
+MQTT-klienséből és Kafka-produceréből áll. A fogyasztó at-least-once
+szemantikát használ, commit-ot a feldolgozás után, és idempotens
+deduplikálást <code>(site, node_id, boot_id, seq)</code> kulccsal. Az
+eseményidő szerinti tumbling ablakok 60 másodpercesek, az állapot
+<code>(ablak_kezdete, node_id)</code> szerint kulcsolt, a watermark
+pedig a maximális látott időbélyegből és a megengedett késésből
+számított. A késő események DLQ-ba kerülnek, az offsetjük mégis
+commitolódik. Az offset, a dedup halmaz, a vízjel és a nyitott ablakok
+egyetlen atomi <code>checkpoint.json</code>-ba kerülnek.
+<strong>Továbbvitt eredmény.</strong> A labor szimuláció, amely nem
+indít MQTT-t, Kafkát, partíciót vagy consumer groupot, és nem bizonyítja
+a valós Kafka-híd létét; a <code>ts-telemetry</code> topic, a 4 partíció
+és a <code>ts-backend</code> consumer group a tervezett éles
+konfiguráció. A labor kódjának ellenőrző futása az M04 numerikus
+ellenőrzés értékeit adta: végső offset 7, hat egyedi kulcs, első ablak
+1699999980000, első n001 átlag 23.6, utolsó n001 átlag 24.4. A valós
+Kafka-integráció külön labor lenne, benne a broker, a partíciók, a
+consumer group és az offset/ack tesztek tényleges futtatásával.</p>
+<h3 data-number="16.1.10" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">16.1.10</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li>Apache Kafka dokumentáció: topicok, partíciók, consumer groupok és
+offset-kezelés (alapfogalmak, stabil).</li>
+<li><a href="https://www.enterpriseintegrationpatterns.com/">Enterprise
+Integration Patterns</a>: messaging minták, idempotens fogyasztó (a
+könyvben hivatkozott, de nem ellenőrzött forrás).</li>
+<li>MQTT 5 specifikáció: topicok és retain viselkedés (lásd <a
+href="i026.html">MQTT: publish/subscribe, broker, topicok</a>–<a
+href="i027.html">MQTT QoS, munkamenetek, retain, Last Will és MQTT
+5</a>).</li>
+<li>A laborban használt Python kód szimuláció, nem kapcsolódik tényleges
+Kafka-hoz. Az ellenőrző futás Python 3-mal, a fenti
+<code>events.json</code> bemenettel, üres checkpointból, valamint az
+<code>I047_CRASH_AFTER_OFFSET=3</code> megszakítási teszttel megtörtént;
+a könyvben közölt kimenetek ebből a futásból származnak. A valós
+Kafka-kliens API (például Java <code>KafkaConsumer</code>) és a Kafka
+Connect MQTT-konnektor pontos konfigurációja gyorsan változik;
+ellenőrizendő a telepített verzió dokumentációja. A particionálási kulcs
+hash algoritmusa a producer beállításától függ, ezt a TerraSense-ben
+explicit módon kell konfigurálni.</li>
+<li>A 10 perces és az 5 perces watermark-érték oktatási szemléltetés,
+nem üzemi javaslat. A TerraSense 7 napos offline pufferelése miatt a
+valós watermarkot a mért késés percentiliséhez kell igazítani.</li>
+<li>A <code>seen</code> halmaz és a teljes ablakállapot checkpointja a
+labor méretében működik; éles rendszerben compacted topic, TTL-es
+adatbázis-tábla vagy elosztott állapottároló szükséges. Ennek
+méretezését és üzemeltetését ez a fejezet nem tárgyalja.</li>
+<li>A valós MQTT → Kafka híd, a Kafka broker, a partíciók és a consumer
+group működése nem került kiépítésre és nem került tesztelésre; a labor
+kizárólag a feldolgozási szemantikát modellezi.</li>
+</ul>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="i046.html">← 15.3 Megőrzés, ritkítás és tárolási költség</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i048.html">16.2 Enterprise integrációs minták IoT-ban →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

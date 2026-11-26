@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>5.3 Szinkronizáció és üzenetátadás: mutex, szemafor, üzenetsor,
+work queue – IoT-rendszerek és szoftverkomponensek – az eszköztől a
+felhőig, programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. RÉSZ – Az eszköz: mikrovezérlő, RTOS, szenzorok, energia</a> › <a href="index.html#ich04">5 RTOS és Zephyr</a></p>
+<div class="links"><a class="prev" rel="prev" href="i010.html">← 5.2 Szálak és ütemezés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i012.html">5.4 Devicetree és Kconfig: a hardver és a konfiguráció leírása →</a></div>
+</nav>
+<h2 data-number="5.3" id="i011"><span
+class="header-section-number">5.3</span> Szinkronizáció és üzenetátadás:
+mutex, szemafor, üzenetsor, work queue</h2>
+<p>A TerraSense eszközén a szenzorok olvasása és a hálózati küldés
+ritmusa eltér egymástól: a mérőszál másodpercenként mintát vesz, a
+küldőszál viszont csak akkor tudja továbbítani az MQTT-üzenetet, ha a
+rádió és a hálózati verem éppen elérhető. Ha a két tevékenység
+ugyanabban a memóriában dolgozik, akkor adatverseny, elveszett frissítés
+vagy részben kiírt rekord keletkezhet. A Zephyr – a pthread világához
+hasonlóan, de beágyazott korlátokkal – szinkronizációs és üzenetátadási
+primitíveket ad ehhez: mutexet, szemaforet, üzenetsort és work queue-t.
+Ebben az alfejezetben ezeket a primitíveket a TerraSense mérési
+rekordjának, a <code>ts_sample</code> struktúrának a továbbításán
+keresztül mutatjuk be.</p>
+<h3 data-number="5.3.1" id="motiváció"><span
+class="header-section-number">5.3.1</span> Motiváció</h3>
+<p>A <code>ts-node</code> szoftverében két szál fut együtt. Az egyik a
+szenzorokat olvassa, a másik az MQTT-üzeneteket állítja össze és adja
+fel. Ha közvetlenül egy globális <code>struct ts_sample</code>
+változóban cserélnének adatot, akkor a küldőszál éppen akkor is
+olvashatná a rekordot, amikor a mérőszál félig írta felül; ráadásul a
+mérőszál többször is felülírhatná a mintát, mielőtt a küldőszál
+elküldené. A megoldás: a mérőszál minden mintát egy üzenetsorba tesz, a
+küldőszál pedig onnan veszi ki. Így a két szál ritmusa szétcsatolódik,
+és a minta nem vész el addig, amíg a sor el nem telik.</p>
+<h3 data-number="5.3.2" id="fogalmak-és-működés"><span
+class="header-section-number">5.3.2</span> Fogalmak és működés</h3>
+<p><strong>Definíció.</strong> A <strong>mutex</strong> (mutual
+exclusion) olyan szinkronizációs objektum, amely legfeljebb egy szálnak
+adhatja meg a belépést egy kritikus szakaszba. A Zephyr
+<code>k_mutex</code> típusa hasonlít a <code>pthread_mutex_t</code>-hez,
+de mindig rekurzív (a tulajdonos szál többször is lezárhatja, és
+ugyanannyiszor kell feloldania), és megszakításkezelőből nem hívható. A
+Zephyr mutex <strong>prioritásöröklést</strong> alkalmaz: ha egy
+alacsony prioritású szál tartja a mutexet, és egy magas prioritású szál
+vár rá, akkor az alacsony prioritású szál átmenetileg megkapja a
+magasabb prioritást, így elkerülhető a prioritásinverzió.</p>
+<p><strong>Definíció.</strong> A <strong>szemafor</strong> (semaphore)
+számláló alapú szinkronizációs objektum. A <code>k_sem_give()</code>
+növeli a számlálót, a <code>k_sem_take()</code> pedig csökkenti, ha a
+számláló nagyobb nullánál; különben blokkol. A mutexszel ellentétben a
+szemafornak nincs tulajdonosa, ezért alkalmas jelzésre (például „új
+minta érkezett”), nem pedig erőforrás-védelemre. Bináris szemafor 0/1
+értékkel egyszerű eseményjelzésre használható. A
+<code>k_sem_give()</code> hívható ISR-ből, a <code>k_sem_take()</code>
+viszont nem, mert blokkolhat.</p>
+<p><strong>Definíció.</strong> Az <strong>üzenetsor</strong> (message
+queue, <code>k_msgq</code>) fix méretű elemeket tároló FIFO puffer. A
+Zephyr üzenetsor a teljes üzenetet <strong>másolja</strong>, nem csak
+mutatót ad át, ezért a termelő a saját veremben lévő rekordot a
+<code>k_msgq_put()</code> után azonnal felülírhatja. A fogyasztó a
+<code>k_msgq_get()</code> hívással másolatot kap. A <code>k_msgq</code>
+kapacitása fordítási időben rögzített, a memóriája statikusan
+foglalt.</p>
+<p><strong>Definíció.</strong> A <strong>work queue</strong> olyan szál,
+amely elhalasztott munkákat hajt végre. A <code>k_work</code> objektum
+egy függvényt és annak paraméterét írja le. A
+<code>k_work_submit()</code> a rendszer work queue-jába teszi a munkát;
+a work queue saját szálon, normál kontextusban futtatja a függvényt.
+Mivel az ISR-ekben nem szabad blokkolni, a Zephyrben az ISR-ből
+elhalasztott munka tipikus megoldása a work queue: az ISR csak
+<code>k_work_submit()</code>-ot hív, a tényleges feldolgozás később,
+szálkontextusban fut.</p>
+<p>A következő diagram a mérőszál és a küldőszál közötti üzenetsoros
+adatátadást mutatja:</p>
+<figure>
+<img src="assets/i011-diagram-1.png"
+alt="Adatátadás msgq-val a ts-node-ban - A mérőszál másolja a ts_sample rekordot az üzenetsorba; a küldőszál onnan veszi ki." />
+<figcaption aria-hidden="true">Adatátadás msgq-val a ts-node-ban - A
+mérőszál másolja a ts_sample rekordot az üzenetsorba; a küldőszál onnan
+veszi ki.</figcaption>
+</figure>
+<p>Az ábra nélkül is érthető: a mérőszál az üzenetsorba helyezi a
+mintát, a küldőszál pedig onnan veszi ki. Ha a sor tele van, a termelő
+blokkol (vagy időtúllépést kap); ha üres, a fogyasztó blokkol.</p>
+<h3 data-number="5.3.3" id="döntési-szempontok"><span
+class="header-section-number">5.3.3</span> Döntési szempontok</h3>
+<p>A négy primitív közötti választás a következő táblázat szerint
+történhet:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Helyzet</th>
+<th>Ajánlott primitív</th>
+<th>Indoklás</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Közös globális állapot (pl. szenzorkonfiguráció) védelme több szál
+között</td>
+<td>mutex</td>
+<td>tulajdonos, prioritásöröklés, kritikus szakasz</td>
+</tr>
+<tr>
+<td>Esemény jelzése (pl. „új minta érkezett”)</td>
+<td>szemafor (bináris)</td>
+<td>ISR-ből adható, nincs tulajdonos</td>
+</tr>
+<tr>
+<td>Erőforrás-készlet kezelése (pl. 4 db puffercella)</td>
+<td>szemafor (számláló)</td>
+<td>a számláló a szabad erőforrások számát jelzi</td>
+</tr>
+<tr>
+<td>Mérési rekordok átadása termelő és fogyasztó szál között</td>
+<td>üzenetsor (<code>k_msgq</code>)</td>
+<td>FIFO, másolás, fix méret, ISR-ből <code>put</code> lehetséges</td>
+</tr>
+<tr>
+<td>Változó méretű adatok átadása (pl. soros keretek)</td>
+<td>FIFO (<code>k_fifo</code>)</td>
+<td>mutató átadása, dinamikus elemek</td>
+</tr>
+<tr>
+<td>ISR-ből elhalasztott, nem sürgős feldolgozás</td>
+<td>work queue</td>
+<td>normál szálkontextus, blokkolható</td>
+</tr>
+</tbody>
+</table>
+<p>A <code>k_msgq</code> előnye a <code>k_fifo</code>-val szemben, hogy
+a teljes üzenetet másolja, így a termelőnek nem kell a puffert a
+fogyasztó felszabadításáig életben tartania. Hátránya, hogy a kapacitás
+és az elem mérete rögzített, és nagy üzeneteknél a másolás időt és
+memóriát igényel.</p>
+<h3 data-number="5.3.4" id="kidolgozott-példa-és-labor"><span
+class="header-section-number">5.3.4</span> Kidolgozott példa és
+labor</h3>
+<p>A labor a TerraSense mérési rekordjának (<code>ts_sample</code>)
+üzenetsoros továbbítását valósítja meg <code>native_sim</code>-en. A
+mérőszál másodpercenként előállít egy mintát, a küldőszál kiveszi a
+sorból és kiírja a konzolra.</p>
+<p><strong>Munkakönyvtár:</strong></p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="bu">source</span> ~/zephyr-venv/bin/activate</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">ZEPHYR_BASE</span><span class="op">=</span>~/zephyrproject/zephyr</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> ~/iot-labor/i011 <span class="kw">&amp;&amp;</span> <span class="bu">cd</span> ~/iot-labor/i011</span></code></pre></div>
+<p>Hozzuk létre a projektfájlokat.</p>
+<p><code>CMakeLists.txt</code>:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cmake"><code class="sourceCode cmake"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">cmake_minimum_required</span>(<span class="ot">VERSION</span> <span class="dt">3.20</span>)</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">find_package</span>(Zephyr <span class="ot">REQUIRED</span> <span class="ot">HINTS</span> <span class="fl">$ENV{ZEPHYR_BASE}</span>)</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">project</span>(ts_sync)</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="kw">target_sources</span>(<span class="bn">app</span> <span class="ot">PRIVATE</span> src/main.c)</span></code></pre></div>
+<p><code>prj.conf</code>:</p>
+<pre class="kconfig"><code>CONFIG_LOG=y
+CONFIG_PRINTK=y
+# A printk &quot;%f&quot; konverziójához a cbprintf lebegőpontos támogatása kell;
+# enélkül a float argumentum nem tizedes értékként jelenik meg.
+CONFIG_CBPRINTF_FP_SUPPORT=y
+# A &quot;%lld&quot; (64 bites) konverzióhoz a teljes szélességű egész támogatás kell.
+CONFIG_CBPRINTF_FULL_INTEGRAL=y
+CONFIG_SHELL=n</code></pre>
+<p>A <code>printk</code> a Zephyr 3.7-ben a cbprintf formázót használja;
+a <code>%f</code> és a <code>%lld</code> konverzió nem része a minimális
+alapkészletnek, ezért a fenti két Kconfig-kapcsoló nélkül a labor
+kimenete nem a várt tizedes, illetve 64 bites értékeket mutatja. Aki nem
+akar lebegőpontos formázást a célon, az a <code>printk</code>-ban
+fixpontos, egész számú megjelenítést használjon (pl.
+<code>milli_c = (int)(temperature_c * 1000.0f)</code> és
+<code>%d.%03d</code>), és a <code>ts_sample</code>ben továbbra is
+<code>float</code> maradhat.</p>
+<p><code>src/main.c</code>:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;zephyr/kernel.h&gt;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;zephyr/sys/printk.h&gt;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdint.h&gt;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string.h&gt;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="co">/* Továbbvitt eredmény: a ts_sample struktúra az eszközszoftver-architektúra</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="co"> * (i018) és a telemetria-séma (i032) fejezetben is használatos.</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="co"> */</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> ts_sample <span class="op">{</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> seq<span class="op">;</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int64_t</span> uptime_ms<span class="op">;</span>         <span class="co">/* a ts-node saját, monoton órája */</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int64_t</span> event_ts_epoch_ms<span class="op">;</span> <span class="co">/* UTC epoch ms; 0 = az óra még nincs szinkronizálva */</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> temperature_c<span class="op">;</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> humidity_rh<span class="op">;</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> soil_moisture_pct<span class="op">;</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a><span class="co">/* 8 elemű msgq, elem mérete a ts_sample struktúra */</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>K_MSGQ_DEFINE<span class="op">(</span>sample_msgq<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span><span class="kw">struct</span> ts_sample<span class="op">),</span> <span class="dv">8</span><span class="op">,</span> <span class="dv">4</span><span class="op">);</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a><span class="co">/* A k_uptime_get() monoton, de nem UTC: csak a boot óta eltelt időt adja.</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a><span class="co"> * A telemetriaszerződés viszont epoch ms-t vár, ezért a kettőt külön visszük.</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a><span class="co"> * Az offset 0 azt jelenti, hogy a ts-node órája még nincs szinkronizálva</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a><span class="co"> * (a laborban nincs RTC/SNTP). A 64 bites offsetet mutex védi, mert 32 bites</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a><span class="co"> * célon a kiírás és az olvasás nem atomikus.</span></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a><span class="co"> */</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> K_MUTEX_DEFINE<span class="op">(</span>clock_lock<span class="op">);</span></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int64_t</span> epoch_offset_ms<span class="op">;</span></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int64_t</span> ts_epoch_ms<span class="op">(</span><span class="dt">int64_t</span> uptime_ms<span class="op">)</span></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int64_t</span> result<span class="op">;</span></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a>    k_mutex_lock<span class="op">(&amp;</span>clock_lock<span class="op">,</span> K_FOREVER<span class="op">);</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a>    result <span class="op">=</span> <span class="op">(</span>epoch_offset_ms <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">?</span> <span class="dv">0</span> <span class="op">:</span> uptime_ms <span class="op">+</span> epoch_offset_ms<span class="op">;</span></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a>    k_mutex_unlock<span class="op">(&amp;</span>clock_lock<span class="op">);</span></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> result<span class="op">;</span></span>
+<span id="cb4-39"><a href="#cb4-39" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-40"><a href="#cb4-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-41"><a href="#cb4-41" aria-hidden="true" tabindex="-1"></a><span class="co">/* Szinkronizáció után (pl. SNTP válaszból) egyszer beállítjuk az eltolást. */</span></span>
+<span id="cb4-42"><a href="#cb4-42" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> ts_clock_set_epoch<span class="op">(</span><span class="dt">int64_t</span> utc_epoch_ms<span class="op">,</span> <span class="dt">int64_t</span> uptime_ms<span class="op">)</span></span>
+<span id="cb4-43"><a href="#cb4-43" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-44"><a href="#cb4-44" aria-hidden="true" tabindex="-1"></a>    k_mutex_lock<span class="op">(&amp;</span>clock_lock<span class="op">,</span> K_FOREVER<span class="op">);</span></span>
+<span id="cb4-45"><a href="#cb4-45" aria-hidden="true" tabindex="-1"></a>    epoch_offset_ms <span class="op">=</span> utc_epoch_ms <span class="op">-</span> uptime_ms<span class="op">;</span></span>
+<span id="cb4-46"><a href="#cb4-46" aria-hidden="true" tabindex="-1"></a>    k_mutex_unlock<span class="op">(&amp;</span>clock_lock<span class="op">);</span></span>
+<span id="cb4-47"><a href="#cb4-47" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-48"><a href="#cb4-48" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-49"><a href="#cb4-49" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> producer_thread<span class="op">(</span><span class="dt">void</span> <span class="op">*</span>p1<span class="op">,</span> <span class="dt">void</span> <span class="op">*</span>p2<span class="op">,</span> <span class="dt">void</span> <span class="op">*</span>p3<span class="op">)</span></span>
+<span id="cb4-50"><a href="#cb4-50" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-51"><a href="#cb4-51" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> ts_sample sample<span class="op">;</span></span>
+<span id="cb4-52"><a href="#cb4-52" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> seq <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb4-53"><a href="#cb4-53" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-54"><a href="#cb4-54" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span><span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-55"><a href="#cb4-55" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* Emulált szenzorolvasás */</span></span>
+<span id="cb4-56"><a href="#cb4-56" aria-hidden="true" tabindex="-1"></a>        sample<span class="op">.</span>seq <span class="op">=</span> <span class="op">++</span>seq<span class="op">;</span></span>
+<span id="cb4-57"><a href="#cb4-57" aria-hidden="true" tabindex="-1"></a>        sample<span class="op">.</span>uptime_ms <span class="op">=</span> k_uptime_get<span class="op">();</span></span>
+<span id="cb4-58"><a href="#cb4-58" aria-hidden="true" tabindex="-1"></a>        sample<span class="op">.</span>event_ts_epoch_ms <span class="op">=</span> ts_epoch_ms<span class="op">(</span>sample<span class="op">.</span>uptime_ms<span class="op">);</span></span>
+<span id="cb4-59"><a href="#cb4-59" aria-hidden="true" tabindex="-1"></a>        sample<span class="op">.</span>temperature_c <span class="op">=</span> <span class="fl">20.0</span><span class="bu">f</span> <span class="op">+</span> <span class="op">(</span>seq <span class="op">*</span> <span class="fl">0.1</span><span class="bu">f</span><span class="op">);</span></span>
+<span id="cb4-60"><a href="#cb4-60" aria-hidden="true" tabindex="-1"></a>        sample<span class="op">.</span>humidity_rh <span class="op">=</span> <span class="fl">60.0</span><span class="bu">f</span> <span class="op">-</span> <span class="op">(</span>seq <span class="op">*</span> <span class="fl">0.05</span><span class="bu">f</span><span class="op">);</span></span>
+<span id="cb4-61"><a href="#cb4-61" aria-hidden="true" tabindex="-1"></a>        sample<span class="op">.</span>soil_moisture_pct <span class="op">=</span> <span class="fl">30.0</span><span class="bu">f</span> <span class="op">+</span> <span class="op">(</span>seq <span class="op">*</span> <span class="fl">0.2</span><span class="bu">f</span><span class="op">);</span></span>
+<span id="cb4-62"><a href="#cb4-62" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-63"><a href="#cb4-63" aria-hidden="true" tabindex="-1"></a>        printk<span class="op">(</span><span class="st">&quot;producer: seq=</span><span class="sc">%u</span><span class="st">, uptime=</span><span class="sc">%lld</span><span class="st"> ms, epoch=</span><span class="sc">%lld</span><span class="st"> ms</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb4-64"><a href="#cb4-64" aria-hidden="true" tabindex="-1"></a>               sample<span class="op">.</span>seq<span class="op">,</span> <span class="op">(</span><span class="dt">long</span> <span class="dt">long</span><span class="op">)</span>sample<span class="op">.</span>uptime_ms<span class="op">,</span></span>
+<span id="cb4-65"><a href="#cb4-65" aria-hidden="true" tabindex="-1"></a>               <span class="op">(</span><span class="dt">long</span> <span class="dt">long</span><span class="op">)</span>sample<span class="op">.</span>event_ts_epoch_ms<span class="op">);</span></span>
+<span id="cb4-66"><a href="#cb4-66" aria-hidden="true" tabindex="-1"></a>        k_msgq_put<span class="op">(&amp;</span>sample_msgq<span class="op">,</span> <span class="op">&amp;</span>sample<span class="op">,</span> K_FOREVER<span class="op">);</span></span>
+<span id="cb4-67"><a href="#cb4-67" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-68"><a href="#cb4-68" aria-hidden="true" tabindex="-1"></a>        k_sleep<span class="op">(</span>K_MSEC<span class="op">(</span><span class="dv">1000</span><span class="op">));</span></span>
+<span id="cb4-69"><a href="#cb4-69" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-70"><a href="#cb4-70" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-71"><a href="#cb4-71" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-72"><a href="#cb4-72" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> consumer_thread<span class="op">(</span><span class="dt">void</span> <span class="op">*</span>p1<span class="op">,</span> <span class="dt">void</span> <span class="op">*</span>p2<span class="op">,</span> <span class="dt">void</span> <span class="op">*</span>p3<span class="op">)</span></span>
+<span id="cb4-73"><a href="#cb4-73" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-74"><a href="#cb4-74" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> ts_sample sample<span class="op">;</span></span>
+<span id="cb4-75"><a href="#cb4-75" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-76"><a href="#cb4-76" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span><span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-77"><a href="#cb4-77" aria-hidden="true" tabindex="-1"></a>        k_msgq_get<span class="op">(&amp;</span>sample_msgq<span class="op">,</span> <span class="op">&amp;</span>sample<span class="op">,</span> K_FOREVER<span class="op">);</span></span>
+<span id="cb4-78"><a href="#cb4-78" aria-hidden="true" tabindex="-1"></a>        printk<span class="op">(</span><span class="st">&quot;consumer: seq=</span><span class="sc">%u</span><span class="st">, temp=</span><span class="sc">%.1f</span><span class="st"> C, hum=</span><span class="sc">%.1f</span><span class="st"> </span><span class="sc">%%</span><span class="st">, soil=</span><span class="sc">%.1f</span><span class="st"> </span><span class="sc">%%\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb4-79"><a href="#cb4-79" aria-hidden="true" tabindex="-1"></a>               sample<span class="op">.</span>seq<span class="op">,</span> sample<span class="op">.</span>temperature_c<span class="op">,</span> sample<span class="op">.</span>humidity_rh<span class="op">,</span></span>
+<span id="cb4-80"><a href="#cb4-80" aria-hidden="true" tabindex="-1"></a>               sample<span class="op">.</span>soil_moisture_pct<span class="op">);</span></span>
+<span id="cb4-81"><a href="#cb4-81" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-82"><a href="#cb4-82" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-83"><a href="#cb4-83" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-84"><a href="#cb4-84" aria-hidden="true" tabindex="-1"></a>K_THREAD_DEFINE<span class="op">(</span>producer_id<span class="op">,</span> <span class="dv">1024</span><span class="op">,</span> producer_thread<span class="op">,</span> NULL<span class="op">,</span> NULL<span class="op">,</span> NULL<span class="op">,</span> <span class="dv">5</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb4-85"><a href="#cb4-85" aria-hidden="true" tabindex="-1"></a>K_THREAD_DEFINE<span class="op">(</span>consumer_id<span class="op">,</span> <span class="dv">1024</span><span class="op">,</span> consumer_thread<span class="op">,</span> NULL<span class="op">,</span> NULL<span class="op">,</span> NULL<span class="op">,</span> <span class="dv">6</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb4-86"><a href="#cb4-86" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-87"><a href="#cb4-87" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb4-88"><a href="#cb4-88" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-89"><a href="#cb4-89" aria-hidden="true" tabindex="-1"></a>    printk<span class="op">(</span><span class="st">&quot;ts-sync labor indult</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb4-90"><a href="#cb4-90" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb4-91"><a href="#cb4-91" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>K_MSGQ_DEFINE</code> makró statikusan létrehozza az
+üzenetsort. A két szál prioritása eltér: a termelőé (5) magasabb, mint a
+fogyasztóé (6), így a mérés nem csúszik el; a fogyasztó akkor fut,
+amikor a termelő alszik, és mivel a termelő másodpercenként csak egyszer
+ír, a sor nem telik meg.</p>
+<p><strong>A két időmező szerepe.</strong> A közös telemetriaszerződés a
+<code>ts</code> mezőben UTC szerinti epoch ezredmásodpercet vár, mert a
+backend, a TimescaleDB és a Grafana ezt rendezi és jeleníti meg. A
+<code>k_uptime_get()</code> ezzel szemben a boot óta eltelt idő, nem
+epoch: értéke minden újraindítás után nulláról indul, és önmagában nem
+hasonlítható össze más csomópontok vagy a szerver idejével. Ezért a
+rekord két mezőt visz: az <code>uptime_ms</code> a helyi, monoton
+sorrendezéshez és a késleltetés méréséhez kell, az
+<code>event_ts_epoch_ms</code> pedig a szerződés szerinti eseményidő.
+Amíg a <code>ts-node</code> órája nincs szinkronizálva (a laborban nincs
+RTC és SNTP, ezért <code>event_ts_epoch_ms == 0</code>), a
+<code>ts-gw</code> a vétel pillanatában kapott idejét használhatja
+becslésként, és ezt a telemetriában külön jelzi
+(<code>ts_estimated: true</code>); a becslés nem mérési idő, és a
+backend csak sorrendezésre, nem fizikai következtetésre használhatja. A
+<code>ts_ms</code> korábbi, egyetlen mezős változata ezt a különbséget
+mosta el, ezért váltottuk ketté.</p>
+<p>A build és a futtatás:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">west</span> build <span class="at">-b</span> native_sim .</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./build/zephyr/zephyr.exe</span></span></code></pre></div>
+<p>Várható kimenet (részlet):</p>
+<pre class="text"><code>ts-sync labor indult
+producer: seq=1, uptime=1023 ms, epoch=0 ms
+consumer: seq=1, temp=20.1 C, hum=60.0 %, soil=30.2 %
+producer: seq=2, uptime=2025 ms, epoch=0 ms
+consumer: seq=2, temp=20.2 C, hum=59.9 %, soil=30.4 %</code></pre>
+<p>A mérőszál másodpercenként termel, a küldőszál azonnal fogyaszt, mert
+a sor üres. Az <code>epoch=0</code> azt jelzi, hogy a laborban a
+<code>ts-node</code> órája nincs szinkronizálva; a kimenet értékei
+illusztratívak, a <code>native_sim</code> ütemezésétől függően néhány
+ms-mal eltérhetnek.</p>
+<p><strong>Továbbvitt eredmény.</strong> A <code>ts_sample</code>
+struktúra és a <code>sample_msgq</code> üzenetsor a <a
+href="i018.html">Eszközszoftver-architektúra: rétegek és
+állapotgépek</a> alfejezetben a rétegek közötti adatátadás alapja lesz,
+a <a href="i032.html">Adatformátumok: JSON, CBOR, Protocol Buffers,
+SenML</a> alfejezet pedig ebből a struktúrából készíti el a
+telemetria-séma első változatát.</p>
+<h3 data-number="5.3.5" id="ellenőrzés-és-hibakeresés"><span
+class="header-section-number">5.3.5</span> Ellenőrzés és
+hibakeresés</h3>
+<p>A labor működését a konzolnapló igazolja: minden
+<code>producer:</code> sorhoz tartozik egy <code>consumer:</code> sor, a
+<code>seq</code> értékek szigorúan növekvők. Ha a küldőszál lassabb, a
+sor telik, de a <code>K_FOREVER</code> miatt a mérőszál blokkol, így
+egyetlen minta sem vész el.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Tünet</th>
+<th>Lehetséges ok</th>
+<th>Javítás</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A consumer nem kap üzenetet</td>
+<td>A <code>K_MSGQ_DEFINE</code> mérete nem egyezik a
+<code>sizeof(struct ts_sample)</code> értékével</td>
+<td>Használjunk <code>sizeof</code> operátort, ne kézzel írt
+konstansot</td>
+</tr>
+<tr>
+<td><code>k_msgq_put</code> fordítási hibát ad</td>
+<td>A struktúra nem másolható (pl. rugalmas tömb tag)</td>
+<td>Kerüljük a mutató tagokat, használjunk fix méretet</td>
+</tr>
+<tr>
+<td>A producer blokkol</td>
+<td>A sor tele van, mert a consumer nem fut</td>
+<td>Ellenőrizzük a prioritásokat, adjunk timeoutot a
+<code>put</code>-nak</td>
+</tr>
+<tr>
+<td>A consumer blokkol</td>
+<td>A sor üres, mert a producer nem termel</td>
+<td>Ellenőrizzük, hogy a producer szál elindult-e</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="5.3.6" id="tipikus-hibák-és-félreértések"><span
+class="header-section-number">5.3.6</span> Tipikus hibák és
+félreértések</h3>
+<ol type="1">
+<li><strong>ISR-ben blokkoló hívás.</strong> A <code>k_msgq_put()</code>
+ugyan hívható ISR-ből, de csak <code>K_NO_WAIT</code> timeouttal. Ha egy
+ISR <code>K_FOREVER</code>-t használ, és a sor tele van, a rendszer
+lefagy. Az ISR-ből mindig <code>K_NO_WAIT</code>-et használjunk, és a
+tényleges feldolgozást work queue-ba tegyük.</li>
+<li><strong>Mutató átadása <code>k_msgq</code>-ban.</strong> A
+<code>k_msgq</code> másol, de ha a struktúra mutató tagot tartalmaz,
+akkor a másolt mutató a termelő veremére mutat. A fogyasztó később
+érvénytelen memóriát olvashat. Az üzenetsorba kerülő struktúrák ne
+tartalmazzanak mutatót, vagy a mutató által címzett adatot is explicit
+módon kezelni kell.</li>
+<li><strong>Holtpont.</strong> Ha két szál két mutexet fordított
+sorrendben vesz fel, mindkettő várhat a másikra. Ezt a sorrend
+rögzítésével kerüljük el, és soha ne tartsunk mutexet blokkoló hívás
+(például <code>k_msgq_get</code>) alatt.</li>
+</ol>
+<h3 data-number="5.3.7" id="feladatok"><span
+class="header-section-number">5.3.7</span> Feladatok</h3>
+<h4 data-number="5.3.7.1" id="a-fogalmi-kérdés"><span
+class="header-section-number">5.3.7.1</span> a) Fogalmi kérdés</h4>
+<p>Mikor használjunk mutexet és mikor szemaforet? Indokolja a választ a
+TerraSense példáján: a szenzorkonfiguráció írása és az „új minta
+érkezett” jelzés.</p>
+<h4 data-number="5.3.7.2" id="b-számolási-feladat"><span
+class="header-section-number">5.3.7.2</span> b) Számolási feladat</h4>
+<p>Tegyük fel, hogy a <code>struct ts_sample</code> mérete a célon mérve
+40 bájt (a pontos értéket mindig <code>sizeof</code>-szal kell megmérni,
+mert függ az ABI-tól és a paddingtól). Hány bájt statikus memóriát
+foglal a
+<code>K_MSGQ_DEFINE(sample_msgq, sizeof(struct ts_sample), 8, 4)</code>
+által létrehozott teljes üzenetsor? Bontsa fel a foglalást pufferre,
+vezérlőobjektumra és igazításra, és mondja meg, hogyan lehet a build
+után a linker <code>.map</code> fájljából visszaellenőrizni a tényleges
+méreteket.</p>
+<h4 data-number="5.3.7.3" id="c-implementációs-feladat"><span
+class="header-section-number">5.3.7.3</span> c) Implementációs
+feladat</h4>
+<p>Bővítse a <code>ts_sample</code> struktúrát egy <code>rssi</code>
+mezővel (<code>int8_t</code>), és módosítsa a mérőszálat, hogy az
+<code>rssi</code> értéke <code>-40</code> és <code>-90</code> között
+változzon. A küldőszál írja ki az <code>rssi</code> értékét is.</p>
+<h4 data-number="5.3.7.4" id="d-hibakeresési-feladat"><span
+class="header-section-number">5.3.7.4</span> d) Hibakeresési
+feladat</h4>
+<p>A küldőszál legyen lassabb, mint a mérőszál: a fogyasztó ciklusába
+tegyen <code>k_sleep(K_MSEC(2000))</code> hívást. Mit tapasztal? Hogyan
+lehet a mérőszálat úgy módosítani, hogy ne blokkoljon végtelenül, hanem
+100 ms után hagyja el a <code>k_msgq_put</code> hívást, és naplózza a
+túlcsordulást?</p>
+<h3 data-number="5.3.8" id="megoldások"><span
+class="header-section-number">5.3.8</span> Megoldások</h3>
+<h4 data-number="5.3.8.1" id="a-fogalmi-kérdés-1"><span
+class="header-section-number">5.3.8.1</span> a) Fogalmi kérdés</h4>
+<p>A szenzorkonfiguráció írása kritikus szakasz: egyszerre csak egy szál
+módosíthatja az értékeket, hogy ne keletkezzen félkész állapot. Itt
+mutexet használunk, mert tulajdonost és prioritásöröklést ad. Az „új
+minta érkezett” jelzés egy egyszerű esemény, amelyet a mérőszál
+<code>k_sem_give()</code>-vel jelezhet a küldőszálnak; itt nincs szükség
+tulajdonosra, elég a bináris szemafor.</p>
+<h4 data-number="5.3.8.2" id="b-számolási-feladat-1"><span
+class="header-section-number">5.3.8.2</span> b) Számolási feladat</h4>
+<p>A <code>K_MSGQ_DEFINE</code> három dolgot foglal statikusan. Az első
+a <strong>puffer</strong>: <code>msgq_sz * msgq_max_cnt</code>, azaz a
+feltételezett 40 bájttal <code>8 * 40 = 320</code> bájt. A második a
+<strong>vezérlőobjektum</strong>, egy <code>struct k_msgq</code>
+(várakozási sor, méret- és számlálómezők, puffer-mutatók), amelynek
+mérete <code>sizeof(struct k_msgq)</code>, jellemzően néhány tíz bájt. A
+harmadik a <strong>padding és igazítás</strong>: a negyedik
+makróargumentum (itt 4) a puffer igazítása, ehhez jön a linkerszekció
+igazítása, ezért a puffer és a vezérlőobjektum között, illetve a szekció
+végén is keletkezhet kihasználatlan hely. A teljes statikus RAM-költség
+tehát nem a 320 bájt, hanem a három rész összege. A build után a
+<code>.map</code> fájlban a <code>sample_msgq</code> (vezérlőobjektum)
+és a <code>sample_msgq_buffer</code> (puffer) szimbólum méretéből
+ellenőrizhető vissza; a <code>sizeof(struct ts_sample)</code> és
+<code>sizeof(struct k_msgq)</code> értékét pedig egy rövid
+<code>printk</code>-kel vagy a fordító <code>-Wpadded</code>
+figyelmeztetésével lehet megmérni. A kódban mindig
+<code>sizeof(struct ts_sample)</code>-et adjunk meg, ne kézzel írt
+számot: így a struktúra bővítésekor a puffer mérete automatikusan követi
+a változást, csak a memóriakeret újraszámolása marad feladat.</p>
+<h4 data-number="5.3.8.3" id="c-implementációs-feladat-1"><span
+class="header-section-number">5.3.8.3</span> c) Implementációs
+feladat</h4>
+<p>A struktúra:</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> ts_sample <span class="op">{</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> seq<span class="op">;</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int64_t</span> uptime_ms<span class="op">;</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int64_t</span> event_ts_epoch_ms<span class="op">;</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> temperature_c<span class="op">;</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> humidity_rh<span class="op">;</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> soil_moisture_pct<span class="op">;</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int8_t</span> rssi<span class="op">;</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A mérőszálban:</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a>sample<span class="op">.</span>rssi <span class="op">=</span> <span class="op">-</span><span class="dv">40</span> <span class="op">-</span> <span class="op">(</span>seq <span class="op">%</span> <span class="dv">50</span><span class="op">);</span></span></code></pre></div>
+<p>A struktúra mérete 8 bájtos <code>int64_t</code>-igazítású ABI-n
+(például Cortex-M AAPCS vagy x86-64) 40 bájt marad: az
+<code>int8_t rssi</code> a meglévő 4 bájtos záró kitöltésbe kerül
+(eltolás 36, 37 bájt kerekítve 40-re). A <code>K_MSGQ_DEFINE</code>
+puffere így továbbra is <code>8 * 40 = 320</code> bájt. A 32 bites x86
+ABI-n (például 32 bites <code>native_sim</code>) az <code>int64_t</code>
+4 bájtra igazodik, ott a méret 32-ről 36 bájtra nő. A méretet mindig
+<code>sizeof</code>-szal mérjük meg.</p>
+<p>A küldőszálban:</p>
+<div class="sourceCode" id="cb9"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a>printk<span class="op">(</span><span class="st">&quot;consumer: seq=</span><span class="sc">%u</span><span class="st">, temp=</span><span class="sc">%.1f</span><span class="st"> C, hum=</span><span class="sc">%.1f</span><span class="st"> </span><span class="sc">%%</span><span class="st">, soil=</span><span class="sc">%.1f</span><span class="st"> </span><span class="sc">%%</span><span class="st">, rssi=</span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>       sample<span class="op">.</span>seq<span class="op">,</span> sample<span class="op">.</span>temperature_c<span class="op">,</span> sample<span class="op">.</span>humidity_rh<span class="op">,</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>       sample<span class="op">.</span>soil_moisture_pct<span class="op">,</span> sample<span class="op">.</span>rssi<span class="op">);</span></span></code></pre></div>
+<h4 data-number="5.3.8.4" id="d-hibakeresési-feladat-1"><span
+class="header-section-number">5.3.8.4</span> d) Hibakeresési
+feladat</h4>
+<p>Ha a fogyasztó lassabb, a sor előbb-utóbb megtelik. A mérőszál a
+<code>K_FOREVER</code> timeout miatt addig blokkol, amíg a fogyasztó ki
+nem vesz egy elemet. A túlcsordulás elkerülésére a
+<code>k_msgq_put</code> hívást <code>K_MSEC(100)</code> timeouttal
+hívjuk:</p>
+<div class="sourceCode" id="cb10"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> ret <span class="op">=</span> k_msgq_put<span class="op">(&amp;</span>sample_msgq<span class="op">,</span> <span class="op">&amp;</span>sample<span class="op">,</span> K_MSEC<span class="op">(</span><span class="dv">100</span><span class="op">));</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>ret <span class="op">==</span> <span class="op">-</span>EAGAIN<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>    printk<span class="op">(</span><span class="st">&quot;producer: msgq tele, minta eldobva</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ekkor a mérőszál nem blokkol végtelenül, hanem 100 ms után feladja a
+küldést, és naplózza a túlcsordulást. A minta elvesztése itt tudatos
+döntés; a későbbi <a href="i037.html">Store-and-forward: offline működés
+és visszatöltés</a> alfejezetben megvizsgáljuk, hogyan lehet ezt
+elkerülni.</p>
+<h3 data-number="5.3.9" id="rövid-összefoglaló"><span
+class="header-section-number">5.3.9</span> Rövid összefoglaló</h3>
+<p>A Zephyr szinkronizációs és kommunikációs primitívjei közül a mutex a
+kritikus szakaszok védelmére, a szemafor az eseményjelzésre, az
+üzenetsor (<code>k_msgq</code>) a fix méretű rekordok másolásos
+átadására, a work queue pedig az ISR-ből elhalasztott munkára való. A
+laborban definiáltuk a <code>ts_sample</code> struktúrát
+(<code>seq</code>, <code>uptime_ms</code>,
+<code>event_ts_epoch_ms</code>, hőmérséklet, páratartalom,
+talajnedvesség), és egy <code>sample_msgq</code> üzenetsorral átadtuk a
+mérést a mérőszálból a küldőszálba. A <code>ts_sample</code> struktúra
+és az üzenetsoros átadás a továbbvitt eredmény: az <a
+href="i018.html">Eszközszoftver-architektúra: rétegek és
+állapotgépek</a> alfejezet ezt használja a rétegek közötti
+kommunikációhoz, az <a href="i032.html">Adatformátumok: JSON, CBOR,
+Protocol Buffers, SenML</a> alfejezet pedig ebből készíti a
+telemetria-sémát. A laborfájlok:
+<code>~/iot-labor/i011/CMakeLists.txt</code>,
+<code>~/iot-labor/i011/prj.conf</code>,
+<code>~/iot-labor/i011/src/main.c</code>.</p>
+<h3 data-number="5.3.10" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">5.3.10</span> Források és ellenőrzési
+hiányok</h3>
+<p>A Zephyr kernel API-k (<code>k_msgq</code>, <code>k_sem</code>,
+<code>k_mutex</code>, <code>k_work</code>) nevei és a
+<code>native_sim</code> build menete a Zephyr hivatalos
+dokumentációjából származnak. A könyv rögzített verziója Zephyr 3.7.0
+LTS; a <code>CONFIG_CBPRINTF_FP_SUPPORT</code> és a
+<code>CONFIG_CBPRINTF_FULL_INTEGRAL</code> nevek ebben a kiadásban a
+<code>lib/os/Kconfig.cbprintf</code> fájlban találhatók, a build után
+pedig a <code>build/zephyr/.config</code> ellenőrzi, hogy ténylegesen
+bekerültek-e. A <code>ts_sample</code> struktúra mérete illusztratív,
+függ a célplatform ABI-jától és a paddingtől.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="i010.html">← 5.2 Szálak és ütemezés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i012.html">5.4 Devicetree és Kconfig: a hardver és a konfiguráció leírása →</a></div>
+</nav>
+</body>
+</html>
