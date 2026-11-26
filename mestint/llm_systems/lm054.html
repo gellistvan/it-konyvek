@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>15.2 Vektorindexek: HNSW, IVF és PQ – LLM-ek és
+domain-specifikus kis modellek programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Alkalmazásépítés</a> › <a href="index.html#lmch14">15 Embeddingek és vektoros keresés</a></p>
+<div class="links"><a class="prev" rel="prev" href="lm053.html">← 15.1 Embedding modellek és hasonlóság</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="lm055.html">15.3 Chunking, metadata és hibrid keresés →</a></div>
+</nav>
+<h2 data-number="15.2" id="lm054"><span
+class="header-section-number">15.2</span> Vektorindexek: HNSW, IVF és
+PQ</h2>
+<h3 data-number="15.2.1" id="miért-indexelünk"><span
+class="header-section-number">15.2.1</span> Miért indexelünk?</h3>
+<p>A vektoros keresésben a bemenet egy már kiszámított sűrű
+vektorhalmaz, például szövegbeágyazásokból származó <code>X</code>
+mátrix:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>X</mi><mo>∈</mo><msup><mi>ℝ</mi><mrow><mi>N</mi><mo>×</mo><mi>d</mi></mrow></msup><mo>,</mo></mrow><annotation encoding="application/x-tex">
+X \in \mathbb{R}^{N\times d},
+</annotation></semantics></math></p>
+<p>ahol <code>N</code> a dokumentumok, chunkok vagy entitások száma,
+<code>d</code> pedig a beágyazási dimenzió. Egy <code>q</code>
+lekérdezésvektorhoz a <code>k</code> legközelebbi tárolt vektort
+keressük valamilyen hasonlósági metrika szerint. A pontos, nyers erővel
+végzett keresés minden <code>q</code> esetén kiszámítja a távolságot
+mind az <code>N</code> vektorhoz:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝒪</mi><mo stretchy="false" form="prefix">(</mo><mi>N</mi><mo>⋅</mo><mi>d</mi><mo stretchy="false" form="postfix">)</mo><mi>.</mi></mrow><annotation encoding="application/x-tex">
+\mathcal{O}(N \cdot d).
+</annotation></semantics></math></p>
+<p>Ez <code>N = 10^5</code> és <code>d = 768</code> mellett
+lekérdezésenként mintegy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>7</mn><mo>,</mo><mn>7</mn><mo>⋅</mo><msup><mn>10</mn><mn>7</mn></msup></mrow><annotation encoding="application/x-tex">7{,}7\cdot10^7</annotation></semantics></math>
+szorzás-összeadás, ami egy mai CPU-n néhány–tíz milliszekundum (becslés,
+nem mérés): kis korpuszon a pontos keresés is elfogadható.
+<code>N = 10^9</code> mellett viszont produkciós környezetben
+értelmezhetetlenül drága. A memóriaigény a nyers <code>float32</code>
+vektoroknál:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>⋅</mo><mi>d</mi><mo>⋅</mo><mn>4</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> bájt</mtext></mrow><mi>.</mi></mrow><annotation encoding="application/x-tex">
+N \cdot d \cdot 4 \text{ bájt}.
+</annotation></semantics></math></p>
+<p>Például <code>10^6</code> darab 1024 dimenziós vektornál ez
+<code>4,096</code> GB, ami még megoldható, de a pontos keresés CPU-n
+lekérdezésenként már a száz milliszekundumos nagyságrendbe eshet
+(hardver- és SLO-függő), ami szigorú késleltetési célnál nem fér bele. A
+megoldás az <strong>approximate nearest neighbor (ANN)</strong>
+indexelés: gyorsabb keresést, kisebb memóriaigényt, de nem mindig
+tökéletes találatokat ad. A cél explicit módon a recall és a latencia
+közötti szabályozható kompromisszum.</p>
+<p>A fejezetben a pontos etalont és a három legfontosabb ANN-technikát
+mutatjuk be:</p>
+<ul>
+<li><strong>flat index</strong>: pontos, nincs közelítés, etalon és
+tesztelési alap;</li>
+<li><strong>IVF</strong>: klaszteralapú inverz lista;</li>
+<li><strong>HNSW</strong>: gráfalapú navigálható kisvilág-index;</li>
+<li><strong>PQ</strong>: produktkvantálás, azaz veszteséges
+vektortömörítés.</li>
+</ul>
+<p>Ezeket a könyvtárak gyakran kombinálják, például IVF-PQ formában. A
+laborban flat és HNSW indexet mérünk recall@k és latencia
+szempontjából.</p>
+<h3 data-number="15.2.2" id="alapfogalmak-recallk-és-latencia"><span
+class="header-section-number">15.2.2</span> Alapfogalmak: recall@k és
+latencia</h3>
+<p>Az ANN indexek kiértékelésénél a ground truthot a pontos keresés
+adja. Ha <code>G_k(q)</code> a <code>q</code> lekérdezéshez tartozó
+<code>k</code> darab pontos legközelebbi azonosító halmaza,
+<code>R_k(q)</code> pedig az ANN index által visszaadott <code>k</code>
+azonosító halmaza, akkor:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mi>recall@k</mi><mo>&#8289;</mo></mrow><mo>=</mo><mfrac><mn>1</mn><mrow><mo stretchy="false" form="prefix">|</mo><mi>Q</mi><mo stretchy="false" form="prefix">|</mo></mrow></mfrac><munder><mo>∑</mo><mrow><mi>q</mi><mo>∈</mo><mi>Q</mi></mrow></munder><mfrac><mrow><mo stretchy="false" form="prefix">|</mo><msub><mi>R</mi><mi>k</mi></msub><mo stretchy="false" form="prefix">(</mo><mi>q</mi><mo stretchy="false" form="postfix">)</mo><mo>∩</mo><msub><mi>G</mi><mi>k</mi></msub><mo stretchy="false" form="prefix">(</mo><mi>q</mi><mo stretchy="false" form="postfix">)</mo><mo stretchy="false" form="prefix">|</mo></mrow><mi>k</mi></mfrac><mi>.</mi></mrow><annotation encoding="application/x-tex">
+\operatorname{recall@k} =
+\frac{1}{|Q|}
+\sum_{q \in Q}
+\frac{|R_k(q) \cap G_k(q)|}{k}.
+</annotation></semantics></math></p>
+<p>A mutató azt mondja meg, hogy a pontos találati lista mekkora részét
+találja meg az ANN index. A recall@k 0 és 1 közötti érték, magasabb
+érték jobb. A gyakorlatban a <code>recall@10</code>,
+<code>recall@100</code> és <code>recall@1000</code> eltérő célokat
+szolgál:</p>
+<ul>
+<li><code>recall@10</code>: a felhasználó által látott első oldal
+minősége;</li>
+<li><code>recall@100</code>: a reranker vagy a RAG-következő lépés
+bemeneti minősége;</li>
+<li><code>recall@1000</code>: a keresési csatorna szélessége, ha utána
+sok jelöltet újrapontozunk.</li>
+</ul>
+<p>A <strong>latencia</strong> mérésénél soha nem elég az átlagot nézni.
+Produkciós rendszerben a percentilisek fontosabbak:</p>
+<ul>
+<li><code>p50</code> vagy medián: tipikus késleltetés;</li>
+<li><code>p90</code>/<code>p95</code>: a felhasználók egy kisebb, de
+kritikus részének élménye;</li>
+<li><code>p99</code>: a SLO-tervezés szempontjából meghatározó.</li>
+</ul>
+<p>A kötegelt keresés más jellemző, mint az egyedi lekérdezés. A
+<strong>throughput</strong> az másodpercenként feldolgozott lekérdezések
+száma, míg a <strong>latency</strong> egy lekérdezés válaszideje. A
+fejezet laborja egyedi lekérdezéseket mér, mert az p50/p95 szempontból
+informatívabb.</p>
+<h3 data-number="15.2.3" id="flat-index-a-pontos-etalon"><span
+class="header-section-number">15.2.3</span> Flat index: a pontos
+etalon</h3>
+<p>A <code>IndexFlatL2</code> vagy a normalizált vektoroknál
+<code>IndexFlatIP</code> minden vektort a memóriában tart, és minden
+lekérdezésnél az összes tárolt vektorral kiszámítja a távolságot vagy
+belső szorzatot. Nincs tanítás, nincs közelítés, nincs extra becslési
+hiba.</p>
+<p>A flat index szerepe:</p>
+<ul>
+<li>kisméretű korpuszoknál a termelési index is lehet;</li>
+<li>kiértékelésnél a recall ground truthját adja;</li>
+<li>hibakeresésnél megmutatja, hogy az embeddingek, a metrika és az
+azonosítók rendben vannak-e;</li>
+<li>referenciaként szolgál, ha egy ANN index recallja rossz.</li>
+</ul>
+<p>A flat index hátránya a lineáris keresési idő. <code>10^6</code> vagy
+nagyobb méretnél már csak akkor használjuk, ha a hardver, például egy
+több GPU-t használó rendszer, elég nagy párhuzamosságot ad, vagy ha a
+korpusz ritkán változik és a késleltetés nem szigorú.</p>
+<p>A következő kód egy normalizált, belső szorzattal dolgozó flat
+indexet mutat:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> numpy <span class="im">as</span> np</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> faiss</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>rng <span class="op">=</span> np.random.default_rng(<span class="dv">42</span>)</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>d <span class="op">=</span> <span class="dv">128</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>N <span class="op">=</span> <span class="dv">100_000</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>X <span class="op">=</span> rng.standard_normal((N, d)).astype(<span class="st">&quot;float32&quot;</span>)</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>faiss.normalize_L2(X)</span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>flat <span class="op">=</span> faiss.IndexFlatIP(d)</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>flat.add(X)</span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>q <span class="op">=</span> rng.standard_normal((<span class="dv">5</span>, d)).astype(<span class="st">&quot;float32&quot;</span>)</span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>faiss.normalize_L2(q)</span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>D, I <span class="op">=</span> flat.search(q, k<span class="op">=</span><span class="dv">10</span>)</span></code></pre></div>
+<p>A <code>normalize_L2</code> azért fontos, mert a normalizált
+vektoroknál a belső szorzat megegyezik a koszinusz-hasonlósággal:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mi>cos</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><mi>θ</mi><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mfrac><mrow><mi>q</mi><mo>⋅</mo><mi>x</mi></mrow><mrow><mo stretchy="false" form="postfix">∥</mo><mi>q</mi><mo stretchy="false" form="postfix">∥</mo><mspace width="0.167em"></mspace><mo stretchy="false" form="postfix">∥</mo><mi>x</mi><mo stretchy="false" form="postfix">∥</mo></mrow></mfrac><mi>.</mi></mrow><annotation encoding="application/x-tex">
+\cos(\theta)
+=
+\frac{q \cdot x}{\|q\|\,\|x\|}.
+</annotation></semantics></math></p>
+<p>Normalizálás után
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="postfix">∥</mo><mi>q</mi><msub><mo stretchy="false" form="postfix">∥</mo><mn>2</mn></msub><mo>=</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">\|q\|_2=1</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="postfix">∥</mo><mi>x</mi><msub><mo stretchy="false" form="postfix">∥</mo><mn>2</mn></msub><mo>=</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">\|x\|_2=1</annotation></semantics></math>,
+tehát
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>q</mi><mo>⋅</mo><mi>x</mi></mrow><annotation encoding="application/x-tex">q\cdot x</annotation></semantics></math>
+közvetlenül koszinusz-hasonlóság. Ha a modellt koszinusz-hasonlóságra
+optimalizálták, és az index mégsem normalizált vektorokkal dolgozik,
+akkor a flat találat sem lesz azonos azzal, amit a modell hasonlósági
+sorrendnek tekint.</p>
+<h3 data-number="15.2.4" id="ivf-klaszteralapú-inverz-lista"><span
+class="header-section-number">15.2.4</span> IVF: klaszteralapú inverz
+lista</h3>
+<p>Az <strong>Inverted File Index (IVF)</strong> a teljes vektorteret
+<code>nlist</code> klaszterre bontja. A klaszterezés gyakorlatilag
+k-közép, amely a tárolt vektorokat <code>nlist</code> centroid köré
+szervezi. Minden centroid egy posztlista felelőse, amelybe a hozzá
+legközelebb eső vektorok azonosítói kerülnek.</p>
+<p>A lekérdezés során az index először a <code>q</code> lekérdezéshez
+legközelebbi <code>nprobe</code> centroidot választja ki, majd csak az
+ezekbe a klaszterekbe tartozó vektorokat vizsgálja meg. A keresési
+költség:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝒪</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>n</mi><mi>p</mi><mi>r</mi><mi>o</mi><mi>b</mi><mi>e</mi><mo>⋅</mo><mfrac><mi>N</mi><mrow><mi>n</mi><mi>l</mi><mi>i</mi><mi>s</mi><mi>t</mi></mrow></mfrac><mo>⋅</mo><mi>d</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>,</mo></mrow><annotation encoding="application/x-tex">
+\mathcal{O}\left(
+nprobe \cdot \frac{N}{nlist} \cdot d
+\right),
+</annotation></semantics></math></p>
+<p>ha a centroidok közötti keresési költséget elhagyjuk. Ha
+<code>nprobe = 1</code> és <code>nlist = 4096</code>, akkor csak a
+vektorok körülbelül <code>1/4096</code> részét vizsgálja. Ha
+<code>nprobe = nlist</code>, akkor a keresés gyakorlatilag a teljes
+adatbázist átfésüli, vagyis a flat indexhez közelít.</p>
+<p>Az IVF-nek két fontos paramétere van:</p>
+<ul>
+<li><code>nlist</code>: a klaszterek száma. Nagyobb <code>nlist</code>
+kisebb posztlistákat jelent, gyorsabb keresést, de nagyobb annak az
+esélye, hogy a valódi legközelebbi szomszéd egy másik klaszterbe
+kerül.</li>
+<li><code>nprobe</code>: a lekérdezésnél megvizsgált klaszterek száma.
+Nagyobb <code>nprobe</code> növeli a recallt és a latenciát is.</li>
+</ul>
+<p>Az IVF-nél tehát a recall-latency görbét a <code>nprobe</code> mentén
+mozgathatjuk. Az index betanítása k-közép modellt igényel. A
+tanítóhalmaz legyen reprezentatív a termelési vektorokra, de ne
+tartalmazzon kiértékelési lekérdezéseket. A tanítási adatot általában a
+tárolt vektorokból veszik, például véletlen mintavétellel, vagy az
+adathalmaz egy dedikált tanító részéből.</p>
+<p>A klaszteralapú index előnye, hogy jól kombinálható tömörítéssel, és
+nagy korpuszoknál is belátható memóriaigényű lehet. Hátránya, hogy a
+clustering határai hibát okozhatnak: ha egy <code>q</code> lekérdezés
+két klaszter határán van, a valódi szomszédok közül több is kimaradhat,
+ha az <code>nprobe</code> kicsi.</p>
+<h3 data-number="15.2.5"
+id="hnsw-gráfalapú-navigálható-kisvilág-index"><span
+class="header-section-number">15.2.5</span> HNSW: gráfalapú navigálható
+kisvilág-index</h3>
+<p>A <strong>Hierarchical Navigable Small World (HNSW)</strong> gráfot
+épít a vektorokból. A csúcsok maguk a tárolt vektorok, az élek pedig
+közeli vektorokat kötnek össze. A keresés mohó gráfbejárással történik:
+egy belépési pontból indulva a felső rétegekben mindig az aktuális csúcs
+szomszédai közül a lekérdezéshez legközelebbi, még meg nem látogatott
+csúcsra lépünk, amíg van közelebbi szomszéd. A legalsó rétegen egy
+<code>efSearch</code> méretű jelöltlistát tartunk karban
+(nyalábkeresés), és ebből adjuk vissza a <code>k</code> legjobbat. A
+HNSW hierarchiája hosszú távú éleket tartalmaz a felső rétegekben, és
+sűrű, lokális éleket az alsó rétegben. Így a bejárás néhány nagy
+ugrással a célterületre ér, majd lokálisan finomít.</p>
+<p>Az alábbi ábra egy kis 2D játékadaton mutatja a rétegenkénti
+keresést, és összeveti az előző szakasz IVF-indexének
+klaszterhatár-hibájával.</p>
+<figure id="fig-lm054-hnsw-ivf">
+<div class="fig-interactive"><iframe src="figures/html/lm054-hnsw-ivf.html" title="Bal: a keresés a felső rétegek ritka gráfján nagy lépésekkel közelít, az alsó rétegen jelöltlistával finomít. Jobb: nprobe egyenlő 1 mellett a szomszédos cella valódi szomszédja kimarad, nprobe egyenlő 2 mellett megtalálja." loading="lazy" style="width:100%;border:0;height:780px"></iframe><noscript><img src="figures/img/lm054-hnsw-ivf.png" style="width:95.0%"
+alt="Bal: a keresés a felső rétegek ritka gráfján nagy lépésekkel közelít, az alsó rétegen jelöltlistával finomít. Jobb: nprobe egyenlő 1 mellett a szomszédos cella valódi szomszédja kimarad, nprobe egyenlő 2 mellett megtalálja." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/lm054-hnsw-ivf.png" style="width:95.0%"
+alt="Bal: a keresés a felső rétegek ritka gráfján nagy lépésekkel közelít, az alsó rétegen jelöltlistával finomít. Jobb: nprobe egyenlő 1 mellett a szomszédos cella valódi szomszédja kimarad, nprobe egyenlő 2 mellett megtalálja." /></details></div>
+<figcaption>HNSW-keresési út rétegenként és IVF klaszterhatár-hiba
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">nprobe</mtext><mo>=</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">\text{nprobe}=1</annotation></semantics></math>,
+illetve
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>2</mn><annotation encoding="application/x-tex">2</annotation></semantics></math>
+mellett (60 pont, 3 klaszter, a lekérdezés két klaszter határán). (A) A
+belépési pontból a felső rétegek ritka gráfján mohón, a 0. rétegen
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">efSearch</mtext><mo>=</mo><mn>8</mn></mrow><annotation encoding="application/x-tex">\text{efSearch}=8</annotation></semantics></math>
+jelöltlistával keres; a 3 találat megegyezik a pontos top-3-mal, 34
+távolságszámítással. (B)
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">nlist</mtext><mo>=</mo><mn>3</mn></mrow><annotation encoding="application/x-tex">\text{nlist}=3</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">nprobe</mtext><mo>=</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">\text{nprobe}=1</annotation></semantics></math>:
+csak a legközelebbi centroid cellája (20 pont) kerül vizsgálatra, két
+valódi szomszéd kimarad (recall@3 = 1/3). (C)
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">nprobe</mtext><mo>=</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">\text{nprobe}=2</annotation></semantics></math>:
+40 vizsgált pont, recall@3 = 1. Sematikus 2D példa egyszerűsített
+gráfépítéssel, nem mérés.</figcaption>
+</figure>
+<p>A HNSW fő paraméterei:</p>
+<ul>
+<li><code>M</code>: az egy csúcsból kiinduló élek maximális száma. A 0.
+rétegben gyakran <code>2M</code> él lehet. Nagyobb <code>M</code> sűrűbb
+gráfot ad, magasabb recallt, de nagyobb memória- és keresési
+költséget.</li>
+<li><code>efConstruction</code>: az építés során használt dinamikus
+jelöltlista mérete. Nagyobb érték jobb gráfot eredményez, de lassabb az
+indexépítés.</li>
+<li><code>efSearch</code>: a lekérdezés során használt jelöltlista
+mérete. Nagyobb <code>efSearch</code> több csúcsot vizsgál, ezért
+magasabb recallt és nagyobb latenciát ad.</li>
+</ul>
+<p>A HNSW erőssége, hogy magas recall mellett is gyors lehet, és a gráf
+építése nem igényel előzetes klaszterezési tanítást. A vektorokat
+fokozatosan is hozzá lehet adni. A gyengesége a memóriaigény, mert a
+vektorokon kívül a gráf éleit is tárolni kell. A törlés és a módosítás
+könyvtárfüggő: egyes implementációk támogatják, mások csak korlátozottan
+vagy költségesen.</p>
+<p>A HNSW-t gyakran <code>IndexHNSWFlat</code>-ként szokás használni,
+ahol a vektorokat eredeti float formában tárolja. Ilyenkor a memória a
+nyers vektorok és a gráf együttes költsége. A keresés költsége nem
+lineáris a korpuszmérettel, hanem a gráf bejárási hosszától függ; ezt jó
+minőségű gráfnál gyakorlati szempontból logaritmikus nagyságrendűnek
+szokták jellemezni, de az elméleti garancia adateloszlástól és
+implementációtól függ.</p>
+<p>A következő vázlat egy HNSW indexet hoz létre:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a>d <span class="op">=</span> <span class="dv">128</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>M <span class="op">=</span> <span class="dv">32</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>ef_construction <span class="op">=</span> <span class="dv">200</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>ef_search <span class="op">=</span> <span class="dv">64</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>hnsw <span class="op">=</span> faiss.IndexHNSWFlat(d, M)</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>hnsw.hnsw.efConstruction <span class="op">=</span> ef_construction</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>hnsw.add(X)</span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>hnsw.hnsw.efSearch <span class="op">=</span> ef_search</span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>D, I <span class="op">=</span> hnsw.search(q, k<span class="op">=</span><span class="dv">10</span>)</span></code></pre></div>
+<p>A <code>q</code> és <code>X</code> shape-ek egyértelműek:</p>
+<ul>
+<li><code>X</code>: <code>[N, d]</code></li>
+<li><code>q</code>: <code>[n_q, d]</code> (<code>n_q</code> a
+lekérdezések száma, a laborban <code>QUERIES</code>)</li>
+<li><code>D</code>, <code>I</code>: <code>[n_q, k]</code></li>
+</ul>
+<p>A keresés előtt be kell állítani az <code>efSearch</code>-et,
+különben az alapértelmezett érték gyakran alacsony recallt ad.</p>
+<h3 data-number="15.2.6"
+id="pq-produktkvantálás-és-vektortömörítés"><span
+class="header-section-number">15.2.6</span> PQ: produktkvantálás és
+vektortömörítés</h3>
+<p>A <strong>Product Quantization (PQ)</strong> nem önmagában keresési
+stratégia, hanem veszteséges tömörítési módszer, amelyet kereséssel is
+lehet kombinálni. A <code>d</code> dimenziós vektort <code>m</code>
+darab egyenlő méretű alblokkra bontjuk:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mi>d</mi><mo>′</mo></msup><mo>=</mo><mfrac><mi>d</mi><mi>m</mi></mfrac><mi>.</mi></mrow><annotation encoding="application/x-tex">
+d&#39; = \frac{d}{m}.
+</annotation></semantics></math></p>
+<p>Minden alblokkhoz külön k-közép modellt tanítunk, jellemzően
+<code>K = 256</code> centroidtal. Egy alblokk kódja ezután egyetlen
+bájton tárolható:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mrow><mi>log</mi><mo>&#8289;</mo></mrow><mn>2</mn></msub><mn>256</mn><mo>=</mo><mn>8</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> bit</mtext></mrow><mi>.</mi></mrow><annotation encoding="application/x-tex">
+\log_2 256 = 8 \text{ bit}.
+</annotation></semantics></math></p>
+<p>A teljes vektor tárolása <code>m</code> bájt, szemben a nyers
+<code>float32</code> vektor <code>4d</code> bájtjával. Például
+<code>d = 768</code> és <code>m = 48</code> esetén:</p>
+<pre class="text"><code>raw float32 : 768 * 4 = 3072 bájt
+PQ 8 bit    : 48 bájt</code></pre>
+<p>Ez körülbelül 64-szeres tömörítés. A <code>q</code> lekérdezés és egy
+kódolt <code>x</code> vektor közötti távolságot a PQ úgy közelíti, hogy
+a lekérdezés minden alblokkjára kiszámítja a távolságot az adott alblokk
+centroidjaitól, majd ezeket az alblokktávolságokat összegzi. L2
+esetén:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mover><mi>d</mi><mo accent="true">̂</mo></mover><mo stretchy="false" form="prefix">(</mo><mi>q</mi><mo>,</mo><mi>x</mi><msup><mo stretchy="false" form="postfix">)</mo><mn>2</mn></msup><mo>=</mo><munderover><mo>∑</mo><mrow><mi>j</mi><mo>=</mo><mn>1</mn></mrow><mi>m</mi></munderover><mo stretchy="false" form="postfix">∥</mo><msup><mi>q</mi><mrow><mo stretchy="false" form="prefix">(</mo><mi>j</mi><mo stretchy="false" form="postfix">)</mo></mrow></msup><mo>−</mo><msubsup><mi>c</mi><msub><mi>i</mi><mi>j</mi></msub><mrow><mo stretchy="false" form="prefix">(</mo><mi>j</mi><mo stretchy="false" form="postfix">)</mo></mrow></msubsup><msubsup><mo stretchy="false" form="postfix">∥</mo><mn>2</mn><mn>2</mn></msubsup><mo>,</mo></mrow><annotation encoding="application/x-tex">
+\hat{d}(q, x)^2
+=
+\sum_{j=1}^{m}
+\| q^{(j)} - c_{i_j}^{(j)} \|_2^2,
+</annotation></semantics></math></p>
+<p>ahol <code>q^{(j)}</code> a <code>q</code> vektor <code>j</code>-edik
+alblokkja, <code>c_{i_j}^{(j)}</code> pedig az <code>x</code> vektor
+<code>j</code>-edik alblokkjának legközelebbi centroidja. A keresés így
+a teljes <code>d</code> dimenziós távolság helyett <code>m</code> darab
+kisebb dimenziós távolságot használ, ráadásul a centroidtávolságokat
+lekérdezésenként egyszer, táblázatban lehet előre kiszámolni.</p>
+<p>A PQ-t ritkán használják önállóan. Jellegzetes kombinációja az
+<strong>IVF-PQ</strong>, ahol:</p>
+<ul>
+<li>az IVF <code>nlist</code> klasztere durván leszűkíti a
+jelölteket;</li>
+<li>a PQ a maradék vektorokat kódolja;</li>
+<li>a keresés <code>nprobe</code> klaszterben, a PQ kódok felett gyors
+távolságbecsléssel fut.</li>
+</ul>
+<p>A maradékvektoros változatban a klasztercentroidot kivonják a
+vektorból, és a PQ a maradékot kódolja:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>r</mi><mo>=</mo><mi>x</mi><mo>−</mo><msub><mi>c</mi><mtext mathvariant="normal">coarse</mtext></msub><mi>.</mi></mrow><annotation encoding="application/x-tex">
+r = x - c_{\text{coarse}}.
+</annotation></semantics></math></p>
+<p>Ez azért jobb, mert a maradékok eloszlása gyakran szűkebb, mint az
+eredeti vektoroké, így a kvantálási hiba kisebb. Az IVF-PQ nagy
+korpuszoknál drámaian csökkenti a memóriaigényt és a keresési költséget,
+de a recallért cserébe. A kódoló és a durva kvantáló betanítása külön
+történik, és mindkettőt rögzíteni kell az index mentésekor.</p>
+<h3 data-number="15.2.7"
+id="indexválasztás-és-produkciós-kompromisszumok"><span
+class="header-section-number">15.2.7</span> Indexválasztás és produkciós
+kompromisszumok</h3>
+<p>A megfelelő index kiválasztása nem elméleti kérdés, hanem mérési
+kérdés. A négy leggyakoribb döntési szempont:</p>
+<ul>
+<li><strong>recall</strong>: milyen közel kell lenni a pontos
+kereséshez;</li>
+<li><strong>latency</strong>: milyen p50/p95/p99 késleltetés fér
+bele;</li>
+<li><strong>memória</strong>: mennyi RAM vagy GPU-memória áll
+rendelkezésre;</li>
+<li><strong>karbantartás</strong>: milyen gyakran változik a
+korpusz.</li>
+</ul>
+<p>A <code>flat</code> index a recall és az egyszerűség szempontjából
+legjobb, de nagy korpuszra nem méretezhető. A <code>HNSW</code> magas
+recall mellett is jó keresési sebességet adhat, de memóriaigénye nagy.
+Az <code>IVF</code> kisebb memóriaigényű lehet, de klaszterhatár-hibát
+okoz. Az <code>IVF-PQ</code> memória- és keresésköltsége a legkisebb, de
+a recallja a tömörítés miatt alacsonyabb, és a kódolási hiba soha nem
+tűnik el.</p>
+<p>A paraméterhatások iránya jól összefoglalható:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>paraméter</th>
+<th>ha növeled, mi nő?</th>
+<th>mi csökken?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>M</code> (HNSW)</td>
+<td>memória, build idő, recall</td>
+<td>lokális keresési hiba</td>
+</tr>
+<tr>
+<td><code>efConstruction</code></td>
+<td>build idő, gráfminőség</td>
+<td>hibás élek esélye</td>
+</tr>
+<tr>
+<td><code>efSearch</code></td>
+<td>recall, latency</td>
+<td>téves leállás esélye</td>
+</tr>
+<tr>
+<td><code>nlist</code></td>
+<td>tanítási idő, centroidkeresés költsége</td>
+<td>posztlisták mérete, latencia és recall rögzített <code>nprobe</code>
+mellett</td>
+</tr>
+<tr>
+<td><code>nprobe</code></td>
+<td>recall, latency</td>
+<td>kihagyott szomszédok esélye</td>
+</tr>
+<tr>
+<td><code>m</code> (PQ)</td>
+<td>memória, kódolási pontosság</td>
+<td>tömörítés mértéke</td>
+</tr>
+</tbody>
+</table>
+<p>Ezek irányok, nem pontos számok. A pontos értéket mindig a saját
+adathalmazon, saját hardveren kell mérni.</p>
+<p>Fontos produkciós szempont, hogy az index nemcsak matematikai
+objektum, hanem verziózott rendszerkomponens. Az indexhez rögzíteni
+kell:</p>
+<ul>
+<li>az embeddingmodell pontos verzióját;</li>
+<li>a <code>d</code> dimenziót;</li>
+<li>az index típusát és paramétereit;</li>
+<li>a tanító- és kódoló adat verzióját;</li>
+<li>a metrikát (koszinusz, L2 vagy belső szorzat), és hogy a vektorok
+normalizáltak-e.</li>
+</ul>
+<p>Az indexek nem hordozhatnak kétértelmű metrikát. Ha a
+szövegembedding-modell koszinusz-hasonlóságra tanult, akkor a vektorokat
+L2-normalizáljuk, és ezután belső szorzatot vagy L2-távolságot
+használunk (normalizált vektorokon a kettő ugyanazt a rangsort adja); a
+normalizálást minden komponensben, indexelésnél és lekérdezésnél is el
+kell végezni, a metrikákat pedig nem szabad keverni.</p>
+<h3 data-number="15.2.8" id="gyakori-hibák"><span
+class="header-section-number">15.2.8</span> Gyakori hibák</h3>
+<p><strong>1. Nem normalizált vektorok belső szorzatos
+indexben.</strong><br />
+Ha az embeddingszerződés koszinusz-hasonlóságot ír elő, a
+<code>IndexFlatIP</code> önmagában nem koszinusz, hanem belső szorzat.
+Rövid és hosszú szövegek vektorai nagyon eltérő normájúak lehetnek, így
+a hosszú dokumentumok mesterségesen felülteljesíthetnek. A megoldás:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>faiss.normalize_L2(X)</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>faiss.normalize_L2(q)</span></code></pre></div>
+<p><strong>2. IVF/PQ tanítása a kiértékelési
+lekérdezéseken.</strong><br />
+Ha a klaszterezőt a tesztlekérdezéseken tanítjuk, a recall mesterségesen
+magas lesz. A tanítóhalmaz legyen a tárolt vektorokból vagy azokból vett
+reprezentatív, diszjunkt minta.</p>
+<p><strong>3. Túl kicsi <code>k</code> egy nagyobb downstream
+csővezetékhez.</strong><br />
+Ha a RAG 20 chunkot akar rerankelni, de az ANN indexből csak 10-et
+kérünk le, akkor a fine reranker nem látja a releváns dokumentumot.
+Ilyenkor <code>k</code>-t nagyobbra kell választani, vagy a recall@10
+mellett recall@100-at is mérni kell.</p>
+<p><strong>4. Csak átlagos latencia mérése.</strong><br />
+Az átlag elrejti a faroklatencia kiugrásait. A laborban p50/p95/p99
+értékeket kell rögzíteni.</p>
+<p><strong>5. Az <code>efSearch</code> vagy <code>nprobe</code>
+alapértelmezett értékén hagyás.</strong><br />
+A könyvtárak alapértelmezései gyakran gyors, de alacsony recallú
+konfigurációt adnak. A termelési rendszerben ezeket tudatosan kell
+beállítani.</p>
+<p><strong>6. A HNSW memóriaigényének alábecslése.</strong><br />
+A nyers vektorok mellett a gráf élei is memóriát foglalnak. A szükséges
+RAM becslésekor ezeket legalább nagyságrendileg bele kell számolni.</p>
+<p><strong>7. Lemaradt identitás- vagy
+metrikamegfeleltetés.</strong><br />
+Az indexből visszakapott <code>I</code> azonosítóknak egyértelműen
+vissza kell mutatniuk a forrás chunkra, dokumentumverzióra és
+embeddingrevízióra. Ha nem tároljuk az azonosítókat az index mellett, a
+keresési találat nem értelmezhető.</p>
+<h3 data-number="15.2.9"
+id="labor-flat-és-hnsw-recalllatency-mérése"><span
+class="header-section-number">15.2.9</span> Labor: flat és HNSW
+recall/latency mérése</h3>
+<p>A labor célja, hogy egyetlen notebookban reprodukálhatóan
+megmérje:</p>
+<ul>
+<li>a flat index recall@10-ét és latenciáját;</li>
+<li>egy HNSW index recall@10-ét és latenciáját;</li>
+<li>a kettő emlékezetes különbségét.</li>
+</ul>
+<p>A labor szintetikus adatot használ, mert a cél az indexek
+viselkedésének ellenőrzése, nem egy konkrét domainmodell teljesítménye.
+A szintetikus jelleget jelölni kell.</p>
+<h3 data-number="15.2.10" id="adatgenerálás"><span
+class="header-section-number">15.2.10</span> Adatgenerálás</h3>
+<p>Az adat legyen klaszteralapú, hogy a közelségi relációk ne legyenek
+teljesen véletlenszerűek. <code>N = 100_000</code>,
+<code>d = 128</code>, <code>c = 200</code> klaszter. A vektorokat a
+középpontok körül
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>σ</mi><mo>=</mo><mn>0</mn><mo>,</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">\sigma=0{,}1</annotation></semantics></math>
+komponensenkénti Gauss-zajjal generáljuk (128 dimenzióban a zaj normája
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>≈</mo><mn>0</mn><mo>,</mo><mn>1</mn><msqrt><mn>128</mn></msqrt><mo>≈</mo><mn>1</mn><mo>,</mo><mn>13</mn></mrow><annotation encoding="application/x-tex">\approx0{,}1\sqrt{128}\approx1{,}13</annotation></semantics></math>,
+vagyis a klaszterek erősen átfednek, és egy klaszteren belül a
+szomszédság közel véletlen; ez az ANN nehéz esete), majd normalizáljuk.
+A lekérdezéseket ugyanabból az eloszlásból vesszük, de külön
+seeddel.</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> numpy <span class="im">as</span> np</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> faiss</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> platform</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pickle</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="co"># A latenciát egy szálon mérjük (egyedi lekérdezés, SLO-szempont)</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>N_THREADS <span class="op">=</span> <span class="dv">1</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>faiss.omp_set_num_threads(N_THREADS)</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;omp_threads:&quot;</span>, faiss.omp_get_max_threads())</span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>SEED <span class="op">=</span> <span class="dv">42</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>DATASET_VERSION <span class="op">=</span> <span class="st">&quot;synth-clusters-v1&quot;</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>N <span class="op">=</span> <span class="dv">100_000</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>DIM <span class="op">=</span> <span class="dv">128</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>QUERIES <span class="op">=</span> <span class="dv">200</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>K <span class="op">=</span> <span class="dv">10</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>M_HNSW <span class="op">=</span> <span class="dv">32</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>EF_CONSTRUCTION <span class="op">=</span> <span class="dv">200</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>EF_SEARCH <span class="op">=</span> <span class="dv">64</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a>rng <span class="op">=</span> np.random.default_rng(SEED)</span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>centers <span class="op">=</span> rng.standard_normal((<span class="dv">200</span>, DIM)).astype(<span class="st">&quot;float32&quot;</span>)</span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a>faiss.normalize_L2(centers)</span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a><span class="co"># tárolt vektorok: [N, DIM]</span></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a>w <span class="op">=</span> rng.integers(<span class="dv">0</span>, centers.shape[<span class="dv">0</span>], size<span class="op">=</span>N)</span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a>X <span class="op">=</span> centers[w] <span class="op">+</span> rng.normal(<span class="dv">0</span>, <span class="fl">0.1</span>, size<span class="op">=</span>(N, DIM)).astype(<span class="st">&quot;float32&quot;</span>)</span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a>faiss.normalize_L2(X)</span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a><span class="co"># lekérdezések: [QUERIES, DIM]</span></span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true" tabindex="-1"></a>qrng <span class="op">=</span> np.random.default_rng(SEED <span class="op">+</span> <span class="dv">1</span>)</span>
+<span id="cb5-33"><a href="#cb5-33" aria-hidden="true" tabindex="-1"></a>wq <span class="op">=</span> qrng.integers(<span class="dv">0</span>, centers.shape[<span class="dv">0</span>], size<span class="op">=</span>QUERIES)</span>
+<span id="cb5-34"><a href="#cb5-34" aria-hidden="true" tabindex="-1"></a>Q <span class="op">=</span> centers[wq] <span class="op">+</span> qrng.normal(<span class="dv">0</span>, <span class="fl">0.1</span>, size<span class="op">=</span>(QUERIES, DIM)).astype(<span class="st">&quot;float32&quot;</span>)</span>
+<span id="cb5-35"><a href="#cb5-35" aria-hidden="true" tabindex="-1"></a>faiss.normalize_L2(Q)</span></code></pre></div>
+<h3 data-number="15.2.11" id="ground-truth-pontos-kereséssel"><span
+class="header-section-number">15.2.11</span> Ground truth pontos
+kereséssel</h3>
+<p>A flat index a ground truth és az egyik mért rendszer is egyben:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a>flat <span class="op">=</span> faiss.IndexFlatIP(DIM)</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>flat.add(X)</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>D_flat, I_flat <span class="op">=</span> flat.search(Q, K)</span></code></pre></div>
+<p>A flat recall@10 definíció szerint 1, mert a ground truthot ugyanaz
+az index adja. Ennek ellenére érdemes kiszámolni, mert ez ellenőrzi a
+<code>k</code> értéket, a query shape-et és a determinisztikus
+viselkedést.</p>
+<h3 data-number="15.2.12" id="hnsw-építése-és-keresése"><span
+class="header-section-number">15.2.12</span> HNSW építése és
+keresése</h3>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a>hnsw <span class="op">=</span> faiss.IndexHNSWFlat(DIM, M_HNSW)</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>hnsw.hnsw.efConstruction <span class="op">=</span> EF_CONSTRUCTION</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>hnsw.add(X)</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>hnsw.hnsw.efSearch <span class="op">=</span> EF_SEARCH</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>D_hnsw, I_hnsw <span class="op">=</span> hnsw.search(Q, K)</span></code></pre></div>
+<h3 data-number="15.2.13" id="recall-kiszámítása"><span
+class="header-section-number">15.2.13</span> Recall kiszámítása</h3>
+<p>A recallt az azonosítók halmazelméleti metszeteként számoljuk:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> recall_at_k(gt, ann, k):</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    gt <span class="op">=</span> np.asarray(gt)</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    ann <span class="op">=</span> np.asarray(ann)</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    hits <span class="op">=</span> <span class="dv">0</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> row_gt, row_ann <span class="kw">in</span> <span class="bu">zip</span>(gt, ann):</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>        hits <span class="op">+=</span> <span class="bu">len</span>(<span class="bu">set</span>(row_ann[:k].tolist())</span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>                     <span class="op">&amp;</span> <span class="bu">set</span>(row_gt[:k].tolist()))</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> hits <span class="op">/</span> (gt.shape[<span class="dv">0</span>] <span class="op">*</span> k)</span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>recall_flat <span class="op">=</span> recall_at_k(I_flat, I_flat, K)</span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>recall_hnsw <span class="op">=</span> recall_at_k(I_flat, I_hnsw, K)</span></code></pre></div>
+<h3 data-number="15.2.14" id="latencia-mérése"><span
+class="header-section-number">15.2.14</span> Latencia mérése</h3>
+<p>A latencia mérése egyetlen lekérdezéssel, egy szálon történik (a
+faiss alapértelmezésben az összes OpenMP-szálat használja, ami a p99-et
+géptől függően torzítja; a szálszámot a jegyzőkönyv rögzíti), hogy a
+p50/p95/p99 felhasználói szempontból értelmezhető legyen; a többszálú
+áteresztőképességet külön, kötegelt kereséssel mérjük:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> measure_latency_ms(index, Q, k, warmup<span class="op">=</span><span class="dv">50</span>, repeat<span class="op">=</span><span class="dv">200</span>):</span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(warmup):</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>        index.search(Q[:<span class="dv">1</span>], k)</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    latencies <span class="op">=</span> []</span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(repeat):</span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>        q <span class="op">=</span> Q[i <span class="op">%</span> <span class="bu">len</span>(Q):i <span class="op">%</span> <span class="bu">len</span>(Q) <span class="op">+</span> <span class="dv">1</span>]</span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>        start <span class="op">=</span> time.perf_counter()</span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>        index.search(q, k)</span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>        end <span class="op">=</span> time.perf_counter()</span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>        latencies.append(<span class="dv">1000</span> <span class="op">*</span> (end <span class="op">-</span> start))</span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>    arr <span class="op">=</span> np.array(latencies)</span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> {</span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;p50_ms&quot;</span>: <span class="bu">float</span>(np.percentile(arr, <span class="dv">50</span>)),</span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;p95_ms&quot;</span>: <span class="bu">float</span>(np.percentile(arr, <span class="dv">95</span>)),</span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;p99_ms&quot;</span>: <span class="bu">float</span>(np.percentile(arr, <span class="dv">99</span>)),</span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>    }</span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a>lat_flat <span class="op">=</span> measure_latency_ms(flat, Q, K)</span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a>lat_hnsw <span class="op">=</span> measure_latency_ms(hnsw, Q, K)</span></code></pre></div>
+<h3 data-number="15.2.15" id="rögzített-környezet-és-változók"><span
+class="header-section-number">15.2.15</span> Rögzített környezet és
+változók</h3>
+<p>A labor elején rögzíteni kell a környezetet:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;python:&quot;</span>, platform.python_version())</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;numpy:&quot;</span>, np.__version__)</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;faiss:&quot;</span>, faiss.__version__)</span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;cpu:&quot;</span>, platform.processor() <span class="kw">or</span> platform.machine())</span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;dataset:&quot;</span>, DATASET_VERSION)</span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;seed:&quot;</span>, SEED)</span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;dim:&quot;</span>, DIM)</span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;N:&quot;</span>, N)</span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;queries:&quot;</span>, QUERIES)</span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;k:&quot;</span>, K)</span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;M:&quot;</span>, M_HNSW)</span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;ef_construction:&quot;</span>, EF_CONSTRUCTION)</span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;ef_search:&quot;</span>, EF_SEARCH)</span></code></pre></div>
+<p>A pontos csomagverziókat a projekt lockfile rögzíti. Az itt
+bemutatott <code>faiss-cpu</code> API a gyakran használt 1.7.x
+viselkedést tükrözi; a labor futtatása előtt ellenőrizni kell a
+telepített verziót, mert a kisebb API-változások könyvtárverziók között
+előfordulhatnak.</p>
+<h3 data-number="15.2.16" id="várt-és-mért-eredmények"><span
+class="header-section-number">15.2.16</span> Várt és mért
+eredmények</h3>
+<p>A várt irányok, nem pontos számok:</p>
+<ul>
+<li><code>recall_flat</code> = <code>1.00</code>, definíció
+szerint.</li>
+<li><code>recall_hnsw</code> magas, de legfeljebb <code>1.00</code>; a
+recall adatfüggő; ezen a magas belső dimenziójú adaton érdemes
+<code>efSearch</code> ∈ {16, 32, 64, 128, 256} mellett görbét
+mérni.</li>
+<li>A HNSW medián latenciája nagyobb korpuszon jellemzően alacsonyabb,
+mint a flat indexé; a különbség iránya a labor gépen mérhető.</li>
+<li>A HNSW p95/p99 értéke fontosabb, mint a p50, mert a gráfbejárás
+faroklatencia-ingadozást mutathat.</li>
+</ul>
+<p>A labor jegyzőkönyvében a mért értékeket külön táblában kell
+megadni:</p>
+<pre class="text"><code>| metrika        | flat       | HNSW       | megjegyzés |
+|----------------|------------|------------|------------|
+| recall@10      | 1.00       | &lt;mért&gt;     | flat = ground truth |
+| p50_ms         | &lt;mért&gt;     | &lt;mért&gt;     | 200 egyedi query |
+| p95_ms         | &lt;mért&gt;     | &lt;mért&gt;     | 200 egyedi query |
+| p99_ms         | &lt;mért&gt;     | &lt;mért&gt;     | 200 egyedi query |</code></pre>
+<p>A <code>&lt;mért&gt;</code> mezőket csak a tényleges futtatás után
+szabad kitölteni. A nem futtatott mérést nem szabad ellenőrzött
+eredményként feltüntetni.</p>
+<h3 data-number="15.2.17" id="önellenőrző-kérdések"><span
+class="header-section-number">15.2.17</span> Önellenőrző kérdések</h3>
+<ol type="1">
+<li><p>Miért növeli az <code>nprobe</code> és az <code>efSearch</code>
+egyszerre a recallt és a latenciát?<br />
+Mindkettő több jelölt megvizsgálását engedi. Az IVF-nél több klasztert,
+a HNSW-nál szélesebb gráfbejárást vizsgálunk. A pontos találat
+megtalálásának esélye nő, de a feldolgozási költség is
+emelkedik.</p></li>
+<li><p>Ha <code>d = 768</code> és a PQ <code>m = 48</code> alblokkra
+bont, mekkora a tömörített vektor mérete 8 bites kódokkal?<br />
+<code>48</code> bájt, szemben a nyers <code>float32</code> forma
+<code>768 · 4 = 3072</code> bájtjával.</p></li>
+<li><p>Miért hibás IP-t használni egy koszinuszra tanult embeddingmodell
+normalizálás nélkül?<br />
+Mert az IP a vektornormákat is figyelembe veszi, ezért a hosszabb
+vektorok hasonlóbbnak tűnhetnek, még akkor is, ha a szögük nem kicsi. A
+normalizálás után az IP koszinusz-hasonlósággá válik.</p></li>
+<li><p>Mi a veszélye annak, ha az IVF/PQ tanításához a
+tesztlekérdezéseket is felhasználjuk?<br />
+A k-közép klaszterek és a PQ centroidok olyanok lesznek, mintha a teszt
+eloszlását ismernék. A mért recall mesterségesen javul, és nem jósolja
+meg a termelési teljesítményt.</p></li>
+<li><p>Miért fontos a faroklatencia mérése ANN indexeknél?<br />
+A gráfbejárás és az IVF <code>nprobe</code> útvonalainak hossza
+lekérdezésenként változhat. Az átlagos latencia elrejtheti a ritka, de
+SLO-t sértő kiugrásokat, amelyeket a p95/p99 mutat meg.</p></li>
+</ol>
+<h3 data-number="15.2.18" id="továbbvezetés"><span
+class="header-section-number">15.2.18</span> Továbbvezetés</h3>
+<p>A következő egység erre az alapra épít: a chunkolás, a metadata és a
+hibrid keresés megtervezése során pontosan tudni fogjuk, hogy a
+vektorindex mit tud szolgáltatni, milyen recall árán, és mit kell a
+rerankernek vagy a szöveges szűrésnek javítania. Az itt bemutatott
+recall@k és percentilisalapú mérés pedig a RAG kiértékelésének egyik
+építőköve lesz.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="lm053.html">← 15.1 Embedding modellek és hasonlóság</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="lm055.html">15.3 Chunking, metadata és hibrid keresés →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

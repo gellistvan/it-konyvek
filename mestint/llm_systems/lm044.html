@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>12.4 Latency, throughput, költség és SLA tervezés – LLM-ek és
+domain-specifikus kis modellek programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz3">III. RÉSZ – Hatékonyság és testreszabás</a> › <a href="index.html#lmch11">12 Inferencia és kiszolgálás</a></p>
+<div class="links"><a class="prev" rel="prev" href="lm043.html">← 12.3 Speculative decoding és draft modellek</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="lm045.html">13.1 CPU, GPU, NPU és memória-korlátok →</a></div>
+</nav>
+<h2 data-number="12.4" id="lm044"><span
+class="header-section-number">12.4</span> Latency, throughput, költség
+és SLA tervezés</h2>
+<p>Az inferencia üzemeltetésében a modell pontossága és a generálási
+minősége csak a történet egyik fele. A produkciós rendszer akkor lesz
+fenntartható, ha a válaszidő, az áteresztőképesség és a költség is előre
+tervezhető, mérhető és szabályozható. Az l043-ban megismert speculative
+decoding elsősorban a decode fázis lépésszámát csökkenti, így egyetlen
+kérés késleltetését javíthatja; ez az egység azt vizsgálja, hogyan
+építsünk ezekre a mechanizmusokra olyan üzemeltetési döntéseket, amelyek
+több GPU-ra, több száz kérésre és több hónapos költségvetésre is
+érvényesek.</p>
+<p>A fejezetben először definiáljuk a legfontosabb inferencia-mutatókat:
+a latencia percentiliseit, a throughputot, a token/GPU-másodperc
+egységet és az ezekből levezethető költségmodellt. Ezután bemutatjuk,
+hogyan mérjük ezeket a mutatókat reprodukálható módon, majd a mérési
+eredményeket SLA- és kapacitástervezési döntéssé fordítjuk. A labor egy
+kis, ellenőrizhető notebookon keresztül vezeti végig a számítást:
+rögzített környezetben generálunk szintetikus terhelést, mérjük a
+farok-latenciát, és kiszámítjuk a cél SLO eléréséhez szükséges GPU-k
+számát, valamint a tokenre vetített költséget.</p>
+<p>A tárgyalás során különbséget teszünk mért és várt vagy levezetett
+érték között. A mért adat egy adott futtatásból származik, a várt adatot
+a modell és a futtatókörnyezet ismert paramétereiből becsüljük. A kettő
+eltérése éppúgy tanulságos, mint az egyezésük.</p>
+<h3 data-number="12.4.1" id="latencia-nem-egy-szám-hanem-eloszlás"><span
+class="header-section-number">12.4.1</span> Latencia: nem egy szám,
+hanem eloszlás</h3>
+<p>Az inferencia-latencia az az időtartam, amely egy kérés elküldésétől
+a teljes válasz utolsó tokenjének megérkezéséig eltelik. A latencia
+magában foglalja:</p>
+<ul>
+<li>a hálózati átvitelt a kliens és a kiszolgáló között;</li>
+<li>a kiszolgáló oldalán a várakozási időt a sorban;</li>
+<li>a prefill fázist, amely a bemeneti tokeneket párhuzamosan dolgozza
+fel;</li>
+<li>a decode fázist, amely a kimeneti tokeneket szekvenciálisan, minden
+lépésben egy tokent generál;</li>
+<li>az esetleges utófeldolgozást, például a kimeneti szűrést vagy a
+strukturált kimenet validálását.</li>
+</ul>
+<p>A prefill időtartama a bemeneti hosszal közelítőleg arányosan nő (a
+lineáris rétegek tokenenként
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>≈</mo><mn>2</mn><mi>N</mi></mrow><annotation encoding="application/x-tex">\approx 2N</annotation></semantics></math>
+FLOP-ot igényelnek,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>
+a paraméterszám); a figyelmi mátrix négyzetes tagja csak nagyon hosszú,
+több tízezer tokenes kontextusnál válik meghatározóvá. Emellett a batch
+mérettől is függ. A decode időtartama a kimeneti tokenek számával
+arányos, mert minden tokenhez egy-egy modell-forward futás tartozik.
+Emiatt két további mutató is hasznos:</p>
+<ul>
+<li><strong>TTFT</strong> (time to first token): az első kimeneti token
+megjelenéséig eltelt idő. Ez döntő a felhasználói élményben, mert a
+felhasználó ezt érzékeli „a modell elkezdett válaszolni”-ként.</li>
+<li><strong>TPOT</strong> (time per output token): a további tokenek
+átlagos generálási ideje. Ez a decode fázis sebességét jellemzi, és
+közvetlenül befolyásolja a teljes válasz idejét.</li>
+</ul>
+<p>Ha a decode fázis lépésideje állandó, a teljes latencia
+közelítőleg:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>t</mi><mtext mathvariant="normal">lat</mtext></msub><mo>≈</mo><msub><mi>t</mi><mtext mathvariant="normal">TTFT</mtext></msub><mo>+</mo><mo stretchy="false" form="prefix">(</mo><msub><mi>L</mi><mtext mathvariant="normal">out</mtext></msub><mo>−</mo><mn>1</mn><mo stretchy="false" form="postfix">)</mo><mo>⋅</mo><msub><mi>t</mi><mtext mathvariant="normal">TPOT</mtext></msub></mrow><annotation encoding="application/x-tex">
+t_{\text{lat}} \approx t_{\text{TTFT}} + (L_{\text{out}} - 1) \cdot t_{\text{TPOT}}
+</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>L</mi><mtext mathvariant="normal">out</mtext></msub><annotation encoding="application/x-tex">L_{\text{out}}</annotation></semantics></math>
+a generált kimeneti tokenek száma. Ez a képlet azonban idealizál; valódi
+rendszerben a batch mérete, a GPU terhelése és a sorban állás miatt a
+TPOT és a TTFT is változik.</p>
+<figure id="fig-lm044-latencia-eloszlas">
+<div class="fig-interactive"><iframe src="figures/html/lm044-latencia-eloszlas.html" title="Bal: hisztogram függőleges vonalakkal az átlagnál, a p50-nél, a p95-nél és a p99-nél; a p95 és a p99 messze az átlag és a medián fölött van. Jobb: egy kérés idővonala hálózat, sorban állás és prefill szakasszal, amelyek együtt a TTFT-t adják, majd 84 decode-szegmenssel." loading="lazy" style="width:100%;border:0;height:540px"></iframe><noscript><img src="figures/img/lm044-latencia-eloszlas.png" style="width:100.0%"
+alt="Bal: hisztogram függőleges vonalakkal az átlagnál, a p50-nél, a p95-nél és a p99-nél; a p95 és a p99 messze az átlag és a medián fölött van. Jobb: egy kérés idővonala hálózat, sorban állás és prefill szakasszal, amelyek együtt a TTFT-t adják, majd 84 decode-szegmenssel." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/lm044-latencia-eloszlas.png" style="width:100.0%"
+alt="Bal: hisztogram függőleges vonalakkal az átlagnál, a p50-nél, a p95-nél és a p99-nél; a p95 és a p99 messze az átlag és a medián fölött van. Jobb: egy kérés idővonala hálózat, sorban állás és prefill szakasszal, amelyek együtt a TTFT-t adják, majd 84 decode-szegmenssel." /></details></div>
+<figcaption>Szintetikus latenciaeloszlás és egy kérés időfelbontása
+(szintetikus, nem mérés: 10 000 kérés, TTFT lognormális 120 ms mediánnal
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>σ</mi><mo>=</mo><mn>0</mn><mo>,</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">\sigma=0{,}5</annotation></semantics></math>,
+TPOT lognormális 14 ms mediánnal és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>σ</mi><mo>=</mo><mn>0</mn><mo>,</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">\sigma=0{,}2</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>L</mi><mrow><mi>o</mi><mi>u</mi><mi>t</mi></mrow></msub><annotation encoding="application/x-tex">L_{out}</annotation></semantics></math>
+egyenletes 20 és 150 között, seed 42). A p95 és a p99 messze az átlag és
+a medián fölött van; egy kérés ideje a TTFT és az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><msub><mi>L</mi><mrow><mi>o</mi><mi>u</mi><mi>t</mi></mrow></msub><mo>−</mo><mn>1</mn><mo stretchy="false" form="postfix">)</mo><mo>⋅</mo><mrow><mi mathvariant="normal">T</mi><mi mathvariant="normal">P</mi><mi mathvariant="normal">O</mi><mi mathvariant="normal">T</mi></mrow></mrow><annotation encoding="application/x-tex">(L_{out}-1)\cdot\mathrm{TPOT}</annotation></semantics></math>
+decode-idő összege.</figcaption>
+</figure>
+<p>A gyakorlatban a latencia eloszlásként viselkedik, nem egyetlen
+értékként. A kérések bemeneti hossza, a kimeneti hossz, a batch
+összetétele és a hardver zaja mind szóródást okoz. Ezért az átlagos
+latency önmagában félrevezető: a szélsőségesen lassú kérések elvesznek
+az átlagban, de a felhasználó számára ezek a leginkább feltűnőek. A
+farok-latencia jellemzésére percentiliseket használunk:</p>
+<ul>
+<li><strong>p50 (medián)</strong> – a kérések fele ennél gyorsabb, fele
+lassabb. Jó általános középérték, de nem mutatja a kiugró eseteket.</li>
+<li><strong>p95</strong> – a kérések 95%-a ennél gyorsabb vagy éppen
+ennyi. Az 5% lassabb. A p95 már érzékelhető a nagy forgalmú fogyasztói
+felületeken.</li>
+<li><strong>p99</strong> – a kérések 99%-a ennél gyorsabb. Ez a mutató a
+leglassabb 1%-ot ragadja meg; gyakran ez a kritikus üzleti mutató, mert
+a leglassabb kérések generálják a legtöbb panaszt és az
+időtúllépést.</li>
+</ul>
+<p>A p99 és p95 közötti különbség is informatív: ha a p95 400 ms, de a
+p99 2500 ms, akkor a rendszerben időnként valamilyen
+erőforrás-kontenció, GC-szünet, hálózati újrapróbálkozás vagy egy nagy
+batch miatti várakozás lép fel. Az ilyen farok hatások a sorban állási
+elméletből is ismertek: a kihasználtság közelítése a 100%-hoz drámaian
+megnöveli a várakozási időt, ezért a farok percentilisek érzékenyen
+reagálnak a terhelésre.</p>
+<p>Egy tipikus hibás következtetés az, amikor valaki csak p50-et mér, és
+p99-et nem, majd a rendszerét „gyorsnak” minősíti, miközben a
+felhasználók 1%-a több másodpercet vár. A helyes gyakorlat: minden
+mérésnél rögzítsük legalább p50, p95 és p99 értékeket, és a
+szolgáltatási célt is percentilissel definiáljuk.</p>
+<h3 data-number="12.4.2"
+id="throughput-a-párhuzamos-feldolgozás-áteresztőképessége"><span
+class="header-section-number">12.4.2</span> Throughput: a párhuzamos
+feldolgozás áteresztőképessége</h3>
+<p>A throughput azt méri, hogy a rendszer egységnyi idő alatt mennyi
+munkát végez el. Két természetes mértékegysége van:</p>
+<ul>
+<li><strong>kérések/másodperc</strong> (requests per second, RPS): hány
+teljes kérést szolgál ki a rendszer egy másodperc alatt. Ez a
+felhasználói forgalom szempontjából kézenfekvő.</li>
+<li><strong>tokenek/másodperc</strong> (tokens per second, TPS): hány
+input vagy output tokent dolgoz fel a rendszer egy másodperc alatt. Ez
+jobban jellemzi a modell számítási teljesítményét, mert figyelembe veszi
+a szekvencia hosszát.</li>
+</ul>
+<p>A gyakorlatban a kettőt együtt érdemes nézni: ugyanaz a rendszer
+rövid válaszoknál magas RPS-t érhet el, de hosszú válaszoknál
+alacsonyabbat, miközben a TPS viszonylag állandó maradhat. A throughput
+és a latency között alapvető trade-off van:</p>
+<ul>
+<li><strong>Nagyobb batch méret</strong> javítja a GPU kihasználtságát,
+mert több kérés párhuzamosan használja a számítási egységeket; így nő a
+TPS. Ugyanakkor a latency is nőhet, mert a kérések várnak a batch
+összeállítására, a prefill lépés hosszabb, és a decode fázisban a batch
+miatt a lépésidő sem csökken lineárisan. A farok-latencia különösen
+érzékeny: ha egy batchben egy hosszú kimenetű kérés van, a rövid kérések
+várakozni kényszerülnek.</li>
+<li><strong>Kisebb batch méret</strong> csökkenti a latency-t, de
+alacsonyabb GPU-kihasználtságot és ezzel magasabb fajlagos költséget
+eredményez.</li>
+</ul>
+<p>A throughput mérésénél nem elegendő egyetlen kérést küldeni és a
+kapott token/másodpercet feljegyezni. Ez a „single-stream latency” csak
+a modell számítási sebességét mutatja; a valódi terhelés alatti
+throughput attól függ, hogyan ütemezi a kiszolgáló a párhuzamos
+kéréseket. A vLLM és a TGI folyamatos batchinget használ: amikor egy
+kérés befejeződik, a felszabaduló batch-helyre azonnal új kérés lép be,
+így a GPU kihasználtsága nem esik vissza. Ez a mechanizmus növeli a
+TPS-t anélkül, hogy minden kérésnek meg kellene várnia egy teljes batch
+befejezését.</p>
+<p>A méréshez szintetikus terhelést kell generálni, amelyben a bemeneti
+hossz, a kimeneti hossz és az érkezési idő eloszlása a valós forgalmat
+közelíti. A kérések elküldése után rögzítjük a kezdési és befejezési
+időpontokat, majd kiszámítjuk:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">TPS</mtext><mo>=</mo><mfrac><mrow><munderover><mo>∑</mo><mrow><mi>i</mi><mo>=</mo><mn>1</mn></mrow><mi>N</mi></munderover><msub><mi>L</mi><mrow><mtext mathvariant="normal">out</mtext><mo>,</mo><mi>i</mi></mrow></msub></mrow><mrow><msub><mi>t</mi><mtext mathvariant="normal">end</mtext></msub><mo>−</mo><msub><mi>t</mi><mtext mathvariant="normal">start</mtext></msub></mrow></mfrac></mrow><annotation encoding="application/x-tex">
+\text{TPS} = \frac{\sum_{i=1}^{N} L_{\text{out},i}}{t_{\text{end}} - t_{\text{start}}}
+</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>
+a kérések száma,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>L</mi><mrow><mtext mathvariant="normal">out</mtext><mo>,</mo><mi>i</mi></mrow></msub><annotation encoding="application/x-tex">L_{\text{out},i}</annotation></semantics></math>
+az i-edik kérés kimeneti tokenjeinek száma. Hasonlóan az RPS:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">RPS</mtext><mo>=</mo><mfrac><mi>N</mi><mrow><msub><mi>t</mi><mtext mathvariant="normal">end</mtext></msub><mo>−</mo><msub><mi>t</mi><mtext mathvariant="normal">start</mtext></msub></mrow></mfrac></mrow><annotation encoding="application/x-tex">
+\text{RPS} = \frac{N}{t_{\text{end}} - t_{\text{start}}}
+</annotation></semantics></math></p>
+<p>Fontos, hogy a mérési ablak elég hosszú legyen ahhoz, hogy a rendszer
+állandósult állapotba kerüljön, különben az indítási tranziensek
+torzítják az eredményt. A gyakorlatban 5–10 perc mérés már informatív,
+de a pontos szám a forgalmi modelltől függ.</p>
+<h3 data-number="12.4.3"
+id="tokengpu-másodperc-és-a-költség-alapja"><span
+class="header-section-number">12.4.3</span> Token/GPU-másodperc és a
+költség alapja</h3>
+<p>A különböző hardverek és felhőszolgáltatók árainak
+összehasonlításához hasznos egy közös, hardver-független egység: a
+<strong>token/GPU-másodperc</strong>. Ez azt fejezi ki, hogy egy GPU egy
+másodperce alatt hány tokent dolgoz fel. Fordított alakja, a
+GPU-másodperc/token, azt mutatja, mennyi számítási erőforrás szükséges
+egyetlen token előállításához.</p>
+<p>A mérőszámot a következőképpen vezetjük le. Tegyük fel, hogy egy
+mérés során egyetlen GPU (vagy több GPU, de akkor az összesített számot
+normáljuk)
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>
+másodperc alatt
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+összes tokent dolgoz fel (input és/vagy output). A
+token/GPU-másodperc:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">tps per GPU</mtext><mo>=</mo><mfrac><mi>K</mi><mrow><mi>T</mi><mo>⋅</mo><mi>G</mi></mrow></mfrac></mrow><annotation encoding="application/x-tex">
+\text{tps per GPU} = \frac{K}{T \cdot G}
+</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>G</mi><annotation encoding="application/x-tex">G</annotation></semantics></math>
+a GPU-k száma. Ha például 2 GPU 120 másodperc alatt 36 000 tokent
+generál, akkor:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">tps per GPU</mtext><mo>=</mo><mfrac><mrow><mn>36</mn><mspace width="0.167em"></mspace><mn>000</mn></mrow><mrow><mn>120</mn><mo>⋅</mo><mn>2</mn></mrow></mfrac><mo>=</mo><mn>150</mn></mrow><annotation encoding="application/x-tex">
+\text{tps per GPU} = \frac{36\,000}{120 \cdot 2} = 150
+</annotation></semantics></math></p>
+<p>azaz GPU-nként 150 token/másodperc. A GPU-másodperc/token ennek
+reciproka:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">GPU-sec/token</mtext><mo>=</mo><mfrac><mrow><mi>T</mi><mo>⋅</mo><mi>G</mi></mrow><mi>K</mi></mfrac><mo>=</mo><mfrac><mrow><mn>120</mn><mo>⋅</mo><mn>2</mn></mrow><mrow><mn>36</mn><mspace width="0.167em"></mspace><mn>000</mn></mrow></mfrac><mo>=</mo><mn>0</mn><mo>,</mo><mn>00667</mn></mrow><annotation encoding="application/x-tex">
+\text{GPU-sec/token} = \frac{T \cdot G}{K} = \frac{120 \cdot 2}{36\,000} = 0{,}00667
+</annotation></semantics></math></p>
+<p>ami azt jelenti, hogy egyetlen token előállítása átlagosan 6,67 ms
+GPU-időt igényel.</p>
+<p>Ez az egység közvetlenül átvihető a költségszámításba. Ha ismerjük a
+GPU óradíját (amely hardver- és szolgáltatófüggő, ezért mindig az
+aktuális árlistából kell ellenőrizni), akkor a token-költség:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>C</mi><mtext mathvariant="normal">token</mtext></msub><mo>=</mo><mfrac><mtext mathvariant="normal">GPU-óra díj</mtext><mrow><mn>3600</mn><mo>⋅</mo><mtext mathvariant="normal">tps per GPU</mtext></mrow></mfrac></mrow><annotation encoding="application/x-tex">
+C_{\text{token}} = \frac{\text{GPU-óra díj}}{3600 \cdot \text{tps per GPU}}
+</annotation></semantics></math></p>
+<p>Például ha a GPU óradíja 1,50 USD, és a modell 150 token/s
+sebességgel fut egy GPU-n, akkor:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>C</mi><mtext mathvariant="normal">token</mtext></msub><mo>=</mo><mfrac><mrow><mn>1</mn><mo>,</mo><mn>50</mn></mrow><mrow><mn>3600</mn><mo>⋅</mo><mn>150</mn></mrow></mfrac><mo>≈</mo><mn>0</mn><mo>,</mo><mn>00000278</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> USD/token</mtext></mrow></mrow><annotation encoding="application/x-tex">
+C_{\text{token}} = \frac{1{,}50}{3600 \cdot 150} \approx 0{,}00000278 \text{ USD/token}
+</annotation></semantics></math></p>
+<p>Egy millió tokenre vetítve ez 2,78 USD. Természetesen ez az ideális,
+teljes kihasználtságú érték; a valóságban a GPU nem mindig dolgozik
+100%-ban, mert a bejövő forgalom ingadozik, a batch méret nem mindig
+optimális, és az üzemeltetési tartalékkapacitás is szükséges. A
+tényleges token-költséget ezért a kihasználtsági faktorral
+korrigáljuk:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>C</mi><mtext mathvariant="normal">valós</mtext></msub><mo>=</mo><mfrac><msub><mi>C</mi><mtext mathvariant="normal">ideális</mtext></msub><mi>η</mi></mfrac></mrow><annotation encoding="application/x-tex">
+C_{\text{valós}} = \frac{C_{\text{ideális}}}{\eta}
+</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>η</mi><annotation encoding="application/x-tex">\eta</annotation></semantics></math>
+a kihasználtság (0 és 1 között). Ha a GPU átlagosan 40%-ban idle, akkor
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>η</mi><mo>=</mo><mn>0</mn><mo>,</mo><mn>6</mn></mrow><annotation encoding="application/x-tex">\eta = 0{,}6</annotation></semantics></math>,
+és a fenti 2,78 USD millió tokenenként 4,63 USD-re nő. Ez a korrekció a
+kapacitástervezés egyik leggyakoribb hibaforrása: az ideális
+throughputot és az ideális költséget veszik alapul, miközben a valós
+üzemeltetés ennél drágább.</p>
+<p>A token/GPU-másodperc hasznos a különböző modellek és
+futtatókörnyezetek összehasonlítására is. Ugyanazon a hardveren egy
+kisebb modell jellemzően magasabb tps per GPU-t ér el, mint egy nagyobb
+modell, mert kevesebb számítást végez. A PagedAttention (vLLM) és a
+folyamatos batching a KV cache memóriafelhasználás csökkentésével
+lehetővé teszi nagyobb batch méretet, ami növeli a tps per GPU-t
+anélkül, hogy a modell paramétereit változtatnánk. Az ilyen
+szoftveroptimalizációk közvetlenül csökkentik a GPU-másodperc/token
+értéket, és ezzel a fajlagos költséget.</p>
+<h3 data-number="12.4.4"
+id="sla-és-slo-a-szolgáltatási-cél-definiálása"><span
+class="header-section-number">12.4.4</span> SLA és SLO: a szolgáltatási
+cél definiálása</h3>
+<p>A <strong>Service Level Indicator</strong> (SLI) egy mérhető
+tulajdonság, például a p95 latency, a rendelkezésre állás vagy a hibák
+aránya. A <strong>Service Level Objective</strong> (SLO) egy célérték,
+amelyet az SLI-nek egy adott időablakban teljesítenie kell, például „a
+p95 latency legyen kisebb, mint 700 ms egy naptári hónapban”. Az
+<strong>SLA</strong> (Service Level Agreement) az SLO szerződéses
+formája, amelyhez gyakran büntetés vagy jóváírás társul, ha a cél nem
+teljesül.</p>
+<p>Az inferencia rendszereknél tipikus SLA-mutatók:</p>
+<ul>
+<li>p95 vagy p99 latencia a kimeneti tokenekre;</li>
+<li>TTFT percentilisek;</li>
+<li>rendelkezésre állás (availability);</li>
+<li>hibaráta (nem generált válasz, timeout);</li>
+<li>minimális throughput vagy maximális várakozási idő.</li>
+</ul>
+<p>A tervezésnél az SLO-t úgy kell megválasztani, hogy az üzleti
+igényeket tükrözze, és mérhető, reprodukálható legyen. A gyakori hiba az
+abszolút latency megadása percentilis nélkül: „a válaszidő legyen 1
+másodperc alatt” nem egyértelmű, mert nem mondja meg, hogy a kérések
+hány százalékára vonatkozik. A helyes megfogalmazás például: „a kérések
+95%-ának teljes válaszideje legfeljebb 800 ms, és a kérések 99%-a
+legfeljebb 1500 ms”.</p>
+<p>Az SLO betartása nem azt jelenti, hogy soha nem lépjük túl, hanem
+azt, hogy a túllépés ritka és szabályozott. Ehhez
+<strong>hibabüdzsét</strong> rendelünk: ha az SLO 99%-os rendelkezésre
+állást ír elő havonta, akkor a havi állásidő legfeljebb 0,01 × 43 200
+perc = 432 perc, azaz 7,2 óra lehet. A hibabüdzsé felhasználható
+tervezett karbantartásra, de ha elfogy, az új kiadásokat vagy
+konfigurációváltozásokat le kell állítani addig, amíg a rendszer
+helyreáll.</p>
+<p>A kapacitástervezés során az SLO eléréséhez szükséges erőforrásokat
+határozzuk meg. Az alapkérdés: adott bejövő forgalom (RPS), adott modell
+és hardver mellett hány GPU replika szükséges ahhoz, hogy a
+farok-latencia az SLO-n belül maradjon?</p>
+<h3 data-number="12.4.5"
+id="kapacitástervezés-a-méréstől-a-döntésig"><span
+class="header-section-number">12.4.5</span> Kapacitástervezés: a
+méréstől a döntésig</h3>
+<p>A kapacitástervezés nem egyszeri számítás, hanem iteratív folyamat:
+mérünk, modellt illesztünk, validálunk, majd a terhelést növelve újra
+mérünk. A lépései a következők.</p>
+<p><strong>1. A forgalmi modell definiálása.</strong> Határozzuk meg a
+kérések érkezési folyamatát (pl. Poisson-folyamat adott
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>λ</mi><annotation encoding="application/x-tex">\lambda</annotation></semantics></math>
+rátával), a bemeneti tokenek eloszlását (pl. 100–500 token között
+egyenletes vagy log-normális), a kimeneti tokenek eloszlását (pl. 10–200
+token), és a csúcsidőszakot. A forgalmi modell lehet historikus
+adatokból becsült vagy szintetikus, de a reprodukálhatósághoz mindig
+rögzíteni kell a paramétereket és a seedet.</p>
+<p><strong>2. A modell és a futtatókörnyezet rögzítése.</strong>
+Válasszuk ki a modellt, a tokenizert, a precisiont (FP16/INT8/INT4), a
+kiszolgáló szoftvert (vLLM, TGI, llama.cpp) és a hardvert. Rögzítsük a
+verziókat, a GPU típusát és a memória beállításait.</p>
+<p><strong>3. Mérési kampány.</strong> Indítsuk el a kiszolgálót a
+célhardveren, és küldjünk szintetikus kéréseket a forgalmi modellnek
+megfelelően. Mérjük a latency percentiliseket és a throughputot
+különböző batch méretek vagy konfigurációk mellett. Legalább 1000 kérés
+kell, hogy a p95 stabil legyen (a leglassabb 50 kérésből becsülve); a
+p99-hez legalább 10 000 kérés ajánlott, kevesebb kérésnél a p99-et
+bizonytalansági intervallummal (bootstrap) adjuk meg.</p>
+<p><strong>4. Modell illesztése.</strong> A mért adatokból becsüljük a
+szolgáltatási időt (a tényleges feldolgozási idő a sorban állás nélkül)
+és a várakozási időt. A szolgáltatási idő közelíthető a prefill és
+decode idők összegével; a várakozási idő a terheléstől és a batch
+ütemezéstől függ. Gyakorlati célra elegendő egy empirikus görbe: a p95
+latency mint a bejövő RPS függvénye.</p>
+<p><strong>5. Kapacitás meghatározása.</strong> Keressük meg azt a
+maximális RPS-t, amelynél a p95 latency még az SLO alatt van. Ha a
+célforgalom ennél nagyobb, akkor több GPU replika kell. A replikák
+számát a csúcsforgalom és az egy GPU-ra eső maximális RPS hányadosa
+adja:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>N</mi><mtext mathvariant="normal">GPU</mtext></msub><mo>=</mo><mrow><mo stretchy="true" form="prefix">⌈</mo><mfrac><msub><mi>R</mi><mtext mathvariant="normal">csúcs</mtext></msub><msub><mi>R</mi><mrow><mrow><mi>max</mi><mo>&#8289;</mo></mrow><mo>,</mo><mtext mathvariant="normal">SLO</mtext></mrow></msub></mfrac><mo stretchy="true" form="postfix">⌉</mo></mrow></mrow><annotation encoding="application/x-tex">
+N_{\text{GPU}} = \left\lceil \frac{R_{\text{csúcs}}}{R_{\max,\text{SLO}}} \right\rceil
+</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>R</mi><mrow><mrow><mi>max</mi><mo>&#8289;</mo></mrow><mo>,</mo><mtext mathvariant="normal">SLO</mtext></mrow></msub><annotation encoding="application/x-tex">R_{\max,\text{SLO}}</annotation></semantics></math>
+az a maximális kérés/másodperc, amelyet egyetlen GPU az SLO betartása
+mellett kiszolgál. A replikák növelése nem lineárisan csökkenti a
+farok-latenciát, mert a kérések szétosztása és az újabb szűk
+keresztmetszetek (pl. hálózat, scheduler) is szerepet játszanak, ezért a
+végső konfigurációt terheléses teszttel kell validálni.</p>
+<p><strong>6. Költségbecslés.</strong> A szükséges GPU-k számából és a
+GPU óradíjából számítsuk ki a havi költséget:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>C</mi><mtext mathvariant="normal">havi</mtext></msub><mo>=</mo><msub><mi>N</mi><mtext mathvariant="normal">GPU</mtext></msub><mo>⋅</mo><msub><mi>c</mi><mtext mathvariant="normal">GPU-óra</mtext></msub><mo>⋅</mo><msub><mi>h</mi><mtext mathvariant="normal">bérelt</mtext></msub></mrow><annotation encoding="application/x-tex">
+C_{\text{havi}} = N_{\text{GPU}} \cdot c_{\text{GPU-óra}} \cdot h_{\text{bérelt}}
+</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>h</mi><mtext mathvariant="normal">bérelt</mtext></msub><annotation encoding="application/x-tex">h_{\text{bérelt}}</annotation></semantics></math>
+a havi bérelt (futó) óraszám; folyamatos üzemnél 730 (az átlagos havi
+óraszám). Ha a GPU-k éjszaka leállnak, a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>h</mi><mtext mathvariant="normal">bérelt</mtext></msub><annotation encoding="application/x-tex">h_{\text{bérelt}}</annotation></semantics></math>
+csökken, nem az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>η</mi><annotation encoding="application/x-tex">\eta</annotation></semantics></math>.
+A kihasználtság a tokenre vetített költségben jelenik meg:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>C</mi><mtext mathvariant="normal">token</mtext></msub><mo>=</mo><msub><mi>C</mi><mtext mathvariant="normal">havi</mtext></msub><mi>/</mi><mo stretchy="false" form="prefix">(</mo><mtext mathvariant="normal">havi kiszolgált tokenek</mtext><mo stretchy="false" form="postfix">)</mo><mo>=</mo><msub><mi>C</mi><mtext mathvariant="normal">ideális</mtext></msub><mi>/</mi><mi>η</mi></mrow><annotation encoding="application/x-tex">C_{\text{token}}=C_{\text{havi}}/(\text{havi kiszolgált tokenek})=C_{\text{ideális}}/\eta</annotation></semantics></math>.
+A költségbecslésnél vegyük figyelembe a tartalékkapacitást is: a
+csúcsforgalomra méretezett rendszer átlagos kihasználtsága ritkán
+haladja meg a 60–70%-ot, különben a farok-latencia azonnal megnő.</p>
+<p>A tervezési folyamatban a mért és a várt értékek elválasztása
+kulcsfontosságú. Például a szolgáltatási időt előre becsülhetjük a
+modell flops-igényéből és a GPU teljesítményéből; a mért latency azonban
+tartalmazza a scheduler várakozási idejét is, ami a becslésben nem
+szerepel. A kettő összevetése mutatja meg, hogy a rendszer a várt módon
+viselkedik-e, vagy valamilyen rejtett szűk keresztmetszet lépett
+fel.</p>
+<h3 data-number="12.4.6"
+id="gyakorlati-példa-egy-közepes-modell-üzemeltetése"><span
+class="header-section-number">12.4.6</span> Gyakorlati példa: egy
+közepes modell üzemeltetése</h3>
+<p><strong>Szemléltető, kitalált számok (nem mérés).</strong> Tegyük
+fel, hogy egy 7B paraméteres decoder-only modellt futtatunk INT4 (AWQ)
+kvantálással egyetlen A10G GPU-n, vLLM-mel (FP16-ban a ≈ 14 GB súly
+miatt a memory-bound TPOT alsó korlátja ≈ 23 ms lenne, a 14 ms ezért
+csak kvantálva reális). A feltételezett értékek:</p>
+<ul>
+<li>A bemeneti hossz átlagosan 300 token, a kimeneti hossz átlagosan 150
+token.</li>
+<li>Egyetlen kérésre a TTFT 120 ms, a TPOT 14 ms; a teljes latency így
+120 + (150-1) × 14 ≈ 2206 ms.</li>
+<li>Folyamatos batchinggel, 8 párhuzamos kérést engedve az összes TPS
+400 token/s (kérésenként 50 token/s, így 150 token ≈ 3,1 s; ez Little
+törvényével konzisztens:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>8</mn><mo>≈</mo><mn>2</mn><mo>,</mo><mn>67</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">kérés/s</mtext><mo>⋅</mo><mn>3</mn><mo>,</mo><mn>1</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">s</mtext></mrow><annotation encoding="application/x-tex">8\approx 2{,}67\ \text{kérés/s}\cdot3{,}1\ \text{s}</annotation></semantics></math>).</li>
+<li>A p50 latency 3000 ms, a p95 latency 4200 ms, a p99 latency 5800
+ms.</li>
+</ul>
+<p>A cél SLO: a p95 latency legyen kisebb, mint 3500 ms. A fenti
+rendszer ezt nem teljesíti, mert a p95 4200 ms. Mit tehetünk?</p>
+<ul>
+<li>Csökkentjük a párhuzamosságot 4-re: kérésenként 75 token/s, az
+összes TPS 300 token/s-ra esik, a p95 latency 4200-ról 3000 ms-ra javul.
+Ezzel teljesül az SLO, de a fajlagos költség nő, mert kevesebb token
+készül el ugyanannyi idő alatt.</li>
+<li>Vagy hozzáadunk egy második GPU-t: azonos forgalomnál a két replika
+fele terhelést kap, a p95 tovább javul, de a teljes TPS a keresletnél
+marad (≈ 400 token/s), ezért a token-költség közel duplázódik. A második
+GPU akkor éri meg, ha a forgalom is nő.</li>
+</ul>
+<p>A döntés a forgalomtól és a költségvetéstől függ. Ha a forgalom eléri
+az egy GPU kapacitását, a replikázás elkerülhetetlen. Ha a forgalom
+alacsony, de a latency SLO szigorú, akkor a kisebb batch és a magasabb
+kihasználtság közötti kompromisszumot kell megtalálni.</p>
+<p>A költségszámításhoz vegyünk egy A10G óradíjat 0,75 USD/óra (a
+tényleges árat ellenőrizni kell a szolgáltatónál). Ha a rendszer (a
+fenti példától függetlenül) összesen 120 token/s sebességgel fut,
+akkor:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">GPU-sec/token</mtext><mo>=</mo><mfrac><mn>1</mn><mn>120</mn></mfrac><mo>=</mo><mn>0</mn><mo>,</mo><mn>00833</mn></mrow><annotation encoding="application/x-tex">
+\text{GPU-sec/token} = \frac{1}{120} = 0{,}00833
+</annotation></semantics></math></p>
+<p>Egy millió token előállítása:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mspace width="0.167em"></mspace><mn>000</mn><mspace width="0.167em"></mspace><mn>000</mn><mo>×</mo><mn>0</mn><mo>,</mo><mn>00833</mn><mo>=</mo><mn>8333</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> s</mtext></mrow><mo>≈</mo><mn>2</mn><mo>,</mo><mn>31</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> óra</mtext></mrow></mrow><annotation encoding="application/x-tex">
+1\,000\,000 \times 0{,}00833 = 8333 \text{ s} \approx 2{,}31 \text{ óra}
+</annotation></semantics></math></p>
+<p>A költség millió tokenenként:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mo>,</mo><mn>31</mn><mo>×</mo><mn>0</mn><mo>,</mo><mn>75</mn><mo>≈</mo><mn>1</mn><mo>,</mo><mn>74</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> USD</mtext></mrow></mrow><annotation encoding="application/x-tex">
+2{,}31 \times 0{,}75 \approx 1{,}74 \text{ USD}
+</annotation></semantics></math></p>
+<p>Ha a kihasználtság 60%, akkor a valós költség:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mfrac><mrow><mn>1</mn><mo>,</mo><mn>74</mn></mrow><mrow><mn>0</mn><mo>,</mo><mn>6</mn></mrow></mfrac><mo>≈</mo><mn>2</mn><mo>,</mo><mn>89</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> USD/millió token</mtext></mrow></mrow><annotation encoding="application/x-tex">
+\frac{1{,}74}{0{,}6} \approx 2{,}89 \text{ USD/millió token}
+</annotation></semantics></math></p>
+<p>Ez a számítás az ideális, folyamatos terhelésű esetre vonatkozik; a
+tényleges üzemeltetésben a batch méret, a modell betöltési ideje, a
+checkpointok mentése és az esetleges újraindulások további veszteséget
+okoznak.</p>
+<h3 data-number="12.4.7"
+id="a-labor-sla--és-kapacitástervezési-számítás"><span
+class="header-section-number">12.4.7</span> A labor: SLA- és
+kapacitástervezési számítás</h3>
+<p>A labor célja, hogy a fenti fogalmakat egy reprodukálható notebookban
+alkalmazzuk. A notebook nem egy teljes termelési rendszer, hanem egy
+kis, ellenőrizhető kísérlet, amelyben a mérési adatokból SLA- és
+kapacitástervezési döntést hozunk. A labor a következő lépésekből
+áll.</p>
+<p><strong>Környezet rögzítése.</strong> A notebook elején rögzítsük a
+Python-verziót (3.12), a PyTorch-verziót, a vLLM-verziót (például 0.6.1
+– a stabil verzió használata előtt ellenőrizzük a hivatalos
+dokumentációt), a GPU típusát (pl. egy NVIDIA L4 24 GB) és a
+driver-verziót. A determinisztikusság érdekében állítsunk be seedet:
+<code>torch.manual_seed(42)</code> és a NumPy seedet is. A méréshez
+használt modell legyen egy kis, nyílt modell, például
+<code>Qwen/Qwen2.5-1.5B-Instruct</code> vagy
+<code>meta-llama/Llama-3.2-3B-Instruct</code>; a pontos revíziót
+rögzítsük.</p>
+<p><strong>Szintetikus adat generálása.</strong> A forgalmi mintát a
+következő paraméterekkel definiáljuk: a bemeneti tokenek hossza
+egyenletes eloszlásból 100 és 400 között, a kimeneti tokenek hossza 20
+és 150 között egyenletes; a kérések Poisson-folyamat szerint érkezzenek,
+átlagos ráta 3 RPS. A generáláshoz használjunk
+<code>numpy.random.default_rng(42)</code> generátort, és mentsük el a
+generált kérések listáját egy JSON fájlba, hogy a mérés reprodukálható
+legyen. A kérések szövege szintetikus, például véletlenszerű tokenekből
+álló sorozat; a lényeg a hossz és az érkezési idő.</p>
+<p><strong>Mérés.</strong> Indítsuk el a vLLM-et a modell betöltésével,
+majd a notebookon belül küldjük el a kéréseket a kiszolgálónak. A
+kliensoldalon mérjük a kezdő és befejező időpontokat, a TTFT-t és a
+teljes latency-t. A mérés során legalább 500 kérést dolgozzunk fel, és
+rögzítsük a p50, p95 és p99 latency-t, valamint az összesített TPS-t. A
+vLLM-ben állítsuk be a <code>max_num_seqs</code> paramétert (például
+16-ra), és rögzítsük a <code>gpu_memory_utilization</code> értékét.</p>
+<p><strong>Várt értékek kiszámítása.</strong> A modell ismert
+tulajdonságaiból és a hardverből előre becsüljük a várható prefill és
+decode időt. A prefill idő egyetlen kérésre közelíthető a bemeneti hossz
+és a modell flops-igényének hányadosával; a decode idő a modell
+paraméterszámából és a memória-sávszélességből becsülhető. Ehelyett
+egyszerűbb, ha a mérés első fázisában egyetlen kérésre megmérjük a
+TTFT-t és a TPOT-t, majd ezekből számítjuk a várható teljes latency-t a
+fenti képlettel. A mért latency eloszlását ezután hasonlítjuk a várt
+értékekhez: ha a mért p95 jelentősen nagyobb, mint a várt, az sorban
+állásra vagy batch-kontencióra utal.</p>
+<p><strong>Kapacitástervezés.</strong> Az SLO legyen: p95 teljes latency
+≤ 3000 ms (ez a kimeneti hossz p95 értékénél, ≈ 143 tokennél is
+teljesíthető kell legyen). Előbb ellenőrizzük, hogy az SLO egyetlen
+kérésnél teljesül-e: TTFT +
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">(</mo><msub><mi>L</mi><mrow><mtext mathvariant="normal">out</mtext><mo>,</mo><mi>p</mi><mn>95</mn></mrow></msub><mo>−</mo><mn>1</mn><mo stretchy="false" form="postfix">)</mo><mo>⋅</mo></mrow><annotation encoding="application/x-tex">(L_{\text{out},p95}-1)\cdot</annotation></semantics></math>TPOT;
+ha nem, a kapacitás növelése nem segít, gyorsabb hardver vagy
+kisebb/kvantált modell kell (a memory-bound TPOT alsó korlátja az L4-en,
+≈ 300 GB/s sávszélességgel, a Qwen2.5-1.5B-nél ≈ 10 ms, a
+Llama-3.2-3B-nél ≈ 21 ms; a sávszélesség és a paraméterszám
+emlékezetből, ellenőrzendő; a 3B modellnél a 3000 ms már egyetlen
+kérésnél is határeset). A mért adatokból határozzuk meg azt a maximális
+RPS-t, amelyet egyetlen GPU az SLO-n belül ki tud szolgálni. Ezt úgy
+tehetjük meg, hogy megismételjük a mérést különböző érkezési rátákkal
+(pl. 1, 2, 3, 4, 5 RPS), és minden esetben feljegyezzük a p95 latency-t.
+Az eredményből interpoláljuk azt a pontot, ahol a p95 eléri a 3000 ms-t;
+ez lesz
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>R</mi><mrow><mrow><mi>max</mi><mo>&#8289;</mo></mrow><mo>,</mo><mtext mathvariant="normal">SLO</mtext></mrow></msub><annotation encoding="application/x-tex">R_{\max,\text{SLO}}</annotation></semantics></math>.
+Ha a célforgalom például 7 RPS, akkor a szükséges GPU-k száma:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>=</mo><mrow><mo stretchy="true" form="prefix">⌈</mo><mfrac><mn>7</mn><msub><mi>R</mi><mrow><mrow><mi>max</mi><mo>&#8289;</mo></mrow><mo>,</mo><mtext mathvariant="normal">SLO</mtext></mrow></msub></mfrac><mo stretchy="true" form="postfix">⌉</mo></mrow></mrow><annotation encoding="application/x-tex">
+N = \left\lceil \frac{7}{R_{\max,\text{SLO}}} \right\rceil
+</annotation></semantics></math></p>
+<figure id="fig-lm044-kapacitas-gorbe">
+<div class="fig-interactive"><iframe src="figures/html/lm044-kapacitas-gorbe.html" title="A p95 latencia az érkezési ráta függvényében 1-től 5 RPS-ig: 2,1; 2,3; 2,7; 3,6; 6,0 másodperc. A vízszintes szaggatott SLO-vonalat 3,0 másodpercnél körülbelül 3,33 RPS-nél metszi a görbe; innen pontozott vonal vezet az x tengelyig. Szövegdoboz: 7 RPS-hez 3 GPU kell." loading="lazy" style="width:100%;border:0;height:560px"></iframe><noscript><img src="figures/img/lm044-kapacitas-gorbe.png" style="width:85.0%"
+alt="A p95 latencia az érkezési ráta függvényében 1-től 5 RPS-ig: 2,1; 2,3; 2,7; 3,6; 6,0 másodperc. A vízszintes szaggatott SLO-vonalat 3,0 másodpercnél körülbelül 3,33 RPS-nél metszi a görbe; innen pontozott vonal vezet az x tengelyig. Szövegdoboz: 7 RPS-hez 3 GPU kell." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/lm044-kapacitas-gorbe.png" style="width:85.0%"
+alt="A p95 latencia az érkezési ráta függvényében 1-től 5 RPS-ig: 2,1; 2,3; 2,7; 3,6; 6,0 másodperc. A vízszintes szaggatott SLO-vonalat 3,0 másodpercnél körülbelül 3,33 RPS-nél metszi a görbe; innen pontozott vonal vezet az x tengelyig. Szövegdoboz: 7 RPS-hez 3 GPU kell." /></details></div>
+<figcaption>Kapacitás meghatározása a p95–RPS görbéből (szemléltető
+adatok, nem mérés). A p95 latencia 4 RPS felett meredeken nő; a 3,0 s-os
+SLO-vonalat a 3 és 4 RPS közötti szakasz lineáris interpolációja
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>R</mi><mi>max</mi></msub><mo>≈</mo><mn>3</mn><mo>,</mo><mn>33</mn></mrow><annotation encoding="application/x-tex">R_{\max}\approx3{,}33</annotation></semantics></math>
+RPS-nél metszi, így 7 RPS-hez
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>=</mo><mo stretchy="false" form="prefix">⌈</mo><mn>7</mn><mi>/</mi><mn>3</mn><mo>,</mo><mn>33</mn><mo stretchy="false" form="postfix">⌉</mo><mo>=</mo><mn>3</mn></mrow><annotation encoding="application/x-tex">N=\lceil7/3{,}33\rceil=3</annotation></semantics></math>
+GPU kell. Az ábra az egyetlen kérésnél is teljesíthető, 3,0 s-os SLO-t
+használja.</figcaption>
+</figure>
+<p>A notebook végén számítsuk ki a havi költséget is a bérelt óraszámból
+és a GPU óradíjából (amelyet a laborban helyőrzőként használjunk, vagy a
+tényleges szolgáltató aktuális árát ellenőrizzük), a token-költséget
+pedig a kihasználtsági faktorral korrigálva.</p>
+<p><strong>Mért és várt elkülönítése.</strong> A notebookban minden
+numerikus eredményt két oszlopban tároljunk: <code>measured</code> és
+<code>expected</code>. A <code>measured</code> a tényleges futtatásból
+származik, a <code>expected</code> a korábbi becslésből vagy a modell
+dokumentációjából. A kettő eltéréseit kommentáljuk: ha a mért TPS
+alacsonyabb a vártnál, az a GPU memória-korlát vagy a batch méret nem
+optimális beállítását jelezheti.</p>
+<p>A labor átadandó eredménye egy notebook, amely tartalmazza a
+környezeti rögzítést, a szintetikus adat generálását, a mérési kódot, a
+számításokat és a konklúziót. A notebook végén válaszoljunk a kérdésre:
+hány GPU szükséges az SLO teljesítéséhez, és mennyi a várható havi
+költség? A választ a mért adatokkal és a használt modellverzióval együtt
+adjuk meg.</p>
+<h3 data-number="12.4.8" id="gyakori-hibák-és-elkerülésük"><span
+class="header-section-number">12.4.8</span> Gyakori hibák és
+elkerülésük</h3>
+<p>Az inferencia üzemeltetési mutatóinak tervezésekor számos tipikus
+hiba lép fel. Az alábbiakban ezeket ismertetjük, és a helyes gyakorlatot
+is megadjuk.</p>
+<p><strong>1. Csak az átlagos latency-t nézni.</strong> Az átlag nem
+mutatja a farok viselkedését. Helyes: p50, p95, p99 mérése és az SLO
+percentilissel definiálása.</p>
+<p><strong>2. A throughputot egyetlen kérésből számolni.</strong> A
+single-stream TPS nem tükrözi a párhuzamos kiszolgálás képességét.
+Helyes: terheléses teszt folyamatos batchinggel, legalább több száz
+kéréssel.</p>
+<p><strong>3. A batch méret és a latency trade-off figyelmen kívül
+hagyása.</strong> A nagyobb batch növeli a TPS-t, de a farok-latencia
+romlik. Helyes: minden batch beállításnál mérjük mindkét mutatót, és az
+SLO alapján válasszunk.</p>
+<p><strong>4. A kihasználtságot elhagyni a költségszámításból.</strong>
+Az ideális token-költség alábecsüli a valós költséget. Helyes: a
+kihasználtsági faktorral korrigáljunk, és a tartalékkapacitást is vegyük
+figyelembe.</p>
+<p><strong>5. A hálózati késleltetés elhanyagolása.</strong> A felhőben
+a kliens és a kiszolgáló közötti távolság 10–100 ms-os pluszt adhat; ez
+különösen a TTFT-nél érzékelhető. Helyes: a mérési környezetben a
+hálózati utat is modellezzük, vagy a klienst a kiszolgálóval azonos
+régióban futtatjuk.</p>
+<p><strong>6. A seed és a verziók rögzítésének hiánya.</strong> Nem
+reprodukálható mérésből nem lehet üzemeltetési döntést hozni. Helyes:
+minden futtatásnál rögzítsük a seedet, a modell- és szoftververziókat, a
+GPU típust és a konfigurációt.</p>
+<p><strong>7. Az SLO percentilis nélküli megfogalmazása.</strong> A
+„válaszidő 1 másodperc alatt” nem egyértelmű. Helyes: „a kérések
+95%-ának teljes válaszideje ≤ 1000 ms”.</p>
+<p><strong>8. A kapacitástervezést egyszeri mérésre alapozni.</strong> A
+forgalom változik, a modell frissül, a hardver cserélődik. Helyes: a
+kapacitást időszakosan újra kell mérni, és a hibabüdzsé alapján kell
+dönteni.</p>
+<h3 data-number="12.4.9" id="önellenőrző-kérdés"><span
+class="header-section-number">12.4.9</span> Önellenőrző kérdés</h3>
+<p>Egy GPU-n futó modell 80 token/s sebességgel generál kimenetet. A GPU
+óradíja 1,20 USD. Mekkora a GPU-másodperc/token érték, és mennyibe kerül
+1 millió token előállítása, ha a kihasználtság 70%? Vezesse le a
+számítást.</p>
+<p><strong>Megoldás:</strong> A GPU-másodperc/token = 1 / 80 = 0,0125
+s/token. Egy millió token = 1 000 000 × 0,0125 = 12 500 s ≈ 3,47 óra. Az
+ideális költség = 3,47 × 1,20 ≈ 4,17 USD. A 70%-os kihasználtság miatt a
+valós költség = 4,17 / 0,7 ≈ 5,95 USD.</p>
+<h3 data-number="12.4.10" id="összefoglalás"><span
+class="header-section-number">12.4.10</span> Összefoglalás</h3>
+<p>Ebben az egységben az inferencia üzemeltetési mutatóit definiáltuk és
+kapcsolatba hoztuk egymással. A latencia egy eloszlás, amelyet a p50,
+p95 és p99 percentilisekkel jellemzünk; a farok-latencia a felhasználói
+élmény és az SLO szempontjából kritikus. A throughput a párhuzamos
+feldolgozás áteresztőképessége, amelyet kérésben és tokenben is mérünk.
+A token/GPU-másodperc egység hidat képez a hardver teljesítmény és a
+fajlagos költség között. Az SLA tervezés során először mérjük a rendszer
+viselkedését szintetikus terhelés alatt, majd meghatározzuk azt a
+maximális terhelést, amelyet egy GPU az SLO-n belül kiszolgál; ebből
+számítjuk a szükséges replikákat és a havi költséget. A labor ezt a
+folyamatot egy reprodukálható notebookban rögzíti, elválasztva a mért és
+a várt értékeket.</p>
+<p>A következő egység (<a href="lm045.html">CPU, GPU, NPU és
+memória-korlátok</a>) ezekre a fogalmakra épít: a CPU, GPU, NPU és
+memória-korlátok vizsgálatakor a latencia és throughput trade-off már
+ismerős lesz, és az edge eszközökön ugyanezeket a mérőszámokat más
+erőforrás-korlátok mellett kell alkalmazni.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="lm043.html">← 12.3 Speculative decoding és draft modellek</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="lm045.html">13.1 CPU, GPU, NPU és memória-korlátok →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

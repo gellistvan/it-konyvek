@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>12.1 KV cache, PagedAttention és folyamatos batch – LLM-ek és
+domain-specifikus kis modellek programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz3">III. RÉSZ – Hatékonyság és testreszabás</a> › <a href="index.html#lmch11">12 Inferencia és kiszolgálás</a></p>
+<div class="links"><a class="prev" rel="prev" href="lm040.html">← 11.4 Modellmerging, MoE és szakértői routing</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="lm042.html">12.2 vLLM, TGI, llama.cpp és Ollama összehasonlítása →</a></div>
+</nav>
+<h2 data-number="12.1" id="lm041"><span
+class="header-section-number">12.1</span> KV cache, PagedAttention és
+folyamatos batch</h2>
+<p>A generatív következtetés (inference) költségprofilja alapvetően
+különbözik a tanításétól. Míg az előtanítás vagy a finomhangolás során a
+grafikus processzor (GPU) számítási teljesítménye (compute) a szűk
+keresztmetszet, addig az autoregresszív szöveggenerálás során a modell
+tokenenként, szekvenciálisan állítja elő a kimenetet. Ebben az
+üzemmódban a modell súlyainak betöltése és a figyelmi mechanizmus
+(attention) köztes állapotainak tárolása gyakran nagyobb terhet jelent,
+mint maga a mátrixszorzás. Ezt a jelenséget nevezzük
+<em>memory-bound</em> inferenciának.</p>
+<p>Ebben az alfejezetben az inferencia hatékonyságának két alappillérét
+vizsgáljuk meg: a <strong>KV cache</strong> memóriakezelését, valamint a
+<strong>PagedAttention</strong> és a <strong>folyamatos batch
+(continuous batching)</strong> technikákat. A cél annak megértése,
+hogyan lehet egyszerre növelni az átbocsátóképességet (throughput) és
+csökkenteni a késleltetést (latency) anélkül, hogy a modell minősége
+romolna.</p>
+<h3 data-number="12.1.1"
+id="az-autoregresszív-generálás-memória-problémája"><span
+class="header-section-number">12.1.1</span> 1. Az autoregresszív
+generálás memória-problémája</h3>
+<p>Amikor egy transformer modellt futtatunk, a figyelmi rétegekben három
+mátrixot számolunk ki a bemeneti tokenekből: a lekérdezést
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>Q</mi><annotation encoding="application/x-tex">Q</annotation></semantics></math>),
+a kulcsot
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>)
+és az értéket
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>V</mi><annotation encoding="application/x-tex">V</annotation></semantics></math>).
+A figyelem képlete:
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mi>Attention</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><mi>Q</mi><mo>,</mo><mi>K</mi><mo>,</mo><mi>V</mi><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mrow><mi>softmax</mi><mo>&#8289;</mo></mrow><mrow><mo stretchy="true" form="prefix">(</mo><mfrac><mrow><mi>Q</mi><msup><mi>K</mi><mi>⊤</mi></msup></mrow><msqrt><msub><mi>d</mi><mi>k</mi></msub></msqrt></mfrac><mo stretchy="true" form="postfix">)</mo></mrow><mi>V</mi></mrow><annotation encoding="application/x-tex">
+\operatorname{Attention}(Q,K,V)=\operatorname{softmax}\left(\frac{QK^\top}{\sqrt{d_k}}\right)V
+</annotation></semantics></math></p>
+<p>A tanítás során a bemeneti szekvencia
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>x</mi><mrow><mn>1</mn><mo>:</mo><mi>n</mi></mrow></msub><annotation encoding="application/x-tex">x_{1:n}</annotation></semantics></math>)
+teljes egészében rendelkezésre áll. A modell minden pozícióban a valódi
+(adatból vett) előzményt kapja bemenetként, nem a saját korábbi
+kimenetét; ezt nevezzük <em>tanári erőltetésnek</em> (teacher forcing).
+Ezért a teljes szekvencia ismert, és a kauzális maszkkal az összes
+pozíció
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>Q</mi><annotation encoding="application/x-tex">Q</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>V</mi><annotation encoding="application/x-tex">V</annotation></semantics></math>
+mátrixa egyszerre kiszámítható.</p>
+<p>Ezzel szemben a generálás során a modell egyesével állítja elő a
+tokeneket
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>x</mi><mrow><mi>t</mi><mo>+</mo><mn>1</mn></mrow></msub><annotation encoding="application/x-tex">x_{t+1}</annotation></semantics></math>).
+Ha naiv módon, minden egyes új token generálásakor a teljes
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>x</mi><mrow><mn>1</mn><mo>:</mo><mi>t</mi></mrow></msub><annotation encoding="application/x-tex">x_{1:t}</annotation></semantics></math>
+szekvenciát újra és újra végigfuttatnánk a modellen, a számítási költség
+négyzetesen növekedne a kimenet hosszával. Ez elfogadhatatlanul lassú
+lenne.</p>
+<p>A megoldás a <strong>KV cache</strong>. A figyelem számításához a
+korábbi tokenekhez tartozó
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>V</mi><annotation encoding="application/x-tex">V</annotation></semantics></math>
+mátrixokra van szükség. A korábbi tokenekhez tartozó
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>Q</mi><annotation encoding="application/x-tex">Q</annotation></semantics></math>
+mátrixokra azonban nincs szükség, mert a figyelem az aktuális token
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>Q</mi><annotation encoding="application/x-tex">Q</annotation></semantics></math>
+vektorát hasonlítja össze az összes eddigi token
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+vektorával. Ezért amikor az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>x</mi><mi>t</mi></msub><annotation encoding="application/x-tex">x_{t}</annotation></semantics></math>
+tokent generáljuk, a modell kiszámítja az új tokenhez tartozó
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>q</mi><mi>t</mi></msub><annotation encoding="application/x-tex">q_t</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>k</mi><mi>t</mi></msub><annotation encoding="application/x-tex">k_t</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>v</mi><mi>t</mi></msub><annotation encoding="application/x-tex">v_t</annotation></semantics></math>
+vektorokat, majd a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>k</mi><mi>t</mi></msub><annotation encoding="application/x-tex">k_t</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>v</mi><mi>t</mi></msub><annotation encoding="application/x-tex">v_t</annotation></semantics></math>
+vektorokat hozzáfűzi a cache-hez. A következő lépésben
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>t</mi><mo>+</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">t+1</annotation></semantics></math>)
+a modell már csak az új tokenhez tartozó
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>q</mi><mrow><mi>t</mi><mo>+</mo><mn>1</mn></mrow></msub><annotation encoding="application/x-tex">q_{t+1}</annotation></semantics></math>
+vektort számolja ki, és a cache-ben tárolt összes
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>V</mi><annotation encoding="application/x-tex">V</annotation></semantics></math>
+vektorral elvégzi a figyelmi műveletet.</p>
+<p>A KV cache azonban jelentős memóriát foglal. A szükséges memória
+mérete négy kulcstényezőtől függ:</p>
+<ol type="1">
+<li><strong>Rétegek száma</strong>
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>L</mi><annotation encoding="application/x-tex">L</annotation></semantics></math>)</li>
+<li><strong>Figyelmi fejek száma</strong>
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>H</mi><annotation encoding="application/x-tex">H</annotation></semantics></math>)
+és a <strong>fejméret</strong>
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>d</mi><mtext mathvariant="normal">head</mtext></msub><annotation encoding="application/x-tex">d_{\text{head}}</annotation></semantics></math>)</li>
+<li><strong>Batch méret</strong>
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>B</mi><annotation encoding="application/x-tex">B</annotation></semantics></math>)</li>
+<li><strong>Szekvenciahossz</strong>
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>S</mi><annotation encoding="application/x-tex">S</annotation></semantics></math>),
+amely az összes eddigi tokent tartalmazza</li>
+</ol>
+<p>Mivel minden rétegben és minden fejben tárolnunk kell a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>V</mi><annotation encoding="application/x-tex">V</annotation></semantics></math>
+mátrixokat, a memóriaigény a következő képlettel becsülhető (float16-os,
+azaz 2 bájtos pontosságot feltételezve):
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>M</mi><mtext mathvariant="normal">KV</mtext></msub><mo>=</mo><mn>2</mn><mo>⋅</mo><mi>B</mi><mo>⋅</mo><mi>S</mi><mo>⋅</mo><mi>H</mi><mo>⋅</mo><msub><mi>d</mi><mtext mathvariant="normal">head</mtext></msub><mo>⋅</mo><mi>L</mi><mo>⋅</mo><mn>2</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> byte</mtext></mrow></mrow><annotation encoding="application/x-tex">
+M_{\text{KV}} = 2 \cdot B \cdot S \cdot H \cdot d_{\text{head}} \cdot L \cdot 2 \text{ byte}
+</annotation></semantics></math> A képletben a legelső
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>2</mn><annotation encoding="application/x-tex">2</annotation></semantics></math>-es
+szorzó a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>V</mi><annotation encoding="application/x-tex">V</annotation></semantics></math>
+mátrixok párját jelöli, a legutolsó
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>2</mn><annotation encoding="application/x-tex">2</annotation></semantics></math>
+byte pedig a 16 bites lebegőpontos ábrázolást (FP16/BF16).</p>
+<p><strong>Példa:</strong> Vegyünk egy modern, 7 milliárd paraméteres
+modellt
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi><mo>=</mo><mn>32</mn></mrow><annotation encoding="application/x-tex">L=32</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>H</mi><mo>=</mo><mn>32</mn></mrow><annotation encoding="application/x-tex">H=32</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>d</mi><mtext mathvariant="normal">head</mtext></msub><mo>=</mo><mn>128</mn></mrow><annotation encoding="application/x-tex">d_{\text{head}}=128</annotation></semantics></math>).
+Ha egy felhasználót szolgálunk ki
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi><mo>=</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">B=1</annotation></semantics></math>),
+és a kontextus hossza 4096 token, a számítás:
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>M</mi><mtext mathvariant="normal">KV</mtext></msub><mo>=</mo><mn>2</mn><mo>⋅</mo><mn>1</mn><mo>⋅</mo><mn>4096</mn><mo>⋅</mo><mn>32</mn><mo>⋅</mo><mn>128</mn><mo>⋅</mo><mn>32</mn><mo>⋅</mo><mn>2</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> byte</mtext></mrow><mo>=</mo><mn>2</mn><mspace width="0.167em"></mspace><mn>147</mn><mspace width="0.167em"></mspace><mn>483</mn><mspace width="0.167em"></mspace><mn>648</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> byte</mtext></mrow><mo>=</mo><mn>2</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> GiB</mtext></mrow><mo>≈</mo><mn>2</mn><mo>,</mo><mn>15</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> GB</mtext></mrow><mi>.</mi></mrow><annotation encoding="application/x-tex">
+M_{\text{KV}} = 2 \cdot 1 \cdot 4096 \cdot 32 \cdot 128 \cdot 32 \cdot 2 \text{ byte} = 2\,147\,483\,648 \text{ byte} = 2 \text{ GiB} \approx 2{,}15 \text{ GB}.
+</annotation></semantics></math> Ez az érték <strong>kisebb</strong>,
+mint a modell FP16-os súlyainak mérete (7 milliárd paraméter
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>×</mi><annotation encoding="application/x-tex">\times</annotation></semantics></math>
+2 bájt = 14 GB). A KV cache tehát egyetlen, 4096 tokenes kérésnél
+önmagában még nem haladja meg a súlyokat; a memória-probléma abból ered,
+hogy a cache a batch mérettel és a szekvenciahosszal
+<strong>lineárisan</strong> nő, miközben a súlyok mérete fix.</p>
+<p>Ugyanezzel a modellel, de
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi><mo>=</mo><mn>8</mn></mrow><annotation encoding="application/x-tex">B=8</annotation></semantics></math>
+párhuzamos kéréssel a KV cache:
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>M</mi><mtext mathvariant="normal">KV</mtext></msub><mo>=</mo><mn>2</mn><mo>⋅</mo><mn>8</mn><mo>⋅</mo><mn>4096</mn><mo>⋅</mo><mn>32</mn><mo>⋅</mo><mn>128</mn><mo>⋅</mo><mn>32</mn><mo>⋅</mo><mn>2</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> byte</mtext></mrow><mo>=</mo><mn>17</mn><mspace width="0.167em"></mspace><mn>179</mn><mspace width="0.167em"></mspace><mn>869</mn><mspace width="0.167em"></mspace><mn>184</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> byte</mtext></mrow><mo>=</mo><mn>16</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> GiB</mtext></mrow><mo>≈</mo><mn>17</mn><mo>,</mo><mn>18</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> GB</mtext></mrow><mo>,</mo></mrow><annotation encoding="application/x-tex">
+M_{\text{KV}} = 2 \cdot 8 \cdot 4096 \cdot 32 \cdot 128 \cdot 32 \cdot 2 \text{ byte} = 17\,179\,869\,184 \text{ byte} = 16 \text{ GiB} \approx 17{,}18 \text{ GB},
+</annotation></semantics></math> ami már meghaladja a 14 GB-os FP16
+súlyt. Ez a hatalmas, a batch méretével és a kontextushosszal együtt
+növekvő memóriaigény a fő oka annak, hogy a nagy kontextusú modellek
+kiszolgálása drága és technikailag nehéz. A hosszú kontextusok és a nagy
+batch méretek esetén a KV cache gyorsan a GPU memóriájának (VRAM) szűk
+keresztmetszetévé válik.</p>
+<h3 data-number="12.1.2"
+id="a-hagyományos-memóriakezelés-problémái"><span
+class="header-section-number">12.1.2</span> 2. A hagyományos
+memóriakezelés problémái</h3>
+<p>A KV cache kezelésére a korai implementációk (például a Hugging Face
+Transformers kezdeti változatai) egyszerű, előre lefoglalt tenzorokat
+használtak. A rendszer a kérés elején lefoglalt egy maximális
+szekvenciahossznak megfelelő memóriaterületet.</p>
+<p>Ez a megközelítés két súlyos problémát okoz:</p>
+<ol type="1">
+<li><strong>Belső fragmentáció (Internal Fragmentation):</strong> A
+legtöbb felhasználói kérés jóval rövidebb, mint a modell maximális
+kontextusablakja (például 128 token egy 4096-os limitből). A lefoglalt,
+de fel nem használt memória kárba vész. A GPU-n nem tudunk más kéréseket
+kiszolgálni, mert a memória foglalt.</li>
+<li><strong>Külső fragmentáció (External Fragmentation):</strong> Mivel
+a különböző kérések különböző időpontokban érkeznek és fejeződnek be, a
+memóriában lyukak keletkeznek. Hiába van szabad memória összességében,
+ha az nem összefüggő (kontiguus) blokk, a nagy, előre lefoglalt tenzorok
+nem férnek el. A rendszer “Ki a memóriából” (OOM) hibát dob annak
+ellenére, hogy a GPU-nak van szabad kapacitása.</li>
+</ol>
+<p>Ezek a hatékonysági problémák vezettek a fejlettebb memóriakezelési
+stratégiák kifejlesztéséhez.</p>
+<h3 data-number="12.1.3"
+id="pagedattention-virtuális-memória-a-kv-cache-számára"><span
+class="header-section-number">12.1.3</span> 3. PagedAttention: Virtuális
+memória a KV cache számára</h3>
+<p>A <strong>PagedAttention</strong> a vLLM rendszerben bevezetett
+technika, amely az operációs rendszerek virtuális memóriakezelésének
+ötletét ülteti át a KV cache-re. Ahelyett, hogy minden szekvenciához egy
+hatalmas, folytonos memóriaterületet rendelnénk, a cache-t kisebb, fix
+méretű blokkokra osztjuk.</p>
+<p><strong>A blokkos (paged) megközelítés működése:</strong></p>
+<ol type="1">
+<li><strong>Blokkok definiálása:</strong> A KV cache-t fizikailag fix
+méretű blokkokra osztjuk. Egy blokk mérete jellemzően 16 vagy 32
+tokenhez tartozó
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>V</mi><annotation encoding="application/x-tex">V</annotation></semantics></math>
+adatokat tartalmaz. Egy blokk mérete FP16-ban, bájtban:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mo>⋅</mo><mtext mathvariant="normal">block_size</mtext><mo>⋅</mo><mi>H</mi><mo>⋅</mo><msub><mi>d</mi><mtext mathvariant="normal">head</mtext></msub><mo>⋅</mo><mi>L</mi><mo>⋅</mo><mn>2</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> byte</mtext></mrow></mrow><annotation encoding="application/x-tex">2 \cdot \text{block\_size} \cdot H \cdot d_{\text{head}} \cdot L \cdot 2 \text{ byte}</annotation></semantics></math>;
+a legelső
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>2</mn><annotation encoding="application/x-tex">2</annotation></semantics></math>
+a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>V</mi><annotation encoding="application/x-tex">V</annotation></semantics></math>
+párosa, a legutolsó
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>2</mn><annotation encoding="application/x-tex">2</annotation></semantics></math>
+byte pedig az FP16 ábrázolás. A bájt/elem szorzó nélkül a képlet csak
+elemszámot ad, nem memóriaméretet.</li>
+<li><strong>Logikai és fizikai címzés:</strong> Amikor egy új kérés
+érkezik, a rendszer nem egybefüggő memóriát foglal, hanem szabad
+blokkokat keres egy blokktáblában (block table). A kéréshez tartozó
+logikai tokenek (1. token, 2. token, …) egy blokktáblán keresztül
+mutatnak a fizikai memóriablokkokra.</li>
+<li><strong>Rugalmas növekedés:</strong> Amikor a generálás során a
+szekvencia kinövi a jelenlegi blokkjait, a rendszer egyszerűen lefoglal
+egy újabb szabad blokkot a memória bármely pontjáról, és frissíti a
+blokktáblát. Nincs szükség nagy, folytonos területre.</li>
+</ol>
+<p><strong>Előnyök:</strong> - <strong>A belső fragmentáció a blokk
+méretére korlátozódik:</strong> A memóriát blokkonként foglaljuk, ezért
+a pazarlás csak a szekvencia utolsó blokkjában keletkezik, és legfeljebb
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">block_size</mtext><mo>−</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">\text{block\_size}-1</annotation></semantics></math>
+token lehet. Ha egy kérés 20 token hosszú, és a blokkméret 16, akkor 2
+blokkot foglalunk (32 tokennyi helyet), vagyis az utolsó blokkban 12
+token helye használatlan; ez a 32 tokennyi foglalás 37,5%-a, de a
+korábbi 4096 tokenes előfoglaláshoz képest mégis minimális. A
+PagedAttention tehát <strong>nem szünteti meg teljesen</strong> a belső
+fragmentációt, csak a blokkméretre korlátozza. - <strong>A külső
+fragmentáció gyakorlatilag megszűnik:</strong> Mivel minden blokk azonos
+méretű, bármely szabad blokk kielégíthet bármely kérést, és nincs
+szükség nagy, összefüggő területre. A klasszikus értelmű külső
+fragmentáció (használhatatlan, nem összefüggő lyukak) így eltűnik, de a
+memória nem használható 100%-ig: a szabad blokkok száma a korlát, és az
+utolsó blokk belső vesztesége megmarad. A gondos megfogalmazás ezért az,
+hogy a <strong>blokkok szintjén</strong> nincs külső fragmentáció, nem
+az, hogy a memória teljesen kihasználható. - <strong>Copy-on-Write
+(CoW):</strong> A PagedAttention rendkívül hatékonyan támogatja a
+párhuzamos mintavételezést (például beam search vagy párhuzamos
+kimenetek generálása). Ha egy ponton a generálás elágazik, a közös
+előzményekhez tartozó blokkokat a rendszer megosztja a különböző ágak
+között. Csak akkor másolja le a blokkot, ha az egyik ág módosítja azt.
+Ez jelentősen csökkenti a memóriafelhasználást olyan feladatoknál, ahol
+egy promptból több választ generálunk.</p>
+<p><strong>Gyakorlati minta és blokkhatár-teszt:</strong> Egy 7B
+paraméteres modellnél, ha a prompt feldolgozása (prefill) során 512
+token érkezik, a rendszer 32 darab 16 tokenes blokkot foglal le, és
+minden blokk tele van. A generálás <strong>első</strong> új tokenje a
+513. token, ezért ahhoz már azonnal új, 33. blokk kell; a következő új
+blokk a 529. tokenig nem szükséges. Ez a viselkedés élesen eltér egy 500
+tokenes prefillétől: ott 32 blokkban 12 szabad hely marad, így 12
+generált token még a meglévő blokkokba fér.</p>
+<p>A blokkhatárok és az utolsó blokk belső vesztesége 16 tokenes
+blokkméret mellett:</p>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr>
+<th>Összes token</th>
+<th>Lefoglalt blokkok</th>
+<th>Kapacitás</th>
+<th>Szabad hely az utolsó blokkban</th>
+<th>Belső veszteség a teljes foglalásból</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>511</td>
+<td>32</td>
+<td>512</td>
+<td>1</td>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mi>/</mi><mn>512</mn><mo>≈</mo><mn>0</mn><mo>,</mo><mn>2</mn><mi>%</mi></mrow><annotation encoding="application/x-tex">1/512 \approx 0{,}2\%</annotation></semantics></math></td>
+</tr>
+<tr>
+<td>512</td>
+<td>32</td>
+<td>512</td>
+<td>0</td>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0</mn><mi>%</mi></mrow><annotation encoding="application/x-tex">0\%</annotation></semantics></math></td>
+</tr>
+<tr>
+<td>513</td>
+<td>33</td>
+<td>528</td>
+<td>15</td>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>15</mn><mi>/</mi><mn>528</mn><mo>≈</mo><mn>2</mn><mo>,</mo><mn>8</mn><mi>%</mi></mrow><annotation encoding="application/x-tex">15/528 \approx 2{,}8\%</annotation></semantics></math></td>
+</tr>
+</tbody>
+</table>
+<figure id="fig-lm041-paged-blokktabla">
+<div class="fig-interactive"><iframe src="figures/html/lm041-paged-blokktabla.html" title="Három panel. Két kérés logikai blokkjai nem szomszédos fizikai blokkokra képeződnek; az 513. token új blokkot nyit; két ág közös blokkot oszt meg, és a nem teli utolsó blokk írásakor másolat készül." loading="lazy" style="width:100%;border:0;height:640px"></iframe><noscript><img src="figures/img/lm041-paged-blokktabla.png" style="width:100.0%"
+alt="Három panel. Két kérés logikai blokkjai nem szomszédos fizikai blokkokra képeződnek; az 513. token új blokkot nyit; két ág közös blokkot oszt meg, és a nem teli utolsó blokk írásakor másolat készül." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/lm041-paged-blokktabla.png" style="width:100.0%"
+alt="Három panel. Két kérés logikai blokkjai nem szomszédos fizikai blokkokra képeződnek; az 513. token új blokkot nyit; két ág közös blokkot oszt meg, és a nem teli utolsó blokk írásakor másolat készül." /></details></div>
+<figcaption>Blokktábla, blokkhatár és Copy-on-Write 16 tokenes
+blokkokkal. Bal: az A (20 token, 2 blokk, 12 üres hely, 37,5%) és a B
+kérés (500 token, 32 blokk, 12 üres hely) logikai blokkjai nem
+szomszédos fizikai blokkokra képeződnek. Közép: 511, 512 és 513 tokennél
+32, 32 és 33 blokk, 512, 512 és 528 hely; az 513. token új blokkot nyit.
+Jobb: két mintavételi ág megosztja a közös blokkokat, az első írás a nem
+teli utolsó blokkot lemásolja.</figcaption>
+</figure>
+<p>A táblázat mutatja, hogy az 511 és az 513 token közötti különbség nem
+egy tokennyi memória, hanem egy egész blokk: az 513. token átlépi a
+blokkhatárt, ezért 33 blokk kell. A PagedAttention külső fragmentációra
+gyakorolt hatása abban áll, hogy a 33 blokk a memória bármely szabad
+helyein elhelyezhető, nem kell egyetlen 528 tokenes összefüggő területet
+találni. A belső veszteség viszont az utolsó blokkban marad, és a
+blokkméret növelésével nő. A részletekért lásd Kwon et al. (2023),
+<em>Efficient Memory Management for Large Language Model Serving with
+PagedAttention</em>, arXiv:2309.06180.</p>
+<h3 data-number="12.1.4" id="folyamatos-batch-continuous-batching"><span
+class="header-section-number">12.1.4</span> 4. Folyamatos batch
+(Continuous Batching)</h3>
+<p>A hagyományos szerverekben a kiszolgálás <em>statikus batch</em>-ben
+történik. A beérkező kéréseket csoportosítják, és a modell egyszerre
+futtatja őket. Ez azonban komoly hatékonysági problémát okoz a generálás
+során.</p>
+<p>Képzeljük el, hogy egy batch 4 kérést tartalmaz. Három kérés 10 token
+hosszú kimenetet igényel, a negyedik pedig 500 tokent. A statikus batch
+addig fut, amíg a leghosszabb kérés be nem fejeződik. Ez azt jelenti,
+hogy az első három kérés befejezése után a GPU számítási kapacitása és
+memóriája tétlenül várakozik a hosszú kérésre. A keletkezett üres
+helyeket “buborékoknak” (bubbles) nevezzük. Ez drasztikusan rontja az
+átbocsátóképességet és a késleltetést.</p>
+<figure id="fig-lm041-batch-gantt">
+<div class="fig-interactive"><iframe src="figures/html/lm041-batch-gantt.html" title="Két Gantt-diagram egymás alatt, négy batch-hely és az iterációk tengelye, amely a 30. lépés után megtörik. Statikus batchnél három hely 490 lépésig üresen áll, folyamatos batchnél ezek a helyek a 11. lépéstől új kéréseket szolgálnak ki." loading="lazy" style="width:100%;border:0;height:620px"></iframe><noscript><img src="figures/img/lm041-batch-gantt.png" style="width:100.0%"
+alt="Két Gantt-diagram egymás alatt, négy batch-hely és az iterációk tengelye, amely a 30. lépés után megtörik. Statikus batchnél három hely 490 lépésig üresen áll, folyamatos batchnél ezek a helyek a 11. lépéstől új kéréseket szolgálnak ki." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/lm041-batch-gantt.png" style="width:100.0%"
+alt="Két Gantt-diagram egymás alatt, négy batch-hely és az iterációk tengelye, amely a 30. lépés után megtörik. Statikus batchnél három hely 490 lépésig üresen áll, folyamatos batchnél ezek a helyek a 11. lépéstől új kéréseket szolgálnak ki." /></details></div>
+<figcaption>Statikus és folyamatos batch 4 batch-hellyel, 3×10 + 1×500
+kimeneti tokennel; a sorban R5–R7 (10 token) vár (sematikus, egységnyi
+lépésidő, nem mérés). Statikus batchnél a három rövid kérés helye a
+11–500. lépésben buborék (kihasználtság 25%), és R5–R7 csak az 501.
+lépésben indul; folyamatos batchnél R5–R7 a 11. lépéstől a felszabadult
+helyeken fut, és a 20. lépésben végez.</figcaption>
+</figure>
+<p>A <strong>folyamatos batch</strong> (más néven iteration-level
+scheduling, iteration-level batching vagy in-flight batching) ezt a
+problémát oldja meg.</p>
+<p><strong>A folyamatos batch működése:</strong></p>
+<p>A folyamatos batch lényege, hogy a batch összetételét nem a kérés
+szintjén, hanem a generálási iteráció szintjén határozzuk meg. A modell
+minden egyes előrelépési lépésben (forward pass) egy tokent generál
+minden aktív szekvenciához.</p>
+<ol type="1">
+<li>Amikor egy kérés befejezi a generálást (elérte a leállítási
+feltételt, például EOS tokent generált), a rendszer azonnal eltávolítja
+a batch-ből.</li>
+<li>A felszabaduló helyre a rendszer azonnal behúz egy új kérést a
+várakozási sorból.</li>
+<li>A batch mérete így folyamatosan változik, de a GPU kihasználtsága
+állandóan magas marad.</li>
+</ol>
+<p>A folyamatos batch két fázisra bontható:</p>
+<ul>
+<li><strong>Prefill fázis:</strong> Amikor egy új kérés beérkezik, a
+teljes promptot egyszerre dolgozzuk fel. Ez a fázis számításigényes
+(compute-bound), mert a modell párhuzamosan dolgozza fel a prompt összes
+tokenjét. A prefill során a KV cache feltöltődik.</li>
+<li><strong>Decode fázis:</strong> A generálás során a modell egyesével
+állítja elő a tokeneket. Ez a fázis memória-sávszélesség-igényes
+(memory-bound), mert a nagy méretű modellsúlyokat és a KV cache-t kell
+beolvasni minden egyes token generálásához.</li>
+</ul>
+<p>A fejlett rendszerek (mint a vLLM vagy a TGI) a prefill és a decode
+fázisokat akár külön is ütemezhetik, hogy maximalizálják a GPU
+kihasználtságát. Például előfordulhat, hogy egy nagy prefill kérés
+feldolgozása közben a rendszer kisebb decode kéréseket is ütemez, hogy
+kitöltse a számítási hézagokat.</p>
+<p><strong>Preemption (kiszorítás, felfüggesztés):</strong>
+Előfordulhat, hogy egy új kérés akkora prompttal érkezik, amely nem fér
+el a szabad KV cache memóriában. Ilyenkor a rendszernek meg kell
+szakítania (preempt) néhány futó kérést. A PagedAttention kétféle
+mechanizmust tesz lehetővé:</p>
+<ol type="1">
+<li><strong>Swapping (Csere):</strong> A futó kérések KV cache blokkjait
+átmenetileg kimenekítjük a CPU RAM-jába. Amikor van hely, visszatöltjük
+a GPU-ra. Ez lassú, de nem veszít el számítási munkát.</li>
+<li><strong>Recomputation (Újraszámítás):</strong> A kiszorított kérés
+KV-blokkjait felszabadítjuk, a tokenjeit (a promptot és az addig
+generált tokeneket) megtartjuk. Amikor újra van kapacitás, ezeket
+egyetlen prefillben újraszámoljuk, és a generálás onnan folytatódik. Ez
+gyorsabb lehet, mint a swapping, mivel a prefill számítási művelet
+gyors.</li>
+</ol>
+<h3 data-number="12.1.5"
+id="labor-kv-cache-méretének-becslése-és-mérése"><span
+class="header-section-number">12.1.5</span> 5. Labor: KV cache méretének
+becslése és mérése</h3>
+<p>A következő labor célja, hogy a becsült és a ténylegesen mért
+GPU-memória-felhasználást összehasonlítsuk egy kis modellen. A példa
+PyTorch-ot és Hugging Face Transformers-t használ.</p>
+<p><strong>Hardver és szoftver környezet (reprodukálhatósági
+szerződés):</strong> - Python: 3.12 - PyTorch: 2.3 (vagy újabb) -
+Transformers: 4.40 (vagy újabb) - GPU: NVIDIA T4 (16 GB) vagy annál
+nagyobb (a labor futtatható CPU-n is, de a mérés pontatlanabb, és a
+képletek GPU-ra vonatkoznak) - Seed: 42</p>
+<p><strong>1. lépés: A várható (levezetett) érték
+kiszámítása</strong></p>
+<p>Használjunk egy kis, mai modellt:
+<code>Qwen/Qwen2.5-0.5B-Instruct</code>. (Ellenőrzési igény: a modell
+pontos neve és konfigurációja változhat a kiadás dátuma szerint, mindig
+a Hugging Face modellkártyájáról ellenőrizd a <code>config.json</code>
+értékeket.)</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> transformers <span class="im">import</span> AutoConfig</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>model_name <span class="op">=</span> <span class="st">&quot;Qwen/Qwen2.5-0.5B-Instruct&quot;</span>  <span class="co"># a revíziót rögzítsd (revision=...)</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>cfg <span class="op">=</span> AutoConfig.from_pretrained(model_name)</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="co"># A paramétereket a konfigurációból olvassuk (GQA: a KV-fejek száma kisebb a query-fejekénél)</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>num_layers <span class="op">=</span> cfg.num_hidden_layers                  <span class="co"># L</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>num_kv_heads <span class="op">=</span> cfg.num_key_value_heads              <span class="co"># H_KV (2, GQA), nem a 14 query-fej</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>head_dim <span class="op">=</span> cfg.hidden_size <span class="op">//</span> cfg.num_attention_heads  <span class="co"># d_head</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>batch_size <span class="op">=</span> <span class="dv">1</span>  <span class="co"># B</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>seq_len <span class="op">=</span> <span class="dv">1024</span>  <span class="co"># S</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="co"># Pontosság: FP16</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>bytes_per_param <span class="op">=</span> <span class="dv">2</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="co"># Várható KV cache méret (K és V, minden rétegben és fejben)</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="co"># Képlet: 2 * B * S * H_KV * d_head * L * bytes_per_param</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>expected_kv_cache_bytes <span class="op">=</span> <span class="dv">2</span> <span class="op">*</span> batch_size <span class="op">*</span> seq_len <span class="op">*</span> num_kv_heads <span class="op">*</span> head_dim <span class="op">*</span> num_layers <span class="op">*</span> bytes_per_param</span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>expected_kv_cache_mb <span class="op">=</span> expected_kv_cache_bytes <span class="op">/</span> (<span class="dv">1024</span> <span class="op">**</span> <span class="dv">2</span>)</span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;Várható KV cache méret: </span><span class="sc">{</span>expected_kv_cache_mb<span class="sc">:.2f}</span><span class="ss"> MiB&quot;</span>)</span></code></pre></div>
+<p>A Qwen2.5-0.5B GQA-t használ (14 Q-fej, 2 KV-fej; a konfigurációs
+értékeket a modellkártyán ellenőrizd), ezért 1024 tokenre a KV cache
+FP16-ban kézzel számolva
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mo>⋅</mo><mn>1</mn><mo>⋅</mo><mn>1024</mn><mo>⋅</mo><mn>2</mn><mo>⋅</mo><mn>64</mn><mo>⋅</mo><mn>24</mn><mo>⋅</mo><mn>2</mn><mo>=</mo><mn>12</mn><mspace width="0.167em"></mspace><mn>582</mn><mspace width="0.167em"></mspace><mn>912</mn></mrow><annotation encoding="application/x-tex">2\cdot1\cdot1024\cdot2\cdot64\cdot24\cdot2 = 12\,582\,912</annotation></semantics></math>
+B = 12 MiB. Ha a 14 Q-fejjel számolnánk, 84 MiB jönne ki; ez a 12.1.6
+szakasz 2. hibája. A szkript kimenetét nem futtattuk le.</p>
+<p><strong>2. lépés: A mért érték meghatározása</strong></p>
+<p>A mérést PyTorch memória-profilozóval végezzük. Generálunk egy
+szekvenciát, és megnézzük, mennyivel nő a GPU memóriafoglalása a prefill
+után.</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> transformers <span class="im">import</span> AutoModelForCausalLM, AutoTokenizer</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>torch.manual_seed(<span class="dv">42</span>)</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>model_name <span class="op">=</span> <span class="st">&quot;Qwen/Qwen2.5-0.5B-Instruct&quot;</span> <span class="co"># Verzió ellenőrzése szükséges</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Modell betöltése FP16-ban</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>model <span class="op">=</span> AutoModelForCausalLM.from_pretrained(</span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    model_name,</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    torch_dtype<span class="op">=</span>torch.float16,</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    device_map<span class="op">=</span><span class="st">&quot;auto&quot;</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>tokenizer <span class="op">=</span> AutoTokenizer.from_pretrained(model_name)</span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="co"># Prompt létrehozása: pontosan seq_len (1024) token</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>prompt <span class="op">=</span> <span class="st">&quot;A mesterséges intelligencia alapjai. &quot;</span> <span class="op">*</span> <span class="dv">400</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>ids <span class="op">=</span> tokenizer(prompt)[<span class="st">&quot;input_ids&quot;</span>][:seq_len]</span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="cf">assert</span> <span class="bu">len</span>(ids) <span class="op">==</span> seq_len, <span class="st">&quot;a prompt túl rövid, növeld az ismétlések számát&quot;</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>inputs <span class="op">=</span> {<span class="st">&quot;input_ids&quot;</span>: torch.tensor([ids], device<span class="op">=</span>model.device)}</span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a><span class="co"># GPU memória kiindulási állapot</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>torch.cuda.empty_cache()</span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>torch.cuda.reset_peak_memory_stats()</span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>base_memory <span class="op">=</span> torch.cuda.memory_allocated()</span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a><span class="co"># Prefill fázis (első forward pass, itt töltődik fel a KV cache)</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a><span class="cf">with</span> torch.no_grad():</span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>    outputs <span class="op">=</span> model(<span class="op">**</span>inputs, use_cache<span class="op">=</span><span class="va">True</span>, logits_to_keep<span class="op">=</span><span class="dv">1</span>)  <span class="co"># csak az utolsó pozíció logitja</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a><span class="co"># Memória a prefill után</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>prefill_memory <span class="op">=</span> torch.cuda.memory_allocated()</span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>measured_kv_cache_bytes <span class="op">=</span> prefill_memory <span class="op">-</span> base_memory</span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>measured_kv_cache_mb <span class="op">=</span> measured_kv_cache_bytes <span class="op">/</span> (<span class="dv">1024</span> <span class="op">**</span> <span class="dv">2</span>)</span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;Mért memórianövekedés (KV cache + maradék): </span><span class="sc">{</span>measured_kv_cache_mb<span class="sc">:.2f}</span><span class="ss"> MiB&quot;</span>)</span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a><span class="co"># Összehasonlítás</span></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;Eltérés: </span><span class="sc">{</span>measured_kv_cache_mb <span class="op">-</span> expected_kv_cache_mb<span class="sc">:.2f}</span><span class="ss"> MiB&quot;</span>)</span></code></pre></div>
+<p>A <code>logits_to_keep=1</code> nélkül a modell a prompt minden
+pozíciójára visszaadná a logitokat (<code>[1, S, 151936]</code>,
+FP16-ban tokenenként 303 872 B), a teljes logit-tenzor
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>S</mi><mo>×</mo><mo stretchy="false" form="prefix">|</mo><mi>V</mi><mo stretchy="false" form="prefix">|</mo></mrow><annotation encoding="application/x-tex">S\times|V|</annotation></semantics></math>)
+pedig nagyobb a KV cache-nél (tokenenként 12 288 B); ezért a különbségi
+mérés csak a logitok elhagyásával értelmes. (A paraméter neve a használt
+Transformers-verzióban ellenőrzendő; régebbi verzióban
+<code>del outputs.logits</code> a mérés előtt.)</p>
+<p><strong>Kiírt shape ellenőrzés:</strong> A gyakorlatban a shape-eket
+ellenőrizni kell. A <code>past_key_values</code> a cache objektum.
+Írassuk ki a cache egy elemének a shape-jét:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Az első réteg K és V cache shape-je</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>first_layer_kv <span class="op">=</span> outputs.past_key_values[<span class="dv">0</span>]</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;K shape: </span><span class="sc">{</span>first_layer_kv[<span class="dv">0</span>]<span class="sc">.</span>shape<span class="sc">}</span><span class="ss">&quot;</span>) <span class="co"># [1, num_kv_heads=2, S, 64] = [1, 2, 1024, 64]</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;V shape: </span><span class="sc">{</span>first_layer_kv[<span class="dv">1</span>]<span class="sc">.</span>shape<span class="sc">}</span><span class="ss">&quot;</span>) <span class="co"># [1, 2, 1024, 64]</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="co"># A KV cache közvetlen mérése a tenzorokból (új Cache API-nál: kv.layers[i].keys / .values)</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>kv <span class="op">=</span> outputs.past_key_values</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>kv_bytes <span class="op">=</span> <span class="bu">sum</span>(t.numel() <span class="op">*</span> t.element_size() <span class="cf">for</span> layer <span class="kw">in</span> kv <span class="cf">for</span> t <span class="kw">in</span> layer)</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="cf">assert</span> kv_bytes <span class="op">==</span> expected_kv_cache_bytes</span></code></pre></div>
+<p>Az <code>assert</code> az 1. lépés
+<code>expected_kv_cache_bytes</code> változóját használja, ezért a két
+kódblokkot ugyanabban a munkamenetben kell futtatni.</p>
+<p><strong>Magyarázat a mért és várt érték különbségére:</strong> A
+mérés során kapott érték jellemzően nagyobb lesz, mint a levezetett
+érték. Ennek okai:</p>
+<ol type="1">
+<li><strong>Visszaadott tenzorok:</strong> Az <code>outputs</code>
+objektum (például a logitok) a mérés pillanatában még él; a teljes
+szekvenciára számolt logit-tenzor a KV cache-nél nagyobb is lehet. A
+köztes aktivációk a <code>no_grad</code> blokkban felszabadulnak.</li>
+<li><strong>Allokációs overhead:</strong> A PyTorch cache-eli a
+memóriafoglalásokat (caching allocator). Bár
+<code>empty_cache()</code>-t hívtunk, a framework bizonyos blokkokat
+fenntart.</li>
+<li><strong>Pontossági eltérések:</strong> Egyes modellekben a KV cache
+különböző pontossággal tárolódik (például FP16 a súly, de FP32 az
+aktiváció). Ezt mindig ellenőrizni kell a modell konfigurációjában.</li>
+</ol>
+<p>A cél nem a pontos egyezés, hanem a nagyságrend és a formula
+mechanikájának megértése.</p>
+<h3 data-number="12.1.6" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">12.1.6</span> 6. Tipikus hibák és helyes
+megoldások</h3>
+<p>Az inferencia optimalizálása során a mérnökök leggyakrabban a
+következő hibákba esnek bele:</p>
+<p><strong>1. hiba: A batch dimenzió elfelejtése a becslésnél.</strong>
+Sokan kiszámolják a KV cache-t egyetlen szekvenciára, de elfelejtik
+megszorozni a batch mérettel
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>B</mi><annotation encoding="application/x-tex">B</annotation></semantics></math>).
+Egy 10-es batch esetén a memóriaigény tízszeres. A helyes megoldás
+mindig a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi><mo>⋅</mo><mi>S</mi></mrow><annotation encoding="application/x-tex">B \cdot S</annotation></semantics></math>
+szorzat használata, ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>B</mi><annotation encoding="application/x-tex">B</annotation></semantics></math>
+a konkurens kérések száma.</p>
+<p><strong>2. hiba: A GQA (Grouped Query Attention) figyelmen kívül
+hagyása.</strong> A modern modellek (Llama 3, Mistral, Qwen 2.5) gyakran
+használnak GQA-t, ahol a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>V</mi><annotation encoding="application/x-tex">V</annotation></semantics></math>
+fejek száma kisebb, mint a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>Q</mi><annotation encoding="application/x-tex">Q</annotation></semantics></math>
+fejek száma. Ha a képletben a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>Q</mi><annotation encoding="application/x-tex">Q</annotation></semantics></math>
+fejek számát használjuk a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>V</mi><annotation encoding="application/x-tex">V</annotation></semantics></math>
+fejek helyett, jelentősen felülbecsüljük a memóriaigényt. A pontos
+számításnál a <code>num_key_value_heads</code> értéket kell használni
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>H</mi><annotation encoding="application/x-tex">H</annotation></semantics></math>
+helyett, vagy külön kell kezelni a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>H</mi><mi>Q</mi></msub><annotation encoding="application/x-tex">H_Q</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>H</mi><mrow><mi>K</mi><mi>V</mi></mrow></msub><annotation encoding="application/x-tex">H_{KV}</annotation></semantics></math>
+értékeket.</p>
+<p><strong>3. hiba: A prefill és a decode fázis összekeverése.</strong>
+A prefill fázis számítási igénye négyzetesen nő a prompt hosszával, míg
+a decode fázisé lineárisan. Ha a rendszer rosszul ütemezi ezeket a
+fázisokat (például hagyja, hogy egy hosszú prefill kiszorítsa a rövid
+decode kéréseket), a latencia kilő. A helyes megoldás a <em>chunked
+prefill</em>: a hosszú promptot iterációnként legfeljebb
+<code>max_num_batched_tokens</code> tokenes darabokban dolgozzuk fel, a
+darabokat a futó decode-lépésekkel együtt ütemezzük, így a TPOT nem
+ugrik meg (a paraméternevet a rögzített vLLM-verzió dokumentációjából
+ellenőrizd).</p>
+<p><strong>4. hiba: A max sequence length túlzott előfoglalása.</strong>
+Ha a szervert úgy konfiguráljuk, hogy minden kérés számára a maximális
+(például 128k) kontextust foglalja le, a memória azonnal elfogy. A
+PagedAttention blokkos foglalása nélkül ez a naiv konfiguráció
+katasztrófa. A helyes konfiguráció a <code>max_model_len</code> reális
+értékre állítása (a valós kérések hosszeloszlása alapján) és a
+<code>gpu_memory_utilization</code> beállítása; a
+<code>max_num_batched_tokens</code> ezzel szemben az egy iterációban
+feldolgozható tokenek számát korlátozza, nem a kérésenkénti kontextust
+(a paraméterneveket a rögzített vLLM-verzió dokumentációjából
+ellenőrizd).</p>
+<h3 data-number="12.1.7" id="összefoglalás"><span
+class="header-section-number">12.1.7</span> Összefoglalás</h3>
+<p>Ebben az alfejezetben az LLM-inferencia memória-hatékonyságának
+alapjait tanítottuk meg. Láttuk, hogy a KV cache elengedhetetlen az
+autoregresszív generálás felgyorsításához, de óriási memóriaterhet
+jelent. A PagedAttention blokkos memóriakezeléssel a külső fragmentációt
+megszünteti, a belsőt pedig az utolsó blokkra (legfeljebb
+<code>block_size</code>−1 token) korlátozza, a folyamatos batch pedig
+kiküszöböli a statikus batch-ekben keletkező üresjáratokat.</p>
+<p>Ezek az alapfogalmak közvetlenül vezetnek át a következő alfejezetbe
+(12.2), ahol a négy elterjedt kiszolgáló motort (vLLM, TGI, llama.cpp,
+Ollama) hasonlítjuk össze. Ott azt vizsgáljuk meg, hogy ezek hogyan
+implementálják a PagedAttention-t és a folyamatos batchet; a speculative
+decodingot a 12.3 tárgyalja.</p>
+<h3 data-number="12.1.8" id="önellenőrző-kérdések"><span
+class="header-section-number">12.1.8</span> Önellenőrző kérdések</h3>
+<ol type="1">
+<li>Egy modell 40 réteggel, 8 KV-fejjel és 128-as fejmérettel
+rendelkezik. Mennyi memóriát foglal a KV cache egyetlen (B=1) 2048 token
+hosszú szekvencia esetén FP16-ban?</li>
+<li>Miért jobb a PagedAttention a hagyományos, előre lefoglalt tenzoros
+megközelítésnél?</li>
+<li>Hogyan oldja meg a folyamatos batch a hosszú és rövid generálások
+keveredésének problémáját?</li>
+</ol>
+<h3 data-number="12.1.9"
+id="megoldások-az-önellenőrző-kérdésekhez"><span
+class="header-section-number">12.1.9</span> Megoldások az önellenőrző
+kérdésekhez</h3>
+<ol type="1">
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mo>⋅</mo><mi>B</mi><mo>⋅</mo><mi>S</mi><mo>⋅</mo><msub><mi>H</mi><mrow><mi>K</mi><mi>V</mi></mrow></msub><mo>⋅</mo><msub><mi>d</mi><mtext mathvariant="normal">head</mtext></msub><mo>⋅</mo><mi>L</mi><mo>⋅</mo><mn>2</mn><mo>=</mo><mn>2</mn><mo>⋅</mo><mn>1</mn><mo>⋅</mo><mn>2048</mn><mo>⋅</mo><mn>8</mn><mo>⋅</mo><mn>128</mn><mo>⋅</mo><mn>40</mn><mo>⋅</mo><mn>2</mn><mo>=</mo><mn>335</mn><mspace width="0.167em"></mspace><mn>544</mn><mspace width="0.167em"></mspace><mn>320</mn></mrow><annotation encoding="application/x-tex">2\cdot B\cdot S\cdot H_{KV}\cdot d_{\text{head}}\cdot L\cdot 2 = 2\cdot1\cdot2048\cdot8\cdot128\cdot40\cdot2 = 335\,544\,320</annotation></semantics></math>
+B = 320 MiB (a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>/<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>V</mi><annotation encoding="application/x-tex">V</annotation></semantics></math>
+fejek számával, nem a query-fejekével számolunk).</li>
+<li>Blokkos foglalás: a belső veszteség legfeljebb egy blokk, nincs
+külső fragmentáció, a közös előtag Copy-on-Write-tal megosztható.</li>
+<li>Iterációszintű ütemezés: a befejezett kérés helye a következő
+lépésben új kérést kap, így nincs buborék.</li>
+</ol>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="lm040.html">← 11.4 Modellmerging, MoE és szakértői routing</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="lm042.html">12.2 vLLM, TGI, llama.cpp és Ollama összehasonlítása →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

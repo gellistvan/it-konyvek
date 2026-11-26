@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>25.2 Multi-tenancy, kvóta és rate limit – LLM-ek és
+domain-specifikus kis modellek programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz6">VI. RÉSZ – LLMOps és produkciós rendszerek</a> › <a href="index.html#lmch24">25 Skálázás és költségoptimalizálás</a></p>
+<div class="links"><a class="prev" rel="prev" href="lm093.html">← 25.1 Batch, cache, routing és modellválasztás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="lm095.html">25.3 GPU-klaszter és autoscaling →</a></div>
+</nav>
+<h2 data-number="25.2" id="lm094"><span
+class="header-section-number">25.2</span> Multi-tenancy, kvóta és rate
+limit</h2>
+<p>A többbérlős üzemeltetés akkor válik valódi mérnöki feladattá, amikor
+egyetlen LLM-szolgáltatás mögött több csapat, ügyfél vagy alkalmazás
+osztozik ugyanazon a GPU-kapacitáson. A cél nem csupán a költségek
+megosztása, hanem az, hogy az egyes bérlők (tenantok) egymástól
+elszigetelten, kiszámítható teljesítménnyel és a saját kvótáiknak
+megfelelően kapjanak erőforrást. Ebben az alfejezetben a multi-tenancy,
+tenantizoláció, rate limit és fairness fogalmait járjuk körül, majd egy
+reprodukálható laborban elkészítünk egy kvóta- és izolációs tervet.</p>
+<h3 data-number="25.2.1"
+id="miért-van-szükség-többbérlős-üzemeltetésre"><span
+class="header-section-number">25.2.1</span> Miért van szükség többbérlős
+üzemeltetésre?</h3>
+<p>Egy szervezeten belül ritkán éri meg minden alkalmazáshoz külön
+dedikált GPU-készletet üzemeltetni. A modellek futtatása drága, a
+terhelés pedig időben ingadozik. A multi-tenancy azt jelenti, hogy több,
+egymástól logikailag független fogyasztó – belső csapatok, külső
+ügyfelek, különböző termékek – ugyanazt a mögöttes modellpéldányt vagy
+modellfarmot használja. A bérlők szintjén a rendszer úgy viselkedik,
+mintha mindegyikük saját dedikált erőforrással rendelkezne, miközben a
+fizikai kapacitás megosztott.</p>
+<p>A multi-tenancy előnyei nyilvánvalóak: jobb kihasználtság,
+alacsonyabb fajlagos költség, egységes üzemeltetés. A kockázatok azonban
+hasonlóan jelentősek. Ha a tenantizoláció sérül, az egyik bérlő adatai
+kiszivároghatnak a másikhoz; ha a rate limit hiányzik vagy rosszul van
+beállítva, egy nagy forgalmú tenant kiforgathatja a többit a sorból; ha
+a kvótákat nem tartják nyilván, a költségelosztás átláthatatlanná válik.
+A fejezetben bemutatott megoldások ezeket a kockázatokat kezelik.</p>
+<h3 data-number="25.2.2"
+id="alapfogalmak-tenant-izoláció-kvóta-rate-limit-fairness"><span
+class="header-section-number">25.2.2</span> Alapfogalmak: tenant,
+izoláció, kvóta, rate limit, fairness</h3>
+<p><strong>Tenant (bérlő):</strong> a rendszer egy logikailag
+elkülönített fogyasztója. Egy tenant lehet például egy szervezeti
+egység, egy alkalmazás vagy egy külső ügyfél. A tenant azonosítása
+általában API-kulccsal, OAuth2 token <code>sub</code> mezőjével vagy
+hasonló hitelesítési adattal történik.</p>
+<p><strong>Tenantizoláció:</strong> annak biztosítása, hogy az egyik
+tenant ne férhessen hozzá a másik adataihoz, kontextusához, promptjaihoz
+vagy generált válaszaihoz, és ne befolyásolhassa annak teljesítményét.
+Az izoláció lehet logikai (alkalmazásszintű) vagy fizikai (dedikált
+erőforrás).</p>
+<p><strong>Kvóta:</strong> az erőforrás-felhasználás felső korlátja egy
+adott időablakban. LLM-eknél a leggyakoribb a token alapú kvóta (például
+havi 10 millió token bemenet + kimenet), de létezhet GPU-óra, tárhely
+vagy kérésszám alapú kvóta is. A kvóta jellemzően üzleti vagy
+költségvetési okokból van, és a számlázás alapjául is szolgálhat.</p>
+<p><strong>Rate limit:</strong> az egységnyi idő alatt engedélyezett
+maximális kérésszám vagy tokensebesség. A rate limit rövid távú védelmet
+nyújt a túlterhelés és a költség kiugrása ellen, míg a kvóta hosszabb
+távú keretet ad.</p>
+<p><strong>Fairness (igazságosság):</strong> az a tulajdonság, hogy a
+versengő tenantok között az erőforrások elosztása arányos, kiszámítható
+és nem engedi egyetlen tenant dominanciáját. A fairness nem feltétlenül
+jelent egyenlő elosztást; a tenantok súlyozhatók, de a rendszernek
+biztosítania kell, hogy egyetlen tenant se tudja tartósan elárasztani a
+többit.</p>
+<h3 data-number="25.2.3"
+id="tenantizoláció-szintjei-és-választási-szempontok"><span
+class="header-section-number">25.2.3</span> Tenantizoláció szintjei és
+választási szempontok</h3>
+<p>Az izoláció megvalósítása több szinten történhet. A választás a
+biztonsági követelményektől, a szabályozási kényszerektől, a költségtől
+és a teljesítményigényektől függ.</p>
+<h4 data-number="25.2.3.1" id="logikai-izoláció"><span
+class="header-section-number">25.2.3.1</span> Logikai izoláció</h4>
+<p>A legegyszerűbb forma, amikor minden tenant ugyanazt a
+modellpéldányt, ugyanazt a GPU-t és ugyanazt a folyamatot használja, de
+a kéréseket egy jól definiált tenant-azonosítóval látják el. Az
+alkalmazásréteg gondoskodik arról, hogy a promptok, a kontextusablak és
+a generált válaszok ne keveredjenek. A logikai izoláció jellemzően
+API-kulcsokkal, külön névterekkel vagy adatbázisbeli particionálással
+valósul meg.</p>
+<p><strong>Előnyök:</strong> alacsony költség, magas kihasználtság,
+egyszerű üzemeltetés.<br />
+<strong>Hátrányok:</strong> ha az alkalmazásban sérülékenység van, az
+egyik tenant adatai kiszivároghatnak; a teljesítménybeli interferencia
+(noisy neighbor) is fennáll.<br />
+<strong>Mikor elég?</strong> Belső, alacsony érzékenységű adatoknál,
+ahol a tenantok közötti bizalmi szint magas.</p>
+<h4 data-number="25.2.3.2" id="fizikai-izoláció"><span
+class="header-section-number">25.2.3.2</span> Fizikai izoláció</h4>
+<p>Ebben az esetben minden tenant saját dedikált modellpéldányt vagy
+akár saját GPU-t kap. A tenantok között nincs közös futási idő, így az
+adatszivárgás és a teljesítmény-interferencia minimálisra csökken.</p>
+<p><strong>Előnyök:</strong> erős biztonsági garancia, jobb
+teljesítmény-kiszámíthatóság, egyszerűbb megfelelés szigorú
+szabályozásoknak (pl. GDPR, egészségügyi adatok).<br />
+<strong>Hátrányok:</strong> magas költség, alacsony kihasználtság, nehéz
+skálázni sok kis tenant esetén.<br />
+<strong>Mikor szükséges?</strong> Külső ügyfeleknél, akik szigorú
+adatvédelmi vagy compliance követelményeket támasztanak, vagy amikor a
+tenantok egymástól független SLA-t igényelnek.</p>
+<h4 data-number="25.2.3.3" id="köztes-megoldások"><span
+class="header-section-number">25.2.3.3</span> Köztes megoldások</h4>
+<p>A két szélsőség között több köztes szint létezik:</p>
+<ul>
+<li><strong>Folyamatszintű izoláció:</strong> minden tenant külön
+processzben fut, de ugyanazon a gépen. Ez védelmet nyújt az alkalmazás
+memóriahibáival szemben, de a GPU-t továbbra is megosztják.</li>
+<li><strong>Konténerizáció:</strong> minden tenant saját konténerben,
+saját környezeti változókkal, de közös GPU-vezérlővel.</li>
+<li><strong>Multi-instance GPU (MIG):</strong> a GPU fizikai
+particionálása kisebb egységekre, amelyek dedikáltan oszthatók ki
+tenantoknak.</li>
+<li><strong>Súlyozott prioritású ütemező:</strong> a tenantok logikailag
+elkülönülnek, de az ütemező garantál bizonyos garantált
+erőforrás-részesedést.</li>
+</ul>
+<p>A gyakorlatban a legtöbb rendszer hibrid megközelítést alkalmaz: az
+alapértelmezett logikai izolációt a kritikus tenantoknál dedikált
+erőforrások egészítik ki.</p>
+<h4 data-number="25.2.3.4" id="izolációs-mátrix-a-döntéshez"><span
+class="header-section-number">25.2.3.4</span> Izolációs mátrix a
+döntéshez</h4>
+<p>Egy hasznos eszköz az izolációs követelmények feltérképezése. Minden
+tenantnál értékeljük:</p>
+<ul>
+<li><strong>Adatérzékenység:</strong> milyen kár keletkezik, ha az
+adatok kiszivárognak?</li>
+<li><strong>Teljesítmény-SLA:</strong> mennyire kritikus a késleltetés
+és az áteresztőképesség?</li>
+<li><strong>Compliance:</strong> vannak-e jogi előírások az
+elkülönítésre?</li>
+<li><strong>Költségkeret:</strong> mekkora a tenant hajlandósága fizetni
+az izolációért?</li>
+<li><strong>Skálázási profil:</strong> hány párhuzamos kérés
+várható?</li>
+</ul>
+<p>Ezek alapján a tenantokat osztályokba soroljuk (pl. bronze, silver,
+gold), és minden osztályhoz izolációs szintet rendelünk.</p>
+<h3 data-number="25.2.4" id="rate-limit-és-fairness"><span
+class="header-section-number">25.2.4</span> Rate limit és fairness</h3>
+<p>A rate limit célja, hogy a rendszer ne terhelődjön túl, és a tenantok
+ne léphessék át a rövid távú erőforrás-korlátokat. LLM-eknél a
+korlátozás több dimenzióban lehetséges: kérések másodpercenként (RPS),
+tokenek másodpercenként (TPS), illetve párhuzamos kérések száma
+(concurrency).</p>
+<h4 data-number="25.2.4.1" id="rate-limit-algoritmusok"><span
+class="header-section-number">25.2.4.1</span> Rate limit
+algoritmusok</h4>
+<p>A leggyakoribb algoritmusok:</p>
+<p><strong>Token bucket:</strong> egy vödörben tokenek állnak
+rendelkezésre, amelyeket a kérések fogyasztanak. A tokenek egy
+meghatározott sebességgel töltődnek vissza. Ha nincs elég token, a kérés
+vagy várakozik, vagy elutasításra kerül (HTTP 429). A token bucket jól
+modellezi a burst-forgalmat: rövid ideig a tenant a normál sebesség fölé
+mehet, ha van felhalmozott tokenje, de hosszú távon a sebesség
+korlátozott. A tokent itt nem szabad összekeverni az LLM tokenjével – ez
+az algoritmus belső számlálója.</p>
+<figure id="fig-lm094-token-bucket">
+<div class="fig-interactive"><iframe src="figures/html/lm094-token-bucket.html" title="Két oszlopban a B és a C tenant. Felül fűrészfog alakú töltöttségi görbe a kapacitás szaggatott vonalával: B-nél 1000-ről az első fél másodpercben 100 alá esik, majd 0 és 400 között ingadozik; C-nél 0 és 100 között. Alul a kérések oszlopai: elfogadott telt, elutasított üres, a C-nél a 100 tokennél nagyobb kérések sraffozottak és mind elutasítottak." loading="lazy" style="width:100%;border:0;height:640px"></iframe><noscript><img src="figures/img/lm094-token-bucket.png" style="width:100.0%"
+alt="Két oszlopban a B és a C tenant. Felül fűrészfog alakú töltöttségi görbe a kapacitás szaggatott vonalával: B-nél 1000-ről az első fél másodpercben 100 alá esik, majd 0 és 400 között ingadozik; C-nél 0 és 100 között. Alul a kérések oszlopai: elfogadott telt, elutasított üres, a C-nél a 100 tokennél nagyobb kérések sraffozottak és mind elutasítottak." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/lm094-token-bucket.png" style="width:100.0%"
+alt="Két oszlopban a B és a C tenant. Felül fűrészfog alakú töltöttségi görbe a kapacitás szaggatott vonalával: B-nél 1000-ről az első fél másodpercben 100 alá esik, majd 0 és 400 között ingadozik; C-nél 0 és 100 között. Alul a kérések oszlopai: elfogadott telt, elutasított üres, a C-nél a 100 tokennél nagyobb kérések sraffozottak és mind elutasítottak." /></details></div>
+<figcaption>Token bucket a labor B (500 token/s, kapacitás 1000) és C
+(50 token/s, kapacitás 100) tenantjára az első 5 másodpercben,
+ugyanazzal a kérésmintával (0,1 s-onként, 10–500 token, seed 42). Felül
+a vödör töltöttsége: a B tenant teli vödre az első néhány kérésen
+gyorsan elfogy (burst), utána a töltöttség a nulla közelében ingadozik;
+25/50 kérés, ≈ 675 token/s, a kezdeti 1000 tokenes burst miatt az 500
+token/s limit fölött. Alul a kérések: a C tenantnál a 36 db 100 tokennél
+nagyobb kérés mind elutasításra kerül, mert a kapacitásnál nagyobb kérés
+soha nem fér be a vödörbe (ezért javasolt a burst
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mo>≥</mo><annotation encoding="application/x-tex">\ge</annotation></semantics></math>
+legnagyobb kérésméret). Az ábra szándékosan a 100 tokenes (hibás)
+C-konfigurációt mutatja; a labor feladata (25.2.19) C-nél már 500
+tokenes burstöt ad. Szimulált óra, szemléltetés, nem mérés.</figcaption>
+</figure>
+<p><strong>Leaky bucket:</strong> a kérések egy sorba kerülnek, és a
+rendszer állandó sebességgel dolgozza fel őket. A sor mérete
+korlátozott, a túlcsorduló kérések elutasításra kerülnek. Ez a modell
+simítja a burstöket, de nem enged átmeneti csúcsforgalmat.</p>
+<p><strong>Fix ablak:</strong> időablakonként (például percenként)
+számláljuk a kéréseket; egyszerű, de az ablakhatáron rövid idő alatt a
+limit kétszerese is átjuthat.</p>
+<p><strong>Csúszó ablak:</strong> az utolsó 60 másodperc kéréseit
+számoljuk minden pillanatban (vagy a két szomszédos fix ablak súlyozott
+összegével közelítjük), így a határhatás eltűnik, cserébe több állapotot
+kell tárolni.</p>
+<p>A gyakorlatban a token bucket a legelterjedtebb, mert rugalmasan
+konfigurálható, és jól illeszkedik a token-alapú számlázáshoz.</p>
+<h4 data-number="25.2.4.2" id="token-alapú-rate-limit"><span
+class="header-section-number">25.2.4.2</span> Token-alapú rate
+limit</h4>
+<p>Mivel az LLM-költség és a számítási igény a tokenek számával arányos,
+a rate limitet gyakran tokenekben fejezzük ki. Például egy tenant kap
+1000 token/másodperc sebességet. Ez azt jelenti, hogy a token bucketbe
+másodpercenként 1000 token töltődik, a kérések pedig a bemeneti és a
+generált tokenek számának összegét fogyasztják. A kérésekhez tartozó
+tokenmennyiséget a tokenizerrel lehet kiszámítani, de a generált tokenek
+száma előre nem ismert – becsléssel vagy maximális kimeneti hosszal kell
+dolgozni.</p>
+<p>Alternatív megoldás, ha a rate limit kérésszám alapú, de a kérésekhez
+tartozó tokenek számát is figyelembe vesszük a fairness érdekében. Egy
+10 ezer tokenes prompt több erőforrást fogyaszt, mint egy 10 tokenes,
+ezért a tisztán RPS-alapú limit nem biztosít fair elosztást.</p>
+<h4 data-number="25.2.4.3" id="fairness-biztosítása"><span
+class="header-section-number">25.2.4.3</span> Fairness biztosítása</h4>
+<p>A fairness azt jelenti, hogy a versengő tenantok az igényeiknek és a
+súlyuknak megfelelően kapnak erőforrást. A legegyszerűbb módszer a
+per-tenant rate limit: minden tenant saját tokensebességet kap, és a
+limitet a tenantazonosító alapján alkalmazzuk. Ez azonban nem garantálja
+a globális igazságosságot, ha a tenantok összesített igénye meghaladja a
+kapacitást.</p>
+<p>Ilyenkor ütemezőre van szükség, amely a bejövő kéréseket sorba
+állítja, és a rendelkezésre álló GPU-kapacitást arányosan osztja el. A
+<strong>weighted fair queueing (WFQ)</strong> elv szerint minden tenant
+kap egy súlyt, és a sorban a csomagok (kérések) a súlyuk arányában
+kerülnek kiszolgálásra. A súlyozás alapulhat a tenant által fizetett
+díjon, a szerződéses szinten vagy a prioritáson.</p>
+<p>Egy másik megközelítés a <strong>max-min fairness</strong>, amelynél
+minden tenant, akinek az igénye kisebb az egyenlő részesedésnél, teljes
+igényét megkapja; a maradékot a többiek között egyenlően osztjuk el, és
+ezt ismételjük. Az LLM-üzemeltetésben gyakran elegendő a per-tenant rate
+limit és egy globális sor, amely FIFO vagy prioritásos elven működik. A
+lényeg, hogy egyetlen tenant se tudja tartósan kiszorítani a többit.</p>
+<h4 data-number="25.2.4.4" id="hibás-rate-limit-következményei"><span
+class="header-section-number">25.2.4.4</span> Hibás rate limit
+következményei</h4>
+<p>Ha a rate limit túl szigorú, a felhasználók feleslegesen 429-es
+hibákat kapnak, és romlik az élmény. Ha túl laza, a rendszer
+túlterhelődik, a késleltetés megnő, és a költségek elszabadulnak. A
+fairness sérülése akkor következik be, ha egy tenant képes a teljes
+kapacitást lekötni, például azért, mert a rate limitet nem per-tenant,
+hanem globálisan alkalmazzák, és a leggyorsabb kliens elviszi az összes
+erőforrást.</p>
+<h3 data-number="25.2.5" id="kvóta-kezelés-és-elszámolás"><span
+class="header-section-number">25.2.5</span> Kvóta kezelés és
+elszámolás</h3>
+<p>A kvóta hosszabb távú korlát, jellemzően napi, heti vagy havi
+szinten. A kvóta nyilvántartása elkülönül a rövid távú rate limittől,
+bár ugyanaz a token-számláló adat használható mindkettőhöz.</p>
+<h4 data-number="25.2.5.1" id="a-kvóta-típusai"><span
+class="header-section-number">25.2.5.1</span> A kvóta típusai</h4>
+<ul>
+<li><strong>Token kvóta:</strong> a leggyakoribb. Külön számolható a
+bemeneti és a kimeneti token, vagy összevontan. A számlázásnál gyakran
+súlyozzák a kimeneti tokeneket, mert azok generálása drágább.</li>
+<li><strong>Kérésszám kvóta:</strong> egyszerűbb, de nem tükrözi az
+erőforrás-felhasználást.</li>
+<li><strong>GPU-óra kvóta:</strong> ha a tenant dedikált erőforrást kap,
+a kvóta az üzemidőre vonatkozhat.</li>
+<li><strong>Tárhely kvóta:</strong> a tenant adatainak, naplóinak vagy
+modellműtárgyainak tárolására.</li>
+</ul>
+<h4 data-number="25.2.5.2" id="a-kvóta-nyilvántartása"><span
+class="header-section-number">25.2.5.2</span> A kvóta
+nyilvántartása</h4>
+<p>A kvótát legalább az alábbi eseményeknél kell frissíteni:</p>
+<ul>
+<li>Kérés érkezésekor a bemeneti tokenek számával.</li>
+<li>Generálás közben vagy után a kimeneti tokenek számával.</li>
+<li>Batch feldolgozás esetén a batch összesített tokenjeivel.</li>
+</ul>
+<p>A nyilvántartásnak atomi műveletekkel kell rendelkeznie, hogy
+párhuzamos kérések esetén se veszhessen el számláló. A leggyakoribb
+megoldás egy Redis vagy hasonló gyors adattár <code>INCRBY</code>
+műveletekkel, vagy egy adatbázis tranzakcióval.</p>
+<p>A kvóta túllépése esetén a rendszer többféleképpen reagálhat:</p>
+<ul>
+<li><strong>Hibaválasz:</strong> a kérés elutasítása 402 (Payment
+Required) vagy 429 (Too Many Requests) hibakóddal.</li>
+<li><strong>Figyelmeztetés:</strong> a tenant értesítést kap, amikor a
+kvóta 80%-át elérte.</li>
+<li><strong>Lágy korlát:</strong> a kérés továbbra is kiszolgálásra
+kerül, de magasabb költséggel vagy alacsonyabb prioritással.</li>
+<li><strong>Felfüggesztés:</strong> a tenant szolgáltatása ideiglenesen
+leáll a kvóta lejártáig.</li>
+</ul>
+<p>A választott mechanizmus a szolgáltatási szerződéstől és az üzleti
+modelltől függ. A lényeg, hogy a tenant előre ismerje a szabályokat, és
+a rendszer konzisztensen betartsa azokat.</p>
+<h3 data-number="25.2.6"
+id="gyakorlati-minta-multi-tenant-gateway-architektúra"><span
+class="header-section-number">25.2.6</span> Gyakorlati minta:
+multi-tenant gateway architektúra</h3>
+<p>A multi-tenancy, rate limit és kvóta kezelését leggyakrabban egy
+központi API gateway vagy reverse proxy réteg valósítja meg. A gateway a
+modelleket futtató backend elé kerül, és minden kérést átenged
+magán.</p>
+<p>Az architektúra fő komponensei:</p>
+<ol type="1">
+<li><p><strong>Autentikáció és tenant-azonosítás:</strong> minden
+kéréshez tartozik egy API-kulcs vagy OAuth2 token, amely alapján a
+gateway megállapítja a tenantot. A tenant-azonosító a kérés kontextusába
+kerül, és végigkíséri a feldolgozást.</p></li>
+<li><p><strong>Rate limit middleware:</strong> a gateway minden tenantra
+külön alkalmazza a token bucket vagy sliding window algoritmust. A
+limitet a tenant profilja határozza meg.</p></li>
+<li><p><strong>Kvóta-ellenőrző:</strong> a gateway lekérdezi a tenant
+aktuális tokenfelhasználását, és ha a kvóta kimerült, elutasítja a
+kérést.</p></li>
+<li><p><strong>Routing:</strong> a tenant profilja alapján a kérés a
+megfelelő modellpéldányhoz kerül. Ez lehet dedikált instance, közös
+instance vagy egy súlyozott prioritású sor.</p></li>
+<li><p><strong>Naplózás és mérés:</strong> a gateway rögzíti a
+tokenfogyasztást, a késleltetést és a hibakódokat, amelyek a kvóták
+frissítéséhez és a monitorozáshoz szükségesek.</p></li>
+<li><p><strong>Adminisztrációs felület:</strong> a tenantok, a kvóták és
+a rate limitek konfigurálására.</p></li>
+</ol>
+<p>Egy ilyen gateway megvalósítható általános API-menedzsment
+eszközökkel (Kong, Apigee, AWS API Gateway) vagy saját fejlesztésű
+komponenssel, például FastAPI alkalmazással, amely a vLLM vagy TGI előtt
+ül. A kulcskérdés, hogy a rate limit és a kvóta állapota megosztott
+legyen, ha a gateway több példányban fut – ezt általában Redis
+biztosítja.</p>
+<h3 data-number="25.2.7"
+id="egyszerű-token-bucket-implementáció-szemléltetés"><span
+class="header-section-number">25.2.7</span> Egyszerű token bucket
+implementáció (szemléltetés)</h3>
+<p>Az alábbi Python-kód egy per-tenant token bucket osztályt mutat be,
+amely a rate limit logikáját valósítja meg. A kód nem produkciós
+rendszerhez készült, hanem a labor szimulációjához.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> dataclasses <span class="im">import</span> dataclass</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="at">@dataclass</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> TokenBucket:</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    rate: <span class="bu">float</span>          <span class="co"># token per second</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    capacity: <span class="bu">float</span>      <span class="co"># maximum burst</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    tokens: <span class="bu">float</span>        <span class="co"># current token count</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    last_refill: <span class="bu">float</span>   <span class="co"># timestamp of last refill</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    <span class="at">@classmethod</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> create(cls, rate: <span class="bu">float</span>, capacity: <span class="bu">float</span>, start: <span class="bu">float</span> <span class="op">|</span> <span class="va">None</span> <span class="op">=</span> <span class="va">None</span>):</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>        t0 <span class="op">=</span> time.monotonic() <span class="cf">if</span> start <span class="kw">is</span> <span class="va">None</span> <span class="cf">else</span> start</span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> cls(rate<span class="op">=</span>rate, capacity<span class="op">=</span>capacity,</span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>                   tokens<span class="op">=</span>capacity, last_refill<span class="op">=</span>t0)</span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> _refill(<span class="va">self</span>, now: <span class="bu">float</span> <span class="op">|</span> <span class="va">None</span> <span class="op">=</span> <span class="va">None</span>):</span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>        now <span class="op">=</span> time.monotonic() <span class="cf">if</span> now <span class="kw">is</span> <span class="va">None</span> <span class="cf">else</span> now  <span class="co"># injektálható óra</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>        elapsed <span class="op">=</span> now <span class="op">-</span> <span class="va">self</span>.last_refill</span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.tokens <span class="op">=</span> <span class="bu">min</span>(<span class="va">self</span>.capacity,</span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>                          <span class="va">self</span>.tokens <span class="op">+</span> elapsed <span class="op">*</span> <span class="va">self</span>.rate)</span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.last_refill <span class="op">=</span> now</span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> consume(<span class="va">self</span>, tokens: <span class="bu">float</span>, now: <span class="bu">float</span> <span class="op">|</span> <span class="va">None</span> <span class="op">=</span> <span class="va">None</span>) <span class="op">-&gt;</span> <span class="bu">bool</span>:</span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>._refill(now)</span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> tokens <span class="op">&lt;=</span> <span class="va">self</span>.tokens:</span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>            <span class="va">self</span>.tokens <span class="op">-=</span> tokens</span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="va">True</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="va">False</span></span></code></pre></div>
+<p>A szimulációban a <code>consume(n, now=i*0.1)</code> hívással a
+szimulált időt adjuk át (és <code>create(..., start=0.0)</code>-val
+indítjuk a vödröt), így a futás determinisztikus, és nem a valós óra
+számít. A <code>consume</code> metódus akkor tér vissza
+<code>True</code> értékkel, ha elegendő token áll rendelkezésre,
+egyébként a kérést el kell utasítani. A <code>tokens</code> itt a kérés
+becsült tokenmennyisége.</p>
+<p>A gyakorlatban a becsléshez a bemeneti prompt tokenizálása szükséges,
+a kimeneti tokenek számát pedig a <code>max_tokens</code> paraméterrel
+vagy egy átlagos hosszal közelíthetjük.</p>
+<h3 data-number="25.2.8" id="labor-kvóta--és-izolációs-terv"><span
+class="header-section-number">25.2.8</span> Labor: kvóta- és izolációs
+terv</h3>
+<p>A labor célja, hogy egy fiktív LLM-szolgáltatás számára elkészítsünk
+egy multi-tenant konfigurációt, lefuttassunk egy determinisztikus
+szimulációt, és összehasonlítsuk a mért és a várt eredményeket.</p>
+<h4 data-number="25.2.8.1" id="feladatleírás"><span
+class="header-section-number">25.2.8.1</span> Feladatleírás</h4>
+<p>Tervezz meg egy gateway-t három tenant számára:</p>
+<ul>
+<li><strong>Tenant A (külső ügyfél, gold):</strong> magas
+adatérzékenység, szigorú SLA, havi kvóta 50 millió token, rate limit
+2000 token/s, burst kapacitás 5000 token, dedikált modellpéldány.</li>
+<li><strong>Tenant B (belső csapat, silver):</strong> közepes
+érzékenység, havi kvóta 20 millió token, rate limit 500 token/s, burst
+1000 token, megosztott modell.</li>
+<li><strong>Tenant C (fejlesztői teszt, bronze):</strong> alacsony
+érzékenység, havi kvóta 2 millió token, rate limit 50 token/s, burst 500
+token (legalább a legnagyobb kérésméret), megosztott modell.</li>
+</ul>
+<p>A gateway a token bucket algoritmust használja, a tokenfogyasztást a
+kérésekhez tartozó tokenbecslések alapján számolja.</p>
+<h4 data-number="25.2.8.2" id="a-notebook-felépítése"><span
+class="header-section-number">25.2.8.2</span> A notebook felépítése</h4>
+<p>A notebook az alábbi lépéseket követi:</p>
+<ol type="1">
+<li><strong>Környezet rögzítése:</strong> Python verzió, szükséges
+csomagok (numpy, matplotlib), seed beállítása
+<code>random.seed(42)</code> és <code>numpy.random.seed(42)</code>.</li>
+<li><strong>Tenant profilok definiálása:</strong> egy Python szótár,
+amely tartalmazza minden tenant rate limitjét, kvótáját, burst
+kapacitását és izolációs szintjét.</li>
+<li><strong>Token bucket szimuláció:</strong> minden tenant kap egy
+<code>TokenBucket</code> példányt a fenti osztály alapján. A szimuláció
+során véletlenszerű kérések érkeznek, mindegyikhez tartozik egy
+tokenmennyiség (pl. 10 és 500 közötti egész). A kérések időbélyegei 0,1
+másodpercenként következnek, összesen 10 000 kérés szimulálásával.</li>
+<li><strong>Kvóta-számláló:</strong> minden tenantnak van egy
+<code>quota_used</code> változója, amely a sikeresen kiszolgált kérések
+tokenjeit összegzi. A kvóta túllépése esetén a kérés elutasításra kerül
+(429).</li>
+<li><strong>Fairness vizsgálat:</strong> a szimuláció után kiszámítja az
+egyes tenantok által ténylegesen fogyasztott tokenek arányát, és
+összehasonlítja a várt arányokkal (amelyek a rate limitekből
+adódnak).</li>
+<li><strong>Izolációs terv:</strong> a notebook szöveges cellában
+bemutatja, hogyan valósítanánk meg az izolációt az egyes tenantoknál
+(például Tenant A dedikált GPU-t kap, Tenant B és C közös instance-t
+használ, de külön API-kulcsokkal).</li>
+<li><strong>Eredmények kiértékelése:</strong> a mért értékeket
+(elfogadott kérések száma, tokenfogyasztás, fairness arány) összevetjük
+a várt értékekkel.</li>
+</ol>
+<h4 data-number="25.2.8.3" id="várt-és-mért-eredmények"><span
+class="header-section-number">25.2.8.3</span> Várt és mért
+eredmények</h4>
+<p>A szimulációban a rate limit miatt a tenantok nem léphetik át a
+tokensebességüket. A várt elfogadott tokenfogyasztás közelítőleg:</p>
+<ul>
+<li>Tenant A: 2000 token/s × szimulációs időtartam</li>
+<li>Tenant B: 500 token/s × szimulációs időtartam</li>
+<li>Tenant C: 50 token/s × szimulációs időtartam</li>
+</ul>
+<p>A tényleges (mért) értékek ettől kissé eltérnek, mert a burst
+kapacitás és a kérések közötti időzítés miatt az elején lehet némi
+túllövés, de hosszú távon a mért sebesség a várt körül mozog. A
+kapacitásnál nagyobb kérés soha nem fér be a vödörbe; ezért a burst ≥
+max. kérésméret feltétel a konfiguráció része. Az ajánlati terhelés
+tenantonként ≈ 2550 token/s (átlagosan 255 token / 0,1 s), így mindhárom
+tenant telített, és az elfogadott sebesség a limit közelében van. A
+kvóták nem merülnek ki, mert a szimuláció rövid (pl. 1000 másodperc), és
+a tokenmennyiségek kicsik.</p>
+<p>A fairness méréséhez kiszámíthatjuk a tenantok közötti tényleges
+tokensebesség-arányt. Ha a rendszer fair, akkor a mért arány közel van a
+beállított rate limit arányokhoz: A:B:C = 2000:500:50 = 40:10:1.</p>
+<p>A várt és mért értékeket táblázatban közöljük, és a notebook
+automatikusan ellenőrzi, hogy az eltérés 10%-on belül van-e.</p>
+<h4 data-number="25.2.8.4" id="ellenőrző-kérdés-a-laborhoz"><span
+class="header-section-number">25.2.8.4</span> Ellenőrző kérdés a
+laborhoz</h4>
+<p>Mi történne, ha a tenantok közül az egyik (például Tenant C) nem
+kapna rate limitet? Magyarázza meg, hogyan sérülne a fairness, és milyen
+hatással lenne a másik két tenantra.</p>
+<h3 data-number="25.2.9" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">25.2.9</span> Tipikus hibák és helyes
+megoldások</h3>
+<p><strong>Hiba 1: Közös API-kulcs használata.</strong> Ha minden tenant
+ugyanazt a kulcsot használja, a rate limit és a kvóta nem
+differenciálható, és a tenantok közötti elszámolás lehetetlenné válik.
+<em>Helyes megoldás:</em> minden tenant saját, egyedi hitelesítési
+adatot kap.</p>
+<p><strong>Hiba 2: A kvóta és a rate limit összekeverése.</strong> A
+rate limit rövid távú, a kvóta hosszú távú korlát. Ha csak kvótát
+használunk rate limit nélkül, egy tenant egyetlen nap alatt
+felhasználhatja a havi keretét, és a többi tenant kiszorul. <em>Helyes
+megoldás:</em> mindkét szintet be kell vezetni.</p>
+<p><strong>Hiba 3: A tokenfogyasztás nem pontos mérése.</strong> Ha a
+kimeneti tokeneket nem számoljuk, a költségelosztás torzul, és a
+tenantok többet fogyaszthatnak, mint amennyit fizetnek. <em>Helyes
+megoldás:</em> minden kérésnél pontosan rögzíteni kell a bemeneti és a
+kimeneti tokenek számát.</p>
+<p><strong>Hiba 4: A fairness hiánya a globális sorban.</strong> Ha a
+modell egyetlen FIFO sort használ minden tenant számára, a nagy forgalmú
+tenant hosszú ideig blokkolhatja a kisebbeket. <em>Helyes megoldás:</em>
+súlyozott sor vagy per-tenant párhuzamos feldolgozási limit.</p>
+<p><strong>Hiba 5: Nem dokumentált izolációs feltételezések.</strong> Ha
+a logikai izolációt választjuk, de a tenant adatai érzékenyek, a
+biztonsági incidens költsége magas. <em>Helyes megoldás:</em> az
+izolációs szintet minden tenantnál tudatosan kell megválasztani, és
+dokumentálni kell a döntés indokait.</p>
+<h3 data-number="25.2.10" id="összefoglalás"><span
+class="header-section-number">25.2.10</span> Összefoglalás</h3>
+<p>A multi-tenancy, kvóta és rate limit három, egymást kiegészítő
+mechanizmus, amelyek együttesen teszik lehetővé, hogy egy
+LLM-infrastruktúra több fogyasztót szolgáljon ki biztonságosan,
+kiszámíthatóan és költséghatékonyan. A tenantizoláció védi az adatokat
+és a teljesítményt, a rate limit a rövid távú túlterhelést, a kvóta
+pedig a hosszú távú erőforrás-felhasználást szabályozza. A fairness
+biztosítása érdekében a rendszert per-tenant konfigurációval és
+súlyozott ütemezővel kell kialakítani.</p>
+<p>A laborban egy determinisztikus szimulációval ellenőrizhető, hogy a
+token bucket algoritmus a beállított sebességeknek megfelelően
+szabályozza a forgalmat, és a tenantok közötti arányok a várt értékekhez
+közelítenek. A következő alfejezet (<a href="lm095.html">GPU-klaszter és
+autoscaling</a>) ezekre az alapokra épít, amikor a GPU-klaszter és az
+automatikus skálázás kérdéseit vizsgálja: a tenantok és a kvóták
+ismeretében hogyan méretezzük a mögöttes hardvert, és hogyan reagáljunk
+a változó terhelésre.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="lm093.html">← 25.1 Batch, cache, routing és modellválasztás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="lm095.html">25.3 GPU-klaszter és autoscaling →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

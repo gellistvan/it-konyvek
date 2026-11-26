@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>30.3 Fine-tuning, kvantálás és deployment – LLM-ek és
+domain-specifikus kis modellek programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz7">VII. RÉSZ – Domain-esettanulmányok és záróprojekt</a> › <a href="index.html#lmch29">30 Záróprojekt: domain-specifikus kis LLM</a></p>
+<div class="links"><a class="prev" rel="prev" href="lm114.html">← 30.2 Adatgyűjtés, tisztítás és jogosultság</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="lm116.html">30.4 Értékelés, dokumentáció és bemutató →</a></div>
+</nav>
+<h2 data-number="30.3" id="lm115"><span
+class="header-section-number">30.3</span> Fine-tuning, kvantálás és
+deployment</h2>
+<p>A záróprojekt ezen szakaszában a kiválasztott kis modellt a
+domain-adatokon finomítjuk, majd a betanított adaptert egyesítjük,
+kvantáljuk, végül kiszolgáljuk. A hangsúly nem az egyes technikák
+elméleti újbóli bemutatásán van – azokat a korábbi fejezetek
+(LoRA/QLoRA, kvantálás, inferencia) már részletezték –, hanem az
+integráción, a reprodukálhatóságon és a produkcióba állítás döntési
+pontjain. A következő alfejezet (<a href="lm116.html">Értékelés,
+dokumentáció és bemutató</a>) erre építve foglalkozik majd a kiadási
+dokumentációval és a bemutatóval.</p>
+<h3 data-number="30.3.1"
+id="a-finomítás-előkészítése-rögzített-környezet-és-konfiguráció"><span
+class="header-section-number">30.3.1</span> 1. A finomítás előkészítése:
+rögzített környezet és konfiguráció</h3>
+<p>A reprodukálható fine-tuning első lépése nem a tréning, hanem a
+környezet és a döntések rögzítése. A korábbi laborokból már ismert, hogy
+a Python-csomagok verziója, a modell-revízió, a tokenizer-verzió és az
+adatverzió együttesen határozzák meg az eredményt. Ezért a
+záróprojektben ezeket egyetlen, verziózott konfigurációs állományban és
+lockfile-ban rögzítjük.</p>
+<p>A gyakorlatban ez a következőket jelenti:</p>
+<ul>
+<li><strong>Python-környezet</strong>: <code>python==3.12</code>, a fő
+csomagok (például <code>torch</code>, <code>transformers</code>,
+<code>datasets</code>, <code>peft</code>, <code>trl</code>,
+<code>accelerate</code>, <code>bitsandbytes</code>) pontos
+verziószámmal. A <code>pip freeze</code> vagy
+<code>poetry.lock</code>/<code>uv.lock</code> kimenete a reprodukciós
+csomag része.</li>
+<li><strong>Modell és tokenizer</strong>: a kiválasztott alapmodell
+pontos neve és commit hash-e (például
+<code>Qwen/Qwen2.5-1.5B-Instruct</code>, a 30.1.4-ben rögzített jelölt
+egy adott revízióval). A tokenizer nem választható el a modelltől; a
+chat template és a speciális tokenek verziója is rögzítendő.</li>
+<li><strong>Adat</strong>: bemenet:
+<code>data/kv-pairs-v0.3.jsonl</code> és
+<code>split/document-groups.json</code> (30.2),
+<code>candidate_id</code> a 30.1-ből; az <a
+href="lm114.html">Adatgyűjtés, tisztítás és jogosultság</a> alfejezetben
+előállított tanító-, validációs- és teszthalmaz verziószáma, a split
+definíciója és az adatkártya hivatkozása. Ha szintetikus adatot
+használtunk, a generáló prompt és a tanármodell is szerepeljen a
+csomagban.</li>
+<li><strong>Seed és determinizmus</strong>: a Python, NumPy, PyTorch és
+CUDA seed-jét egy helyen állítjuk be. A determinisztikus mód
+(<code>torch.backends.cudnn.deterministic = True</code>,
+<code>torch.backends.cudnn.benchmark = False</code>, az NVIDIA
+determinisztikus algoritmusok környezeti változója) csökkenti a nem
+determinisztikus műveletek hatását, bár teljes bitpontos reprodukciót
+nem mindig garantál. A seed mellett a hardver (GPU típus, driver verzió)
+is naplózandó.</li>
+</ul>
+<p>A konfigurációt érdemes egy szöveges állományban (például YAML vagy
+JSON) tárolni, amelyből a tréning és a kiértékelés is dolgozik. Ez a
+gyakorlatban az “egyetlen igazságforrás” elvét érvényesíti: a
+hyperparaméterek, a LoRA-beállítások, a batch méret és a kiértékelési
+prompt egy helyen élnek.</p>
+<h3 data-number="30.3.2" id="peft-és-qlora-a-záróprojektben"><span
+class="header-section-number">30.3.2</span> 2. PEFT és QLoRA a
+záróprojektben</h3>
+<p>A kiválasztott kis modell finomításához paraméterhatékony adaptációt
+használunk. A LoRA az eredeti súlyokat fagyasztva tanít egy alacsony
+rangú frissítést:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mi>W</mi><mo>′</mo></msup><mo>=</mo><mi>W</mi><mo>+</mo><mfrac><mi>α</mi><mi>r</mi></mfrac><mi>B</mi><mi>A</mi></mrow><annotation encoding="application/x-tex">W&#39; = W + \frac{\alpha}{r}BA</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi><mo>∈</mo><msup><mi>ℝ</mi><mrow><mi>d</mi><mo>×</mo><mi>r</mi></mrow></msup></mrow><annotation encoding="application/x-tex">B\in\mathbb{R}^{d\times r}</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>A</mi><mo>∈</mo><msup><mi>ℝ</mi><mrow><mi>r</mi><mo>×</mo><mi>k</mi></mrow></msup></mrow><annotation encoding="application/x-tex">A\in\mathbb{R}^{r\times k}</annotation></semantics></math>.
+A QLoRA ezt kiegészíti a fagyasztott alapmodell 4-bites kvantálásával
+(általában NF4 típusú, dupla kvantálással), így a teljes modell
+memóriaigénye töredékére csökken. A záróprojektben a QLoRA azért
+praktikus, mert egy 7 milliárd paraméteres modellt is elfogadható
+GPU-memórián (pl. 16–24 GB VRAM) lehet finomítani, miközben az adapter
+csak néhány millió paramétert jelent.</p>
+<p>A tipikus beállítások, amelyeket a konfigurációban rögzítünk:</p>
+<ul>
+<li><code>r</code>: a LoRA rangja; kis modelleknél és kevés adatnál 8–16
+gyakran elegendő, nagyobb adatnál 32–64.</li>
+<li><code>lora_alpha</code>: általában <code>r</code> kétszerese, vagy
+16–32; a <code>lora_alpha / r</code> hányados szabályozza a frissítés
+erősségét.</li>
+<li><code>target_modules</code>: a figyelem és MLP vetítési mátrixai
+(például <code>q_proj</code>, <code>k_proj</code>, <code>v_proj</code>,
+<code>o_proj</code>, <code>gate_proj</code>, <code>up_proj</code>,
+<code>down_proj</code>). A pontos nevek modellfüggőek; a PEFT
+dokumentációja és a modell architektúrája alapján ellenőrizendő.</li>
+<li><code>lora_dropout</code>: 0,05–0,1, ha kevés az adat; nagyobb
+adatnál csökkenthető.</li>
+<li><code>bias</code>: általában <code>none</code>.</li>
+</ul>
+<p>A QLoRA betöltéshez <code>bitsandbytes</code> szükséges. A 4-bites
+kvantálás konfigurációját – NF4, dupla kvantálás, bf16 számítás – a
+betöltési paraméterek között adjuk meg. A modell betöltése után a PEFT
+<code>LoraConfig</code> segítségével definiáljuk az adaptert, majd a
+tréninget a TRL <code>SFTTrainer</code> osztályával futtatjuk.</p>
+<p>Az alábbi kódrészlet a fő lépéseket szemlélteti, nem futtatható
+utasítás. A pontos osztály- és paraméternevek a felhasznált
+könyvtárverziók dokumentációjából ellenőrizendők:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Szemléltető kód: QLoRA finomítás előkészítése</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> transformers <span class="im">import</span> AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> peft <span class="im">import</span> LoraConfig, get_peft_model, prepare_model_for_kbit_training</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="co"># A projektben rögzített értékek: a modell-azonosító és a revízió külön konstans.</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>MODEL_ID <span class="op">=</span> <span class="st">&quot;Qwen/Qwen2.5-1.5B-Instruct&quot;</span>  <span class="co"># a 30.1 jelöltje</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>REVISION <span class="op">=</span> <span class="st">&quot;&lt;rögzített-commit-hash&gt;&quot;</span>  <span class="co"># a projekt lockfile-ában szereplő érték</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>bnb_config <span class="op">=</span> BitsAndBytesConfig(</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    load_in_4bit<span class="op">=</span><span class="va">True</span>,</span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    bnb_4bit_quant_type<span class="op">=</span><span class="st">&quot;nf4&quot;</span>,</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>    bnb_4bit_use_double_quant<span class="op">=</span><span class="va">True</span>,</span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    bnb_4bit_compute_dtype<span class="op">=</span>torch.bfloat16,</span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>model <span class="op">=</span> AutoModelForCausalLM.from_pretrained(</span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>    MODEL_ID,</span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>    revision<span class="op">=</span>REVISION,</span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>    quantization_config<span class="op">=</span>bnb_config,</span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>    device_map<span class="op">=</span><span class="st">&quot;auto&quot;</span>,</span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>tokenizer <span class="op">=</span> AutoTokenizer.from_pretrained(MODEL_ID, revision<span class="op">=</span>REVISION)</span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="cf">assert</span> tokenizer.pad_token <span class="kw">is</span> <span class="kw">not</span> <span class="va">None</span> <span class="kw">and</span> tokenizer.pad_token_id <span class="op">!=</span> tokenizer.eos_token_id, <span class="op">\</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;a pad és az eos tokennek különböznie kell&quot;</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>model <span class="op">=</span> prepare_model_for_kbit_training(model)</span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>lora_config <span class="op">=</span> LoraConfig(</span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>    r<span class="op">=</span><span class="dv">16</span>,</span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a>    lora_alpha<span class="op">=</span><span class="dv">32</span>,</span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>    target_modules<span class="op">=</span>[<span class="st">&quot;q_proj&quot;</span>, <span class="st">&quot;k_proj&quot;</span>, <span class="st">&quot;v_proj&quot;</span>, <span class="st">&quot;o_proj&quot;</span>, <span class="st">&quot;gate_proj&quot;</span>, <span class="st">&quot;up_proj&quot;</span>, <span class="st">&quot;down_proj&quot;</span>],</span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a>    lora_dropout<span class="op">=</span><span class="fl">0.05</span>,</span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a>    bias<span class="op">=</span><span class="st">&quot;none&quot;</span>,</span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a>    task_type<span class="op">=</span><span class="st">&quot;CAUSAL_LM&quot;</span>,</span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a>model <span class="op">=</span> get_peft_model(model, lora_config)</span></code></pre></div>
+<p>A <code>MODEL_ID</code> és a <code>REVISION</code> külön konstans: a
+modell-azonosítót és a rögzített commit hash-t minden betöltésnél
+(modell és tokenizer) át kell adni, így a finomítás és a későbbi
+újratöltés ugyanarra a verzióra támaszkodik. A
+<code>bnb_4bit_compute_dtype</code> és a későbbi egyesítés
+<code>torch_dtype</code>-ja csak a tényleges hardver által támogatott
+típus lehet (például <code>bfloat16</code> csak megfelelő GPU/CPU
+támogatással); ezt a környezet rögzítésekor ellenőrizni kell. Ha a
+tokenizernek nincs pad tokenje, külön pad tokent adunk hozzá; a pad =
+eos beállítás a válaszvégi eos maszkolásához vezethet, és a modell nem
+tanul meg megállni. Fontos, hogy a
+<code>prepare_model_for_kbit_training</code> meghívása után a
+gradiens-ellenőrzőpontok és a kevert precizitás beállításai a
+tréningkonfigurációban tovább finomíthatók.</p>
+<h3 data-number="30.3.3"
+id="az-sft-tréning-futtatása-és-monitorozása"><span
+class="header-section-number">30.3.3</span> 3. Az SFT tréning futtatása
+és monitorozása</h3>
+<p>Az utasításfinomítás (SFT) során a modell a domain-specifikus
+utasítás–válasz párokon tanul. A tréning adatát a tokenizer chat
+template-jével formázzuk, és a loss-t csak a válasz tokenjeire számítjuk
+(a felhasználói promptra maszkolunk). A TRL újabb verzióiban a
+completion-only (csak-válasz) maszkolást az <code>SFTConfig</code>
+kapcsolója végzi (<code>assistant_only_loss</code>, chat template-tel és
+a verzió által támogatott formátummal); régebbi verzióban a
+<code>DataCollatorForCompletionOnlyLM</code> szolgált erre (az újabb
+TRL-ben már nincs). A pontos paraméterneveket a rögzített TRL-verzió
+dokumentációjából kell ellenőrizni.</p>
+<p>A fő hyperparaméterek, amelyeket a záróprojektben rögzíteni kell:</p>
+<ul>
+<li><strong>Learning rate</strong>: QLoRA esetén jellemzően 1e-4 és 5e-4
+között; kis modellnél és kevés adatnál inkább az alsó tartomány.</li>
+<li><strong>Batch méret</strong>: az effektív globális batch =
+eszközönkénti batch × gradiensakkumulációs lépések száma ×
+adatpárhuzamos replikák száma. A záróprojektben ezt a szorzatot
+(jellemzően 32–64 körül) és külön a feldolgozott tokenek számát is
+rögzíteni kell; a tényleges érték a GPU-memóriától függ.</li>
+<li><strong>Epochok</strong>: kis domain-adatnál 1–3 epoch; a túl sok
+epoch overfittinghez vezet.</li>
+<li><strong>Optimizer</strong>: QLoRA esetén
+<code>paged_adamw_8bit</code> gyakori.</li>
+<li><strong>Scheduler</strong>: cosine vagy linear, rövid warmup-pal
+(pl. 5%).</li>
+<li><strong>Gradient clipping</strong>: 1,0 körül.</li>
+<li><strong>Gradient checkpointing</strong>: engedélyezve, ha kevés a
+VRAM.</li>
+</ul>
+<p>A tréning során a validációs loss-t és a perplexityt figyeljük. A
+perplexity
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mi>e</mi><mi>L</mi></msup><annotation encoding="application/x-tex">e^{L}</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>L</mi><annotation encoding="application/x-tex">L</annotation></semantics></math>
+a negatív log-likelihood a validációs halmazon. A loss csökkenése
+önmagában nem elég; a feladatmetrikát (accuracy, F1 vagy generatív
+metrika) a tréning után külön mérjük. Az alacsony validációs loss
+önmagában nem bizonyítja a tanítóhalmaz memorizálását: kialakulhat a
+validációs halmaz könnyebb volta, a feladat egyszerűsége vagy a
+train–valid eloszlások különbsége miatt is. A memorizálást és az
+átfedést ezért külön kell vizsgálni: (1) a train–valid loss-rés
+nagyságát és alakulását, (2) a tanító- és validációs halmaz szöveges
+átfedését (n-gram vagy embedding alapú egyezés), valamint (3) egy önálló
+memorizációs próbát, amelyben a modellnek a tanítóhalmaz részleteire
+kérdezünk vissza. Valódi adatszivárgás gyanúja esetén a splitet kell
+javítani, nem a modellt.</p>
+<p>A determinizmus érdekében a tréning elején minden random generátort
+seed-elünk, és a <code>torch.use_deterministic_algorithms(True)</code>
+opciót akkor használjuk, ha nem ütközik a könyvtárakkal. Az
+<code>SFTConfig</code> <code>seed</code> paramétere a tréner indulásakor
+a Python-, NumPy- és PyTorch-generátort is seedeli
+(<code>transformers.set_seed</code>); az adatfeldolgozó lépéseket
+(például a <code>datasets</code> keverését) külön seeddel rögzítjük. A
+tényleges hardver (GPU modell, driver) befolyásolhatja a nem
+determinisztikus műveleteket, ezért a reprodukciós csomagban ezt is
+feltüntetjük.</p>
+<p>Az alábbi vázlat (nem futtatott; a paraméternevek a rögzített
+TRL-verzióhoz igazítandók) a fő lépéseket mutatja:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> trl <span class="im">import</span> SFTConfig, SFTTrainer</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>cfg <span class="op">=</span> SFTConfig(</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    output_dir<span class="op">=</span><span class="st">&quot;out&quot;</span>, learning_rate<span class="op">=</span><span class="fl">2e-4</span>,</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    per_device_train_batch_size<span class="op">=</span><span class="dv">4</span>, gradient_accumulation_steps<span class="op">=</span><span class="dv">8</span>,</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    num_train_epochs<span class="op">=</span><span class="dv">2</span>, lr_scheduler_type<span class="op">=</span><span class="st">&quot;cosine&quot;</span>, warmup_ratio<span class="op">=</span><span class="fl">0.05</span>,</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    max_grad_norm<span class="op">=</span><span class="fl">1.0</span>, optim<span class="op">=</span><span class="st">&quot;paged_adamw_8bit&quot;</span>,</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    gradient_checkpointing<span class="op">=</span><span class="va">True</span>, seed<span class="op">=</span><span class="dv">42</span>,</span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    assistant_only_loss<span class="op">=</span><span class="va">True</span>,   <span class="co"># csak-válasz loss (a TRL-verziótól függ)</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>trainer <span class="op">=</span> SFTTrainer(model<span class="op">=</span>model, args<span class="op">=</span>cfg, train_dataset<span class="op">=</span>train,</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>                     eval_dataset<span class="op">=</span>val, processing_class<span class="op">=</span>tokenizer)</span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>trainer.train()</span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>model.save_pretrained(<span class="st">&quot;./adapters/acme-qa-lora-v1&quot;</span>)  <span class="co"># a 30.4 ezt az azonosítót használja</span></span></code></pre></div>
+<p>A tréning után a LoRA adaptert külön mentsük el. A teljes, egyesített
+modellt csak a validálás és a kvantálás előtt állítjuk elő.</p>
+<h3 data-number="30.3.4"
+id="adapter-egyesítése-és-kvantálás-gguf-formátumba"><span
+class="header-section-number">30.3.4</span> 4. Adapter egyesítése és
+kvantálás GGUF formátumba</h3>
+<p>A finomított adaptert a gyakorlatban érdemes egyesíteni az
+alapmodellel, mielőtt a modellt kvantálnánk vagy kiszolgálnánk. Az
+egyesítés a <code>model.merge_and_unload()</code> hívással történik,
+amely a LoRA-súlyokat beépíti az eredeti mátrixokba, és visszaad egy
+teljes, hagyományos modellt. Ezt a modellt elmenthetjük
+<code>float16</code> vagy <code>bfloat16</code> formátumban.</p>
+<p>Fontos sorrend: a 4-bites QLoRA modell nem alkalmas közvetlen
+egyesítésre. Az adaptert el kell menteni, majd az alapmodellt
+<strong>újra be kell tölteni a rögzített
+<code>MODEL_ID</code>/<code>REVISION</code> értékkel, float
+dtype-pal</strong> (a hardver által támogatott <code>float16</code> vagy
+<code>bfloat16</code>), erre kell betölteni a <code>PeftModel</code>-lel
+az adaptert, és csak ezután jöhet a <code>merge_and_unload()</code>. Az
+így kapott egyesített float modellt konvertáljuk GGUF-ra, és kvantáljuk
+a támogatott backenddel (például a <code>llama.cpp</code>
+<code>convert_hf_to_gguf.py</code> és kvantáló segédeszközeivel).</p>
+<figure id="fig-lm115-egyesites-lanc">
+<div class="fig-interactive"><iframe src="figures/html/lm115-egyesites-lanc.html" title="Nyolc csomópontos folyamatábra két sorban: NF4 alapmodell és LoRA-adapter, adapter mentése, alapmodell újratöltése fp16 vagy bf16 dtype-pal, PeftModel betöltés és merge, egyesített fp16 modell és tokenizer, GGUF f16 konverzió, Q4_K_M kvantálás, kiszolgálás vLLM-mel vagy Ollamával. Mérési pontok: 1 a QLoRA-modellnél, 2 az egyesített modellnél, 3 a kvantált modellnél. Szaggatott tiltott nyíl az NF4 modelltől a merge-ig." loading="lazy" style="width:100%;border:0;height:820px"></iframe><noscript><img src="figures/img/lm115-egyesites-lanc.png" style="width:95.0%"
+alt="Nyolc csomópontos folyamatábra két sorban: NF4 alapmodell és LoRA-adapter, adapter mentése, alapmodell újratöltése fp16 vagy bf16 dtype-pal, PeftModel betöltés és merge, egyesített fp16 modell és tokenizer, GGUF f16 konverzió, Q4_K_M kvantálás, kiszolgálás vLLM-mel vagy Ollamával. Mérési pontok: 1 a QLoRA-modellnél, 2 az egyesített modellnél, 3 a kvantált modellnél. Szaggatott tiltott nyíl az NF4 modelltől a merge-ig." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/lm115-egyesites-lanc.png" style="width:95.0%"
+alt="Nyolc csomópontos folyamatábra két sorban: NF4 alapmodell és LoRA-adapter, adapter mentése, alapmodell újratöltése fp16 vagy bf16 dtype-pal, PeftModel betöltés és merge, egyesített fp16 modell és tokenizer, GGUF f16 konverzió, Q4_K_M kvantálás, kiszolgálás vLLM-mel vagy Ollamával. Mérési pontok: 1 a QLoRA-modellnél, 2 az egyesített modellnél, 3 a kvantált modellnél. Szaggatott tiltott nyíl az NF4 modelltől a merge-ig." /></details></div>
+<figcaption>Adapter egyesítése és kvantálás: a helyes sorrend és a három
+mérési pont. Az adaptert mentjük, az alapmodellt float dtype-pal
+(<code>MODEL_ID</code> + <code>REVISION</code>) újratöltjük, erre
+töltjük az adaptert, és csak ezután jön a
+<code>merge_and_unload()</code>; a 4-bites NF4 modellbe közvetlenül nem
+egyesítünk (szaggatott, áthúzott út). Az 1–3. mérési pont (PEFT,
+egyesített float, kvantált) ugyanazon a befagyasztott teszthalmazon mér.
+A méretek elméleti becslések a labor 0,5B paraméteres modelljére, nem
+mérések.</figcaption>
+</figure>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Az adapter egyesítése: tiszta alapmodell float dtype-pal, majd PeftModel</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> peft <span class="im">import</span> PeftModel</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>base <span class="op">=</span> AutoModelForCausalLM.from_pretrained(</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    MODEL_ID,</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    revision<span class="op">=</span>REVISION,</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    torch_dtype<span class="op">=</span>torch.float16,  <span class="co"># vagy bfloat16, a hardver támogatása szerint</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    device_map<span class="op">=</span><span class="st">&quot;cpu&quot;</span>,           <span class="co"># az egyesítés CPU-n is elvégezhető</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>tokenizer <span class="op">=</span> AutoTokenizer.from_pretrained(MODEL_ID, revision<span class="op">=</span>REVISION)</span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>merged <span class="op">=</span> PeftModel.from_pretrained(base, <span class="st">&quot;./adapter&quot;</span>)</span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>merged <span class="op">=</span> merged.merge_and_unload()</span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>merged.save_pretrained(<span class="st">&quot;./merged_model&quot;</span>, safe_serialization<span class="op">=</span><span class="va">True</span>)</span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>tokenizer.save_pretrained(<span class="st">&quot;./merged_model&quot;</span>)</span></code></pre></div>
+<p>Az egyesítés után három állapotot külön kell mérni ugyanazon a
+befagyasztott teszthalmazon: (1) az adapteres (PEFT) modellt, (2) az
+egyesített float modellt és (3) a kvantált GGUF modellt. Így az adapter
+betöltésének, az egyesítésnek és a kvantálásnak a hatása nem keveredik
+össze.</p>
+<p>A kvantálás célja a modell méretének és memóriaigényének csökkentése,
+hogy CPU-n vagy korlátozott GPU-n is futtatható legyen. A záróprojektben
+a GGUF formátumot választjuk, mert a <code>llama.cpp</code> és az Ollama
+ökoszisztémája széleskörűen támogatja, és a CPU-s út is egyszerű. A GGUF
+konverzió két lépésből áll:</p>
+<ol type="1">
+<li>A Hugging Face formátumú modell átalakítása GGUF-ra (a megfelelő
+<code>convert_hf_to_gguf.py</code> szkripttel, amely a
+<code>llama.cpp</code> repozitórium részét képezi, vagy annak modern
+változatával).</li>
+<li>A GGUF súlyok kvantálása, például <code>Q4_K_M</code>,
+<code>Q5_K_M</code> vagy <code>Q8_0</code> szintre.</li>
+</ol>
+<p>A kvantálási szintek trade-offot jelentenek: a kisebb bitszám kisebb
+fájlt és gyorsabb inferenciát ad, de növeli a perplexityt és ronthatja a
+feladatteljesítményt. A <code>Q4_K_M</code> általában jó kompromisszum a
+7–8B paraméteres modelleknél, míg a <code>Q8_0</code> a float16-hoz
+közeli minőséget ad, de nagyobb méretben. A választást a deployment
+környezet (memória, sebességigény) és a kiértékelési eredmények
+határozzák meg.</p>
+<p>Fontos: a kvantálás veszteséges. A kvantált modellt ugyanazon a
+teszthalmazon kell kiértékelni, mint a float változatot, és a romlást
+dokumentálni kell. A romlás elfogadható mértéke projektenként változik;
+gyakran a feladatmetrika 1–3 százalékpontos csökkenése elfogadható, ha
+cserébe a memóriaigény jelentősen csökken. A döntést a deployment
+költség- és latency-korlátjaival együtt hozzuk meg.</p>
+<h3 data-number="30.3.5" id="deployment-vllm-és-ollamallama.cpp"><span
+class="header-section-number">30.3.5</span> 5. Deployment: vLLM és
+Ollama/llama.cpp</h3>
+<p>A kiszolgálás módja a cél-hardvertől és a késleltetési
+követelményektől függ. Két tipikus út:</p>
+<ul>
+<li><strong>GPU-s, nagy áteresztőképességű kiszolgálás</strong>: vLLM. A
+vLLM a PagedAttention mechanizmussal és folyamatos batch-kiszolgálással
+hatékonyan kezeli a párhuzamos kéréseket. A KV cache-t lapokra osztja,
+így a memóriapazarlás kisebb, és a batch dinamikusan nőhet. A vLLM
+OpenAI-kompatibilis API-t biztosít, ami egyszerűsíti a meglévő kliensek
+integrációját.</li>
+<li><strong>CPU-s, egyszerű vagy edge kiszolgálás</strong>: Ollama vagy
+közvetlenül a <code>llama.cpp</code>. Az Ollama a GGUF modellt egyetlen
+parancssal betölti, és lokális HTTP API-t biztosít. A
+<code>llama.cpp</code> alacsonyabb szintű irányítást ad, de nagyobb
+mérnöki erőfeszítést igényel.</li>
+</ul>
+<p>A záróprojektben a labor mindkét utat bemutathatja, de a hangsúlyt a
+reprodukálhatóságra helyezi: a deployment konfigurációt ugyanúgy
+verziózni kell, mint a tréningét. A vLLM esetén a fő paraméterek:</p>
+<ul>
+<li><code>model</code>: a finomított, egyesített modell elérési útja
+vagy Hugging Face azonosítója.</li>
+<li><code>tensor_parallel_size</code>: a GPU-k száma (egy modell több
+GPU-ra osztása).</li>
+<li><code>max_model_len</code>: a maximális szekvenciahossz, összhangban
+a tréning kontextusablakkal.</li>
+<li><code>gpu_memory_utilization</code>: a GPU-memória kihasználtsága,
+pl. 0,9.</li>
+<li><code>dtype</code>: a modell betöltési pontossága (float16,
+bfloat16).</li>
+</ul>
+<p>A vLLM indítása után a kliens a <code>/v1/chat/completions</code>
+végpontot hívja, ahol a sampling paraméterek (hőmérséklet, top-p,
+max_tokens) ugyanazok, mint a tréning utáni kiértékelésnél használtak.
+Ez a konzisztencia elengedhetetlen a mért eredmények
+összehasonlíthatóságához.</p>
+<p>Az alábbi parancs a vLLM indítását szemlélteti (a tényleges verziótól
+függően a paraméterek neve változhat):</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python</span> <span class="at">-m</span> vllm.entrypoints.openai.api_server <span class="dt">\</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--model</span> ./merged_model <span class="dt">\</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--tensor-parallel-size</span> 1 <span class="dt">\</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--max-model-len</span> 4096 <span class="dt">\</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--gpu-memory-utilization</span> 0.90 <span class="dt">\</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--dtype</span> bfloat16</span></code></pre></div>
+<p>Az Ollama esetén a GGUF modellt egy <code>Modelfile</code>
+segítségével importáljuk, amelyben rögzítjük a rendszerpromptot, a
+hőmérsékletet és a context hosszt. Az importálás után az Ollama
+lokálisan kiszolgálja a modellt. A <code>llama.cpp</code> közvetlen
+futtatása esetén a <code>--ctx-size</code>, <code>--threads</code> és a
+batch paraméterek a konfiguráció részét képezik.</p>
+<h3 data-number="30.3.6"
+id="kiértékelés-a-deployment-előtt-és-után"><span
+class="header-section-number">30.3.6</span> 6. Kiértékelés a deployment
+előtt és után</h3>
+<p>A finomított, kvantált modell kiértékelése három szinten történik: az
+adapteres (PEFT) modellre, a tréning utáni egyesített float modellre és
+a kvantált változatra. A validációs/kalibrációs halmazon választjuk ki a
+kvantálási változatot; a teszthalmazt, a küszöbértéket és a kiválasztott
+jelöltet a záró mérés előtt befagyasztjuk, és a teszten már nem
+hangolunk. A kiértékelési konfiguráció megegyezik az <a
+href="lm114.html">Adatgyűjtés, tisztítás és jogosultság</a> alfejezetben
+meghatározottal: ugyanaz a teszthalmaz, ugyanazok a promptok, ugyanaz a
+sampling (determinisztikus vagy alacsony hőmérsékletű), ugyanaz a
+metrika.</p>
+<p>A záróprojektben legalább két metrikát használjunk:</p>
+<ol type="1">
+<li><strong>Feladatszintű metrika</strong>: a domain-feladatnak
+megfelelően pontosság, F1, exact match, vagy ha generatív, akkor
+automatikus átfedési metrika (ROUGE, BLEU) – bár ezek korlátait
+ismerjük.</li>
+<li><strong>Emberi vagy LLM-as-judge értékelés</strong> egy kis,
+reprezentatív mintán, rubrika alapján. Ez különösen fontos, ha a feladat
+nyitott végű.</li>
+</ol>
+<p>A kvantálás utáni romlást a kvantált és a float modell azonos
+körülmények közötti összehasonlításával mérjük. A küszöböt a mérés előtt
+rögzítjük, és a validációs/kalibrációs halmaz eredménye alapján
+választjuk ki a kvantálási szintet; a teszthalmazon már csak a záró
+mérés történik. Ha a romlás meghaladja az előre meghatározott küszöböt
+(a fejezet példájában 2 százalékpont), a kvantálási szintet finomítani
+kell (például Q5_K_M vagy Q8_0), vagy a kvantált változatot elvetni.</p>
+<p>A százalékpont és a relatív százalék megkülönböztetése kötelező: ha a
+feladatmetrika 80%-ról 82%-ra javul, az +2 százalékpont, ami relatív
+értelemben
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>82</mn><mi>/</mi><mn>80</mn><mo>−</mo><mn>1</mn><mo>=</mo><mn>0</mn><mo>,</mo><mn>025</mn></mrow><annotation encoding="application/x-tex">82/80 - 1 = 0{,}025</annotation></semantics></math>,
+azaz +2,5%. A kétféle kifejezés ugyanazt az eredményt írja le, de
+összekeverve félrevezető; a táblázatokban ezért mindig jelölni kell,
+melyiket használjuk.</p>
+<p>A deployment utáni kiértékelés célja annak ellenőrzése, hogy a
+kiszolgált modell viselkedése megegyezik a lokálisan tesztelt modellel.
+A vLLM vagy Ollama által visszaadott válaszoknak – azonos prompt és
+sampling paraméterek mellett – konzisztensnek kell lenniük. Az eltérések
+okai lehetnek: eltérő tokenizálás, chat template nem egyezik, vagy a
+kvantálás miatti különbség. Ezért a deployment konfigurációban a chat
+template-et és a sampling paramétereket explicit módon rögzíteni
+kell.</p>
+<h3 data-number="30.3.7" id="rollback-stratégia"><span
+class="header-section-number">30.3.7</span> 7. Rollback stratégia</h3>
+<p>A produkciós rendszerben a rollback nem utólagos gondolat, hanem a
+deployment terv része. A modellverziókat és a hozzájuk tartozó
+konfigurációkat, adatverziókat és kiértékelési eredményeket egy
+modellregiszterben tartjuk. A rollback során a korábbi, már validált
+modellhez térünk vissza, ha az új modell a produkciós forgalomban hibát
+mutat, vagy a kiértékelési eredmények elmaradnak a várakozástól.</p>
+<p>A rollback gyakorlati lépései:</p>
+<ul>
+<li>A deployment réteg (például a vLLM szerver vagy az Ollama) egyetlen
+modell-azonosítóra mutat. A rollback ennek az azonosítónak a cseréjét
+jelenti, a konfiguráció többi részének megtartásával.</li>
+<li>A modellregiszterben minden verzióhoz tartozik egy állapotjelző:
+<code>candidate</code>, <code>shadow</code>, <code>production</code>,
+<code>archived</code>. Az új modell először <code>shadow</code> módban
+futhat (valós forgalom másolata, de nem befolyásolja a választ), majd az
+eredmények alapján <code>production</code> lesz, vagy
+<code>archived</code>.</li>
+<li>A rollback döntést mérési adatokra alapozzuk: ha a produkciós
+metrikák (feladatpontosság, felhasználói visszajelzés, hibajegyek)
+romlanak, a rollback küszöbértéke előre definiált.</li>
+</ul>
+<p>A fejezet laborjában a rollback bemutatása egyszerű: a finomított
+modell telepítése után egy szándékosan hibás konfigurációval (például
+rossz chat template) indítsunk egy kérést, majd térjünk vissza a helyes
+verzióra. Ez a gyakorlat megerősíti, hogy a verziózott deployment a
+hibák gyors helyreállítását teszi lehetővé.</p>
+<h3 data-number="30.3.8"
+id="labor-finomított-kvantált-modell-telepítése"><span
+class="header-section-number">30.3.8</span> 8. Labor: finomított,
+kvantált modell telepítése</h3>
+<p>A labor célja, hogy a tanuló egy kis, domain-specifikus modellt
+finomítson, kvantáljon, és helyileg kiszolgáljon. A labor a záróprojekt
+részét képezi, így az adatok és a modell kiválasztása az 30.1–30.2
+eredményeire épül. A labor hardverigénye: GPU-t igénylő rész a QLoRA
+finomítás (≈ 6–8 GB VRAM az 1,5B modellhez, ≤ 2048 token, batch 1–4; 7B
+esetén ≥ 16 GB), és CPU-s rész a GGUF kiszolgáláshoz. A labor pontos
+lépései:</p>
+<ol type="1">
+<li><strong>Környezet</strong>: hozzuk létre a Python-környezetet a
+megadott verziókkal. Rögzítsük a seed-et és a hardverinformációkat.</li>
+<li><strong>Adat betöltése</strong>: a verziózott domain-adathalmaz
+betöltése, a tanító/valid/teszt split ellenőrzése. A tokenizer chat
+template-jét alkalmazzuk, és a válasz tokenekre maszkolunk.</li>
+<li><strong>QLoRA finomítás</strong>: a fenti konfigurációval futtassuk
+a tréninget. Naplózzuk a tanítási és validációs loss-t, a perplexityt,
+és mentsük el az adaptert.</li>
+<li><strong>Egyesítés</strong>: az adapter betöltése a rögzített
+alapmodell (<code>MODEL_ID</code>, <code>REVISION</code>) float
+példányára, majd <code>merge_and_unload()</code>, és a teljes modell
+mentése float16/bf16 formátumban. Az egyesítést nem a 4-bites QLoRA
+modellen végezzük.</li>
+<li><strong>Kvantálás</strong>: a modell konvertálása GGUF-ra, majd
+kvantálás Q4_K_M szintre (vagy más választott szintre). Mérjük a
+fájlméretet.</li>
+<li><strong>Deployment</strong>: a float modell kiszolgálása vLLM-mel
+(ha GPU elérhető), illetve a kvantált modell betöltése Ollama-ba.
+Ellenőrizzük az egészségügyi végpontot és egy minta kérést.</li>
+<li><strong>Kiértékelés</strong>: a befagyasztott teszthalmazon három
+állapotot mérünk: az adapteres (PEFT), az egyesített float és a kvantált
+modellt. Rögzítsük a metrikákat.</li>
+<li><strong>Rollback demonstráció</strong>: váltsunk egy korábbi
+modellverzióra, és ellenőrizzük, hogy a rendszer visszaáll.</li>
+</ol>
+<p>Az elvárt eredmények a következők:</p>
+<ul>
+<li>A tanítási loss összességében csökkenő trendet mutat, de lépésenként
+ingadozhat; a validációs loss kezdetben csökken, majd stagnál vagy
+enyhén nő. A pontos értékek adat- és modellfüggők, ezért a laborban a
+„várt” értéket tartományként adjuk meg, például: „a validációs
+perplexity 20–40%-kal alacsonyabb a kiindulási modellnél”. A mért
+eredményt ettől elkülönítve rögzítjük, és a döntést nem az egyes lépések
+loss-értéke, hanem a validációs feladatmetrika trendje és a train–valid
+rés alakulása alapozza meg.</li>
+<li>A feladatmetrika (például pontosság) a finomított float modellnél
+jobb, mint az alapmodellnél. A kvantált modellnél a romlás nem haladja
+meg a küszöböt (pl. 2 százalékpont).</li>
+<li>A GGUF fájl mérete a float16 modell méretének kb. 25–30%-a (Q4_K_M
+esetén).</li>
+<li>A vLLM/Ollama válaszideje egyetlen kérésre a hardvertől függ, de a
+konfigurációban rögzített érték a mérési jegyzőkönyvben szerepel.</li>
+</ul>
+<p>A mért és várt eredmények elkülönítése a labornaplóban explicit
+táblázatban történik. A következő táblázat <strong>szimulált
+mintakimenet</strong> a formátum szemléltetésére; a számok nem valódi
+futás mérési eredményei.</p>
+<table>
+<colgroup>
+<col style="width: 15%" />
+<col style="width: 28%" />
+<col style="width: 37%" />
+<col style="width: 18%" />
+</colgroup>
+<thead>
+<tr>
+<th>Mérőszám</th>
+<th>Várt (tartomány)</th>
+<th>Mért (szimulált minta)</th>
+<th>Megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Validációs loss</td>
+<td>1,8 – 2,2</td>
+<td>2,05</td>
+<td>A várt tartomány az adat méretétől függ</td>
+</tr>
+<tr>
+<td>Feladatpontosság</td>
+<td>+5–10 százalékpont az alapmodellhez képest</td>
+<td>+7,3 százalékpont</td>
+<td>A befagyasztott teszthalmazon mérve</td>
+</tr>
+<tr>
+<td>Perplexity (kvantált vs float)</td>
+<td>+0,05 – +0,15</td>
+<td>+0,11</td>
+<td>Q4_K_M szinten</td>
+</tr>
+<tr>
+<td>GGUF fájlméret (Q4_K_M)</td>
+<td>≈ 0,9–1,1 GB (Qwen2.5-1.5B; ≈ 30% az fp16 3,1 GB-hoz képest)</td>
+<td>szimulált: 1,0 GB</td>
+<td>becslés: paraméterszám × ≈ 4,85 bit / 8 (7B esetén ≈ 4,1–4,6
+GB)</td>
+</tr>
+</tbody>
+</table>
+<p>A labor notebookja rögzíti a seed-et, a környezeti változókat, a
+csomagverziókat és a modell-revíziót. A kimenet nem csak a számok, hanem
+a reprodukálhatósági csomag.</p>
+<h3 data-number="30.3.9" id="tipikus-hibák-és-megelőzésük"><span
+class="header-section-number">30.3.9</span> 9. Tipikus hibák és
+megelőzésük</h3>
+<p>A záróprojektben a leggyakoribb hibák a reprodukálhatóság, a
+túltanulás és a deployment-konzisztencia köré csoportosulnak.</p>
+<ul>
+<li><strong>Hiányzó seed vagy determinizmus</strong>: a tréning
+futásonként eltérő eredményt ad, a kiértékelés nem összehasonlítható.
+Megoldás: központi seed-kezelés, determinisztikus mód, és a hardver
+rögzítése.</li>
+<li><strong>Túl magas learning rate</strong>: a modell katasztrofálisan
+felejti az alapképességeket, a loss instabillá válik. Megoldás: learning
+rate warmup, kisebb LR, és rövid próbafutás.</li>
+<li><strong>Overfitting</strong>: a tanítóhalmazon alacsony a loss, de a
+teszten romlik a teljesítmény. Megoldás: kevesebb epoch, dropout, early
+stopping a validációs metrika alapján.</li>
+<li><strong>Kvantálás utáni drasztikus romlás</strong>: a Q4 szint túl
+agresszív a modellhez vagy a feladathoz. Megoldás: magasabb bitszám (Q5,
+Q8), vagy a fontos rétegek kihagyása a kvantálásból (nem minden eszköz
+támogatja).</li>
+<li><strong>Chat template eltérés</strong>: a tréningnél használt
+template nem egyezik a deploymentnél használttal, a modell nem érti a
+promptot. Megoldás: a template-et a modellkártyából és a tokenizerből
+venni, és a deployment konfigurációban explicit rögzíteni.</li>
+<li><strong>Nem verziózott deployment</strong>: a rollback lehetetlen,
+mert nem tudjuk, melyik modellverzió futott. Megoldás: modellregiszter,
+állapotjelzők, automatikus naplózás.</li>
+</ul>
+<p>Minden hibához tartozik egy diagnosztikai lépés és egy javítás,
+amelyet a labor során be lehet mutatni.</p>
+<h3 data-number="30.3.10" id="összefoglalás-és-átvezetés"><span
+class="header-section-number">30.3.10</span> 10. Összefoglalás és
+átvezetés</h3>
+<p>Ebben az alfejezetben a záróprojekt modellkészítési fázisát jártuk
+végig: a reprodukálható QLoRA finomítást, az adapter egyesítését, a GGUF
+kvantálást, és a vLLM/Ollama alapú kiszolgálást. A hangsúly a rögzített
+konfiguráción, a mérésen és a rollback-képességen volt. A finomított
+modell csak akkor léphet tovább a kiadási kapun, ha a kiértékelési
+eredmények a várt tartományba esnek, és a deployment konfigurációja
+megegyezik a tesztelési konfigurációval.</p>
+<p>A következő alfejezet (30.4, <a href="lm116.html">Értékelés,
+dokumentáció és bemutató</a>) értékelési riportot és demót készít; a
+reprodukciós csomag a 31.2, a korlátok a 31.3 témája. Itt rögzítjük a
+metrikákat és konfigurációkat, amelyek a dokumentáció alapját adják. Az
+itt rögzített metrikák és konfigurációk adják a dokumentáció
+alapját.</p>
+<p><strong>Önellenőrző kérdés</strong>: Miért nem elegendő a tréning
+utáni feladatmetrika a deployment jóváhagyásához, és milyen további
+méréseket kell elvégezni a kvantált, kiszolgált modellen? Válaszában
+térjen ki a chat template, a sampling paraméterek és a kvantálási romlás
+szerepére.</p>
+<p><em>Mintaválasz (vázlat).</em> (1) A kiszolgált modell más
+tokenizálást/chat template-et kaphat → a 30.3.6 konzisztenciatesztje;
+(2) a sampling eltérése (például vLLM alapértelmezett temperature) →
+explicit paraméterek; (3) a kvantált állapotot a befagyasztott teszten
+kell mérni, romlás ≤ 2 százalékpont. Rollback: v1 = alapmodell, v2 =
+finomított; v2 hibás chat template-tel → hibás válasz; a registry
+<code>production</code> mutatóját v1-re (vagy a helyes konfigurációjú
+v2-re) állítjuk, a mintakérés újra helyes.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="lm114.html">← 30.2 Adatgyűjtés, tisztítás és jogosultság</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="lm116.html">30.4 Értékelés, dokumentáció és bemutató →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

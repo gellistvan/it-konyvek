@@ -1,0 +1,800 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>12.3 Speculative decoding és draft modellek – LLM-ek és
+domain-specifikus kis modellek programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz3">III. RÉSZ – Hatékonyság és testreszabás</a> › <a href="index.html#lmch11">12 Inferencia és kiszolgálás</a></p>
+<div class="links"><a class="prev" rel="prev" href="lm042.html">← 12.2 vLLM, TGI, llama.cpp és Ollama összehasonlítása</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="lm044.html">12.4 Latency, throughput, költség és SLA tervezés →</a></div>
+</nav>
+<h2 data-number="12.3" id="lm043"><span
+class="header-section-number">12.3</span> Speculative decoding és draft
+modellek</h2>
+<p>A megelőző egységben a kiszolgálórendszerek fókuszában a memória, a
+folyamatos batch és az ütemezés állt. Itt egy olyan módszert vezetünk
+be, amely nem a kiszolgáló rétegét, hanem magát a generálási algoritmust
+változtatja meg: egy kis segédmodell javaslatot tesz, a nagy modell
+pedig egyetlen párhuzamos lépésben ellenőrzi a javaslatot. Ez a
+<em>speculatív dekódolás</em> (speculative decoding), más néven
+asszisztált generálás (assisted generation). A cél ugyanaz, mint a <a
+href="lm042.html">vLLM, TGI, llama.cpp és Ollama összehasonlítása</a>
+eszközeinél: csökkenteni az egy tokenre jutó fal-időt, miközben a
+generált szöveg eloszlása nem változik.</p>
+<h3 data-number="12.3.1"
+id="miért-lassú-az-autoregresszív-generálás"><span
+class="header-section-number">12.3.1</span> 1. Miért lassú az
+autoregresszív generálás?</h3>
+<p>Egy decoder-only modell egy tokent generál egy forward pass alatt.
+Bár ez a passz számításilag drága, a batch méretétől és a hardvertől
+függően a szűk keresztmetszet gyakran nem a számítás, hanem a
+memória-sávszélesség. A modell súlyait minden token generálásakor
+legalább egyszer ki kell olvasni a GPU/HBM memóriából vagy a CPU
+RAM-ból. Ha a modell 7 milliárd paraméteres, és minden paramétert 16
+biten tárolunk, akkor körülbelül 14 GB (≈ 13 GiB) súlyt kell mozgatni
+egyetlen token kedvéért. Eközben a tényleges szorzások és aktivációk
+csak egyetlen tokenre vonatkoznak, így a számítási egységek
+kihasználtsága alacsony.</p>
+<p>Ezért batch méret 1 esetén a generálás jellemzően
+<em>memory-bound</em>: a fal-időt a súlyok beolvasása uralja, nem a
+szorzások száma. Ha egyetlen forward passban több tokent dolgozunk fel,
+akkor a súlyokat csak egyszer kell beolvasni, a számítás pedig több
+tokenre amortizálódik. A speculatív dekódolás pontosan ezt használja ki:
+a kis modell sorosan megír néhány valószínű tokent, a nagy modell pedig
+egyetlen, párhuzamos forwarddal ellenőrzi azokat.</p>
+<p>Fontos, hogy ez az érv batch méret 1-re és a memory-bound tartományra
+a legerősebb. Nagy batch esetén a target forward egyre inkább
+compute-bound lesz, ezért a speculatív dekódolás hozadéka
+csökkenhet.</p>
+<h3 data-number="12.3.2" id="az-alapötlet-draft-és-verifikáció"><span
+class="header-section-number">12.3.2</span> 2. Az alapötlet: draft és
+verifikáció</h3>
+<p>Két modellünk van:</p>
+<ul>
+<li><strong>Target modell</strong>: a nagy, pontos modell, amelynek a
+kimeneti eloszlását meg akarjuk őrizni. Jelölje a feltételes eloszlását
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>p</mi><mi>θ</mi></msub><mo stretchy="false" form="prefix">(</mo><msub><mi>x</mi><mi>t</mi></msub><mo>∣</mo><msub><mi>x</mi><mrow><mo>&lt;</mo><mi>t</mi></mrow></msub><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">p_\theta(x_t \mid x_{&lt;t})</annotation></semantics></math>,
+röviden
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>p</mi><mo stretchy="false" form="prefix">(</mo><msub><mi>x</mi><mi>t</mi></msub><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">p(x_t)</annotation></semantics></math>.</li>
+<li><strong>Draft modell</strong>: egy kicsi, gyors, olcsó modell,
+amelynek eloszlása
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>q</mi><mo stretchy="false" form="prefix">(</mo><msub><mi>x</mi><mi>t</mi></msub><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">q(x_t)</annotation></semantics></math>.
+A draft nem kell, hogy ugyanolyan pontos legyen; az a dolga, hogy
+valószínű folytatásokat javasoljon.</li>
+</ul>
+<p>A két fázis:</p>
+<ol type="1">
+<li><strong>Draft fázis</strong>: a draft modell autoregresszíven
+legenerál
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+tokent:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mover><mi>x</mi><mo accent="true">̂</mo></mover><mn>1</mn></msub><mo>,</mo><msub><mover><mi>x</mi><mo accent="true">̂</mo></mover><mn>2</mn></msub><mo>,</mo><mi>…</mi><mo>,</mo><msub><mover><mi>x</mi><mo accent="true">̂</mo></mover><mi>K</mi></msub></mrow><annotation encoding="application/x-tex">\hat x_1, \hat x_2, \ldots, \hat x_K</annotation></semantics></math>.
+Közben minden lépésben elmenti a saját valószínűségeit is:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>q</mi><mi>i</mi></msub><mo stretchy="false" form="prefix">(</mo><msub><mover><mi>x</mi><mo accent="true">̂</mo></mover><mi>i</mi></msub><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mi>q</mi><mo stretchy="false" form="prefix">(</mo><msub><mover><mi>x</mi><mo accent="true">̂</mo></mover><mi>i</mi></msub><mo>∣</mo><msub><mi>x</mi><mrow><mo>&lt;</mo><mi>t</mi></mrow></msub><mo>,</mo><msub><mover><mi>x</mi><mo accent="true">̂</mo></mover><mrow><mo>&lt;</mo><mi>i</mi></mrow></msub><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">q_i(\hat x_i) = q(\hat x_i \mid x_{&lt;t}, \hat x_{&lt;i})</annotation></semantics></math>.</li>
+<li><strong>Verifikációs fázis</strong>: a target modell egyetlen
+forward passban, causalis maszkkal kiszámítja a logiteket mind a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+pozícióra. Így megkapjuk a target valószínűségeket
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>p</mi><mi>i</mi></msub><mo stretchy="false" form="prefix">(</mo><mi>⋅</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">p_i(\cdot)</annotation></semantics></math>
+minden
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>i</mi><mo>=</mo><mn>1</mn><mo>,</mo><mi>…</mi><mo>,</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">i=1,\ldots,K</annotation></semantics></math>
+pozícióra, ugyanarra a prefixre és a draft által javasolt
+előzményekre.</li>
+</ol>
+<p>A kérdés: hogyan döntsük el, mely draft tokeneket fogadjuk el úgy,
+hogy a végső kimenet eloszlása pontosan
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>p</mi><annotation encoding="application/x-tex">p</annotation></semantics></math>
+legyen? Ha egyszerűen csak akkor fogadnánk el a draft tokent, ha az a
+legvalószínűbb a target szerint, akkor torzítanánk a target eloszlást. A
+helyes eljárás a <em>módosított elutasításos mintavétel</em>.</p>
+<h3 data-number="12.3.3" id="a-módosított-elutasításos-mintavétel"><span
+class="header-section-number">12.3.3</span> 3. A módosított elutasításos
+mintavétel</h3>
+<p>Tegyük fel, hogy a draft a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>q</mi><annotation encoding="application/x-tex">q</annotation></semantics></math>
+eloszlásból mintavételezte a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mover><mi>x</mi><mo accent="true">̂</mo></mover><annotation encoding="application/x-tex">\hat x</annotation></semantics></math>
+tokent, és a target eloszlás
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>p</mi><annotation encoding="application/x-tex">p</annotation></semantics></math>.
+Az elfogadási valószínűség:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>α</mi><mo stretchy="false" form="prefix">(</mo><mover><mi>x</mi><mo accent="true">̂</mo></mover><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mrow><mi>min</mi><mo>&#8289;</mo></mrow><mrow><mo stretchy="true" form="prefix">(</mo><mn>1</mn><mo>,</mo><mfrac><mrow><mi>p</mi><mo stretchy="false" form="prefix">(</mo><mover><mi>x</mi><mo accent="true">̂</mo></mover><mo stretchy="false" form="postfix">)</mo></mrow><mrow><mi>q</mi><mo stretchy="false" form="prefix">(</mo><mover><mi>x</mi><mo accent="true">̂</mo></mover><mo stretchy="false" form="postfix">)</mo></mrow></mfrac><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">
+\alpha(\hat x) = \min\left(1, \frac{p(\hat x)}{q(\hat x)}\right)
+</annotation></semantics></math></p>
+<p>Azaz:</p>
+<ul>
+<li>ha
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>p</mi><mo stretchy="false" form="prefix">(</mo><mover><mi>x</mi><mo accent="true">̂</mo></mover><mo stretchy="false" form="postfix">)</mo><mo>≥</mo><mi>q</mi><mo stretchy="false" form="prefix">(</mo><mover><mi>x</mi><mo accent="true">̂</mo></mover><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">p(\hat x) \ge q(\hat x)</annotation></semantics></math>,
+akkor mindig elfogadjuk a tokent;</li>
+<li>ha
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>p</mi><mo stretchy="false" form="prefix">(</mo><mover><mi>x</mi><mo accent="true">̂</mo></mover><mo stretchy="false" form="postfix">)</mo><mo>&lt;</mo><mi>q</mi><mo stretchy="false" form="prefix">(</mo><mover><mi>x</mi><mo accent="true">̂</mo></mover><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">p(\hat x) &lt; q(\hat x)</annotation></semantics></math>,
+akkor csak
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>p</mi><mo stretchy="false" form="prefix">(</mo><mover><mi>x</mi><mo accent="true">̂</mo></mover><mo stretchy="false" form="postfix">)</mo><mi>/</mi><mi>q</mi><mo stretchy="false" form="prefix">(</mo><mover><mi>x</mi><mo accent="true">̂</mo></mover><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">p(\hat x)/q(\hat x)</annotation></semantics></math>
+valószínűséggel fogadjuk el.</li>
+</ul>
+<p>Ha elutasítjuk, akkor nem egyszerűen új mintát veszünk a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>p</mi><annotation encoding="application/x-tex">p</annotation></semantics></math>
+eloszlásból, hanem a <em>reziduális</em> eloszlásból:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>p</mi><mrow><mi mathvariant="normal">r</mi><mi mathvariant="normal">e</mi><mi mathvariant="normal">s</mi></mrow></msub><mo stretchy="false" form="prefix">(</mo><mi>z</mi><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mfrac><mrow><mrow><mi>max</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><mn>0</mn><mo>,</mo><mi>p</mi><mo stretchy="false" form="prefix">(</mo><mi>z</mi><mo stretchy="false" form="postfix">)</mo><mo>−</mo><mi>q</mi><mo stretchy="false" form="prefix">(</mo><mi>z</mi><mo stretchy="false" form="postfix">)</mo><mo stretchy="false" form="postfix">)</mo></mrow><mrow><munder><mo>∑</mo><msup><mi>z</mi><mo>′</mo></msup></munder><mrow><mi>max</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><mn>0</mn><mo>,</mo><mi>p</mi><mo stretchy="false" form="prefix">(</mo><msup><mi>z</mi><mo>′</mo></msup><mo stretchy="false" form="postfix">)</mo><mo>−</mo><mi>q</mi><mo stretchy="false" form="prefix">(</mo><msup><mi>z</mi><mo>′</mo></msup><mo stretchy="false" form="postfix">)</mo><mo stretchy="false" form="postfix">)</mo></mrow></mfrac></mrow><annotation encoding="application/x-tex">
+p_{\mathrm{res}}(z) = \frac{\max(0, p(z) - q(z))}{\sum_{z&#39;} \max(0, p(z&#39;) - q(z&#39;))}
+</annotation></semantics></math></p>
+<p>Ezt a korrekciós eloszlást normalizáljuk a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>p</mi><annotation encoding="application/x-tex">p</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>q</mi><annotation encoding="application/x-tex">q</annotation></semantics></math>
+különbségéből. A teljes eljárás tetszőleges draft-eloszlás mellett
+pontosan a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>p</mi><annotation encoding="application/x-tex">p</annotation></semantics></math>-t
+állítja elő: ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>q</mi><annotation encoding="application/x-tex">q</annotation></semantics></math>
+kevés (vagy nulla) valószínűséget ad, ott a reziduális eloszlás pótolja
+a hiányzó tömeget (a kimenet marginálisa
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mi>min</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><mi>p</mi><mo>,</mo><mi>q</mi><mo stretchy="false" form="postfix">)</mo><mo stretchy="false" form="prefix">(</mo><mi>z</mi><mo stretchy="false" form="postfix">)</mo><mo>+</mo><mrow><mi>max</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><mn>0</mn><mo>,</mo><mi>p</mi><mo stretchy="false" form="prefix">(</mo><mi>z</mi><mo stretchy="false" form="postfix">)</mo><mo>−</mo><mi>q</mi><mo stretchy="false" form="prefix">(</mo><mi>z</mi><mo stretchy="false" form="postfix">)</mo><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mi>p</mi><mo stretchy="false" form="prefix">(</mo><mi>z</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">\min(p,q)(z)+\max(0,p(z)-q(z))=p(z)</annotation></semantics></math>).
+A
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>q</mi><annotation encoding="application/x-tex">q</annotation></semantics></math>
+megválasztása csak az elfogadási arányt (és ezzel a sebességet)
+befolyásolja, a helyességet nem.</p>
+<p>A pszeudokód a következő:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Input: x_prefix, K draft hossz, p target, q draft</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Output: legalább 1, legfeljebb K + 1 új token</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co">#   (elfogadott draft tokenek + egy korrekciós vagy bónusz token)</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 1) Draft fázis</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>draft_tokens <span class="op">=</span> []</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>q_dists <span class="op">=</span> []                      <span class="co"># a teljes q_i eloszlások, mindegyik shape: [V]</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(K):</span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    logits_q <span class="op">=</span> q.forward(x_prefix <span class="op">+</span> draft_tokens)  <span class="co"># shape: [1, V] (az utolsó pozíció logitja)</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    dist_q <span class="op">=</span> softmax(logits_q[<span class="dv">0</span>] <span class="op">/</span> T)              <span class="co"># shape: [V]</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    x_i <span class="op">=</span> sample(dist_q)          <span class="co"># egy token, skalár</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    draft_tokens.append(x_i)</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>    q_dists.append(dist_q)        <span class="co"># a reziduálishoz a teljes eloszlás kell</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 2) Target verifikáció egyetlen forward passban</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="co"># A target causalis maszkkal feldolgozza az egész draft szekvenciát.</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="co"># dist_p[i] a p(x_i | prefix, x_&lt;i) eloszlás; a K+1-edik pozíció a bónusz tokenhez kell.</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="co"># A kimenet alakja [1, |prefix| + K, V]; az utolsó K + 1 pozíció logitja felel meg</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="co"># a draft tokenek és a bónusz pozíció eloszlásának.</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>logits_p <span class="op">=</span> p.forward(x_prefix <span class="op">+</span> draft_tokens)[:, <span class="op">-</span>(K <span class="op">+</span> <span class="dv">1</span>):, :]  <span class="co"># shape: [1, K + 1, V]</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>dist_p <span class="op">=</span> softmax(logits_p[<span class="dv">0</span>] <span class="op">/</span> T)                               <span class="co"># shape: [K + 1, V]</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="co"># 3) Elfogadás és korrekció</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>accepted <span class="op">=</span> []</span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(K):</span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a>    x_i <span class="op">=</span> draft_tokens[i]</span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>    p_i <span class="op">=</span> dist_p[i, x_i]</span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>    q_i <span class="op">=</span> q_dists[i][x_i]</span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a>    r <span class="op">=</span> random_uniform(<span class="dv">0</span>, <span class="dv">1</span>)</span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> r <span class="op">&lt;</span> <span class="bu">min</span>(<span class="fl">1.0</span>, p_i <span class="op">/</span> q_i):</span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a>        accepted.append(x_i)</span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a>    <span class="cf">else</span>:</span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a>        <span class="co"># residual mintavétel: a korrekciós token a p - q pozitív részéből jön</span></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a>        residual <span class="op">=</span> clip(dist_p[i] <span class="op">-</span> q_dists[i], <span class="bu">min</span><span class="op">=</span><span class="fl">0.0</span>)</span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a>        residual <span class="op">=</span> residual <span class="op">/</span> residual.<span class="bu">sum</span>()</span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a>        x_corr <span class="op">=</span> sample(residual)</span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a>        accepted.append(x_corr)</span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> accepted  <span class="co"># a korrekció után megállunk</span></span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-40"><a href="#cb1-40" aria-hidden="true" tabindex="-1"></a><span class="co"># Ha mind a K draft tokent elfogadtuk, a target adja a bónusz tokent</span></span>
+<span id="cb1-41"><a href="#cb1-41" aria-hidden="true" tabindex="-1"></a>accepted.append(sample(dist_p[K]))</span>
+<span id="cb1-42"><a href="#cb1-42" aria-hidden="true" tabindex="-1"></a><span class="cf">return</span> accepted</span></code></pre></div>
+<p>A legfontosabb tulajdonság, hogy a fenti eljárás kimenetének
+eloszlása megegyezik azzal, mintha a target modellt futtattuk volna
+autoregresszíven. Ezt a tulajdonságot <em>eloszlástartó
+gyorsításnak</em> nevezzük. Ha a target modell determinisztikus, például
+greedy dekódolást használ
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>T</mi><mo>→</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">T \to 0</annotation></semantics></math>),
+akkor a kimenet nem változik (a lebegőpontos, batch-függő numerikától
+eltekintve); ha sztochasztikus, akkor a generált szövegek
+statisztikailag ugyanolyanok, mint a target modell közvetlen
+mintavételezése esetén.</p>
+<h3 data-number="12.3.4" id="egy-numerikus-példa"><span
+class="header-section-number">12.3.4</span> Egy numerikus példa</h3>
+<p>Legyen a target eloszlás egy adott lépésben:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>p</mi><mo>=</mo><mo stretchy="false" form="prefix">[</mo><mn>0</mn><mo>,</mo><mn>7</mn><mo>,</mo><mspace width="0.278em"></mspace><mn>0</mn><mo>,</mo><mn>2</mn><mo>,</mo><mspace width="0.278em"></mspace><mn>0</mn><mo>,</mo><mn>1</mn><mo stretchy="false" form="postfix">]</mo></mrow><annotation encoding="application/x-tex">
+p = [0{,}7,\; 0{,}2,\; 0{,}1]
+</annotation></semantics></math></p>
+<p>a draft eloszlás pedig:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>q</mi><mo>=</mo><mo stretchy="false" form="prefix">[</mo><mn>0</mn><mo>,</mo><mn>6</mn><mo>,</mo><mspace width="0.278em"></mspace><mn>0</mn><mo>,</mo><mn>3</mn><mo>,</mo><mspace width="0.278em"></mspace><mn>0</mn><mo>,</mo><mn>1</mn><mo stretchy="false" form="postfix">]</mo></mrow><annotation encoding="application/x-tex">
+q = [0{,}6,\; 0{,}3,\; 0{,}1]
+</annotation></semantics></math></p>
+<p>Ha a draft az első tokent választja, elfogadási valószínűsége
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mi>min</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><mn>1</mn><mo>,</mo><mn>0</mn><mo>,</mo><mn>7</mn><mi>/</mi><mn>0</mn><mo>,</mo><mn>6</mn><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">\min(1, 0{,}7 / 0{,}6) = 1</annotation></semantics></math>.
+Ha a másodikat választja,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mi>min</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><mn>1</mn><mo>,</mo><mn>0</mn><mo>,</mo><mn>2</mn><mi>/</mi><mn>0</mn><mo>,</mo><mn>3</mn><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mn>0</mn><mo>,</mo><mn>667</mn></mrow><annotation encoding="application/x-tex">\min(1, 0{,}2 / 0{,}3) = 0{,}667</annotation></semantics></math>.
+A harmadiknál
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mi>min</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><mn>1</mn><mo>,</mo><mn>0</mn><mo>,</mo><mn>1</mn><mi>/</mi><mn>0</mn><mo>,</mo><mn>1</mn><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">\min(1, 0{,}1 / 0{,}1) = 1</annotation></semantics></math>.
+A várható elfogadási valószínűség a draft választásaira súlyozva:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0</mn><mo>,</mo><mn>6</mn><mo>⋅</mo><mn>1</mn><mo>+</mo><mn>0</mn><mo>,</mo><mn>3</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>667</mn><mo>+</mo><mn>0</mn><mo>,</mo><mn>1</mn><mo>⋅</mo><mn>1</mn><mo>=</mo><mn>0</mn><mo>,</mo><mn>9</mn></mrow><annotation encoding="application/x-tex">
+0{,}6 \cdot 1 + 0{,}3 \cdot 0{,}667 + 0{,}1 \cdot 1 = 0{,}9
+</annotation></semantics></math></p>
+<p>Ez megegyezik a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mo>∑</mo><mi>z</mi></msub><mrow><mi>min</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><mi>p</mi><mo stretchy="false" form="prefix">(</mo><mi>z</mi><mo stretchy="false" form="postfix">)</mo><mo>,</mo><mi>q</mi><mo stretchy="false" form="prefix">(</mo><mi>z</mi><mo stretchy="false" form="postfix">)</mo><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">\sum_z \min(p(z), q(z))</annotation></semantics></math>
+értékkel, ami pedig
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>−</mo><mrow><mi mathvariant="normal">T</mi><mi mathvariant="normal">V</mi><mi mathvariant="normal">D</mi></mrow><mo stretchy="false" form="prefix">(</mo><mi>p</mi><mo>,</mo><mi>q</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">1 - \mathrm{TVD}(p,q)</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="normal">T</mi><mi mathvariant="normal">V</mi><mi mathvariant="normal">D</mi></mrow><annotation encoding="application/x-tex">\mathrm{TVD}</annotation></semantics></math>
+a teljes variációs távolság:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mi mathvariant="normal">T</mi><mi mathvariant="normal">V</mi><mi mathvariant="normal">D</mi></mrow><mo stretchy="false" form="prefix">(</mo><mi>p</mi><mo>,</mo><mi>q</mi><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mfrac><mn>1</mn><mn>2</mn></mfrac><munder><mo>∑</mo><mi>z</mi></munder><mo stretchy="false" form="prefix">|</mo><mi>p</mi><mo stretchy="false" form="prefix">(</mo><mi>z</mi><mo stretchy="false" form="postfix">)</mo><mo>−</mo><mi>q</mi><mo stretchy="false" form="prefix">(</mo><mi>z</mi><mo stretchy="false" form="postfix">)</mo><mo stretchy="false" form="prefix">|</mo></mrow><annotation encoding="application/x-tex">
+\mathrm{TVD}(p,q) = \frac{1}{2}\sum_z |p(z) - q(z)|
+</annotation></semantics></math></p>
+<p>Minél közelebb van
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>q</mi><annotation encoding="application/x-tex">q</annotation></semantics></math>
+a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>p</mi><annotation encoding="application/x-tex">p</annotation></semantics></math>-hez,
+annál nagyobb az elfogadási arány.</p>
+<p><strong>Kis, mesterséges példa a három tokentípusra.</strong> Legyen
+a szókészlet négy token, és</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>p</mi><mo>=</mo><mo stretchy="false" form="prefix">[</mo><mn>0</mn><mo>,</mo><mn>4</mn><mo>,</mo><mspace width="0.278em"></mspace><mn>0</mn><mo>,</mo><mn>3</mn><mo>,</mo><mspace width="0.278em"></mspace><mn>0</mn><mo>,</mo><mn>2</mn><mo>,</mo><mspace width="0.278em"></mspace><mn>0</mn><mo>,</mo><mn>1</mn><mo stretchy="false" form="postfix">]</mo><mo>,</mo><mspace width="2.0em"></mspace><mi>q</mi><mo>=</mo><mo stretchy="false" form="prefix">[</mo><mn>0</mn><mo>,</mo><mn>2</mn><mo>,</mo><mspace width="0.278em"></mspace><mn>0</mn><mo>,</mo><mn>2</mn><mo>,</mo><mspace width="0.278em"></mspace><mn>0</mn><mo>,</mo><mn>5</mn><mo>,</mo><mspace width="0.278em"></mspace><mn>0</mn><mo>,</mo><mn>1</mn><mo stretchy="false" form="postfix">]</mo><mi>.</mi></mrow><annotation encoding="application/x-tex">
+p = [0{,}4,\; 0{,}3,\; 0{,}2,\; 0{,}1], \qquad q = [0{,}2,\; 0{,}2,\; 0{,}5,\; 0{,}1].
+</annotation></semantics></math></p>
+<p>Az elfogadási valószínűségek rendre
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>1</mn><annotation encoding="application/x-tex">1</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>1</mn><annotation encoding="application/x-tex">1</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0</mn><mo>,</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">0{,}4</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>1</mn><annotation encoding="application/x-tex">1</annotation></semantics></math>;
+a várható elfogadási arány
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0</mn><mo>,</mo><mn>2</mn><mo>⋅</mo><mn>1</mn><mo>+</mo><mn>0</mn><mo>,</mo><mn>2</mn><mo>⋅</mo><mn>1</mn><mo>+</mo><mn>0</mn><mo>,</mo><mn>5</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>4</mn><mo>+</mo><mn>0</mn><mo>,</mo><mn>1</mn><mo>⋅</mo><mn>1</mn><mo>=</mo><mn>0</mn><mo>,</mo><mn>7</mn></mrow><annotation encoding="application/x-tex">0{,}2\cdot 1 + 0{,}2\cdot 1 + 0{,}5\cdot 0{,}4 + 0{,}1\cdot 1 = 0{,}7</annotation></semantics></math>,
+ami
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>−</mo><mrow><mi mathvariant="normal">T</mi><mi mathvariant="normal">V</mi><mi mathvariant="normal">D</mi></mrow><mo stretchy="false" form="prefix">(</mo><mi>p</mi><mo>,</mo><mi>q</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">1-\mathrm{TVD}(p,q)</annotation></semantics></math>,
+mert
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mi mathvariant="normal">T</mi><mi mathvariant="normal">V</mi><mi mathvariant="normal">D</mi></mrow><mo stretchy="false" form="prefix">(</mo><mi>p</mi><mo>,</mo><mi>q</mi><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mn>0</mn><mo>,</mo><mn>3</mn></mrow><annotation encoding="application/x-tex">\mathrm{TVD}(p,q)=0{,}3</annotation></semantics></math>.</p>
+<ul>
+<li><strong>Elfogadott draft token:</strong> ha a draft a 2. tokent
+javasolja, azt mindig elfogadjuk.</li>
+<li><strong>Elutasítás és korrekciós token:</strong> ha a draft a 3.
+tokent javasolja
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>q</mi><mn>3</mn></msub><mo>=</mo><mn>0</mn><mo>,</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">q_3=0{,}5</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>p</mi><mn>3</mn></msub><mo>=</mo><mn>0</mn><mo>,</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">p_3=0{,}2</annotation></semantics></math>),
+az esetek 60%-ában elutasítjuk; a reziduális eloszlás arányos
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mi>max</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><mn>0</mn><mo>,</mo><mi>p</mi><mo>−</mo><mi>q</mi><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mo stretchy="false" form="prefix">[</mo><mn>0</mn><mo>,</mo><mn>2</mn><mo>,</mo><mn>0</mn><mo>,</mo><mn>1</mn><mo>,</mo><mn>0</mn><mo>,</mo><mn>0</mn><mo stretchy="false" form="postfix">]</mo></mrow><annotation encoding="application/x-tex">\max(0,p-q) = [0{,}2,0{,}1,0,0]</annotation></semantics></math>
+értékkel, azaz
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">[</mo><mn>2</mn><mi>/</mi><mn>3</mn><mo>,</mo><mn>1</mn><mi>/</mi><mn>3</mn><mo>,</mo><mn>0</mn><mo>,</mo><mn>0</mn><mo stretchy="false" form="postfix">]</mo></mrow><annotation encoding="application/x-tex">[2/3,1/3,0,0]</annotation></semantics></math>,
+tehát a korrekciós token az 1. vagy a 2. token.</li>
+<li><strong>Bónusz token:</strong> ha minden draft javaslatot
+elfogadtunk, a target még egy tokent ad a következő pozíció
+eloszlásából; ez a bónusz token.</li>
+</ul>
+<figure id="fig-lm043-spec-elfogadas">
+<div class="fig-interactive"><iframe src="figures/html/lm043-spec-elfogadas.html" title="Három panel: a target és a draft eloszlás oszlopai; tokenenként egymásra rakott oszlop, alul az elfogadott rész, felül a korrekció, amelyek együtt pontosan a p eloszlást adják ki: 0,4; 0,3; 0,2; 0,1; végül a döntés folyamatábrája elfogadással vagy korrekciós mintavétellel." loading="lazy" style="width:100%;border:0;height:560px"></iframe><noscript><img src="figures/img/lm043-spec-elfogadas.png" style="width:100.0%"
+alt="Három panel: a target és a draft eloszlás oszlopai; tokenenként egymásra rakott oszlop, alul az elfogadott rész, felül a korrekció, amelyek együtt pontosan a p eloszlást adják ki: 0,4; 0,3; 0,2; 0,1; végül a döntés folyamatábrája elfogadással vagy korrekciós mintavétellel." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/lm043-spec-elfogadas.png" style="width:100.0%"
+alt="Három panel: a target és a draft eloszlás oszlopai; tokenenként egymásra rakott oszlop, alul az elfogadott rész, felül a korrekció, amelyek együtt pontosan a p eloszlást adják ki: 0,4; 0,3; 0,2; 0,1; végül a döntés folyamatábrája elfogadással vagy korrekciós mintavétellel." /></details></div>
+<figcaption>Módosított elutasításos mintavétel a négytokenes példán:
+elfogadott tömeg + korrekció = target eloszlás. (a)
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>p</mi><annotation encoding="application/x-tex">p</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>q</mi><annotation encoding="application/x-tex">q</annotation></semantics></math>;
+(b) tokenenként az elfogadott
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mi>min</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><mi>p</mi><mo>,</mo><mi>q</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">\min(p,q)</annotation></semantics></math>
+és a súlyozott reziduális
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0</mn><mo>,</mo><mn>3</mn><mo>⋅</mo><msub><mi>p</mi><mrow><mi>r</mi><mi>e</mi><mi>s</mi></mrow></msub><mo>=</mo><mo stretchy="false" form="prefix">[</mo><mn>0</mn><mo>,</mo><mn>2</mn><mo>;</mo><mspace width="0.167em"></mspace><mn>0</mn><mo>,</mo><mn>1</mn><mo>;</mo><mspace width="0.167em"></mspace><mn>0</mn><mo>;</mo><mspace width="0.167em"></mspace><mn>0</mn><mo stretchy="false" form="postfix">]</mo></mrow><annotation encoding="application/x-tex">0{,}3\cdot p_{res} = [0{,}2;\,0{,}1;\,0;\,0]</annotation></semantics></math>
+együtt pontosan
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>p</mi><annotation encoding="application/x-tex">p</annotation></semantics></math>-t
+adja; (c) egy draftpozíció döntése. Az elfogadott tömeg
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0</mn><mo>,</mo><mn>7</mn><mo>=</mo><mn>1</mn><mo>−</mo><mrow><mi mathvariant="normal">T</mi><mi mathvariant="normal">V</mi><mi mathvariant="normal">D</mi></mrow><mo stretchy="false" form="prefix">(</mo><mi>p</mi><mo>,</mo><mi>q</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">0{,}7 = 1-\mathrm{TVD}(p,q)</annotation></semantics></math>.</figcaption>
+</figure>
+<p>A kimenet marginális eloszlása tokenenként
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mi>min</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><mi>p</mi><mo>,</mo><mi>q</mi><mo stretchy="false" form="postfix">)</mo><mo stretchy="false" form="prefix">(</mo><mi>z</mi><mo stretchy="false" form="postfix">)</mo><mo>+</mo><mrow><mi>max</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><mn>0</mn><mo>,</mo><mi>p</mi><mo stretchy="false" form="prefix">(</mo><mi>z</mi><mo stretchy="false" form="postfix">)</mo><mo>−</mo><mi>q</mi><mo stretchy="false" form="prefix">(</mo><mi>z</mi><mo stretchy="false" form="postfix">)</mo><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mi>p</mi><mo stretchy="false" form="prefix">(</mo><mi>z</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">\min(p,q)(z) + \max(0,p(z)-q(z)) = p(z)</annotation></semantics></math>,
+például a 3. tokenre
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0</mn><mo>,</mo><mn>2</mn><mo>+</mo><mn>0</mn><mo>=</mo><mn>0</mn><mo>,</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">0{,}2 + 0 = 0{,}2</annotation></semantics></math>.
+Ez a számítás mutatja, hogy az eljárás a kizárólag target alapú
+mintavételezéssel azonos eloszlást ad. A tényleges GPU-s gyorsulás
+mérése viszont külön reprodukciós csomagot igényel, és nem következik
+ebből a táblázatból.</p>
+<h3 data-number="12.3.5"
+id="elfogadási-arány-és-várható-gyorsulás"><span
+class="header-section-number">12.3.5</span> 4. Elfogadási arány és
+várható gyorsulás</h3>
+<p>Az <em>elfogadási arány</em> (acceptance rate) a javasolt draft
+tokenek közül elfogadott tokenek aránya. Ez nem tévesztendő össze az egy
+tokenre vonatkozó elfogadási valószínűséggel; a rendszerszintű mérésnél
+fontos, hogyan definiáljuk a nevezőt.</p>
+<p>Jelölje
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mover><mi>α</mi><mo accent="true">‾</mo></mover><mi>i</mi></msub><annotation encoding="application/x-tex">\bar\alpha_i</annotation></semantics></math>
+az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>i</mi><annotation encoding="application/x-tex">i</annotation></semantics></math>-edik
+lépésben a várható elfogadási valószínűséget, feltéve, hogy az előző
+tokeneket elfogadtuk:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mover><mi>α</mi><mo accent="true">‾</mo></mover><mi>i</mi></msub><mo>=</mo><msub><mi>𝔼</mi><mrow><mi>z</mi><mo>∼</mo><msub><mi>q</mi><mi>i</mi></msub></mrow></msub><mrow><mo stretchy="true" form="prefix">[</mo><mi>min</mi><mrow><mo stretchy="true" form="prefix">(</mo><mn>1</mn><mo>,</mo><mfrac><mrow><msub><mi>p</mi><mi>i</mi></msub><mo stretchy="false" form="prefix">(</mo><mi>z</mi><mo stretchy="false" form="postfix">)</mo></mrow><mrow><msub><mi>q</mi><mi>i</mi></msub><mo stretchy="false" form="prefix">(</mo><mi>z</mi><mo stretchy="false" form="postfix">)</mo></mrow></mfrac><mo stretchy="true" form="postfix">)</mo></mrow><mo stretchy="true" form="postfix">]</mo></mrow><mo>=</mo><mn>1</mn><mo>−</mo><mrow><mi mathvariant="normal">T</mi><mi mathvariant="normal">V</mi><mi mathvariant="normal">D</mi></mrow><mo stretchy="false" form="prefix">(</mo><msub><mi>p</mi><mi>i</mi></msub><mo>,</mo><msub><mi>q</mi><mi>i</mi></msub><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">
+\bar\alpha_i = \mathbb E_{z \sim q_i}\left[\min\left(1, \frac{p_i(z)}{q_i(z)}\right)\right]
+= 1 - \mathrm{TVD}(p_i, q_i)
+</annotation></semantics></math></p>
+<p>Ha minden lépésben
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mover><mi>α</mi><mo accent="true">‾</mo></mover><mi>i</mi></msub><mo>≈</mo><mover><mi>α</mi><mo accent="true">‾</mo></mover></mrow><annotation encoding="application/x-tex">\bar\alpha_i \approx \bar\alpha</annotation></semantics></math>
+állandó, akkor három mennyiséget kell megkülönböztetni. Az
+<strong>elfogadott draft tokenek</strong> várható száma</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝔼</mi><mo stretchy="false" form="prefix">[</mo><mi>A</mi><mo stretchy="false" form="postfix">]</mo><mo>=</mo><mover><mi>α</mi><mo accent="true">‾</mo></mover><mo>+</mo><msup><mover><mi>α</mi><mo accent="true">‾</mo></mover><mn>2</mn></msup><mo>+</mo><mi>⋯</mi><mo>+</mo><msup><mover><mi>α</mi><mo accent="true">‾</mo></mover><mi>K</mi></msup><mo>=</mo><mfrac><mrow><mover><mi>α</mi><mo accent="true">‾</mo></mover><mo stretchy="false" form="prefix">(</mo><mn>1</mn><mo>−</mo><msup><mover><mi>α</mi><mo accent="true">‾</mo></mover><mi>K</mi></msup><mo stretchy="false" form="postfix">)</mo></mrow><mrow><mn>1</mn><mo>−</mo><mover><mi>α</mi><mo accent="true">‾</mo></mover></mrow></mfrac><mi>.</mi></mrow><annotation encoding="application/x-tex">
+\mathbb E[A] = \bar\alpha + \bar\alpha^2 + \cdots + \bar\alpha^K
+= \frac{\bar\alpha(1-\bar\alpha^K)}{1-\bar\alpha}.
+</annotation></semantics></math></p>
+<p>A <strong>korrekciós token</strong> akkor keletkezik, ha az első
+elutasítás után megállunk; a <strong>bónusz token</strong> pedig akkor,
+ha mind a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+draft tokent elfogadtuk. A kimenet hossza ezért
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi><mo>=</mo><mi>A</mi><mo>+</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">L = A + 1</annotation></semantics></math>:
+az a plusz egy token vagy a korrekciós, vagy a bónusz token. Ebből</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝔼</mi><mo stretchy="false" form="prefix">[</mo><mi>L</mi><mo stretchy="false" form="postfix">]</mo><mo>=</mo><mn>1</mn><mo>+</mo><mover><mi>α</mi><mo accent="true">‾</mo></mover><mo>+</mo><msup><mover><mi>α</mi><mo accent="true">‾</mo></mover><mn>2</mn></msup><mo>+</mo><mi>⋯</mi><mo>+</mo><msup><mover><mi>α</mi><mo accent="true">‾</mo></mover><mi>K</mi></msup><mo>=</mo><mfrac><mrow><mn>1</mn><mo>−</mo><msup><mover><mi>α</mi><mo accent="true">‾</mo></mover><mrow><mi>K</mi><mo>+</mo><mn>1</mn></mrow></msup></mrow><mrow><mn>1</mn><mo>−</mo><mover><mi>α</mi><mo accent="true">‾</mo></mover></mrow></mfrac><mi>.</mi></mrow><annotation encoding="application/x-tex">
+\mathbb E[L] = 1 + \bar\alpha + \bar\alpha^2 + \cdots + \bar\alpha^K
+= \frac{1-\bar\alpha^{K+1}}{1-\bar\alpha}.
+</annotation></semantics></math></p>
+<p>Például
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mover><mi>α</mi><mo accent="true">‾</mo></mover><mo>=</mo><mn>0</mn><mo>,</mo><mn>9</mn></mrow><annotation encoding="application/x-tex">\bar\alpha = 0{,}9</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>=</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">K = 5</annotation></semantics></math>
+esetén
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝔼</mi><mo stretchy="false" form="prefix">[</mo><mi>A</mi><mo stretchy="false" form="postfix">]</mo><mo>≈</mo><mn>3</mn><mo>,</mo><mn>6856</mn></mrow><annotation encoding="application/x-tex">\mathbb E[A] \approx 3{,}6856</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝔼</mi><mo stretchy="false" form="prefix">[</mo><mi>L</mi><mo stretchy="false" form="postfix">]</mo><mo>≈</mo><mn>4</mn><mo>,</mo><mn>6856</mn></mrow><annotation encoding="application/x-tex">\mathbb E[L] \approx 4{,}6856</annotation></semantics></math>.
+(A
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>+</mo><mn>0</mn><mo>,</mo><mn>9</mn><mo>+</mo><mn>0</mn><mo>,</mo><mn>81</mn><mo>+</mo><mn>0</mn><mo>,</mo><mn>729</mn><mo>+</mo><mn>0</mn><mo>,</mo><mn>6561</mn><mo>=</mo><mn>4</mn><mo>,</mo><mn>0951</mn></mrow><annotation encoding="application/x-tex">1+0{,}9+0{,}81+0{,}729+0{,}6561 = 4{,}0951</annotation></semantics></math>
+összeg nem a kimenet várható hossza, hanem az első
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+pozíció elérési valószínűségeinek összege, amelyből a bónusz tag
+hiányzik.)</p>
+<p>Vagyis átlagosan öt draft tokenből körülbelül 3,69-et fogadunk el, és
+a kimenet ennél eggyel több, körülbelül 4,69 tokent tartalmaz.</p>
+<p>A gyorsulás költségmodellje batch méret 1, memory-bound esetben a
+következő. Legyen:</p>
+<ul>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mi mathvariant="normal">d</mi></msub><annotation encoding="application/x-tex">T_{\mathrm{d}}</annotation></semantics></math>
+egy draft token generálási ideje a draft modellel;</li>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mi mathvariant="normal">t</mi></msub><annotation encoding="application/x-tex">T_{\mathrm{t}}</annotation></semantics></math>
+egy target token generálási ideje a tisztán target alapú
+baseline-ban;</li>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mi mathvariant="normal">v</mi></msub><annotation encoding="application/x-tex">T_{\mathrm{v}}</annotation></semantics></math>
+a verifikációs blokk tényleges ideje (a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+draft pozíció és a bónusz pozíció együttes forwardja);</li>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+a draft hossz;</li>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>L</mi><annotation encoding="application/x-tex">L</annotation></semantics></math>
+a kimenet várható hossza.</li>
+</ul>
+<p>Egy iteráció fal-ideje
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><msub><mi>T</mi><mi mathvariant="normal">d</mi></msub><mo>+</mo><msub><mi>T</mi><mi mathvariant="normal">v</mi></msub></mrow><annotation encoding="application/x-tex">K T_{\mathrm{d}} + T_{\mathrm{v}}</annotation></semantics></math>,
+mert a draft
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+tokent sorosan generál, a target pedig egyetlen, de
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>+</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">K+1</annotation></semantics></math>
+pozíciót feldolgozó forwarddal ellenőrzi a javaslatot. A kiinduló,
+tisztán target alapú generálás
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>L</mi><annotation encoding="application/x-tex">L</annotation></semantics></math>
+tokenre
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi><msub><mi>T</mi><mi mathvariant="normal">t</mi></msub></mrow><annotation encoding="application/x-tex">L T_{\mathrm{t}}</annotation></semantics></math>
+időt igényelne. A gyorsulás tehát:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>S</mi><mo>=</mo><mfrac><mrow><mi>L</mi><mspace width="0.167em"></mspace><msub><mi>T</mi><mi mathvariant="normal">t</mi></msub></mrow><mrow><mi>K</mi><msub><mi>T</mi><mi mathvariant="normal">d</mi></msub><mo>+</mo><msub><mi>T</mi><mi mathvariant="normal">v</mi></msub></mrow></mfrac><mi>.</mi></mrow><annotation encoding="application/x-tex">
+S = \frac{L\,T_{\mathrm{t}}}{K T_{\mathrm{d}} + T_{\mathrm{v}}}.
+</annotation></semantics></math></p>
+<p>Memory-bound esetben
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi mathvariant="normal">v</mi></msub><mo>≈</mo><msub><mi>T</mi><mi mathvariant="normal">t</mi></msub></mrow><annotation encoding="application/x-tex">T_{\mathrm{v}} \approx T_{\mathrm{t}}</annotation></semantics></math>,
+és ekkor az egyszerűsített alak:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>S</mi><mo>≈</mo><mfrac><mi>L</mi><mrow><mn>1</mn><mo>+</mo><mi>K</mi><mfrac><msub><mi>T</mi><mi mathvariant="normal">d</mi></msub><msub><mi>T</mi><mi mathvariant="normal">t</mi></msub></mfrac></mrow></mfrac><mi>.</mi></mrow><annotation encoding="application/x-tex">
+S \approx \frac{L}{1 + K \frac{T_{\mathrm{d}}}{T_{\mathrm{t}}}}.
+</annotation></semantics></math></p>
+<p>A nevezőben mindig a tényleges verifikációs blokk költsége szerepel;
+ha az compute-bound futás vagy nagyobb batch miatt nagyobb, mint
+egyetlen target token ideje, a gyorsulás csökken.</p>
+<p>Ha például a draft modell tizedannyi idő alatt generál egy tokent,
+mint a target, azaz
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi mathvariant="normal">d</mi></msub><mi>/</mi><msub><mi>T</mi><mi mathvariant="normal">t</mi></msub><mo>=</mo><mn>0</mn><mo>,</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">T_{\mathrm{d}}/T_{\mathrm{t}} = 0{,}1</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi><mo>≈</mo><mn>4</mn><mo>,</mo><mn>6856</mn></mrow><annotation encoding="application/x-tex">L \approx 4{,}6856</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>=</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">K = 5</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi mathvariant="normal">v</mi></msub><mo>=</mo><msub><mi>T</mi><mi mathvariant="normal">t</mi></msub></mrow><annotation encoding="application/x-tex">T_{\mathrm{v}} = T_{\mathrm{t}}</annotation></semantics></math>,
+akkor:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>S</mi><mo>=</mo><mfrac><mrow><mn>4</mn><mo>,</mo><mn>6856</mn></mrow><mrow><mn>1</mn><mo>+</mo><mn>5</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>1</mn></mrow></mfrac><mo>=</mo><mfrac><mrow><mn>4</mn><mo>,</mo><mn>6856</mn></mrow><mrow><mn>1</mn><mo>,</mo><mn>5</mn></mrow></mfrac><mo>≈</mo><mn>3</mn><mo>,</mo><mn>12</mn><mi>.</mi></mrow><annotation encoding="application/x-tex">
+S = \frac{4{,}6856}{1 + 5 \cdot 0{,}1} = \frac{4{,}6856}{1{,}5} \approx 3{,}12.
+</annotation></semantics></math></p>
+<p>Ha a draft modell relatíve lassú, például
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi mathvariant="normal">d</mi></msub><mi>/</mi><msub><mi>T</mi><mi mathvariant="normal">t</mi></msub><mo>=</mo><mn>0</mn><mo>,</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">T_{\mathrm{d}}/T_{\mathrm{t}} = 0{,}5</annotation></semantics></math>,
+akkor
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>S</mi><mo>=</mo><mn>4</mn><mo>,</mo><mn>6856</mn><mi>/</mi><mn>3</mn><mo>,</mo><mn>5</mn><mo>≈</mo><mn>1</mn><mo>,</mo><mn>34</mn></mrow><annotation encoding="application/x-tex">S = 4{,}6856/3{,}5 \approx 1{,}34</annotation></semantics></math>.</p>
+<p>Végpontellenőrzés:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mover><mi>α</mi><mo accent="true">‾</mo></mover><mo>=</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">\bar\alpha = 0</annotation></semantics></math>
+esetén
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi><mo>=</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">L = 1</annotation></semantics></math>
+(minden draftot elutasítunk, egy korrekciós token jön), és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>S</mi><mo>=</mo><mn>1</mn><mi>/</mi><mo stretchy="false" form="prefix">(</mo><mn>1</mn><mo>+</mo><mi>K</mi><msub><mi>T</mi><mi mathvariant="normal">d</mi></msub><mi>/</mi><msub><mi>T</mi><mi mathvariant="normal">t</mi></msub><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">S = 1/(1 + K T_{\mathrm{d}}/T_{\mathrm{t}})</annotation></semantics></math>,
+azaz
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>S</mi><mo>&lt;</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">S&lt;1</annotation></semantics></math>:
+a draft költsége miatt a generálás lassabb a baseline-nál (például
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>=</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">K=5</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi mathvariant="normal">d</mi></msub><mi>/</mi><msub><mi>T</mi><mi mathvariant="normal">t</mi></msub><mo>=</mo><mn>0</mn><mo>,</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">T_{\mathrm{d}}/T_{\mathrm{t}}=0{,}1</annotation></semantics></math>
+mellett
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>S</mi><mo>≈</mo><mn>0</mn><mo>,</mo><mn>67</mn></mrow><annotation encoding="application/x-tex">S\approx0{,}67</annotation></semantics></math>).
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mover><mi>α</mi><mo accent="true">‾</mo></mover><mo>=</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">\bar\alpha = 1</annotation></semantics></math>
+esetén
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi><mo>=</mo><mi>K</mi><mo>+</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">L = K+1</annotation></semantics></math>
+(minden draft elfogadva, plusz bónusz token), és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>S</mi><mo>=</mo><mo stretchy="false" form="prefix">(</mo><mi>K</mi><mo>+</mo><mn>1</mn><mo stretchy="false" form="postfix">)</mo><mi>/</mi><mo stretchy="false" form="prefix">(</mo><mn>1</mn><mo>+</mo><mi>K</mi><msub><mi>T</mi><mi mathvariant="normal">d</mi></msub><mi>/</mi><msub><mi>T</mi><mi mathvariant="normal">t</mi></msub><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">S = (K+1)/(1 + K T_{\mathrm{d}}/T_{\mathrm{t}})</annotation></semantics></math>;
+a draft költsége ekkor is megjelenik a nevezőben. A két végpontot a
+labornak tesztként ellenőriznie kell.</p>
+<p>A target verifikáció költsége a gyakorlatban nem mindig egyenlő
+egyetlen target tokengenerálás költségével. Memory-bound esetben a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+tokenre kiterjesztett forward pass alig drágább, mint egy token
+forwardja, mert a súlyokat így is úgy is egyszer kell beolvasni.
+Compute-bound esetben vagy nagy batch méretnél azonban a számítási
+költség
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>-val
+skálázódik, ezért a fenti
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mi mathvariant="normal">v</mi></msub><annotation encoding="application/x-tex">T_{\mathrm{v}}</annotation></semantics></math>-s
+képletet kell használni. A laborban ezért mindig mérjük a tényleges
+fal-időt és a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mi mathvariant="normal">v</mi></msub><annotation encoding="application/x-tex">T_{\mathrm{v}}</annotation></semantics></math>
+értéket, nem hagyatkozunk kizárólag az idealizált
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi mathvariant="normal">v</mi></msub><mo>≈</mo><msub><mi>T</mi><mi mathvariant="normal">t</mi></msub></mrow><annotation encoding="application/x-tex">T_{\mathrm{v}} \approx T_{\mathrm{t}}</annotation></semantics></math>
+közelítésre.</p>
+<h3 data-number="12.3.6" id="a-draft-modell-kiválasztása"><span
+class="header-section-number">12.3.6</span> 5. A draft modell
+kiválasztása</h3>
+<p>A gyakorlatban a legfontosabb döntés a draft modell megválasztása. A
+következő szempontokat érdemes figyelembe venni:</p>
+<ol type="1">
+<li><p><strong>Tokenizer egyezés</strong>: a draft és a target modell
+tokenizere lehetőleg azonos legyen. Ha eltér, akkor a draft által
+kiadott tokenID-ket nem lehet közvetlenül a target elé tenni. Ilyenkor
+szöveges szintű átalakításra van szükség: a draft tokeneket dekódoljuk,
+majd a target tokenizerrel újrakódoljuk. Ez nemcsak lassú, hanem az
+igazítási hibák miatt az elfogadási arányt is rontja. A legtöbb
+implementáció ezért megköveteli, hogy a két modell ugyanazt a tokenizert
+használja, vagy legalább kompatibilis tokenizere legyen.</p></li>
+<li><p><strong>Modellcsalád és méret</strong>: gyakran ugyanazon
+modellcsalád egy kisebb tagja a legjobb draft. Ha a target egy 7
+milliárd paraméteres modell, egy 1 milliárdos vagy annál kisebb változat
+jó választás lehet. A közös előtanítás és a hasonló adat miatt az
+eloszlások közelebb állnak egymáshoz, így az elfogadási arány
+magasabb.</p></li>
+<li><p><strong>Késleltetés</strong>: a draft modellnek nagyon gyorsnak
+kell lennie. Egy kisebb modell is lehet lassú, ha CPU-n fut, miközben a
+target GPU-n; ilyenkor a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi mathvariant="normal">d</mi></msub><mi>/</mi><msub><mi>T</mi><mi mathvariant="normal">t</mi></msub></mrow><annotation encoding="application/x-tex">T_{\mathrm{d}}/T_{\mathrm{t}}</annotation></semantics></math>
+arány rossz lehet. A draftot lehetőség szerint ugyanazon a hardveren, de
+kisebb memóriaigénnyel futtassuk.</p></li>
+<li><p><strong>Mintavételezési beállítások</strong>: a draft és a target
+mintavételezési hőmérséklete legyen összhangban. Ha a draft greedy, a
+target pedig magas hőmérsékletű mintavételt használ, az elfogadási arány
+alacsony lesz, mert a draft által javasolt egyetlen tokenre a target
+valószínűsége kicsi lehet. Ha a target greedy, akkor a draft greedy is
+lehet, és a kimenet determinisztikusan megegyezik a target greedy
+kimenetével, és ez a draft találati arányától függetlenül igaz: az első
+eltérő draft tokent a target argmaxa váltja fel, a találati arány csak a
+gyorsulást határozza meg. Ez kényelmes módja a gyorsításnak, mert nincs
+eloszlásváltozás.</p></li>
+<li><p><strong>K választása</strong>: a draft hossz növelése növeli a
+potenciális gyorsulást, de csökkenő hozadékkal. Ha
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mover><mi>α</mi><mo accent="true">‾</mo></mover><mo>=</mo><mn>0</mn><mo>,</mo><mn>9</mn></mrow><annotation encoding="application/x-tex">\bar\alpha = 0{,}9</annotation></semantics></math>,
+a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>=</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">K=5</annotation></semantics></math>
+esetén
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝔼</mi><mo stretchy="false" form="prefix">[</mo><mi>L</mi><mo stretchy="false" form="postfix">]</mo><mo>≈</mo><mn>4</mn><mo>,</mo><mn>69</mn></mrow><annotation encoding="application/x-tex">\mathbb E[L] \approx 4{,}69</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>=</mo><mn>10</mn></mrow><annotation encoding="application/x-tex">K=10</annotation></semantics></math>
+esetén
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝔼</mi><mo stretchy="false" form="prefix">[</mo><mi>L</mi><mo stretchy="false" form="postfix">]</mo><mo>=</mo><mo stretchy="false" form="prefix">(</mo><mn>1</mn><mo>−</mo><mn>0</mn><mo>,</mo><msup><mn>9</mn><mn>11</mn></msup><mo stretchy="false" form="postfix">)</mo><mi>/</mi><mn>0</mn><mo>,</mo><mn>1</mn><mo>≈</mo><mn>6</mn><mo>,</mo><mn>86</mn></mrow><annotation encoding="application/x-tex">\mathbb E[L] = (1-0{,}9^{11})/0{,}1 \approx 6{,}86</annotation></semantics></math>.
+A draft generálás költsége viszont lineárisan nő. Ráadásul nagyon hosszú
+draft esetén a target verifikáció memóriaigénye is nő, mert a KV cache-t
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+pozícióra kell fenntartani. A gyakorlatban a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+jellemzően 3 és 10 között van.</p></li>
+</ol>
+<figure id="fig-lm043-draft-hossz">
+<div class="fig-interactive"><iframe src="figures/html/lm043-draft-hossz.html" title="Két görbe a draft hossz függvényében: gyors draftnál a gyorsulás K egyenlő 10-ig nő 3,43-ig, lassú draftnál K egyenlő 3-nál éri el a maximumát 1,38-cal, majd 1 alá esik; vízszintes pontozott vonal az 1-es szintnél." loading="lazy" style="width:100%;border:0;height:520px"></iframe><noscript><img src="figures/img/lm043-draft-hossz.png" style="width:85.0%"
+alt="Két görbe a draft hossz függvényében: gyors draftnál a gyorsulás K egyenlő 10-ig nő 3,43-ig, lassú draftnál K egyenlő 3-nál éri el a maximumát 1,38-cal, majd 1 alá esik; vízszintes pontozott vonal az 1-es szintnél." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/lm043-draft-hossz.png" style="width:85.0%"
+alt="Két görbe a draft hossz függvényében: gyors draftnál a gyorsulás K egyenlő 10-ig nő 3,43-ig, lassú draftnál K egyenlő 3-nál éri el a maximumát 1,38-cal, majd 1 alá esik; vízszintes pontozott vonal az 1-es szintnél." /></details></div>
+<figcaption>Várható gyorsulás a draft hossz függvényében
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mover><mi>α</mi><mo accent="true">‾</mo></mover><mo>=</mo><mn>0</mn><mo>,</mo><mn>9</mn></mrow><annotation encoding="application/x-tex">\bar\alpha=0{,}9</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi>v</mi></msub><mo>=</mo><msub><mi>T</mi><mi>t</mi></msub></mrow><annotation encoding="application/x-tex">T_v=T_t</annotation></semantics></math>,
+batch = 1; képletből, nem mérés). Gyors draftnál
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi>d</mi></msub><mi>/</mi><msub><mi>T</mi><mi>t</mi></msub><mo>=</mo><mn>0</mn><mo>,</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">T_d/T_t=0{,}1</annotation></semantics></math>)
+a maximum
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>=</mo><mn>10</mn></mrow><annotation encoding="application/x-tex">K=10</annotation></semantics></math>-nél
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>3</mn><mo>,</mo><mn>43</mn></mrow><annotation encoding="application/x-tex">3{,}43</annotation></semantics></math>,
+lassú draftnál
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi>d</mi></msub><mi>/</mi><msub><mi>T</mi><mi>t</mi></msub><mo>=</mo><mn>0</mn><mo>,</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">T_d/T_t=0{,}5</annotation></semantics></math>)
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>=</mo><mn>3</mn></mrow><annotation encoding="application/x-tex">K=3</annotation></semantics></math>-nál
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>,</mo><mn>38</mn></mrow><annotation encoding="application/x-tex">1{,}38</annotation></semantics></math>,
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>=</mo><mn>14</mn></mrow><annotation encoding="application/x-tex">K=14</annotation></semantics></math>-től
+a gyorsulás 1 alá esik.
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>=</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">K=5</annotation></semantics></math>-nél
+a két érték
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>3</mn><mo>,</mo><mn>12</mn></mrow><annotation encoding="application/x-tex">3{,}12</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>,</mo><mn>34</mn></mrow><annotation encoding="application/x-tex">1{,}34</annotation></semantics></math>.</figcaption>
+</figure>
+<h3 data-number="12.3.7"
+id="gyakorlati-implementáció-hugging-face-transformersben"><span
+class="header-section-number">12.3.7</span> 6. Gyakorlati implementáció
+Hugging Face Transformersben</h3>
+<p>A Hugging Face <code>generate</code> metódusa támogatja az
+asszisztált generálást. A pontos paraméternév verziófüggő; az alábbi
+példa az <code>assistant_model</code> paramétert használja (a
+Transformers 4.29-es verziójától; a verziószám emlékezetből,
+ellenőrzendő). A laborban a konkrét verziót mindig rögzíteni kell.</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Illusztráció, nem futtatandó éles környezetben.</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Helyőrző modellnevek, valódi azonosítók nélkül.</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> transformers <span class="im">import</span> AutoModelForCausalLM, AutoTokenizer</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>target_name <span class="op">=</span> <span class="st">&quot;target-model-placeholder&quot;</span>   <span class="co"># pl. egy nagyobb modell revíziója</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>draft_name  <span class="op">=</span> <span class="st">&quot;draft-model-placeholder&quot;</span>    <span class="co"># pl. ugyanazon család kisebb tagja</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>tokenizer <span class="op">=</span> AutoTokenizer.from_pretrained(target_name)</span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>target <span class="op">=</span> AutoModelForCausalLM.from_pretrained(</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    target_name,</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    torch_dtype<span class="op">=</span>torch.float16,</span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    device_map<span class="op">=</span><span class="st">&quot;cuda:0&quot;</span>,</span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>draft <span class="op">=</span> AutoModelForCausalLM.from_pretrained(</span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    draft_name,</span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>    torch_dtype<span class="op">=</span>torch.float16,</span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>    device_map<span class="op">=</span><span class="st">&quot;cuda:0&quot;</span>,</span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>prompt <span class="op">=</span> <span class="st">&quot;A budapesti közlekedés&quot;</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>inputs <span class="op">=</span> tokenizer(prompt, return_tensors<span class="op">=</span><span class="st">&quot;pt&quot;</span>).to(<span class="st">&quot;cuda&quot;</span>)</span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a><span class="co"># Greedy target, greedy draft: a kimenet determinisztikusan azonos a target greedy kimenetével</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>output <span class="op">=</span> target.generate(</span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>    <span class="op">**</span>inputs,</span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>    max_new_tokens<span class="op">=</span><span class="dv">64</span>,</span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>    assistant_model<span class="op">=</span>draft,</span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>    do_sample<span class="op">=</span><span class="va">False</span>,</span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(tokenizer.decode(output[<span class="dv">0</span>], skip_special_tokens<span class="op">=</span><span class="va">True</span>))</span></code></pre></div>
+<p>Ha a target sztochasztikus, akkor mindkét modellre azonos
+hőmérsékletet és top-p/top-k beállításokat alkalmazzunk. A
+<code>do_sample=True</code> esetén az eloszlástartó (speculative
+sampling) viselkedés verziófüggő, a rögzített verzió dokumentációjából
+ellenőrizendő; ha teljesül, a generálás statisztikailag ugyanazt az
+eloszlást követi, mint a target közvetlen mintavételezése, de a konkrét
+tokenek a véletlenszámtól függően eltérhetnek. A reprodukálhatósághoz
+rögzítsük a seedet, és a laborban többször futtassuk a mérést.</p>
+<p>A standard <code>generate</code> API nem minden verzióban adja vissza
+az elfogadási arányt. Ha erre szükség van, érdemes a generálást saját
+ciklussal megvalósítani, vagy az <code>AssistedCandidateGenerator</code>
+(<code>transformers.generation.candidate_generator</code>)
+<code>update_candidate_strategy</code> metódusát bővíteni a naplózáshoz
+(a név és a hely verziófüggő, ellenőrzendő). A laborban ezért
+megkülönböztetjük a külső, API-szintű mérést (fal-idő, tokens per
+second) és a belső, algoritmusszintű mérést (draft hossz, elfogadások
+száma).</p>
+<h3 data-number="12.3.8" id="tipikus-hibák-és-hibakeresés"><span
+class="header-section-number">12.3.8</span> 7. Tipikus hibák és
+hibakeresés</h3>
+<p>A speculatív dekódolás bevezetésekor gyakori hibák:</p>
+<ol type="1">
+<li><p><strong>A promptfeldolgozást nem választják le a generálási
+időről.</strong> A target modell a promptot először egyszer dolgozza
+fel. Ha a mérés a teljes <code>generate</code> hívást nézi, akkor a
+hosszú prompt ideje elnyomhatja a tényleges gyorsulást. Használjunk
+külön TTFT (time to first token) és generálási idő mérést.</p></li>
+<li><p><strong>A target és a draft batch mérete eltér, vagy a draft
+modell nincs ugyanazon az eszközön.</strong> Ha a draft CPU-n, a target
+GPU-n fut, akkor az eszközök közötti adatmozgatás miatt a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi mathvariant="normal">d</mi></msub><mi>/</mi><msub><mi>T</mi><mi mathvariant="normal">t</mi></msub></mrow><annotation encoding="application/x-tex">T_{\mathrm{d}}/T_{\mathrm{t}}</annotation></semantics></math>
+arány romlik. A draftot lehetőleg ugyanarra a GPU-ra tegyük, vagy
+használjunk nagyon kis draftot, ha CPU-ra kényszerülünk.</p></li>
+<li><p><strong>A tokenizerek nem egyeznek.</strong> Ez az egyik
+leggyakoribb ok, amiért az elfogadási arány drasztikusan leesik. Mindig
+ellenőrizzük, hogy a két modell tokenizere megegyezik, vagy legalább a
+tokenID-tér azonos.</p></li>
+<li><p><strong>A draft hossz túl nagy.</strong> Bár a képlet szerint a
+nagyobb
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+növeli
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>L</mi><annotation encoding="application/x-tex">L</annotation></semantics></math>-t,
+a gyakorlatban a nagyon hosszú draft esetén a target verifikáció
+memóriaigénye nő, és a hibás draft tokenek után a korrekció hamar
+leállítja a folyamatot. A tipikus optimum 3 és 10 között van, de ezt
+méréssel kell meghatározni.</p></li>
+<li><p><strong>A mintavételezési beállítások nincsenek
+összehangolva.</strong> Ha a draft greedy, a target pedig
+sztochasztikus, vagy fordítva, az elfogadási arány alacsony lesz. Ha a
+cél a determinisztikus gyorsítás, használjunk greedy targetet és greedy
+draftot.</p></li>
+<li><p><strong>A gyorsulást nem ugyanazon a hardveren mérik.</strong> A
+CPU-s és GPU-s futás között nagyságrendi különbség lehet. A mérési
+jegyzőkönyvben rögzíteni kell a hardvert, a precisiont, a batch méretet
+és a verziókat.</p></li>
+<li><p><strong>Azt feltételezik, hogy a speedup minden batch méretre
+ugyanaz.</strong> Nagy batch esetén a target verifikáció egyre inkább
+compute-bound, és a nyereség csökkenhet. A bevezetés előtt a célzott
+üzemi terhelésen kell mérni.</p></li>
+</ol>
+<h3 data-number="12.3.9" id="labor-speculatív-dekódolás-mérése"><span
+class="header-section-number">12.3.9</span> 8. Labor: speculatív
+dekódolás mérése</h3>
+<p>A labor célja egy reprodukálható notebook elkészítése, amely
+összehasonlítja a tisztán target alapú generálást a speculatív
+dekódolással, és méri az elfogadási arányt. A labor önmagában nem
+futtatható; itt a pontos specifikációt és a kiértékelési keretet adjuk
+meg. A GPU nélküli rész a 8.0 szakasz CPU-s szimulációja; a tényleges
+GPU-s gyorsulásmérés külön reprodukciós csomagot igényel.</p>
+<h3 data-number="12.3.10" id="cpu-s-szimuláció-gpu-nélkül"><span
+class="header-section-number">12.3.10</span> 8.0. CPU-s szimuláció (GPU
+nélkül)</h3>
+<p>A 4. szakasz numerikus példájának szimulációja: a draft eloszlásából
+mintavételezünk, az elfogadást és a reziduális korrekciót a fenti
+pszeudokód szerint végezzük, és a kimenet marginálisát összevetjük
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>p</mi><annotation encoding="application/x-tex">p</annotation></semantics></math>-vel.</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> numpy <span class="im">as</span> np</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>rng <span class="op">=</span> np.random.default_rng(<span class="dv">42</span>)</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>p <span class="op">=</span> np.array([<span class="fl">0.4</span>, <span class="fl">0.3</span>, <span class="fl">0.2</span>, <span class="fl">0.1</span>])  <span class="co"># target</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>q <span class="op">=</span> np.array([<span class="fl">0.2</span>, <span class="fl">0.2</span>, <span class="fl">0.5</span>, <span class="fl">0.1</span>])  <span class="co"># draft</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> step():</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    x <span class="op">=</span> rng.choice(<span class="dv">4</span>, p<span class="op">=</span>q)</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> rng.random() <span class="op">&lt;</span> <span class="bu">min</span>(<span class="fl">1.0</span>, p[x] <span class="op">/</span> q[x]):</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> x, <span class="va">True</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    r <span class="op">=</span> np.maximum(p <span class="op">-</span> q, <span class="fl">0.0</span>)</span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    r <span class="op">/=</span> r.<span class="bu">sum</span>()</span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> rng.choice(<span class="dv">4</span>, p<span class="op">=</span>r), <span class="va">False</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>N <span class="op">=</span> <span class="dv">200_000</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>counts <span class="op">=</span> np.zeros(<span class="dv">4</span>)</span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>accepted <span class="op">=</span> <span class="dv">0</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(N):</span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>    z, ok <span class="op">=</span> step()</span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>    counts[z] <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>    accepted <span class="op">+=</span> ok</span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;elfogadási arány:&quot;</span>, accepted <span class="op">/</span> N)</span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;marginális:&quot;</span>, counts <span class="op">/</span> N)</span></code></pre></div>
+<p>Várt kimenet (levezetve, a szkriptet nem futtattuk): az elfogadási
+arány
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mo>∑</mo><mi>z</mi></msub><mrow><mi>min</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><mi>p</mi><mo stretchy="false" form="prefix">(</mo><mi>z</mi><mo stretchy="false" form="postfix">)</mo><mo>,</mo><mi>q</mi><mo stretchy="false" form="prefix">(</mo><mi>z</mi><mo stretchy="false" form="postfix">)</mo><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mn>0</mn><mo>,</mo><mn>2</mn><mo>+</mo><mn>0</mn><mo>,</mo><mn>2</mn><mo>+</mo><mn>0</mn><mo>,</mo><mn>2</mn><mo>+</mo><mn>0</mn><mo>,</mo><mn>1</mn><mo>=</mo><mn>0</mn><mo>,</mo><mn>7</mn></mrow><annotation encoding="application/x-tex">\sum_z\min(p(z),q(z))=0{,}2+0{,}2+0{,}2+0{,}1=0{,}7</annotation></semantics></math>,
+a marginális pedig
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>p</mi><mo>=</mo><mo stretchy="false" form="prefix">[</mo><mn>0</mn><mo>,</mo><mn>4</mn><mo>;</mo><mn>0</mn><mo>,</mo><mn>3</mn><mo>;</mo><mn>0</mn><mo>,</mo><mn>2</mn><mo>;</mo><mn>0</mn><mo>,</mo><mn>1</mn><mo stretchy="false" form="postfix">]</mo></mrow><annotation encoding="application/x-tex">p=[0{,}4;0{,}3;0{,}2;0{,}1]</annotation></semantics></math>
+a mintavételi szórás keretein belül. A saját futtatás eredményét a
+jegyzőkönyvben külön, mértként kell feltüntetni.</p>
+<h3 data-number="12.3.11" id="környezet-és-adat"><span
+class="header-section-number">12.3.11</span> 8.1. Környezet és adat</h3>
+<ul>
+<li><strong>Python</strong>: 3.12+</li>
+<li><strong>Kulcscsomagok</strong>: <code>transformers</code>,
+<code>torch</code>, <code>datasets</code>, <code>accelerate</code>; a
+pontos verziókat a notebook elején <code>requirements.txt</code>-ben
+vagy <code>pip freeze</code> kimenettel rögzítsük.</li>
+<li><strong>Hardver</strong>: legalább egy GPU, amely mindkét modellt
+egyszerre el tudja futtatni. Ha nincs elegendő GPU-memória, a draft
+modell CPU-ra is kerülhet, de ezt a mérési jegyzőkönyvben jelölni kell,
+mert a gyorsulási arányt befolyásolja.</li>
+<li><strong>Modellek</strong>: helyőrzőként használjunk ugyanazon
+modellcsalád két méretét, például egy 1B draftot és egy 7B targetet. A
+labor notebookban a modellnevek, revíziók és licencek helyőrzők; éles
+használat előtt ellenőrizni kell a licencfeltételeket.</li>
+<li><strong>Adat</strong>: készítsünk 20 darab rövid promptból álló
+tesztkészletet. A promptok tartalmazzanak magyar és angol kevert
+szöveget, de ne tartalmazzanak személyes adatot, hitelesítő adatot vagy
+valós belső URL-t. Az adatverziót rögzítsük, például egy
+<code>prompts.jsonl</code> fájl hash-ével.</li>
+</ul>
+<h3 data-number="12.3.12" id="mérési-elrendezés"><span
+class="header-section-number">12.3.12</span> 8.2. Mérési elrendezés</h3>
+<p>Három konfigurációt mérjünk:</p>
+<ol type="1">
+<li><strong>Baseline</strong>: csak a target modell,
+<code>do_sample=False</code>, greedy dekódolás.</li>
+<li><strong>Speculative deterministic</strong>: target és draft,
+mindkettő <code>do_sample=False</code>.</li>
+<li><strong>Speculative stochastic</strong>: target és draft, mindkettő
+<code>do_sample=True</code>, azonos hőmérséklet és top-p, seed
+rögzítve.</li>
+</ol>
+<p>Minden konfigurációt mind a 20 promptra futtassuk le, és mérjük:</p>
+<ul>
+<li><strong>TTFT</strong>: a prompt feldolgozástól az első új tokenig
+eltelt idő.</li>
+<li><strong>Generálási idő</strong>: az első tokentől az utolsóig eltelt
+idő.</li>
+<li><strong>Összes generált token</strong>: a kimenet tokenhossza.</li>
+<li><strong>Tokens per second</strong>: összes generált token /
+generálási idő.</li>
+<li><strong>Elfogadási arány</strong> (csak speculatív esetben): az
+elfogadott draft tokenek aránya az összes javasolt draft tokenhez
+képest. Ha az API nem adja vissza közvetlenül, saját naplózó wrapperrel
+mérjük.</li>
+</ul>
+<p>A mérési jegyzőkönyvben minden futásnál rögzítsük a seedet, a modell-
+és tokenizer-revíziót, a precisiont, a batch méretet, a hőmérsékletet és
+a top-p értéket.</p>
+<h3 data-number="12.3.13"
+id="várt-és-mért-eredmények-szétválasztása"><span
+class="header-section-number">12.3.13</span> 8.3. Várt és mért
+eredmények szétválasztása</h3>
+<p>A notebookban külön szakaszban szerepeljen a
+<strong>várt/levezetett</strong> és a <strong>mért</strong>
+eredmény.</p>
+<p><strong>Várt értékek</strong> (a képletek alapján):</p>
+<ul>
+<li>A várható elfogadási arány a draft és target eloszlások
+közelségéből. Mintavételes konfigurációban (3.) pozíciónként
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mover><mi>α</mi><mo accent="true">‾</mo></mover><mi>i</mi></msub><mo>=</mo><msub><mo>∑</mo><mi>z</mi></msub><mrow><mi>min</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><msub><mi>p</mi><mi>i</mi></msub><mo stretchy="false" form="prefix">(</mo><mi>z</mi><mo stretchy="false" form="postfix">)</mo><mo>,</mo><msub><mi>q</mi><mi>i</mi></msub><mo stretchy="false" form="prefix">(</mo><mi>z</mi><mo stretchy="false" form="postfix">)</mo><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">\bar\alpha_i=\sum_z\min(p_i(z),q_i(z))</annotation></semantics></math>,
+azonos hőmérséklettel és top-p-vel számolt eloszlásokon; greedy
+konfigurációban (2.)
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mover><mi>α</mi><mo accent="true">‾</mo></mover><annotation encoding="application/x-tex">\bar\alpha</annotation></semantics></math>
+azon pozíciók aránya, ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mi>arg</mi><mo>&#8289;</mo></mrow><mrow><mi>max</mi><mo>&#8289;</mo></mrow><msub><mi>q</mi><mi>i</mi></msub><mo>=</mo><mrow><mi>arg</mi><mo>&#8289;</mo></mrow><mrow><mi>max</mi><mo>&#8289;</mo></mrow><msub><mi>p</mi><mi>i</mi></msub></mrow><annotation encoding="application/x-tex">\arg\max q_i=\arg\max p_i</annotation></semantics></math>.
+Mindkettőt a baseline target-kimenet mentén becsüljük (teacher forcing a
+target greedy kimenetén), ne csak a promptok első tokenjén. Ebből a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+draft hosszra várható kimenethossz:
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>L</mi><mrow><mi mathvariant="normal">v</mi><mi mathvariant="normal">a</mi><mi mathvariant="normal">r</mi><mi mathvariant="normal">t</mi></mrow></msub><mo>=</mo><mfrac><mrow><mn>1</mn><mo>−</mo><msup><mover><mi>α</mi><mo accent="true">‾</mo></mover><mrow><mi>K</mi><mo>+</mo><mn>1</mn></mrow></msup></mrow><mrow><mn>1</mn><mo>−</mo><mover><mi>α</mi><mo accent="true">‾</mo></mover></mrow></mfrac></mrow><annotation encoding="application/x-tex">
+L_{\mathrm{vart}} = \frac{1 - \bar\alpha^{K+1}}{1 - \bar\alpha}
+</annotation></semantics></math></li>
+<li>A várható gyorsulás:
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>S</mi><mrow><mi mathvariant="normal">v</mi><mi mathvariant="normal">a</mi><mi mathvariant="normal">r</mi><mi mathvariant="normal">t</mi></mrow></msub><mo>=</mo><mfrac><mrow><msub><mi>L</mi><mrow><mi mathvariant="normal">v</mi><mi mathvariant="normal">a</mi><mi mathvariant="normal">r</mi><mi mathvariant="normal">t</mi></mrow></msub><mspace width="0.167em"></mspace><msub><mi>T</mi><mi mathvariant="normal">t</mi></msub></mrow><mrow><mi>K</mi><mspace width="0.167em"></mspace><msub><mi>T</mi><mi mathvariant="normal">d</mi></msub><mo>+</mo><msub><mi>T</mi><mi mathvariant="normal">v</mi></msub></mrow></mfrac><mo>,</mo></mrow><annotation encoding="application/x-tex">
+S_{\mathrm{vart}} = \frac{L_{\mathrm{vart}}\, T_{\mathrm{t}}}{K\,T_{\mathrm{d}} + T_{\mathrm{v}}},
+</annotation></semantics></math> ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mi mathvariant="normal">d</mi></msub><annotation encoding="application/x-tex">T_{\mathrm{d}}</annotation></semantics></math>
+a draft tokenenkénti ideje,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mi mathvariant="normal">t</mi></msub><annotation encoding="application/x-tex">T_{\mathrm{t}}</annotation></semantics></math>
+a baseline target tokenenkénti ideje,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mi mathvariant="normal">v</mi></msub><annotation encoding="application/x-tex">T_{\mathrm{v}}</annotation></semantics></math>
+pedig a verifikációs blokk mért ideje. Ha
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mi mathvariant="normal">v</mi></msub><annotation encoding="application/x-tex">T_{\mathrm{v}}</annotation></semantics></math>
+külön nem mérhető, a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi mathvariant="normal">v</mi></msub><mo>≈</mo><msub><mi>T</mi><mi mathvariant="normal">t</mi></msub></mrow><annotation encoding="application/x-tex">T_{\mathrm{v}} \approx T_{\mathrm{t}}</annotation></semantics></math>
+közelítést kell alkalmazni, és ezt a jegyzőkönyvben jelölni kell.</li>
+</ul>
+<p><strong>Mért értékek</strong>:</p>
+<ul>
+<li>Az átlagos generálási idő és tokens per second a három
+konfigurációban.</li>
+<li>Az átlagos elfogadási arány a speculatív futásokban.</li>
+<li>A mért gyorsulás: baseline generálási idő / speculatív generálási
+idő azonos promptkészleten.</li>
+</ul>
+<p>A kiértékelés során hasonlítsuk össze a mért gyorsulást a várttal. Ha
+a mért lényegesen alacsonyabb, vizsgáljuk meg a draft modell valódi
+késleltetését, az eszközök közötti adatmozgatást és a batch méretet. Ha
+a mért magasabb, ellenőrizzük, hogy a target verifikáció valóban
+párhuzamos-e, és hogy nem rövidült-e a kimenet.</p>
+<p>A reprodukálhatóság miatt a notebook minden celláját determinisztikus
+seeddel futtassuk, a promptok sorrendjét rögzítsük, és a kimeneteket
+mentsük el a modellkártyához hasonlóan verziózott formában.</p>
+<h3 data-number="12.3.14" id="önellenőrző-kérdés"><span
+class="header-section-number">12.3.14</span> 9. Önellenőrző kérdés</h3>
+<p>Tegyük fel, hogy a draft modell tokenenkénti ideje a target modell
+tokenenkénti idejének 40%-a. Az elfogadási valószínűség átlagosan
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mover><mi>α</mi><mo accent="true">‾</mo></mover><mo>=</mo><mn>0</mn><mo>,</mo><mn>8</mn></mrow><annotation encoding="application/x-tex">\bar\alpha = 0{,}8</annotation></semantics></math>,
+a draft hossz
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>=</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">K = 4</annotation></semantics></math>.
+Számítsd ki az elfogadott draft tokenek számának
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝔼</mi><mo stretchy="false" form="prefix">[</mo><mi>A</mi><mo stretchy="false" form="postfix">]</mo></mrow><annotation encoding="application/x-tex">\mathbb E[A]</annotation></semantics></math>)
+és a kimenet hosszának
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝔼</mi><mo stretchy="false" form="prefix">[</mo><mi>L</mi><mo stretchy="false" form="postfix">]</mo></mrow><annotation encoding="application/x-tex">\mathbb E[L]</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi><mo>=</mo><mi>A</mi><mo>+</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">L=A+1</annotation></semantics></math>)
+várható értékét, valamint a várható gyorsulást. Mi történik, ha a draft
+modell tokenenkénti ideje a target 80%-ára nő? Válaszodban mutasd meg a
+képletet és a behelyettesítést.</p>
+<p><strong>Megoldás.</strong>
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝔼</mi><mo stretchy="false" form="prefix">[</mo><mi>A</mi><mo stretchy="false" form="postfix">]</mo><mo>=</mo><mn>0</mn><mo>,</mo><mn>8</mn><mo stretchy="false" form="prefix">(</mo><mn>1</mn><mo>−</mo><mn>0</mn><mo>,</mo><msup><mn>8</mn><mn>4</mn></msup><mo stretchy="false" form="postfix">)</mo><mi>/</mi><mn>0</mn><mo>,</mo><mn>2</mn><mo>≈</mo><mn>2</mn><mo>,</mo><mn>36</mn></mrow><annotation encoding="application/x-tex">\mathbb E[A]=0{,}8(1-0{,}8^4)/0{,}2\approx2{,}36</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝔼</mi><mo stretchy="false" form="prefix">[</mo><mi>L</mi><mo stretchy="false" form="postfix">]</mo><mo>=</mo><mo stretchy="false" form="prefix">(</mo><mn>1</mn><mo>−</mo><mn>0</mn><mo>,</mo><msup><mn>8</mn><mn>5</mn></msup><mo stretchy="false" form="postfix">)</mo><mi>/</mi><mn>0</mn><mo>,</mo><mn>2</mn><mo>≈</mo><mn>3</mn><mo>,</mo><mn>36</mn></mrow><annotation encoding="application/x-tex">\mathbb E[L]=(1-0{,}8^5)/0{,}2\approx3{,}36</annotation></semantics></math>;
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>S</mi><mo>≈</mo><mn>3</mn><mo>,</mo><mn>36</mn><mi>/</mi><mo stretchy="false" form="prefix">(</mo><mn>1</mn><mo>+</mo><mn>4</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>4</mn><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mn>3</mn><mo>,</mo><mn>36</mn><mi>/</mi><mn>2</mn><mo>,</mo><mn>6</mn><mo>≈</mo><mn>1</mn><mo>,</mo><mn>29</mn></mrow><annotation encoding="application/x-tex">S\approx3{,}36/(1+4\cdot0{,}4)=3{,}36/2{,}6\approx1{,}29</annotation></semantics></math>.
+Az 80%-os draftidőnél
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>S</mi><mo>≈</mo><mn>3</mn><mo>,</mo><mn>36</mn><mi>/</mi><mo stretchy="false" form="prefix">(</mo><mn>1</mn><mo>+</mo><mn>4</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>8</mn><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mn>3</mn><mo>,</mo><mn>36</mn><mi>/</mi><mn>4</mn><mo>,</mo><mn>2</mn><mo>≈</mo><mn>0</mn><mo>,</mo><mn>80</mn></mrow><annotation encoding="application/x-tex">S\approx3{,}36/(1+4\cdot0{,}8)=3{,}36/4{,}2\approx0{,}80</annotation></semantics></math>,
+vagyis a speculatív dekódolás lassít.</p>
+<p>Ez az alfejezet lefektette a speculatív dekódolás alapjait: a
+draft–target felosztást, az elutasításos mintavételen alapuló
+elfogadást, az elfogadási arány és a költségmodell szerepét, valamint a
+laborban mérhető metrikákat. A következő egység (<a
+href="lm044.html">Latency, throughput, költség és SLA tervezés</a>)
+ezekre az alapokra épít, amikor a latencia-, throughput- és SLA-tervezés
+teljes rendszerképét tárgyalja.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="lm042.html">← 12.2 vLLM, TGI, llama.cpp és Ollama összehasonlítása</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="lm044.html">12.4 Latency, throughput, költség és SLA tervezés →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>

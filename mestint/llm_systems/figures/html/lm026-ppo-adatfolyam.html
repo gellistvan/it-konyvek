@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PPO-alapú RLHF adatfolyama</title>
+<style>
+:root{--fg:#111;--bg:#fff;--muted:#666;--hl:#1f4e79;--hl2:#c55a11;--cell:#fff;--cellhl:#d9d9d9;--line:#000;--code:#f3f3f3}
+@media (prefers-color-scheme:dark){:root{--fg:#eee;--bg:#1b1b1b;--muted:#aaa;--hl:#8fb8e8;--hl2:#f0a060;--cell:#262626;--cellhl:#4a4a4a;--line:#ddd;--code:#2a2a2a}}
+*{box-sizing:border-box}
+body{margin:0;padding:10px;font:14px/1.45 system-ui,sans-serif;color:var(--fg);background:var(--bg)}
+.ctl{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:6px}
+button{font:inherit;padding:3px 10px;cursor:pointer}
+input[type=range]{flex:1;min-width:120px}
+#status{margin:4px 0 6px;min-height:2.9em}
+/* A pszeudokód a rajz ALATT, teljes szélességben (hosszú sorok ne görgessenek oldalra) */
+.wrap{display:flex;flex-direction:column;gap:10px;align-items:stretch}
+svg{width:100%;height:auto;display:block}
+pre#code{width:100%;margin:0;padding:6px 8px;background:var(--code);font:12.5px/1.5 ui-monospace,monospace;white-space:pre;overflow-x:auto}
+pre#code span{display:block;padding:0 4px}
+pre#code span.on{outline:2px solid var(--hl);font-weight:bold}
+svg text:not([fill]){fill:var(--fg);}
+svg text{font-family:system-ui,sans-serif}
+.small{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="ctl" role="group" aria-label="Lejátszás vezérlői">
+  <button id="first" title="Első lépés">⏮</button>
+  <button id="prev" title="Előző lépés">◀ Lépés</button>
+  <button id="play" title="Lejátszás / szünet">▶ Lejátszás</button>
+  <button id="next" title="Következő lépés">Lépés ▶</button>
+  <input id="pos" type="range" min="0" max="0" value="0" aria-label="Lépés kiválasztása">
+  <span id="cnt" class="small"></span>
+</div>
+<div class="ctl"><label>β (KL-együttható) <input id="b" type="range" min="0.005" max="0.5" step="0.005" value="0.05" oninput="beta()" aria-label="KL-együttható béta"> <b id="bv">0,05</b></label><span id="bt" class="small" aria-live="polite">közepes β: a jutalom javul, a policy a referencia közelében marad.</span></div>
+<div id="status" aria-live="polite"></div>
+<div class="wrap">
+  <svg id="v" viewBox="0 0 560 300" role="img" aria-label="Négy modell (policy és értékmodell tanul, referencia és jutalommodell fagyasztott) és az adatfolyam: generálás, pontozás, KL-büntetés, előny, klipelt frissítés, értékfrissítés."></svg>
+  <pre id="code" aria-label="Pszeudokód"></pre>
+</div>
+<p class="small">Sematikus ábra. A β-csúszka szövege illusztratív (minőségi hatás), nem mérés. Az értékmodell a PPO alatt a policyval együtt tanul.</p>
+<script>
+// ---- Adat: lépések (a Python-szkript számolja ki és illeszti be, a könyv példájával egyezően) ----
+// Minden lépés: {msg: "állapotsor szövege", line: kiemelt pszeudokódsor indexe vagy -1, ...saját mezők}
+let STEPS = [{"msg": "1. Generálás: A policy π_θ (tanul) a prompt x-re y választ generál.", "k": 1, "line": 0}, {"msg": "2. Pontozás: A fagyasztott jutalommodell R_φ pontozza: R_φ(x, y).", "k": 2, "line": 1}, {"msg": "3. KL-büntetés: A policy és a fagyasztott referencia log-valószínűsége: log π_θ(y|x) − log π_ref(y|x) → −β·KL; R_total = R_φ − β·KL.", "k": 3, "line": 2}, {"msg": "4. Előny: Az értékmodell V_ψ becslése és R_total alapján GAE-vel az előny: A_t.", "k": 4, "line": 3}, {"msg": "5. Klipelt frissítés: ρ_t = π_θ / π_θ,régi; cél: min(ρ_t A_t, clip(ρ_t, 1 − ε, 1 + ε) A_t), ε = 0,2 → gradiens a policyra.", "k": 5, "line": 4}, {"msg": "6. Értékfrissítés: Értékveszteség (V_ψ − visszatérés)² → az értékmodell is tanul.", "k": 6, "line": 5}];
+const CODE = ["1. Generálás: A policy π_θ (tanul) a prompt x-re y választ generál.", "2. Pontozás: A fagyasztott jutalommodell R_φ pontozza: R_φ(x, y).", "3. KL-büntetés: A policy és a fagyasztott referencia log-valószínűsége: log π_θ(y|x) − log π_ref(y|x) → −β·KL; R_total = R_φ − β·KL.", "4. Előny: Az értékmodell V_ψ becslése és R_total alapján GAE-vel az előny: A_t.", "5. Klipelt frissítés: ρ_t = π_θ / π_θ,régi; cél: min(ρ_t A_t, clip(ρ_t, 1 − ε, 1 + ε) A_t), ε = 0,2 → gradiens a policyra.", "6. Értékfrissítés: Értékveszteség (V_ψ − visszatérés)² → az értékmodell is tanul."];          // pszeudokód sorai (üres lista: a panel elrejtve)
+
+// ---- Rajzolás: ezt a függvényt kell az ábrához igazítani ----
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, text){const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);if(text!==undefined)e.textContent=text;svg.appendChild(e);return e;}
+const svg = document.getElementById("v");
+function css(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim();}
+function render(s){
+  // Példa: tömb cellákként, s.a = értékek, s.hl = kiemelt indexek
+  svg.innerHTML = "";
+  const a = s.a || [], w = 48, x0 = (560 - a.length * w) / 2, y0 = 110;
+  a.forEach((v, i) => {
+    const on = (s.hl || []).includes(i);
+    el("rect", {x: x0 + i * w, y: y0, width: w, height: w, fill: on ? css("--cellhl") : css("--cell"), stroke: css("--line"), "stroke-width": on ? 3 : 1.2});
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w / 2 + 6, "text-anchor": "middle", "font-size": 18}, String(v));
+    el("text", {x: x0 + i * w + w / 2, y: y0 + w + 18, "text-anchor": "middle", "font-size": 12, fill: css("--muted")}, String(i));
+  });
+}
+
+const NN = {"x": {"x": 0.0, "y": 3.3, "w": 1.2, "h": 0.8, "typ": "data", "t": "prompt x"}, "pol": {"x": 1.75, "y": 3.05, "w": 2.2, "h": 1.3, "typ": "learn", "t": "Policy π_θ\n(tanul)"}, "ans": {"x": 4.6, "y": 3.3, "w": 1.5, "h": 0.8, "typ": "data", "t": "válasz y"}, "rm": {"x": 6.9, "y": 4.9, "w": 2.5, "h": 1.15, "typ": "frozen", "t": "Jutalommodell R_φ\n(fagyasztott)"}, "ref": {"x": 3.9, "y": 1.15, "w": 2.5, "h": 1.15, "typ": "frozen", "t": "Referencia π_ref\n(fagyasztott)"}, "kl": {"x": 6.9, "y": 1.15, "w": 2.5, "h": 1.15, "typ": "op", "t": "logπ_θ-logπ_ref\n→ −β·KL"}, "sum": {"x": 9.95, "y": 3.2, "w": 1.75, "h": 1.0, "typ": "op", "t": "R_total=\nR_φ-β·KL"}, "gae": {"x": 9.95, "y": -1.0, "w": 1.75, "h": 1.1, "typ": "op", "t": "GAE\n→ A_t"}, "val": {"x": 6.9, "y": -1.05, "w": 2.5, "h": 1.2, "typ": "learn", "t": "Értékmodell V_ψ\n(tanul)"}, "clip": {"x": 0.3, "y": -1.15, "w": 4.9, "h": 1.4, "typ": "op", "t": "klipelt cél, ε=0,2:\nmin(ρ_t A_t, clip(ρ_t,1-ε,1+ε)A_t)"}}, EE = [{"a": "x", "b": "pol", "s": 1, "g": false, "r": false, "lab": "", "lp": [0.5, 0, 0.1, "center"]}, {"a": "pol", "b": "ans", "s": 1, "g": false, "r": false, "lab": "generál", "lp": [0.5, 0.0, 0.3, "center"]}, {"a": "ans", "b": "rm", "s": 2, "g": false, "r": false, "lab": "pontozás", "lp": [0.5, -0.1, 0.1, "right"]}, {"a": "rm", "b": "sum", "s": 2, "g": false, "r": false, "lab": "R_φ(x,y)", "lp": [0.5, 0.1, 0.1, "left"]}, {"a": "pol", "b": "kl", "s": 3, "g": false, "r": false, "lab": "log π_θ", "lp": [0.72, 0.1, 0.12, "left"]}, {"a": "ans", "b": "ref", "s": 3, "g": false, "r": false, "lab": "(x,y)", "lp": [0.45, -0.1, 0.0, "right"]}, {"a": "ref", "b": "kl", "s": 3, "g": false, "r": false, "lab": "log π_ref", "lp": [0.5, 0.0, 0.3, "center"]}, {"a": "kl", "b": "sum", "s": 3, "g": false, "r": false, "lab": "", "lp": [0.5, 0, 0.1, "center"]}, {"a": "sum", "b": "gae", "s": 4, "g": false, "r": false, "lab": "R_total", "lp": [0.5, 0.12, 0.0, "left"]}, {"a": "val", "b": "gae", "s": 4, "g": false, "r": false, "lab": "V_ψ(s_t)", "lp": [0.5, 0.0, 0.4, "center"]}, {"a": "gae", "b": "clip", "s": 4, "g": false, "r": true, "lab": "A_t", "lp": [0.5, 0, 0.1, "center"]}, {"a": "clip", "b": "pol", "s": 5, "g": true, "r": false, "lab": "gradiens ∇θ", "lp": [0.5, -0.15, 0.0, "right"]}, {"a": "clip", "b": "val", "s": 6, "g": true, "r": false, "lab": "értékveszteség", "lp": [0.5, 0.0, 0.22, "center"]}];
+function render(s){
+  svg.setAttribute("viewBox", "0 0 720 420");
+  svg.innerHTML = "";
+  const X = x => 14 + x * 58, Y = y => 20 + (6.0 - y) * 52, cx = n => X(NN[n].x + NN[n].w / 2), cy = n => Y(NN[n].y + NN[n].h / 2);
+  function bp(n, t){ const N = NN[n], dx = cx(t) - cx(n), dy = cy(t) - cy(n);
+    const q = Math.min(dx ? (N.w * 29) / Math.abs(dx) : 1e9, dy ? (N.h * 26) / Math.abs(dy) : 1e9); return [cx(n) + dx * q, cy(n) + dy * q]; }
+  const defs = el("defs", {}); const mk = (id, col) => { const m = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+    [["id", id], ["viewBox", "0 0 10 10"], ["refX", 9], ["refY", 5], ["markerWidth", 10], ["markerHeight", 10], ["markerUnits", "userSpaceOnUse"], ["orient", "auto"]].forEach(([a, b]) => m.setAttribute(a, b));
+    const p = document.createElementNS("http://www.w3.org/2000/svg", "path"); p.setAttribute("d", "M0,0L10,5L0,10Z"); p.setAttribute("fill", col); m.appendChild(p); defs.appendChild(m); };
+  mk("a0", css("--muted")); mk("a1", css("--hl2"));
+  EE.forEach(e => { const on = e.s === s.k, col = on ? css("--hl2") : css("--muted"), w = on ? 3 : 1.2;
+    if (e.r) { const gx = cx("gae"), gy = Y(NN.gae.y), kx = cx("clip"), ky = Y(NN.clip.y);
+      el("path", {d: `M${gx},${gy}L${gx},${Y(-1.55)}L${kx},${Y(-1.55)}L${kx},${ky}`, fill: "none", stroke: col, "stroke-width": w, "marker-end": `url(#a${on ? 1 : 0})`});
+      el("text", {x: (gx + kx) / 2, y: Y(-1.55) - 4, "text-anchor": "middle", "font-size": 12}, e.lab); return; }
+    const [x0, y0] = bp(e.a, e.b), [x1, y1] = bp(e.b, e.a);
+    if (e.g) { el("line", {x1: x0, y1: y0, x2: x1, y2: y1, stroke: col, "stroke-width": on ? 9 : 6}); el("line", {x1: x0, y1: y0, x2: x1, y2: y1, stroke: css("--bg"), "stroke-width": on ? 4 : 2.5}); }
+    el("line", {x1: x0, y1: y0, x2: x1, y2: y1, stroke: e.g ? "none" : col, "stroke-width": w, "marker-end": `url(#a${on ? 1 : 0})`});
+    if (e.g) el("line", {x1: x0 + (x1 - x0) * 0.9, y1: y0 + (y1 - y0) * 0.9, x2: x1, y2: y1, stroke: "none", "marker-end": `url(#a${on ? 1 : 0})`});
+    if (e.lab) { const [f, dx, dy, ha] = e.lp; el("text", {x: x0 + f * (x1 - x0) + dx * 58, y: y0 + f * (y1 - y0) - dy * 52 + 4, "text-anchor": ha === "left" ? "start" : ha === "right" ? "end" : "middle", "font-size": 11.5, "font-weight": on ? "bold" : "normal"}, e.lab); } });
+  Object.entries(NN).forEach(([n, N]) => { const fr = N.typ === "frozen", le = N.typ === "learn";
+    const act = EE.some(e => e.s === s.k && (e.a === n || e.b === n));
+    el("rect", {x: X(N.x), y: Y(N.y + N.h), width: N.w * 58, height: N.h * 52, rx: 8, fill: fr ? css("--code") : css("--cell"),
+      stroke: act ? css("--hl") : css("--line"), "stroke-width": le ? 3.5 : act ? 2.5 : 1.2, "stroke-dasharray": fr ? "7 4" : ""});
+    const L = N.t.split("\n"); L.forEach((t, i) => el("text", {x: X(N.x + N.w / 2), y: Y(N.y + N.h / 2) + 5 + (i - (L.length - 1) / 2) * 15, "text-anchor": "middle", "font-size": n === "clip" ? 10.5 : 12.5, "font-weight": i === 0 ? "bold" : "normal"}, t + (fr && i === 1 ? " ❄" : "")));
+  });
+}
+function beta(){ const b = +document.getElementById("b").value;
+  document.getElementById("bv").textContent = b.toFixed(2).replace(".", ",");
+  document.getElementById("bt").textContent = b < 0.03 ? "kis β: gyenge KL-kötés – a policy messzire eltávolodhat, jutalom-kijátszás (reward hacking) veszélye."
+    : b > 0.3 ? "nagy β: erős KL-kötés – a policy alig változik az SFT-hez képest." : "közepes β: a jutalom javul, a policy a referencia közelében marad.";
+}
+
+
+// ---- Vezérlés (általában nem kell módosítani) ----
+let k = 0, timer = null;
+const pos = document.getElementById("pos"), status = document.getElementById("status");
+const codeEl = document.getElementById("code");
+if (!CODE.length) codeEl.style.display = "none";
+else codeEl.innerHTML = CODE.map((l, i) => `<span id="L${i}">${l.replace(/&/g,"&amp;").replace(/</g,"&lt;")}</span>`).join("");
+pos.max = STEPS.length - 1;
+// Új lépéssor betöltése (pl. saját bemenetből számolva): setSteps(lista)
+function setSteps(list){ stop(); STEPS = list; pos.max = STEPS.length - 1; show(0); }
+function show(i){
+  k = Math.max(0, Math.min(STEPS.length - 1, i));
+  const s = STEPS[k];
+  pos.value = k;
+  document.getElementById("cnt").textContent = `${k + 1}/${STEPS.length}`;
+  status.textContent = s.msg || "";
+  codeEl.querySelectorAll("span").forEach(x => x.classList.remove("on"));
+  if (s.line !== undefined && s.line >= 0) { const L = document.getElementById("L" + s.line); if (L) L.classList.add("on"); }
+  render(s);
+}
+function stop(){ if (timer) { clearInterval(timer); timer = null; } document.getElementById("play").textContent = "▶ Lejátszás"; }
+document.getElementById("first").onclick = () => { stop(); show(0); };
+document.getElementById("prev").onclick = () => { stop(); show(k - 1); };
+document.getElementById("next").onclick = () => { stop(); show(k + 1); };
+document.getElementById("play").onclick = () => {
+  if (timer) { stop(); return; }
+  if (k >= STEPS.length - 1) show(0);
+  document.getElementById("play").textContent = "⏸ Szünet";
+  timer = setInterval(() => { if (k >= STEPS.length - 1) stop(); else show(k + 1); }, 1400);
+};
+pos.oninput = () => { stop(); show(+pos.value); };
+document.addEventListener("keydown", e => { if (e.key === "ArrowRight") { stop(); show(k + 1); } if (e.key === "ArrowLeft") { stop(); show(k - 1); } });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => show(k));
+show(0);
+</script>
+<script>(function(){function s(){var b=document.body;parent.postMessage({figResize:Math.ceil(b.getBoundingClientRect().height)},"*")}addEventListener("load",s);addEventListener("resize",s);if(window.ResizeObserver)new ResizeObserver(s).observe(document.body);s()})()</script></body>
+</html>

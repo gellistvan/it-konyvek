@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>25.3 GPU-klaszter és autoscaling – LLM-ek és domain-specifikus
+kis modellek programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz6">VI. RÉSZ – LLMOps és produkciós rendszerek</a> › <a href="index.html#lmch24">25 Skálázás és költségoptimalizálás</a></p>
+<div class="links"><a class="prev" rel="prev" href="lm094.html">← 25.2 Multi-tenancy, kvóta és rate limit</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="lm096.html">25.4 Zöld AI, energia és hatékonyság →</a></div>
+</nav>
+<h2 data-number="25.3" id="lm095"><span
+class="header-section-number">25.3</span> GPU-klaszter és
+autoscaling</h2>
+<p>A modellkiszolgáló akkor válik költség- és késleltetésoldalról is
+tervezhetővé, ha a számítási kapacitás nem véletlenül alakul, hanem a
+terheléshez igazodik. Az előző alfejezetben a multi-tenancy, a kvóták és
+a rate limitek oldaláról néztük meg, hogyan osztható el a belépő
+forgalom. Itt a másik oldalt vizsgáljuk: hogyan építsünk fel egy
+GPU-poolt, hogyan ütemezzük a kéréseket, és hogyan skálázzuk a
+replikákat úgy, hogy a latency-cél teljesüljön anélkül, hogy felesleges
+GPU-kat fizetnénk.</p>
+<p>A fejezetben szándékosan nem adunk végleges, minden hardverre
+érvényes receptet; a hangsúlyt a döntési modellre és az ellenőrzésre
+helyezzük. A pontos Kubernetes- vagy gyártóspecifikus API-k, a
+kvantálási teljesítményadatok és a felhőárazás gyorsan változik, ezért
+azokat a helyszínen, a mindenkori dokumentációból kell ellenőrizni.</p>
+<h3 data-number="25.3.1" id="a-számítási-kapacitás-skálázása"><span
+class="header-section-number">25.3.1</span> A számítási kapacitás
+skálázása</h3>
+<p>LLM-inferencia esetén a skálázás tárgya nem egyszerűen „egy
+processz”, hanem egy olyan rendszer, amelyben egy modellsúlyokat
+tartalmazó, memória- és sávszélesség-igényes munkamenetet kell
+replikálni. A kapacitásot a következő négy tényező határozza meg:</p>
+<ol type="1">
+<li><strong>Replikák száma</strong> – hány párhuzamos modellpéldány
+szolgálja ki a forgalmat.</li>
+<li><strong>Egy replika teljesítménye</strong> – mennyi tokent tud
+generálni másodpercenként adott modellméret, precision, batch és
+kontextushossz esetén.</li>
+<li><strong>Kérések erőforrásigénye</strong> – átlagos prompt- és
+generálási hossz, valamint az ebből következő KV cache-méret.</li>
+<li><strong>SLO</strong> – milyen p50/p95/p99 latencyt vagy átbocsátást
+kell tartani, és milyen hibabüdzsével.</li>
+</ol>
+<p>A skálázás két alapiránya közismert. A <strong>vertikális
+skálázás</strong> nagyobb GPU-t, több memóriát vagy több GPU-t rendel
+egyetlen modellpéldányhoz. A <strong>horizontális skálázás</strong>
+több, egymással párhuzamos replikát indít. A modern LLM-kiszolgálásban
+általában mindkettőre szükség van: egy nagy modellhez több GPU kell, a
+forgalomhoz pedig több replika. A fejezetben elsősorban a horizontális
+skálázást és a mögötte álló GPU-poolt tárgyaljuk, mert a vertikális
+beállítás jellemzően modell- és hardware-specifikus.</p>
+<p>Fontos megkülönböztetni a <strong>kiszolgálási kapacitást</strong> a
+<strong>rendelkezésre álló GPU darabszámtól</strong>. Ha egy 7 milliárd
+paraméteres modellt egyetlen GPU-n futtatunk, a rendszer átbocsátása nem
+feltétlenül nő lineárisan a batch méretével, mert a figyelem és a KV
+cache memóriaigénye nő, a latency pedig romlik. A tervezéskor ezért
+mindig egységnyi teljesítményből indulunk ki:
+<code>token/s per GPU</code> vagy <code>request/s per GPU</code> adott
+konfigurációnál. Ezt méréssel, nem gyártói adatlapról kell meghatározni,
+mert az adott prompteloszlás, a kvantálás és a kontextushossz jelentősen
+módosítja.</p>
+<h3 data-number="25.3.2" id="gpu-pool-és-queue"><span
+class="header-section-number">25.3.2</span> GPU-pool és queue</h3>
+<p>Éles környezetben a GPU-kat ritkán érdemes egyetlen dedikált
+szolgáltatáshoz kötni úgy, hogy azokon kívül semmilyen más modell ne
+futhasson. A <strong>GPU-pool</strong> egy közös erőforráskészlet,
+amelyből különböző modellreplikák foglalhatnak le kapacitást. A pool
+lehet homogén (például csak egy adott GPU-típus) vagy heterogén (eltérő
+memóriájú, generációjú vagy gyorsítójú csomópontok). A pool fölött egy
+<strong>scheduler</strong> osztja el a kéréseket, és egy
+<strong>autoscaler</strong> dönt arról, hogy hány replika fusson. A pool
+fontos következménye, hogy a kapacitás foglalása és felszabadítása
+költséggel jár, ezért a skálázási döntést nem lehet ingyenként
+kezelni.</p>
+<p>A kérések nem azonnal kerülnek GPU-ra. A belépő forgalom először egy
+<strong>queue</strong>-ba vagy bufferbe kerül, ahol a scheduler kiosztja
+a szabad replikáknak. A queue célja a rövid távú terhelésingadozás
+kiegyenlítése, nem pedig a hosszú távú túlterhelés megoldása. Ha a queue
+tartósan nő, az azt jelzi, hogy a rendszer nem képes lépést tartani az
+érkezéssel; ilyenkor kell kapacitást hozzáadni.</p>
+<p>A sorban állás matematikája a kapacitásbecslés alapja. Tegyük fel,
+hogy a kérések λ átlagos rátával érkeznek (request/s), egy replika μ
+kérést tud kiszolgálni másodpercenként, és c replika fut. A rendszer
+kihasználtsága:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>ρ</mi><mo>=</mo><mfrac><mi>λ</mi><mrow><mi>c</mi><mi>μ</mi></mrow></mfrac><mi>.</mi></mrow><annotation encoding="application/x-tex">
+\rho = \frac{\lambda}{c\mu}.
+</annotation></semantics></math></p>
+<p>Ha ρ &lt; 1, a rendszer stacionárius állapotban stabil lehet; ha ρ
+közelít az 1-hez, a várakozási idő és a sor hossza robbanásszerűen nő. A
+közelítés exponenciális érkezési és kiszolgálási időt feltételező M/M/c
+modellen alapszik, de valós LLM-munkaterhelésnél a szolgáltatási idő nem
+exponenciális: a generálási hossz eloszlása gyakran hosszú farkú. Az
+M/M/c ezért hasznos első közelítés, de éles döntéshez szimulációt vagy
+valós terheléstesztet kell futtatni.</p>
+<p>A <strong>Little-törvény</strong> egyszerűbb és robusztusabb
+összefüggést ad:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi><mo>=</mo><mi>λ</mi><mi>W</mi><mo>,</mo></mrow><annotation encoding="application/x-tex">
+L = \lambda W,
+</annotation></semantics></math></p>
+<p>ahol L az átlagos kérések száma a rendszerben, λ az érkezési ráta, W
+az átlagos válaszidő. Ha például 20 kérés érkezik másodpercenként, és az
+átlagos válaszidő 1,5 másodperc, akkor átlagosan 30 kérés tartózkodik a
+rendszerben (queue és GPU együtt). Ebből közvetlenül levezethető, hogy
+adott W SLO-hoz mekkora λ tartható: ha túl nagy a λ, a queue és W együtt
+nő. A Little-törvény nem csak M/M/c rendszerekre igaz, hanem tetszőleges
+stabil sorban állási rendszerre, ezért különösen hasznos az
+ellenőrzéshez.</p>
+<p>A gyakorlatban a queue-nak több rétege van:</p>
+<ul>
+<li><strong>HTTP/szolgáltatási réteg</strong>: a bejövő API-kapuk és a
+modellszerver közötti puffer.</li>
+<li><strong>Inferencia-szerver belső queue</strong>: például a
+folyamatos batch ütemezője, amely a beérkezett kéréseket prefix-cache
+vagy KV-cache szempontok szerint csoportosítja.</li>
+<li><strong>Klaszter szintű queue</strong>: ha a poolban nincs azonnal
+elérhető replika, a kérés vár, amíg egy meleg vagy hideg replika készen
+nem áll.</li>
+</ul>
+<p>Az autoscaling szempontjából a legfontosabb a klaszter szintű queue
+mélysége, mert ez mutatja meg, hogy a jelenlegi replikák és a
+feladat-végrehajtók közötti kapacitás elegendő-e.</p>
+<h3 data-number="25.3.3" id="autoscaling-politikák"><span
+class="header-section-number">25.3.3</span> Autoscaling-politikák</h3>
+<p>Az autoscaler feladata, hogy a megfigyelt metrikák alapján replikákat
+indítson vagy állítson le. A döntéseknek három fő dimenziója van:</p>
+<ol type="1">
+<li><p><strong>Mit figyelünk?</strong> A legjobb metrika az, amelyik a
+felhasználói SLO-hoz kapcsolódik. Lehetséges metrikák:</p>
+<ul>
+<li><strong>GPU-kihasználtság</strong>: egyszerű, de félrevezető lehet,
+mert az LLM-inferencia gyakran memória- vagy sávszélesség-kötött, nem
+feltétlenül számítás-kötött; a magas GPU-kihasználtság nem jelenti azt,
+hogy a latency romlik.</li>
+<li><strong>Queue depth</strong>: az átlagos vagy maximális várakozó
+kérések száma. Közvetlenül jelzi a túlterhelést.</li>
+<li><strong>Latency p95/p99</strong>: a legközvetlenebb SLO-mutató, de
+kiszámítása időben késleltetett lehet, és a kiugró értékek zajt
+okoznak.</li>
+<li><strong>Token throughput</strong>: a rendszer tényleges
+tokenteljesítménye; inkább a modell kiválasztásánál és a batch méreténél
+hasznos, mint a replikák számának növelésénél.</li>
+<li><strong>Aktív kérések száma</strong>: a folyamatban lévő kérések,
+beleértve a generálás közbenieket is.</li>
+</ul>
+<p>A gyakorlatban a leggyakrabban a queue depth és a p95 latency
+kombinációja válik be, mert ezek közvetlenül a felhasználói élményhez
+kapcsolódnak.</p></li>
+<li><p><strong>Mikor és mennyit skálázunk?</strong> A legegyszerűbb
+reaktív politika küszöbértékeket használ: ha a queue depth egy megadott
+érték fölé emelkedik, indítunk egy vagy több replikát; ha egy adott
+ideig alatta marad, leállítunk. A <strong>reaktív</strong> politika csak
+a már bekövetkezett terhelésre reagál; a <strong>prediktív</strong>
+politika előrejelzi a forgalmat, például napszakos mintázat vagy
+ütemezett kampány alapján. A prediktív skálázás bonyolultabb, de
+csökkenti a hidegindítási várakozást, mert előre melegíti a
+replikákat.</p></li>
+<li><p><strong>Mekkora lépésekkel és milyen korlátokkal?</strong> A
+kisméretű lépések finoman követik a terhelést, de gyakori skálázást
+okoznak; a nagy lépések ritkábban, de nagyobb ugrásokat produkálnak. A
+<strong>cooldown</strong> (lehűlési idő) megakadályozza, hogy a rendszer
+oszcilláljon: két skálázási esemény között kötelező várakozási idő. A
+<strong>scale-up</strong> és <strong>scale-down</strong> cooldown
+általában eltér, mert a leállítás gyakran gyorsabb, mint az indítás, de
+a felhasználói hatása más.</p></li>
+</ol>
+<p>A Kubernetes ökoszisztémában ezt gyakran HPA-val (Horizontal Pod
+Autoscaler) vagy KEDA-val valósítják meg. A HPA általában CPU- vagy
+memóriamutatóra skáláz, de egyéni metrikákkal is kiegészíthető; a KEDA
+pedig képes Prometheus-, RabbitMQ- vagy akár saját HTTP-metrikákra is. A
+Ray Serve és a vLLM üzemeltetési rétege saját autoscaling fogalmakat is
+kínál; a pontos API-k és verziók a jelenlegi dokumentációban
+ellenőrizendők, mert ezek gyorsan változnak.</p>
+<p>Az alábbi YAML-példa egy KEDA <code>ScaledObject</code> vázlatot
+mutat, amely Prometheusból olvasott queue depth alapján skáláz egy
+modell-deploymentet. A helyőrzők nem futtathatók közvetlenül; a valós
+metrikaneveket, címeket és thresholdokat a környezethez kell
+igazítani:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> keda.sh/v1alpha1</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> ScaledObject</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> llm-gpu-scaler</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> inference</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">scaleTargetRef</span><span class="kw">:</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">name</span><span class="kw">:</span><span class="at"> llm-inference-deployment</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">minReplicaCount</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">maxReplicaCount</span><span class="kw">:</span><span class="at"> </span><span class="dv">16</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">cooldownPeriod</span><span class="kw">:</span><span class="at"> </span><span class="dv">300</span><span class="co">   # csak a 0 replikára skálázásnál hat</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">advanced</span><span class="kw">:</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">horizontalPodAutoscalerConfig</span><span class="kw">:</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">behavior</span><span class="kw">:</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">scaleDown</span><span class="kw">:</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">stabilizationWindowSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">300</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">scaleUp</span><span class="kw">:</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">stabilizationWindowSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">0</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">triggers</span><span class="kw">:</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">type</span><span class="kw">:</span><span class="at"> prometheus</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">serverAddress</span><span class="kw">:</span><span class="at"> http://prometheus.observability.svc.cluster.local:9090</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">threshold</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;5&quot;</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a><span class="fu">        query</span><span class="kw">: </span><span class="ch">|</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>          avg(avg_over_time(llm_queue_depth{app=&quot;llm-inference&quot;}[2m]))</span></code></pre></div>
+<p>A <code>minReplicaCount</code> és <code>maxReplicaCount</code>
+közötti tartományt a kapacitásbecslésből kell származtatni. Az alsó
+korlát garantálja a minimális rendelkezésre állást, a felső korlát pedig
+a költségplafont. A <code>threshold</code> replikánkénti célérték: a HPA
+annyi replikát kér, hogy a várakozó kérések átlagosan ≤ 5 jussanak egy
+replikára. Az érték a QoS-célból következik, a pontos értéket méréssel
+kell ellenőrizni; a pontos szemantikát és a mezőneveket a használt
+KEDA-verzió dokumentációjából kell ellenőrizni.</p>
+<h3 data-number="25.3.4" id="hidegindítás-és-költség"><span
+class="header-section-number">25.3.4</span> Hidegindítás és költség</h3>
+<p>A <strong>hidegindítás</strong> az az idő, amíg egy új replika kérés
+kiszolgálására képessé válik. LLM-inferencia esetén ennek több fázisa
+van:</p>
+<ol type="1">
+<li><strong>Konténerindítás</strong>: a futási környezet és a
+Python-függőségek betöltése.</li>
+<li><strong>Modelltöltés</strong>: a súlyok beolvasása a háttértárból
+vagy a model cache-ből; nagy modelleknél ez több tíz másodperc vagy perc
+is lehet.</li>
+<li><strong>CUDA-kontextus és kernel-fordítás</strong>: az első kérés
+előtt a GPU-kontextus inicializálása, a kernelcache feltöltése vagy a
+graph capture végrehajtása.</li>
+<li><strong>KV cache és memóriaallokálás</strong>: a konfigurált batch
+mérethez és kontextusablakhoz szükséges GPU-memória lefoglalása.</li>
+<li><strong>Egészségügyi ellenőrzés</strong>: a modell készenléti jele,
+például egy egyszerű generálási vagy logit-ellenőrzés.</li>
+</ol>
+<p>A hidegindítási idő modellméret, tárolási réteg és precizitás
+függvénye. Egy 7–8 milliárd paraméteres modell esetén tipikusan 20–90
+másodperc lehet, de nagyobb modelleknél vagy lassú tárolón akár több
+perc is. A pontos értéket mindig mérni kell, mert a felhőszolgáltatók, a
+tárolóhálózat és a konténer-réteg nagy eltéréseket okozhatnak. A könyv
+mérési szerződése szerint a hidegindítási méréshez rögzíteni kell a
+modellt, a precizitást, a batch méretet, a kontextusablakot, a
+GPU-típust és a tárolórendszert.</p>
+<p>A hidegindítás költsége kétféle:</p>
+<ul>
+<li><strong>Késleltetési költség</strong>: azok a kérések, amelyek
+hidegindításra várnak, hosszabb latencyt tapasztalnak, és adott esetben
+timeoutot szenvednek.</li>
+<li><strong>Erőforrásköltség</strong>: a hidegindítás alatt a GPU már
+foglalt, de még nem szolgál ki kéréseket; ez az idő az óradíjban
+fizetendő, de nem termel.</li>
+</ul>
+<p>A költségoptimalizálás kulcskérdése, hogy <strong>mennyi meleg
+kapacitást</strong> tartsunk. Ha túl keveset, a hidegindítások miatt
+romlik a latency; ha túl sokat, feleslegesen fizetünk az üresjárati
+GPU-kért. A <strong>scale-to-zero</strong> takarékos, mert forgalom
+hiányában nullára csökkenti a replikákat, de a hidegindítási büntetés
+nagy. A <strong>készenléti replika</strong> fenntart egy kis meleg
+poolt, amely azonnal kiszolgálja az első kéréseket, amíg a további
+replikák fel nem állnak. A kettő közötti optimumot a forgalmi mintázat
+és az SLO határozza meg.</p>
+<p>A hidegindítási idő csökkentésére gyakori módszerek:</p>
+<ul>
+<li><strong>Modell cache és gyors, lokális SSD vagy NVMe</strong>: a
+súlyok betöltésének gyorsítása.</li>
+<li><strong>Snapshot vagy pre-sharded checkpoint</strong>: a modell
+memóriába emelésének elkerülése.</li>
+<li><strong>Lazy loading</strong>: a súlyok egy részének betöltése után
+a készenlét jelzése, a tényleges igény szerinti betöltéssel.</li>
+<li><strong>Warm pool</strong>: előre elindított csomópontok vagy
+konténerek, amelyek a modellt már memóriában tartják.</li>
+<li><strong>Prewarming ütemezése</strong>: napi vagy kampányszerű
+forgalomnövekedés előtt.</li>
+</ul>
+<p>A költségszámításban a <strong>GPU-óra</strong> az alapegység. Ha egy
+modell replikái összesen c darab GPU-t foglalnak, és egy GPU óradíja p,
+akkor a napi költség:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>C</mi><mtext mathvariant="normal">nap</mtext></msub><mo>=</mo><mi>c</mi><mo>⋅</mo><mi>p</mi><mo>⋅</mo><mn>24</mn><mi>.</mi></mrow><annotation encoding="application/x-tex">
+C_{\text{nap}} = c \cdot p \cdot 24.
+</annotation></semantics></math></p>
+<p>A tényleges költség ennél magasabb lehet, ha a poolcsomópontok nem
+teljesen kihasználtak, vagy ha a node autoscaler nem tudja
+felszabadítani a felesleges kapacitást. A felhőben a GPU-k fenntartott,
+on-demand és spot árazása is eltérő; a spot GPU-k olcsóbbak, de bármikor
+elvehetők, ami további hidegindításokat okozhat.</p>
+<h3 data-number="25.3.5" id="kapacitásbecslés"><span
+class="header-section-number">25.3.5</span> Kapacitásbecslés</h3>
+<p>A kapacitásbecslés célja, hogy a várható forgalomhoz meghatározzuk a
+szükséges replikák számát és a skálázási tartományt. Első lépésként
+rögzíteni kell a modellkártya és a hardver adatait:</p>
+<ul>
+<li>Modell neve, revíziója, precizitása.</li>
+<li>Kontextusablak és maximális batch méret.</li>
+<li>Méréssel meghatározott átlagos token/sebesség egy GPU-n, adott batch
+méretnél és prompt/kimeneti token eloszlásnál.</li>
+</ul>
+<p>Egyetlen kérés átlagos tokenszáma:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>N</mi><mtext mathvariant="normal">token/kérés</mtext></msub><mo>=</mo><msub><mi>L</mi><mtext mathvariant="normal">in</mtext></msub><mo>+</mo><msub><mi>L</mi><mtext mathvariant="normal">out</mtext></msub><mo>,</mo></mrow><annotation encoding="application/x-tex">
+N_{\text{token/kérés}} = L_{\text{in}} + L_{\text{out}},
+</annotation></semantics></math></p>
+<p>(ez egyetlen mért „token/s” értékkel számoló közelítés; pontosabban
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>t</mi><mtext mathvariant="normal">kérés</mtext></msub><mo>≈</mo><msub><mi>L</mi><mtext mathvariant="normal">in</mtext></msub><mi>/</mi><msub><mi>T</mi><mtext mathvariant="normal">prefill</mtext></msub><mo>+</mo><msub><mi>L</mi><mtext mathvariant="normal">out</mtext></msub><mi>/</mi><msub><mi>T</mi><mtext mathvariant="normal">decode</mtext></msub></mrow><annotation encoding="application/x-tex">t_{\text{kérés}} \approx L_{\text{in}}/T_{\text{prefill}} + L_{\text{out}}/T_{\text{decode}}</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mtext mathvariant="normal">prefill</mtext></msub><annotation encoding="application/x-tex">T_{\text{prefill}}</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mtext mathvariant="normal">decode</mtext></msub><annotation encoding="application/x-tex">T_{\text{decode}}</annotation></semantics></math>
+az adott batchnél mért prefill- és dekódolási tokensebesség; ha csak
+egyetlen „token/s” mérés van, rögzítsük, hogy az a kimeneti tokenekre
+vagy az összesre vonatkozik, és a mérés prompt/kimeneti eloszlása
+egyezzen a tervezettel) ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>L</mi><mtext mathvariant="normal">in</mtext></msub><annotation encoding="application/x-tex">L_{\text{in}}</annotation></semantics></math>
+az átlagos prompt hossz,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>L</mi><mtext mathvariant="normal">out</mtext></msub><annotation encoding="application/x-tex">L_{\text{out}}</annotation></semantics></math>
+az átlagos generált tokenek száma. Ha egy GPU sebessége
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mtext mathvariant="normal">tok/s</mtext></msub><annotation encoding="application/x-tex">T_{\text{tok/s}}</annotation></semantics></math>,
+akkor az egy GPU-ra jutó kérésátbocsátás:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>R</mi><mtext mathvariant="normal">gpu</mtext></msub><mo>=</mo><mfrac><msub><mi>T</mi><mtext mathvariant="normal">tok/s</mtext></msub><msub><mi>N</mi><mtext mathvariant="normal">token/kérés</mtext></msub></mfrac><mi>.</mi></mrow><annotation encoding="application/x-tex">
+R_{\text{gpu}} = \frac{T_{\text{tok/s}}}{N_{\text{token/kérés}}}.
+</annotation></semantics></math></p>
+<p>A célterhelés
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>R</mi><mtext mathvariant="normal">cél</mtext></msub><annotation encoding="application/x-tex">R_{\text{cél}}</annotation></semantics></math>
+(request/s) kiszolgálásához szükséges replikaszám:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>c</mi><mtext mathvariant="normal">min</mtext></msub><mo>=</mo><mrow><mo stretchy="true" form="prefix">⌈</mo><mfrac><msub><mi>R</mi><mtext mathvariant="normal">cél</mtext></msub><msub><mi>R</mi><mtext mathvariant="normal">gpu</mtext></msub></mfrac><mo>⋅</mo><mi>s</mi><mo stretchy="true" form="postfix">⌉</mo></mrow><mo>,</mo></mrow><annotation encoding="application/x-tex">
+c_{\text{min}} = \left\lceil \frac{R_{\text{cél}}}{R_{\text{gpu}}} \cdot s \right\rceil,
+</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>s</mi><mo>&gt;</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">s &gt; 1</annotation></semantics></math>
+a biztonsági tényező. A biztonsági tényező a forgalom szórását, a
+hidegindítási veszteséget és a pufferigényt fedezi; tipikus értéke
+1,2–1,5. A képlet csak kihasználtsági alsó becslést ad; a latency SLO
+betartását ezután terhelésteszttel kell igazolni.</p>
+<p><strong>Példa</strong>: Tegyük fel, hogy egy 7B paraméteres modellt
+futtatunk 16 bites pontossággal, batch méret 32 mellett, és a mérés
+szerint egy GPU átlagosan 2500 token/s sebességet ér el. Az átlagos
+prompt hossza 200 token, az átlagos kimenet 400 token, így kérésenként
+600 tokenre van szükség. Egy GPU átbocsátása:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>R</mi><mtext mathvariant="normal">gpu</mtext></msub><mo>=</mo><mfrac><mn>2500</mn><mn>600</mn></mfrac><mo>≈</mo><mn>4</mn><mo>,</mo><mn>17</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">request/s</mtext><mi>.</mi></mrow><annotation encoding="application/x-tex">
+R_{\text{gpu}} = \frac{2500}{600} \approx 4{,}17\ \text{request/s}.
+</annotation></semantics></math></p>
+<p>Ha a célterhelés
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>R</mi><mtext mathvariant="normal">cél</mtext></msub><mo>=</mo><mn>50</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">request/s</mtext></mrow><annotation encoding="application/x-tex">R_{\text{cél}} = 50\ \text{request/s}</annotation></semantics></math>,
+és 1,3-as biztonsági tényezővel dolgozunk:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>c</mi><mtext mathvariant="normal">min</mtext></msub><mo>=</mo><mrow><mo stretchy="true" form="prefix">⌈</mo><mfrac><mn>50</mn><mrow><mn>4</mn><mo>,</mo><mn>17</mn></mrow></mfrac><mo>⋅</mo><mn>1</mn><mo>,</mo><mn>3</mn><mo stretchy="true" form="postfix">⌉</mo></mrow><mo>=</mo><mo stretchy="false" form="prefix">⌈</mo><mn>15</mn><mo>,</mo><mn>6</mn><mo stretchy="false" form="postfix">⌉</mo><mo>=</mo><mn>16</mn><mi>.</mi></mrow><annotation encoding="application/x-tex">
+c_{\text{min}} = \left\lceil \frac{50}{4{,}17} \cdot 1{,}3 \right\rceil = \lceil 15{,}6 \rceil = 16.
+</annotation></semantics></math></p>
+<p>A tényleges kihasználtság így:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>ρ</mi><mo>=</mo><mfrac><mn>50</mn><mrow><mn>16</mn><mo>⋅</mo><mn>4</mn><mo>,</mo><mn>17</mn></mrow></mfrac><mo>≈</mo><mn>0</mn><mo>,</mo><mn>75</mn><mi>.</mi></mrow><annotation encoding="application/x-tex">
+\rho = \frac{50}{16 \cdot 4{,}17} \approx 0{,}75.
+</annotation></semantics></math></p>
+<p>Ez jó kiindulópont, de ha a p95 latency mérése meghaladja a célt, a
+biztonsági tényezőt vagy a batch méretet kell módosítani. A p95 latency
+SLO-t nem a képletből, hanem a replikák és a scheduler együttes
+viselkedéséből kapjuk. A várható
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>W</mi><annotation encoding="application/x-tex">W</annotation></semantics></math>
+válaszidőt a Little-törvényből közelíthetjük:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi><mo>=</mo><mi>λ</mi><mi>W</mi></mrow><annotation encoding="application/x-tex">L = \lambda W</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>L</mi><annotation encoding="application/x-tex">L</annotation></semantics></math>
+a rendszerben tartózkodó kérések átlagos száma. A Little-törvényt itt a
+batch figyelembevételével kell alkalmazni. Egy kérés átlagos
+kiszolgálási ideje kb. a batchméret / GPU-kérésátbocsátás:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>32</mn><mi>/</mi><mn>4</mn><mo>,</mo><mn>17</mn><mo>≈</mo><mn>7</mn><mo>,</mo><mn>7</mn></mrow><annotation encoding="application/x-tex">32/4{,}17 \approx 7{,}7</annotation></semantics></math>
+s (ezt méréssel kell igazolni). Ekkor
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi><mo>=</mo><mi>λ</mi><mi>W</mi><mo>≈</mo><mn>50</mn><mo>⋅</mo><mn>7</mn><mo>,</mo><mn>7</mn><mo>≈</mo><mn>385</mn></mrow><annotation encoding="application/x-tex">L = \lambda W \approx 50 \cdot 7{,}7 \approx 385</annotation></semantics></math>
+kérés van egyszerre a rendszerben, ami a 16 GPU 512 batch-helyének ≈
+75%-a – összhangban a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>ρ</mi><mo>≈</mo><mn>0</mn><mo>,</mo><mn>75</mn></mrow><annotation encoding="application/x-tex">\rho \approx 0{,}75</annotation></semantics></math>
+értékkel. Az M/M/c modellben ilyenkor a kiszolgálók száma a batch-helyek
+száma
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>c</mi><mo>=</mo><mn>16</mn><mo>⋅</mo><mn>32</mn></mrow><annotation encoding="application/x-tex">c = 16 \cdot 32</annotation></semantics></math>),
+a kiszolgálási ráta
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>μ</mi><mo>=</mo><mn>1</mn><mi>/</mi><mn>7</mn><mo>,</mo><mn>7</mn><mspace width="0.222em"></mspace><msup><mtext mathvariant="normal">s</mtext><mrow><mi>−</mi><mn>1</mn></mrow></msup></mrow><annotation encoding="application/x-tex">\mu = 1/7{,}7\ \text{s}^{-1}</annotation></semantics></math>.
+Ez csak akkor érvényes, ha a sor nem telített; a p95 ennél nagyobb.</p>
+<p>A fenti számításhoz a mérési feltételeket rögzíteni kell: a modell
+pontos neve és revíziója, a GPU típusa, a precision, a batch méret, a
+kontextusablak, valamint a prompt/kimeneti eloszlás. A könyv mérési
+szerződése szerint a mért és a várt értéket külön kell feltüntetni; a
+2500 token/s itt <strong>példa érték</strong>, nem ellenőrzött
+mérés.</p>
+<h3 data-number="25.3.6"
+id="labor-autoscaling-politika-és-kapacitásbecslés"><span
+class="header-section-number">25.3.6</span> Labor: autoscaling-politika
+és kapacitásbecslés</h3>
+<p>A labor célja, hogy egy egyszerű szimulációval ellenőrizd a sorban
+állási modellt és egy küszöbalapú autoscaling-politikát. A környezet
+legyen reprodukálható: Python 3.12+, <code>numpy</code> és a
+<code>random</code> modul, seed rögzítve 42-re. A terhelés szintetikus,
+Poisson-érkezésű, exponenciális kiszolgálási idejű kérésekből áll; ez az
+M/M/c modell. A mért és a várt eredményt különítsd el.</p>
+<p><strong>Lépések</strong>:</p>
+<ol type="1">
+<li><p><strong>Kapacitásbecslés</strong>: λ = 20 kérés/s, μ = 5 kérés/s
+GPU-nként, c = 5 GPU. Számítsd ki a kihasználtságot és az Erlang C
+formulával a várakozási mutatókat. Várt értékek (ellenőrzéshez):
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>ρ</mi><mo>=</mo><mn>0</mn><mo>,</mo><mn>8</mn></mrow><annotation encoding="application/x-tex">\rho = 0{,}8</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>P</mi><mtext mathvariant="normal">wait</mtext></msub><mo>≈</mo><mn>0</mn><mo>,</mo><mn>554</mn></mrow><annotation encoding="application/x-tex">P_{\text{wait}} \approx 0{,}554</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>W</mi><mi>q</mi></msub><mo>≈</mo><mn>0</mn><mo>,</mo><mn>111</mn></mrow><annotation encoding="application/x-tex">W_q \approx 0{,}111</annotation></semantics></math>
+s,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>W</mi><mo>≈</mo><mn>0</mn><mo>,</mo><mn>311</mn></mrow><annotation encoding="application/x-tex">W \approx 0{,}311</annotation></semantics></math>
+s; a várakozás p95-je
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mi>ln</mi><mo>&#8289;</mo></mrow><mo stretchy="false" form="prefix">(</mo><msub><mi>P</mi><mtext mathvariant="normal">wait</mtext></msub><mi>/</mi><mn>0</mn><mo>,</mo><mn>05</mn><mo stretchy="false" form="postfix">)</mo><mi>/</mi><mo stretchy="false" form="prefix">(</mo><mi>c</mi><mi>μ</mi><mo>−</mo><mi>λ</mi><mo stretchy="false" form="postfix">)</mo><mo>≈</mo><mn>0</mn><mo>,</mo><mn>48</mn></mrow><annotation encoding="application/x-tex">\ln(P_{\text{wait}}/0{,}05)/(c\mu-\lambda) \approx 0{,}48</annotation></semantics></math>
+s, a válaszidő p95-je numerikusan ≈ 0,84 s (kézi számítás, nem
+futtatva). Ezeket jelöld „várt” értékként.</p></li>
+<li><p><strong>Szimuláció skálázás nélkül</strong>: eseményvezérelt
+szimulációt futtass 3600 másodpercig. Az érkezési időközöket és a
+kiszolgálási időket a seedelt véletlengenerátorral generáld. Mérd a p95
+latencyt. Hasonlítsd össze a várt értékkel.</p></li>
+<li><p><strong>Autoscaling-politika</strong>: implementálj egy egyszerű
+szabályt:</p>
+<ul>
+<li>ha a queue hossza meghaladja az 5 kérést, indíts egy új GPU-t;</li>
+<li>a skálázási események között legyen 300 másodperces cooldown;</li>
+<li>a replikák száma nem haladhatja meg a 8-at;</li>
+<li>a hidegindítást 120 másodperces késleltetéssel modellezd: az új GPU
+csak ennyi idő múlva kezd kiszolgálni;</li>
+<li>a leállítási szabályt most hagyd el, vagy csak akkor skálázz le, ha
+a queue 0 és az átlagos kihasználtság 0,3 alatt van 300 másodpercen
+át.</li>
+</ul>
+<figure id="fig-lm095-autoscaling-idovonal">
+<div class="fig-interactive"><iframe src="figures/html/lm095-autoscaling-idovonal.html" title="Három idősor közös időtengellyel 0 és 1800 s között: az érkezési ráta 600 s-nál 20-ról 30-ra ugrik; a sor csúcsai 5 fölött ingadoznak, a lépcső után 25 körülire nőnek; a kért replikák 2, 318 és 619 s-kor, a kiszolgálók 122, 438 és 739 s-kor nőnek eggyel, 5-ről 8-ra." loading="lazy" style="width:100%;border:0;height:560px"></iframe><noscript><img src="figures/img/lm095-autoscaling-idovonal.png"
+style="width:100.0%"
+alt="Három idősor közös időtengellyel 0 és 1800 s között: az érkezési ráta 600 s-nál 20-ról 30-ra ugrik; a sor csúcsai 5 fölött ingadoznak, a lépcső után 25 körülire nőnek; a kért replikák 2, 318 és 619 s-kor, a kiszolgálók 122, 438 és 739 s-kor nőnek eggyel, 5-ről 8-ra." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/lm095-autoscaling-idovonal.png"
+style="width:100.0%"
+alt="Három idősor közös időtengellyel 0 és 1800 s között: az érkezési ráta 600 s-nál 20-ról 30-ra ugrik; a sor csúcsai 5 fölött ingadoznak, a lépcső után 25 körülire nőnek; a kért replikák 2, 318 és 619 s-kor, a kiszolgálók 122, 438 és 739 s-kor nőnek eggyel, 5-ről 8-ra." /></details></div>
+<figcaption>Küszöbalapú autoscaling M/M/c szimulációban a labor
+szabályával (queue &gt; 5, cooldown 300 s, hidegindítás 120 s,
+legfeljebb 8 GPU,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>μ</mi><mo>=</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">\mu = 5</annotation></semantics></math>/s,
+kezdetben 5 GPU) és terheléslépcsővel
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>λ</mi><mo>=</mo><mn>20</mn></mrow><annotation encoding="application/x-tex">\lambda = 20</annotation></semantics></math>/s,
+600 s-tól 30/s). Minden kért replika pontosan 120 s múlva kezd
+kiszolgálni (csíkozott sáv), a következő skálázás csak a 300 s-os
+cooldown (szürke) után jöhet: kérés 2, 318 és 619 s-kor, kiszolgálás
+122, 438 és 739 s-tól. Már
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>λ</mi><mo>=</mo><mn>20</mn></mrow><annotation encoding="application/x-tex">\lambda = 20</annotation></semantics></math>
+mellett
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>ρ</mi><mo>=</mo><mn>0</mn><mo>,</mo><mn>8</mn></mrow><annotation encoding="application/x-tex">\rho = 0{,}8</annotation></semantics></math>)
+is átlépi a sor az 5-ös küszöböt, ezért a szabály a lépcső előtt 7
+GPU-ra skáláz; a lépcső után a 8. replika csak 120 s múlva érkezik,
+addig a sor megugrik.
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>λ</mi><mo>=</mo><mn>30</mn></mrow><annotation encoding="application/x-tex">\lambda = 30</annotation></semantics></math>-nál
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>c</mi><mo>=</mo><mn>6</mn></mrow><annotation encoding="application/x-tex">c = 6</annotation></semantics></math>
+mellett
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>ρ</mi><mo>=</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">\rho = 1</annotation></semantics></math>,
+a stabilitáshoz legalább 7 GPU kell. Szimuláció, nem mérés.</figcaption>
+</figure></li>
+<li><p><strong>Eredmények</strong>: futtasd le a szimulációt a
+skálázással és anélkül is. Rögzítsd a p95 latencyt, az átlagos
+kihasználtságot, a maximális queue mélységet és a GPU-órák számát. A
+mért eredményeket táblázatosan vesd össze a várt értékkel.</p></li>
+</ol>
+<p>Az alábbi Python-vázlat a szimuláció fő szerkezetét mutatja; a
+hiányzó függvényeket a laborban kell kitölteni. A kód csak szemléltetés,
+nem futtatható közvetlenül:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> heapq</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> random</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> math</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>rng <span class="op">=</span> random.Random(<span class="dv">42</span>)</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>ARRIVAL_RATE <span class="op">=</span> <span class="fl">20.0</span>     <span class="co"># kérés/s, lambda</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>SERVICE_RATE <span class="op">=</span> <span class="fl">5.0</span>      <span class="co"># kérés/s per GPU, mu</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>INITIAL_GPUS <span class="op">=</span> <span class="dv">5</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>SIM_TIME <span class="op">=</span> <span class="fl">3600.0</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>MAX_GPUS <span class="op">=</span> <span class="dv">8</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>COOLDOWN <span class="op">=</span> <span class="fl">300.0</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>COLD_START_DELAY <span class="op">=</span> <span class="fl">120.0</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>QUEUE_THRESHOLD <span class="op">=</span> <span class="dv">5</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> exp_interval(rate):</span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">-</span>math.log(<span class="fl">1.0</span> <span class="op">-</span> rng.random()) <span class="op">/</span> rate</span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> service_time(gpu_rate):</span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> exp_interval(gpu_rate)</span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a><span class="co"># Eseménynapló: (time, type, request_id)</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a><span class="co"># type: &quot;arrival&quot;, &quot;service_done&quot;, &quot;gpu_ready&quot;</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>events <span class="op">=</span> []</span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>heapq.heapify(events)</span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a><span class="co"># Kezdeti érkezés</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>next_arrival <span class="op">=</span> exp_interval(ARRIVAL_RATE)</span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>heapq.heappush(events, (next_arrival, <span class="st">&quot;arrival&quot;</span>, <span class="va">None</span>))</span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a><span class="co"># GPU-állapot: {gpu_id: {&quot;ready&quot;: True/False, &quot;ready_time&quot;: ...}}</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a><span class="co"># ...</span></span></code></pre></div>
+<p>A szimuláció során a <code>metrics</code> nevű gyűjtőben tárold a
+kérések beérkezési és kiszolgálási idejét, a queue hosszát és a GPU-k
+állapotát. Az adatkimenet legyen determinisztikus a seed miatt.</p>
+<p>A laborban a várt p95 latencyt az M/M/c modellből számíthatod. Az
+Erlang C formula alapján a várakozás valószínűsége:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>P</mi><mtext mathvariant="normal">wait</mtext></msub><mo>=</mo><mfrac><mrow><mo stretchy="false" form="prefix">(</mo><mi>c</mi><mi>ρ</mi><msup><mo stretchy="false" form="postfix">)</mo><mi>c</mi></msup></mrow><mrow><mi>c</mi><mi>!</mi><mspace width="0.167em"></mspace><mo stretchy="false" form="prefix">(</mo><mn>1</mn><mo>−</mo><mi>ρ</mi><mo stretchy="false" form="postfix">)</mo></mrow></mfrac><msup><mrow><mo stretchy="true" form="prefix">(</mo><munderover><mo>∑</mo><mrow><mi>k</mi><mo>=</mo><mn>0</mn></mrow><mrow><mi>c</mi><mo>−</mo><mn>1</mn></mrow></munderover><mfrac><mrow><mo stretchy="false" form="prefix">(</mo><mi>c</mi><mi>ρ</mi><msup><mo stretchy="false" form="postfix">)</mo><mi>k</mi></msup></mrow><mrow><mi>k</mi><mi>!</mi></mrow></mfrac><mo>+</mo><mfrac><mrow><mo stretchy="false" form="prefix">(</mo><mi>c</mi><mi>ρ</mi><msup><mo stretchy="false" form="postfix">)</mo><mi>c</mi></msup></mrow><mrow><mi>c</mi><mi>!</mi><mspace width="0.167em"></mspace><mo stretchy="false" form="prefix">(</mo><mn>1</mn><mo>−</mo><mi>ρ</mi><mo stretchy="false" form="postfix">)</mo></mrow></mfrac><mo stretchy="true" form="postfix">)</mo></mrow><mrow><mi>−</mi><mn>1</mn></mrow></msup><mo>,</mo></mrow><annotation encoding="application/x-tex">
+P_{\text{wait}} = \frac{(c\rho)^c}{c!\,(1-\rho)} \left( \sum_{k=0}^{c-1} \frac{(c\rho)^k}{k!} + \frac{(c\rho)^c}{c!\,(1-\rho)} \right)^{-1},
+</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>ρ</mi><mo>=</mo><mi>λ</mi><mi>/</mi><mo stretchy="false" form="prefix">(</mo><mi>c</mi><mi>μ</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">\rho = \lambda/(c\mu)</annotation></semantics></math>.
+A várakozó kérések átlagos várakozási ideje:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>W</mi><mi>q</mi></msub><mo>=</mo><mfrac><msub><mi>P</mi><mtext mathvariant="normal">wait</mtext></msub><mrow><mi>c</mi><mi>μ</mi><mo>−</mo><mi>λ</mi></mrow></mfrac><mi>.</mi></mrow><annotation encoding="application/x-tex">
+W_q = \frac{P_{\text{wait}}}{c\mu - \lambda}.
+</annotation></semantics></math></p>
+<p>Ebből a teljes válaszidő
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>W</mi><mo>=</mo><msub><mi>W</mi><mi>q</mi></msub><mo>+</mo><mn>1</mn><mi>/</mi><mi>μ</mi></mrow><annotation encoding="application/x-tex">W = W_q + 1/\mu</annotation></semantics></math>.
+A válaszidő p95-je a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>W</mi><mi>q</mi></msub><annotation encoding="application/x-tex">W_q</annotation></semantics></math>
+és a kiszolgálási idő eloszlásából numerikusan számítható, vagy
+szimulációval becsülhető; az exponenciális eloszlás miatt a p95 latency
+a p50-nél lényegesen nagyobb lehet.</p>
+<p>Ellenőrzési szempont: ha a szimulált p95 lényegesen eltér a várt
+értéktől, először a bemelegedési szakaszt, a futás hosszát és az
+eseménykezelés helyességét vizsgáld, ne a matematikai modellt
+módosítsd.</p>
+<h3 data-number="25.3.7" id="tipikus-hibák-és-helyes-megoldásuk"><span
+class="header-section-number">25.3.7</span> Tipikus hibák és helyes
+megoldásuk</h3>
+<p><strong>1. Csak a GPU-kihasználtságra skálázás.</strong><br />
+A GPU-kihasználtság nem közvetlen latency-mutató. Egy rendszer lehet
+100%-osan kihasznált úgy is, hogy a latency elfogadható, és lehet
+alacsony kihasználtságú úgy is, hogy a queue már hosszú. Ehelyett a
+queue depth és a p95 latency alapján kell skálázni, és a
+GPU-kihasználtságot csak diagnosztikai mutatóként érdemes figyelni.</p>
+<p><strong>2. Túl gyors skálázás, koherencia nélkül.</strong><br />
+Ha a replikákat azonnal hozzáadjuk vagy leállítjuk, a rendszer
+oszcillálni fog. A cooldown és a hiszterézis (más küszöb a fel- és
+leskálázásra) segít stabilizálni. A skálázási lépés méretét is érdemes
+korlátozni: egyszerre például legfeljebb 1–2 replikát, kivéve a
+tervezett terhelésugrásokat.</p>
+<p><strong>3. A hidegindítás figyelmen kívül hagyása.</strong><br />
+Az autoscaler döntésénél nem elég a replikák számát növelni; a
+hidegindítási idő alatt a kérések továbbra is a régi replikákra és a
+queue-ra terhelődnek. A hidegindítást a skálázási modellben
+késleltetésként kell figyelembe venni. A gyakorlatban ez azt jelenti,
+hogy a thresholdot alacsonyabbra vagy a cooldownt hosszabbra kell
+állítani, illetve warm poolt kell fenntartani.</p>
+<p><strong>4. A KV cache és a batch méret elhanyagolása.</strong><br />
+A kapacitásbecslésnél gyakran azt feltételezik, hogy a token/s állandó,
+függetlenül a kontextushossztól és a batch mérettől. Valójában a hosszú
+kontextus és a nagy batch növeli a KV cache memóriaigényét és a figyelem
+számítási költségét. A mérésnél ezért a valós prompt- és kimeneti
+eloszlást kell használni, nem pedig egy rögzített rövid promptot.</p>
+<p><strong>5. A költség csak a GPU-k darabszámában való
+gondolkodás.</strong><br />
+A GPU-pool költségét nemcsak a replikák száma határozza meg, hanem a
+pool csomópontjainak száma, a spot vagy on-demand árazás, a hálózati
+forgalom és a mentési/tárolási költségek is. A költségmodellnek
+tartalmaznia kell a csomópontok foglaltságát és a gyakori hidegindítások
+büntetését.</p>
+<p><strong>6. A skálázási tartomány hiánya.</strong><br />
+Ha a replikák száma nem korlátozott, a forgalmi hurok akár több száz
+GPU-t is elindíthat, ami költségrobbanáshoz vezet. A felső korlátot a
+költségplafonból, az alsó korlátot a minimális rendelkezésre állásból
+kell származtatni.</p>
+<h3 data-number="25.3.8" id="ellenőrző-kérdések"><span
+class="header-section-number">25.3.8</span> Ellenőrző kérdések</h3>
+<ol type="1">
+<li>Adott modellnél egy GPU 1800 token/s sebességet ér el. Az átlagos
+prompt 300, az átlagos kimenet 300 token. Mekkora az egy GPU-ra jutó
+kérésátbocsátás? Ha a célterhelés 30 kérés/s és a biztonsági tényező
+1,2, hány replika szükséges?</li>
+<li>Miben különbözik a reaktív és a prediktív autoscaling? Milyen
+helyzetben előnyös az egyik vagy a másik?</li>
+<li>Miért nem elegendő a GPU-kihasználtság az autoscaling egyetlen
+metrikájaként? Milyen mutatót érdemes mellé tenni, és miért?</li>
+</ol>
+<hr />
+<p>A következő alfejezet az energiahatékonysággal és a környezeti
+hatással foglalkozik, és az itt bevezetett kapacitásfogalmakra épít. A
+GPU-pool mérete, kihasználtsága és üresjárati ideje közvetlenül
+meghatározza az energiafogyasztást, ezért a skálázási döntéseket a
+fenntarthatósági szempontokkal együtt érdemes továbbgondolni.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="lm094.html">← 25.2 Multi-tenancy, kvóta és rate limit</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="lm096.html">25.4 Zöld AI, energia és hatékonyság →</a></div>
+</nav>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
+</html>
